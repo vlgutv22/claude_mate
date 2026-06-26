@@ -1,0 +1,3 @@
+# Claude Mate daemon — Python dependencies.
+# Only third-party requirement: pyserial for the USB serial link.
+pyserial>=3.5

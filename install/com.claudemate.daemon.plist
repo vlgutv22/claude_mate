@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Claude Mate LaunchAgent
+  ============================================================================
+  This is a TEMPLATE. install.sh rewrites the __REPO__ and __PYTHON__
+  placeholders with the real repository path and python3 interpreter before
+  copying it into ~/Library/LaunchAgents/.
+
+  Runs the daemon at login (RunAtLoad) and keeps it alive (KeepAlive) so the
+  USB hardware companion reconnects automatically. Logs go to
+  ~/Library/Logs/claude-mate.out.log and claude-mate.err.log.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.claudemate.daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>__REPO__/daemon/claude_mate_daemon.py</string>
+    </array>
+
+    <!-- Start at login. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart the daemon if it exits (e.g. USB unplugged then replugged). -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Throttle restarts so a hard-failing daemon does not spin. -->
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <!-- Run from the repo so relative paths / mock helpers resolve sensibly. -->
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+
+    <!-- Unbuffer Python so logs are written promptly. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/claude-mate.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/claude-mate.err.log</string>
+
+    <!-- Run only when the user is logged in (Aqua GUI session). -->
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

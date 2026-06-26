@@ -1,0 +1,30 @@
+# EditorConfig — https://editorconfig.org
+# Top-most EditorConfig file.
+root = true
+
+# Defaults for all files.
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+# Python — 4-space indentation.
+[*.py]
+indent_style = space
+indent_size = 4
+
+# JSON, Markdown, and Arduino sketches — 2-space indentation.
+[*.{json,md,ino}]
+indent_style = space
+indent_size = 2
+
+# Markdown: keep trailing whitespace (it can be significant for hard breaks).
+[*.md]
+trim_trailing_whitespace = false
+
+# Makefiles require real tabs.
+[Makefile]
+indent_style = tab

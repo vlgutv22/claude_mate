@@ -1,0 +1,25 @@
+{
+  "_comment": "Claude Mate hooks. Merge the 'hooks' object below into ~/.claude/settings.json. Install the script at ~/.claude/hooks/claude-status.sh and chmod +x it. The StopFailure->error hook ('claudeMateError') is OPTIONAL: StopFailure fires (instead of Stop) when a turn ends on an API error (5xx/overloaded/timeout/rate-limit). If your Claude Code build does not support StopFailure, simply omit the 'claudeMateError' entry — the rest still works. See README for merge instructions.",
+  "hooks": {
+    "claudeMateWorking": {
+      "type": "shell",
+      "events": ["UserPromptSubmit"],
+      "command": "~/.claude/hooks/claude-status.sh working"
+    },
+    "claudeMateWaiting": {
+      "type": "shell",
+      "events": ["Notification"],
+      "command": "~/.claude/hooks/claude-status.sh waiting"
+    },
+    "claudeMateDone": {
+      "type": "shell",
+      "events": ["Stop"],
+      "command": "~/.claude/hooks/claude-status.sh done"
+    },
+    "claudeMateError": {
+      "type": "shell",
+      "events": ["StopFailure"],
+      "command": "~/.claude/hooks/claude-status.sh error"
+    }
+  }
+}
