@@ -1,0 +1,129 @@
+#!/bin/bash
+# Claude Mate pkg postinstall.
+# Runs as root AFTER the payload is laid down at:
+#     /Library/Application Support/ClaudeMate/
+# It wires the install up for the GUI *console user* (not root):
+#   1. installs the hook into ~/.claude/hooks/
+#   2. merges the hooks block into ~/.claude/settings.json (idempotent)
+#   3. instantiates the LaunchAgent into ~/Library/LaunchAgents/ and loads it
+# Best-effort: log everything, but never hard-fail the install.
+set -u
+
+SUPPORT="/Library/Application Support/ClaudeMate"
+PY="/usr/bin/python3"
+LOG=/tmp/claude-mate-install.log
+exec >>"$LOG" 2>&1
+echo "=== postinstall $(date) ==="
+
+# ---------------------------------------------------------------------------
+# Resolve the GUI console user (the human), not root.
+# ---------------------------------------------------------------------------
+USER_NAME="$(/usr/bin/stat -f%Su /dev/console 2>/dev/null || true)"
+if [ -z "${USER_NAME}" ] || [ "${USER_NAME}" = "root" ]; then
+    USER_NAME="$(/usr/bin/scutil <<< 'show State:/Users/ConsoleUser' 2>/dev/null \
+        | /usr/bin/awk '/Name :/ { print $3 }')"
+fi
+if [ -z "${USER_NAME}" ] || [ "${USER_NAME}" = "root" ]; then
+    echo "FATAL: could not resolve a GUI console user; aborting user wiring."
+    exit 0   # files are installed; user can run packaging/scripts manually
+fi
+
+UID_NUM="$(/usr/bin/id -u "${USER_NAME}")"
+USER_HOME="$(/usr/bin/dscl . -read "/Users/${USER_NAME}" NFSHomeDirectory 2>/dev/null \
+    | /usr/bin/awk '{ print $2 }')"
+[ -z "${USER_HOME}" ] && USER_HOME="/Users/${USER_NAME}"
+echo "user=${USER_NAME} uid=${UID_NUM} home=${USER_HOME}"
+
+run_as_user() { /usr/bin/sudo -u "${USER_NAME}" "$@"; }
+
+# Python3 sanity (Command Line Tools provide /usr/bin/python3).
+if ! "${PY}" --version >/dev/null 2>&1; then
+    echo "WARN: ${PY} not runnable yet (Command Line Tools may be installing)."
+fi
+
+# ---------------------------------------------------------------------------
+# 1. Install the hook into the user's ~/.claude/hooks/
+# ---------------------------------------------------------------------------
+run_as_user /bin/mkdir -p "${USER_HOME}/.claude/hooks"
+/usr/bin/install -m 0755 "${SUPPORT}/hooks/claude-status.sh" \
+    "${USER_HOME}/.claude/hooks/claude-status.sh"
+/usr/sbin/chown "${USER_NAME}" "${USER_HOME}/.claude/hooks/claude-status.sh"
+echo "installed hook -> ${USER_HOME}/.claude/hooks/claude-status.sh"
+
+# ---------------------------------------------------------------------------
+# 2. Merge the hooks block into ~/.claude/settings.json (idempotent deep-merge)
+# ---------------------------------------------------------------------------
+SETTINGS="${USER_HOME}/.claude/settings.json"
+SNIPPET="${SUPPORT}/hooks/settings.snippet.json"
+run_as_user "${PY}" - "${SETTINGS}" "${SNIPPET}" <<'PY'
+import json, os, sys
+
+settings_path, snippet_path = sys.argv[1], sys.argv[2]
+
+def load(path):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        sys.stderr.write(f"[claude-mate] could not parse {path}: {exc}\n")
+        return {}
+
+settings = load(settings_path)
+snippet = load(snippet_path)
+hooks = {k: v for k, v in snippet.get("hooks", {}).items()}
+
+def deep_merge(dst, src):
+    for key, val in src.items():
+        if key not in dst:
+            dst[key] = val
+        elif isinstance(val, dict) and isinstance(dst[key], dict):
+            deep_merge(dst[key], val)
+        elif isinstance(val, list) and isinstance(dst[key], list):
+            for item in val:
+                if item not in dst[key]:
+                    dst[key].append(item)
+        else:
+            dst[key] = val
+    return dst
+
+settings.setdefault("hooks", {})
+deep_merge(settings["hooks"], hooks)
+
+os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+tmp = settings_path + ".claude-mate.tmp"
+with open(tmp, "w") as fh:
+    json.dump(settings, fh, indent=2)
+    fh.write("\n")
+os.replace(tmp, settings_path)
+print(f"[claude-mate] merged hooks into {settings_path}")
+PY
+echo "merged settings -> ${SETTINGS}"
+
+# ---------------------------------------------------------------------------
+# 3. Instantiate + load the LaunchAgent in the user's GUI domain
+# ---------------------------------------------------------------------------
+run_as_user /bin/mkdir -p "${USER_HOME}/Library/LaunchAgents" "${USER_HOME}/Library/Logs"
+PLIST_DST="${USER_HOME}/Library/LaunchAgents/com.claudemate.daemon.plist"
+
+/usr/bin/sed \
+    -e "s#__PYTHON__#${PY}#g" \
+    -e "s#__DAEMON__#${SUPPORT}/daemon/claude_mate_daemon.py#g" \
+    -e "s#__PYTHONPATH__#${SUPPORT}/vendor#g" \
+    -e "s#__SUPPORT__#${SUPPORT}#g" \
+    -e "s#__HOME__#${USER_HOME}#g" \
+    "${SUPPORT}/com.claudemate.daemon.plist.in" > "${PLIST_DST}"
+/usr/sbin/chown "${USER_NAME}" "${PLIST_DST}"
+echo "wrote LaunchAgent -> ${PLIST_DST}"
+
+# (Re)load it in the user's GUI session.
+/bin/launchctl asuser "${UID_NUM}" /bin/launchctl bootout   "gui/${UID_NUM}" "${PLIST_DST}" 2>/dev/null || true
+/bin/launchctl asuser "${UID_NUM}" /bin/launchctl bootstrap "gui/${UID_NUM}" "${PLIST_DST}" \
+    || run_as_user /bin/launchctl load "${PLIST_DST}" 2>/dev/null || true
+/bin/launchctl asuser "${UID_NUM}" /bin/launchctl enable   "gui/${UID_NUM}/com.claudemate.daemon" 2>/dev/null || true
+/bin/launchctl asuser "${UID_NUM}" /bin/launchctl kickstart -k "gui/${UID_NUM}/com.claudemate.daemon" 2>/dev/null || true
+echo "launched com.claudemate.daemon for uid ${UID_NUM}"
+
+echo "=== postinstall done ==="
+exit 0

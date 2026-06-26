@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Claude Mate LaunchAgent (pkg variant).
+  ============================================================================
+  The pkg postinstall script substitutes the __PLACEHOLDERS__ below and writes
+  the result into the installing user's ~/Library/LaunchAgents/. The daemon
+  lives in /Library/Application Support/ClaudeMate and finds pyserial via the
+  vendored PYTHONPATH, so no pip / network is needed at install time.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.claudemate.daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>__DAEMON__</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <key>WorkingDirectory</key>
+    <string>__SUPPORT__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+        <key>PYTHONPATH</key>
+        <string>__PYTHONPATH__</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/claude-mate.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/claude-mate.err.log</string>
+
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

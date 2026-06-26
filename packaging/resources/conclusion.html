@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8">
+<style>
+  body { font: 13px -apple-system, "Helvetica Neue", sans-serif; color: #222; margin: 16px; }
+  h1 { font-size: 18px; margin: 0 0 8px; }
+  code { background: #f0f0f0; padding: 1px 4px; border-radius: 3px; }
+  ol { margin: 8px 0 0 0; padding-left: 18px; }
+  li { margin: 5px 0; }
+  .muted { color: #777; }
+</style>
+</head>
+<body>
+  <h1>Installed &#9989;</h1>
+  <p>The Claude Mate daemon is running and will start automatically at login.</p>
+  <p><b>Next steps:</b></p>
+  <ol>
+    <li>Plug in your Arduino and flash the firmware (<code>firmware/claude_mate</code>) &mdash; see <code>docs/INSTALL.md</code>.</li>
+    <li>Verify with mock data: <code>python3 "/Library/Application Support/ClaudeMate/daemon/claude_mate_daemon.py" --mock</code></li>
+    <li>Open a Claude Code session &mdash; status should appear on the device.</li>
+  </ol>
+  <p class="muted">Logs: <code>~/Library/Logs/claude-mate.out.log</code> and <code>claude-mate.err.log</code>.<br>
+     Install log: <code>/tmp/claude-mate-install.log</code>.<br>
+     To remove: run <code>packaging/uninstall-pkg.sh</code> from the repo.</p>
+</body>
+</html>

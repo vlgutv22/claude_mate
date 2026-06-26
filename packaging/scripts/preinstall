@@ -1,0 +1,29 @@
+#!/bin/bash
+# Claude Mate pkg preinstall — stop a previously installed daemon (upgrade path).
+# Runs as root. Never fail the install: always exit 0.
+set -u
+
+LOG=/tmp/claude-mate-install.log
+exec >>"$LOG" 2>&1
+echo "=== preinstall $(date) ==="
+
+# Resolve the GUI console user (the human installing), not root.
+USER_NAME="$(/usr/bin/stat -f%Su /dev/console 2>/dev/null || true)"
+if [ -z "${USER_NAME}" ] || [ "${USER_NAME}" = "root" ]; then
+    USER_NAME="$(/usr/bin/scutil <<< 'show State:/Users/ConsoleUser' 2>/dev/null \
+        | /usr/bin/awk '/Name :/ { print $3 }')"
+fi
+
+if [ -n "${USER_NAME}" ] && [ "${USER_NAME}" != "root" ]; then
+    UID_NUM="$(/usr/bin/id -u "${USER_NAME}" 2>/dev/null || true)"
+    USER_HOME="$(/usr/bin/dscl . -read "/Users/${USER_NAME}" NFSHomeDirectory 2>/dev/null \
+        | /usr/bin/awk '{ print $2 }')"
+    PLIST="${USER_HOME}/Library/LaunchAgents/com.claudemate.daemon.plist"
+    if [ -n "${UID_NUM}" ] && [ -f "${PLIST}" ]; then
+        echo "booting out existing agent for ${USER_NAME} (uid ${UID_NUM})"
+        /bin/launchctl asuser "${UID_NUM}" /bin/launchctl bootout "gui/${UID_NUM}" "${PLIST}" 2>/dev/null || true
+        /bin/launchctl bootout "gui/${UID_NUM}" "${PLIST}" 2>/dev/null || true
+    fi
+fi
+
+exit 0

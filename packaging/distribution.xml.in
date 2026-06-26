@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+    <title>Claude Mate</title>
+    <organization>com.claudemate</organization>
+
+    <welcome    file="welcome.html"    mime-type="text/html"/>
+    <license    file="LICENSE.txt"     mime-type="text/plain"/>
+    <conclusion file="conclusion.html" mime-type="text/html"/>
+
+    <!-- No per-component customization; one simple flow. -->
+    <options customize="never" require-scripts="true" hostArchitectures="arm64,x86_64"/>
+
+    <!-- Install for the whole machine (payload goes under /Library). -->
+    <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
+
+    <volume-check>
+        <allowed-os-versions>
+            <os-version min="11.0"/>
+        </allowed-os-versions>
+    </volume-check>
+
+    <choices-outline>
+        <line choice="default"/>
+    </choices-outline>
+    <choice id="default" title="Claude Mate">
+        <pkg-ref id="com.claudemate.pkg"/>
+    </choice>
+
+    <pkg-ref id="com.claudemate.pkg" version="__VERSION__" onConclusion="none">ClaudeMate-component.pkg</pkg-ref>
+</installer-gui-script>

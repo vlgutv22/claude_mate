@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8">
+<style>
+  body { font: 13px -apple-system, "Helvetica Neue", sans-serif; color: #222; margin: 16px; }
+  h1 { font-size: 18px; margin: 0 0 8px; }
+  code { background: #f0f0f0; padding: 1px 4px; border-radius: 3px; }
+  ul { margin: 8px 0 0 0; padding-left: 18px; }
+  li { margin: 4px 0; }
+  .muted { color: #777; }
+</style>
+</head>
+<body>
+  <h1>Claude Mate</h1>
+  <p>This installs the Mac side of <b>Claude Mate</b> &mdash; the daemon that bridges
+     Claude Code session status to your USB hardware status device (OLED + traffic light).</p>
+  <p>The installer will:</p>
+  <ul>
+    <li>Install the daemon to <code>/Library/Application&nbsp;Support/ClaudeMate</code></li>
+    <li>Install the status hook into <code>~/.claude/hooks/</code></li>
+    <li>Merge the Claude Mate hooks into your <code>~/.claude/settings.json</code> (your existing settings are preserved)</li>
+    <li>Start the daemon now and at every login (LaunchAgent)</li>
+  </ul>
+  <p class="muted">Flashing the Arduino firmware is a separate step &mdash; see the project
+     <code>docs/INSTALL.md</code> and <code>docs/WIRING.md</code>.</p>
+</body>
+</html>
