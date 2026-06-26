@@ -23,6 +23,27 @@ passes.
 
 ---
 
+## Level −1 — Automated tests (no hardware, no Claude)
+
+Two self-contained tests exercise the Mac side before you touch any hardware:
+
+```sh
+pip install pyserial                  # one-time, for the e2e test
+
+python3 tools/test_e2e.py             # fake Arduino over a PTY: drives real
+                                      # hook events through the socket and asserts
+                                      # the traffic light, carousel cards, and the
+                                      # FOCUS deep-link (nothing is launched)
+
+python3 tools/test_settings_merge.py  # proves the installer's settings.json merge
+                                      # preserves your existing config and is idempotent
+```
+
+Both print a `PASS`/`FAIL` checklist and exit non-zero on failure, so they double
+as CI smoke tests. They never touch your real `~/.claude` or serial ports.
+
+---
+
 ## Level 0 — Port shows up
 
 Plug the Nano into the Mac, then:
