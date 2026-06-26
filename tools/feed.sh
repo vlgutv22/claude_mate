@@ -3,7 +3,7 @@
 # feed.sh — tiny manual test helper for the Claude Mate daemon.
 #
 # Pipes a "<state>|<session_id>|<name>" line into the daemon's Unix socket so
-# you can exercise the registry, traffic light and carousel without Claude Code
+# you can exercise the registry, status wheel and carousel without Claude Code
 # hooks or real hardware.
 #
 # Usage:

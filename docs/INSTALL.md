@@ -76,7 +76,7 @@ python3 $REPO/daemon/claude_mate_daemon.py --mock
 ```
 
 `--mock` injects a few fake sessions that cycle through states so you can demo
-the OLED card, the traffic light, and the carousel without Claude or hooks.
+the OLED card, the status wheel, and the carousel without Claude or hooks.
 
 ---
 

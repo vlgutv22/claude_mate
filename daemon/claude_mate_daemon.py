@@ -16,7 +16,9 @@ The "brain" of the Claude Mate USB hardware companion. It:
         B|2      -> NEXT (advance the carousel, pausing auto-rotation ~10s).
   4. Drives a carousel that rotates through sessions (~3s/step, urgent-first)
      and sends one S card per step.
-  5. Computes the overall traffic light (G/Y/R) and pushes it with L.
+  5. Computes the overall status word (FREE/WIP/BLOCKED/WTF) and pushes it with
+     "D|<WORD>", which tells the Arduino to rotate its stepper-driven status
+     wheel to that word by the shortest path.
   6. Focuses a VS Code session via a deep link, with a window-raise fallback.
 
 Only third-party dependency: pyserial.
@@ -195,18 +197,28 @@ class Registry:
         with self._lock:
             return len(self._sessions)
 
-    def light_color(self) -> str:
-        """Compute the overall traffic-light color per the CONTRACT."""
+    def status_word(self) -> str:
+        """Compute the overall status word for the wheel per the CONTRACT.
+
+        Mapping (single source of truth), priority WTF > BLOCKED > WIP > FREE:
+            WTF     <- at least one session in error
+            BLOCKED <- at least one session waiting (Claude needs your input)
+            WIP     <- at least one session working
+            FREE    <- everything idle/done, or no sessions (also HOME position)
+        """
         with self._lock:
             states = [s.state for s in self._sessions.values()]
-        # RED if any human is needed (error or waiting).
-        if any(st in ("error", "waiting") for st in states):
-            return "R"
-        # YELLOW if anything is actively working.
+        # WTF if anything errored (highest priority).
+        if any(st == "error" for st in states):
+            return "WTF"
+        # BLOCKED if anything is waiting for the human.
+        if any(st == "waiting" for st in states):
+            return "BLOCKED"
+        # WIP if anything is actively working.
         if any(st == "working" for st in states):
-            return "Y"
-        # GREEN otherwise (done/idle/empty).
-        return "G"
+            return "WIP"
+        # FREE otherwise (done/idle/empty).
+        return "FREE"
 
 
 # --------------------------------------------------------------------------- #
@@ -327,19 +339,20 @@ class Display:
         self._link = link
         self._reg = registry
         self._lock = threading.Lock()
-        self._last_color: Optional[str] = None
+        self._last_word: Optional[str] = None
         self._current_index = 0          # carousel position within ordered list
         self._current_session: Optional[Session] = None  # last shown card's session
 
-    # ---- light ----------------------------------------------------------- #
+    # ---- dial (stepper status wheel) ------------------------------------- #
 
-    def push_light(self, force: bool = False) -> None:
-        color = self._reg.light_color()
+    def push_dial(self, force: bool = False) -> None:
+        """Send "D|<WORD>" so the Arduino rotates the wheel; only on change."""
+        word = self._reg.status_word()
         with self._lock:
-            changed = (color != self._last_color)
-            self._last_color = color
+            changed = (word != self._last_word)
+            self._last_word = word
         if changed or force:
-            self._link.write_line(f"L|{color}")
+            self._link.write_line(f"D|{word}")
 
     # ---- cards ----------------------------------------------------------- #
 
@@ -373,7 +386,7 @@ class Display:
                 self._current_index = 0
                 self._current_session = None
             self._link.write_line("I")
-            self._link.write_line("L|G")
+            self._link.write_line("D|FREE")
             return
         idx = index % total
         sess = sessions[idx]
@@ -395,9 +408,9 @@ class Display:
         self.show_index(idx)
 
     def resend_full_state(self) -> None:
-        """On handshake (H): push light + current card from scratch."""
+        """On handshake (H): push dial (force) + current card from scratch."""
         log("handshake H -> resending full state")
-        self.push_light(force=True)
+        self.push_dial(force=True)
         self.refresh_current()
 
     def current_session(self) -> Optional[Session]:
@@ -697,14 +710,14 @@ class Carousel(threading.Thread):
             self._paused_until = time.time() + NEXT_PAUSE
 
     def notify_change(self) -> None:
-        """Called on any registry change: refresh light + current card."""
-        self._display.push_light()
+        """Called on any registry change: refresh dial + current card."""
+        self._display.push_dial()
         self._display.refresh_current()
 
     def run(self) -> None:
         # Prime the display.
         self._display.show_index(0)
-        self._display.push_light(force=True)
+        self._display.push_dial(force=True)
         while not self._stop.is_set():
             now = time.time()
 
@@ -719,15 +732,15 @@ class Carousel(threading.Thread):
             if paused:
                 # While paused, still keep the current card's runtime ticking.
                 self._display.refresh_current()
-                self._display.push_light()
+                self._display.push_dial()
             else:
                 if now - self._last_rotate >= CAROUSEL_PERIOD:
                     self._display.advance()
                     self._last_rotate = now
                 else:
-                    # Between rotations, refresh runtime/light without advancing.
+                    # Between rotations, refresh runtime/dial without advancing.
                     self._display.refresh_current()
-                    self._display.push_light()
+                    self._display.push_dial()
 
             self._stop.wait(1.0)
 
@@ -757,9 +770,13 @@ class MockInjector(threading.Thread):
             ("sid-ccc", "infra", "/Users/demo/infra"),
             ("sid-ddd", "notes", "/Users/demo/notes"),
         ]
+        # Cycle covers every state so the wheel visits all four words over time:
+        #   working -> WIP, waiting -> BLOCKED, error -> WTF, done/idle -> FREE.
         cycle = ["working", "waiting", "error", "done", "idle"]
         log("MOCK mode: injecting fake sessions")
-        # Seed initial states.
+        # Seed initial states. These four exercise all four words at once
+        # (WTF via 'error' > BLOCKED via 'waiting' > WIP via 'working' > FREE),
+        # and the 'waiting' seed guarantees BLOCKED is reachable.
         seeds = ["working", "waiting", "error", "done"]
         for (sid, name, cwd), st in zip(fakes, seeds):
             self._reg.update(st, sid, name, cwd)
@@ -792,7 +809,7 @@ class MockInjector(threading.Thread):
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Claude Mate daemon: bridges Claude Code hooks to the "
-                    "Arduino traffic-light/OLED companion over USB serial.",
+                    "Arduino status-wheel/OLED companion over USB serial.",
     )
     parser.add_argument(
         "--mock",
@@ -869,10 +886,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             stop = getattr(t, "stop", None)
             if callable(stop):
                 stop()
-        # Best-effort: blank the display by sending idle.
+        # Best-effort: blank the display by sending idle (also homes the wheel).
         try:
             link.write_line("I")
-            link.write_line("L|G")
+            link.write_line("D|FREE")
         except Exception:
             pass
         link.close()

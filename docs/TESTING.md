@@ -32,8 +32,10 @@ pip install pyserial                  # one-time, for the e2e test
 
 python3 tools/test_e2e.py             # fake Arduino over a PTY: drives real
                                       # hook events through the socket and asserts
-                                      # the traffic light, carousel cards, and the
-                                      # FOCUS deep-link (nothing is launched)
+                                      # the status wheel (D|FREE / D|WIP /
+                                      # D|BLOCKED / D|WTF), carousel cards, and the
+                                      # FOCUS deep-link (nothing is launched; the
+                                      # stepper lives only on the Arduino)
 
 python3 tools/test_settings_merge.py  # proves the installer's settings.json merge
                                       # preserves your existing config and is idempotent
@@ -66,16 +68,22 @@ Pass criterion: a `cu.*` device appears (and disappears when you unplug).
 ## Level 1 — Selftest sketch
 
 Confirm the **hardware** works independently of the protocol. Flash the selftest
-sketch (in `firmware/`, e.g. a `selftest` example) and watch the board:
+sketch (`firmware/selftest/selftest.ino`) and watch the board. On boot it now:
 
-- The **OLED** lights up and shows text/graphics → I2C + display OK
+- **Homes the wheel** against the D4 endstop, then **cycles the dial** through
+  `FREE → WIP → BLOCKED → WTF` in turn every ~2 s, printing each target and the
+  live endstop state over serial → motor + driver + endstop OK.
+- The **OLED** lights up and shows text + the current word → I2C + display OK
   (if blank, try address **0x3D**; if it's a 1.3" panel, you may need the
   **SH1106** driver — see [WIRING.md](WIRING.md)).
-- The **GREEN / YELLOW / RED LEDs** each blink in turn → LED wiring + 220 Ω OK.
-- Pressing **FOCUS (D2)** and **NEXT (D3)** is detected (e.g. printed or shown).
+- Pressing **FOCUS (D2)** and **NEXT (D3)** is printed over serial → buttons OK.
 - If the buzzer is enabled, it chirps.
 
-Pass criterion: screen, all three LEDs, and both buttons respond.
+This validates motor + driver + endstop + OLED + buttons with **no Mac
+software**.
+
+Pass criterion: the wheel homes and cycles all four words, the screen shows
+text + word, the endstop registers, and both buttons respond.
 
 ---
 
@@ -90,14 +98,16 @@ Flash the **real firmware**. Open the Arduino IDE **Serial Monitor** at
    H
    ```
 
-2. Now **send** lines by hand and watch the display/LEDs. Set the light:
+2. Now **send** lines by hand and watch the display/wheel. Set the dial:
 
    ```
-   L|R
+   D|WTF
    ```
 
-   → RED LED on (and a buzzer chirp if enabled, since this is a transition into
-   RED). Try `L|Y` and `L|G` too.
+   → the wheel rotates to the **WTF** position (and a buzzer chirp if enabled,
+   since this is a transition into WTF) and the OLED echoes the word. Try
+   `D|BLOCKED`, `D|WIP`, and `D|FREE` too — each turns the dial by the shortest
+   path.
 
 3. Send a full session card:
 
@@ -125,8 +135,8 @@ Flash the **real firmware**. Open the Arduino IDE **Serial Monitor** at
    B|1
    ```
 
-Pass criterion: `H` on boot, cards/lights render from typed lines, button
-presses emit `B|1` / `B|2`.
+Pass criterion: `H` on boot, cards render and the wheel turns from typed lines,
+button presses emit `B|1` / `B|2`.
 
 > When done, **close the Serial Monitor** so the daemon can use the port.
 
@@ -140,21 +150,22 @@ Run the daemon with fake sessions — no Claude, no hooks needed:
 python3 $REPO/daemon/claude_mate_daemon.py --mock
 ```
 
-`--mock` injects a few fake sessions that cycle through states. Watch the real
-hardware:
+`--mock` injects a few fake sessions that cycle through states (including a
+`waiting` session, so all four words appear). Watch the real hardware:
 
 - The **carousel** rotates through cards roughly every 3 seconds.
-- The **traffic light** follows the logic: RED when any session is
-  `error`/`waiting`, YELLOW when something is `working`, GREEN otherwise.
+- The **status wheel** follows the logic: **WTF** when any session is `error`,
+  **BLOCKED** else if any is `waiting`, **WIP** else if any is `working`, **FREE**
+  otherwise. It should visit all four words as the mock states cycle.
 - Press **NEXT** → the carousel advances immediately and pauses ~10 s.
 - Press **FOCUS** → the daemon attempts to focus that card's session (in mock,
   watch the daemon log for the focus call).
 
 Also confirm robustness: **unplug** the Nano mid-run — the daemon should not
-crash — then **replug**; it should reconnect and (via the `H` handshake) restore
-the display.
+crash — then **replug**; it should reconnect, re-home the wheel, and (via the `H`
+handshake) restore the display.
 
-Pass criterion: live carousel + correct light + buttons handled + survives a
+Pass criterion: live carousel + correct wheel word + buttons handled + survives a
 unplug/replug.
 
 ---
@@ -173,13 +184,14 @@ $REPO/tools/feed.sh working abc123 demo        # in another
 `tools/feed.sh` writes one newline-terminated line to `/tmp/claude-mate.sock` in
 the socket format `<state>|<session_id>|<name>` (here:
 `working|abc123|demo`). Try each state — `working`, `waiting`, `done`, `error` —
-and watch the card and the light update accordingly:
+and watch the card and the wheel update accordingly:
 
-- `waiting` or `error` → light **RED**.
-- `working` (and nothing waiting/error) → **YELLOW**.
-- `done` / nothing pending → **GREEN**.
+- `error` → wheel to **WTF**.
+- `waiting` (and nothing errored) → **BLOCKED**.
+- `working` (and nothing waiting/errored) → **WIP**.
+- `done` / nothing pending → **FREE**.
 
-Pass criterion: feeding socket lines drives the card and the traffic light per
+Pass criterion: feeding socket lines drives the card and the status wheel per
 [PROTOCOL.md](PROTOCOL.md).
 
 ---
@@ -190,22 +202,23 @@ Finally, exercise the whole pipeline with Claude Code. With the daemon running
 and the hooks merged (see [INSTALL.md](INSTALL.md)):
 
 1. Open a Claude Code session (VS Code extension or CLI) and **submit a prompt**
-   (`UserPromptSubmit`) → light goes **YELLOW**, a card appears as `working`.
-2. Trigger a **Notification** (e.g. a permission prompt) → light goes **RED**,
-   card shows `waiting`.
-3. Let a turn **complete** (`Stop`) → card shows `done`; light goes **GREEN** if
-   nothing else needs you.
-4. Cause an **API error** (`StopFailure`) → card shows `error`, light **RED**.
+   (`UserPromptSubmit`) → wheel turns to **WIP**, a card appears as `working`.
+2. Trigger a **Notification** (e.g. a permission prompt) → wheel turns to
+   **BLOCKED**, card shows `waiting`.
+3. Let a turn **complete** (`Stop`) → card shows `done`; wheel returns to
+   **FREE** if nothing else needs you.
+4. Cause an **API error** (`StopFailure`) → card shows `error`, wheel to **WTF**.
    (`StopFailure` fires instead of `Stop` on API errors — they never both fire.)
 5. Open multiple sessions and confirm the carousel orders them most-urgent-first
-   (`error` → `waiting` → `working` → `done` → `idle`).
+   (`error` → `waiting` → `working` → `done` → `idle`) and the wheel shows the
+   highest-priority word (WTF > BLOCKED > WIP > FREE).
 6. Press **FOCUS** on a card → VS Code focuses that session via the deep link, or
    raises the workspace window as a fallback (see the focus Limitations in
    [ARCHITECTURE.md](ARCHITECTURE.md)).
 7. End a session (`SessionEnd`) → it drops to `idle` / disappears; with zero
-   sessions the display shows the idle screen and the light is GREEN.
+   sessions the display shows the idle screen and the wheel returns to **FREE**.
 
-Pass criterion: real hook events move the cards and light correctly and FOCUS
+Pass criterion: real hook events move the cards and the wheel correctly and FOCUS
 brings up the right session.
 
 ---
@@ -217,6 +230,9 @@ brings up the right session.
 | Daemon: "could not open port" / "resource busy" | Serial Monitor (or another daemon) still holds the port. Close it. |
 | No device in `ls /dev/cu.*` | Bad cable, missing CH340 driver, or no power. |
 | OLED blank | Wrong I2C address (try 0x3D) or SH1106 1.3" panel needs the SH1106 driver. |
-| Display blanks ~1.5 s when daemon reconnects | Expected — USB open resets the Nano; the `H` handshake restores state. |
-| Light never goes RED on a question | Check the `Notification` hook is wired and the daemon is running. |
+| Display blanks ~1.5 s when daemon reconnects | Expected — USB open resets the Nano; it re-homes the wheel and the `H` handshake restores state. |
+| Wheel never reaches BLOCKED on a question | Check the `Notification` hook is wired and the daemon is running. |
+| Wheel spins endlessly or never finds home | Endstop/tab misaligned. Homing aborts after ~1.5 rev and warns over serial; check the D4 switch and the wheel tab. |
+| Wheel drifts off the words over time | Endstop self-correction relies on the tab pressing D4 at FREE — verify it clicks the switch each pass. |
+| Motor stutters / OLED flickers / board reboots | Motor brown-out — power it from the USB 5 V rail or an external supply, not the Nano regulator (see [WIRING.md](WIRING.md)). |
 | Buttons do nothing in the daemon | Confirm Level 2 first (`B|1`/`B|2` over serial), then check the daemon's button thread/logs. |

@@ -121,13 +121,13 @@ For end-to-end setup including the hooks, follow
 Validate changes from the bottom up, the same ladder used in
 [docs/TESTING.md](docs/TESTING.md):
 
-1. **Daemon in `--mock` mode** — exercises the display/light/carousel logic with
+1. **Daemon in `--mock` mode** — exercises the display/wheel/carousel logic with
    fake sessions and no hardware or Claude.
 2. **Serial loopback / protocol** — verify the `|`-delimited lines the daemon
    emits and the `H` / `B|<n>` lines it consumes (see
    [docs/PROTOCOL.md](docs/PROTOCOL.md)).
-3. **Firmware on the bench** — flash the Nano, confirm the OLED, the three LEDs,
-   and both buttons respond.
+3. **Firmware on the bench** — flash the Nano, confirm the OLED, the status wheel
+   (homes + cycles FREE/WIP/BLOCKED/WTF), the endstop, and both buttons respond.
 4. **End-to-end** — run the daemon against real hardware, install the hooks, and
    drive real Claude Code sessions through `working → waiting → error → done`.
 

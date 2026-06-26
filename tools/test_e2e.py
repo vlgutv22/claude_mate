@@ -8,7 +8,9 @@ End-to-end test of the Claude Mate daemon with NO hardware.
     must-have focus action is verified WITHOUT launching anything on this Mac
   - real hook lines are fed through the Unix socket, exactly like claude-status.sh
 
-Drives a scenario and asserts the traffic light, carousel cards, and focus URI.
+Drives a scenario and asserts the status wheel (D|<WORD>), carousel cards, and
+focus URI. The stepper itself lives only on the Arduino; the daemon just emits
+"D|FREE|WIP|BLOCKED|WTF" lines, so this passes with no hardware.
 
 Run:   python3 tools/test_e2e.py      (needs pyserial: pip install pyserial)
 """
@@ -101,20 +103,24 @@ def saw(pred):
 
 time.sleep(2.5)
 
-print("\n-- phase 1: one working session (expect YELLOW) --")
+print("\n-- phase 1: one working session (expect WIP) --")
 feed("working|sid-1|webapp"); time.sleep(2.0)
 
 print("\n-- phase 2: FOCUS button, single session (deterministic) --")
 arduino_send("B|1"); time.sleep(1.5)
 
-print("\n-- phase 3: an API error arrives (expect RED) --")
+print("\n-- phase 3: a session starts waiting for input (expect BLOCKED) --")
+feed("waiting|sid-3|infra"); time.sleep(3.5)
+
+print("\n-- phase 4: an API error arrives (expect WTF) --")
 feed("error|sid-2|api"); time.sleep(3.5)
 
-print("\n-- phase 4: handshake H -> full resend --")
+print("\n-- phase 5: handshake H -> full resend --")
 arduino_send("H"); time.sleep(1.5)
 
-print("\n-- phase 5: everything finishes (expect GREEN) --")
-feed("done|sid-2|api"); feed("done|sid-1|webapp"); time.sleep(3.0)
+print("\n-- phase 6: everything finishes (expect FREE) --")
+feed("done|sid-2|api"); feed("done|sid-3|infra")
+feed("done|sid-1|webapp"); time.sleep(3.0)
 
 proc.terminate()
 try:
@@ -131,10 +137,12 @@ def check(name, ok):
     print(f"  [{'PASS' if ok else 'FAIL'}] {name}")
 
 check("idle frame at boot (I)", saw(lambda l: l == "I"))
-check("GREEN at boot (L|G)", saw(lambda l: l == "L|G"))
-check("YELLOW while working (L|Y)", saw(lambda l: l == "L|Y"))
-check("RED on API error (L|R)", saw(lambda l: l == "L|R"))
+check("FREE at boot (D|FREE)", saw(lambda l: l == "D|FREE"))
+check("WIP while working (D|WIP)", saw(lambda l: l == "D|WIP"))
+check("BLOCKED on waiting session (D|BLOCKED)", saw(lambda l: l == "D|BLOCKED"))
+check("WTF on API error (D|WTF)", saw(lambda l: l == "D|WTF"))
 check("webapp working card", saw(lambda l: l.startswith("S|") and "|webapp|working|" in l))
+check("infra waiting card", saw(lambda l: l.startswith("S|") and "|infra|waiting|" in l))
 check("api error card", saw(lambda l: l.startswith("S|") and "|api|error|" in l))
 check("FOCUS opened a vscode deep link",
       any("vscode://anthropic.claude-code/open?session=" in l for l in focus_lines))
