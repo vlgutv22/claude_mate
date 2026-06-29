@@ -118,6 +118,7 @@ static bool          vibroOn       = false; // motor currently energised?
 static uint16_t      vibroOnMs     = 0;     // on-duration for the active pattern
 static uint16_t      vibroOffMs    = 0;     // gap between pulses
 static uint8_t       vibroDuty     = 255;   // PWM amplitude (0-255) of the pattern
+static uint8_t       vibroDutyLast = 255;   // amplitude of the FINAL pulse (accent)
 static unsigned long vibroPhaseMs  = 0;     // millis() at the last phase change
 
 // ---- Button debounce state ---------------------------------------------------
@@ -185,20 +186,25 @@ static uint8_t parseWord(const char *s) {
 // pulses play out in pollVibro(). A new call replaces any pattern in progress.
 // PIN_VIBRO (D5) is PWM-capable, so duty sets how hard the motor pushes --
 // lower = gentler. analogWrite on D5 does not disturb millis().
-static void startBuzz(uint8_t pulses, uint16_t onMs, uint16_t offMs, uint8_t duty) {
+// `duty` is the amplitude of every pulse except the LAST, which uses `dutyLast`
+// -- so a pattern can be e.g. soft then hard ("felt") in one buzz.
+static void startBuzz(uint8_t pulses, uint16_t onMs, uint16_t offMs,
+                      uint8_t duty, uint8_t dutyLast) {
   if (pulses == 0) {                   // nothing to do -- make sure motor is off
     vibroPulses = 0;
     vibroOn = false;
     analogWrite(PIN_VIBRO, 0);
     return;
   }
-  vibroPulses  = pulses;
-  vibroOnMs    = onMs;
-  vibroOffMs   = offMs;
-  vibroDuty    = duty;
-  vibroOn      = true;                  // start the first pulse now
-  vibroPhaseMs = millis();
-  analogWrite(PIN_VIBRO, duty);
+  vibroPulses   = pulses;
+  vibroOnMs     = onMs;
+  vibroOffMs    = offMs;
+  vibroDuty     = duty;
+  vibroDutyLast = dutyLast;
+  vibroOn       = true;                 // start the first pulse now
+  vibroPhaseMs  = millis();
+  // First pulse: if it is also the last (pulses==1) use the accent amplitude.
+  analogWrite(PIN_VIBRO, pulses == 1 ? dutyLast : duty);
 }
 
 // Advance the haptic state machine. Call every loop(); never blocks.
@@ -216,8 +222,9 @@ static void pollVibro() {
     }
   } else {
     if ((now - vibroPhaseMs) >= vibroOffMs) {
-      // Gap elapsed: start the next pulse at the pattern's amplitude.
-      analogWrite(PIN_VIBRO, vibroDuty);
+      // Gap elapsed: start the next pulse. The final pulse gets the accent
+      // amplitude (vibroPulses == 1 means the one we're about to play is last).
+      analogWrite(PIN_VIBRO, vibroPulses == 1 ? vibroDutyLast : vibroDuty);
       vibroOn = true;
       vibroPhaseMs = now;
     }
@@ -230,10 +237,11 @@ static void pollVibro() {
 // the firmest is a nudge, not a jolt -- urgency reads as a bit more push and a
 // few more pulses, not a longer jarring buzz.
 static void buzzForKind(const char *k) {
-  if      (!strcmp(k, "START")) startBuzz(1, 25,   0,  70);  // job started: a tick
-  else if (!strcmp(k, "DONE"))  startBuzz(2, 40, 110, 100);  // finished  (repeats 15s)
-  else if (!strcmp(k, "INPUT")) startBuzz(3, 50,  80, 150);  // needs you (repeats 10s)
-  else if (!strcmp(k, "ERROR")) startBuzz(4, 60,  80, 200);  // error     (repeats 5s)
+  //                              pulses onMs offMs duty dutyLast
+  if      (!strcmp(k, "START")) startBuzz(1, 25,   0,  70,  70);  // job started: a tick
+  else if (!strcmp(k, "DONE"))  startBuzz(2, 70,  45,  90, 255);  // finished: soft then HARD
+  else if (!strcmp(k, "INPUT")) startBuzz(3, 50,  80, 150, 150);  // needs you (repeats 10s)
+  else if (!strcmp(k, "ERROR")) startBuzz(4, 60,  80, 200, 200);  // error     (repeats 5s)
 }
 
 // -----------------------------------------------------------------------------

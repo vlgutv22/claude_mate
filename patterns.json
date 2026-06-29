@@ -1,5 +1,5 @@
 {
-  "_comment": "Live state-detection tuning for bin/claude-mate-wrap. Case-insensitive substrings matched against the rendered claude TUI screen. The wrapper hot-reloads this file (~every 0.25s) so edits take effect with NO restart. Order of precedence: error > waiting > busy > idle.",
+  "_comment": "Live state-detection tuning for bin/claude-mate-wrap. Case-insensitive substrings matched against the rendered claude TUI screen. Hot-reloaded (~0.25s), no restart. Precedence: error > waiting > waiting_footer > busy > idle. 'error'/'waiting'/'busy' match anywhere on screen, so keep them SPECIFIC (generic words there false-trigger on conversation/file content). 'waiting_footer' holds GENERIC picker phrases matched ONLY in the footer (last few non-empty lines).",
 
   "error": [
     "api error",
@@ -12,7 +12,6 @@
     "connection error",
     "request timed out",
     "service is temporarily",
-    "rate_limit_error",
     "usage limit reached"
   ],
 
@@ -21,9 +20,12 @@
     "yes, and don't ask",
     "tell claude what to do differently",
     "no, and tell claude",
-    "press enter to continue",
-    "enter to select",
-    "keys to navigate",
+    "press enter to continue"
+  ],
+
+  "waiting_footer": [
+    "to select",
+    "to navigate",
     "esc to cancel",
     "esc to go back"
   ],
