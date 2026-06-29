@@ -1,5 +1,5 @@
 {
-  "_comment": "Live state-detection tuning for bin/claude-mate-wrap. Case-insensitive substrings matched against the rendered claude TUI screen. Hot-reloaded (~0.25s), no restart. Precedence: error > waiting > waiting_footer > busy > idle. 'error'/'waiting'/'busy' match anywhere on screen, so keep them SPECIFIC (generic words there false-trigger on conversation/file content). 'waiting_footer' holds GENERIC picker phrases matched ONLY in the footer (last few non-empty lines).",
+  "_comment": "Live state-detection tuning for bin/claude-mate-wrap. Case-insensitive substrings matched against the rendered claude TUI screen. Hot-reloaded (~0.25s), no restart. Precedence: error > waiting > waiting_footer > busy > idle. Matching is scoped to Claude's LIVE STATUS REGION (bottom ~20 non-empty lines) for error/waiting/busy, so error/prompt keywords in scrollback/logs/code/conversation above don't false-trigger. 'waiting_footer' holds GENERIC picker phrases matched ONLY in the last ~4 lines.",
 
   "error": [
     "api error",

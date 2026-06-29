@@ -129,6 +129,12 @@ POLL_MS = 0.25            # re-evaluate the screen this often (quiescence)
 DEBOUNCE_S = 0.30         # require a state to persist before reporting it
 KEEPALIVE_S = 20.0        # re-send current state periodically
 
+# How many non-empty bottom lines count as Claude's "live status region". State
+# signals (error/prompt/generating) are matched only here, so the same keywords
+# in scrollback / logs / code / conversation above don't false-trigger.
+STATUS_TAIL_LINES = 20    # error/waiting/busy region
+FOOTER_LINES = 4          # tighter region for the generic picker-footer phrases
+
 # --------------------------------------------------------------------------- #
 # Terminal size helpers
 # --------------------------------------------------------------------------- #
@@ -274,24 +280,25 @@ def ctrl_listener():
 # State detection from the rendered screen
 # --------------------------------------------------------------------------- #
 def detect_state(screen_text):
-    t = screen_text.lower()
-    if any(p in t for p in _patterns["error"]):
-        return "error"
-    if any(p in t for p in _patterns["waiting"]):
-        return "waiting"
-    # Generic picker-footer phrases are matched ONLY in the footer (the last few
-    # non-empty lines, where Claude renders its live picker), so the same words
-    # appearing in conversation/file content higher up don't flip us to waiting.
+    # Read only Claude's LIVE STATUS REGION (the bottom of the visible screen),
+    # not the whole scrollback. Error/prompt/generating chrome renders there, so
+    # the same keywords appearing in conversation / logs / code / file content
+    # higher up no longer false-trigger the state.
     nonblank = [ln for ln in screen_text.splitlines() if ln.strip()]
-    footer = "\n".join(nonblank[-4:]).lower()
-    # A genuine picker is NOT generating: if the footer shows the live
-    # "esc to interrupt" / background-work hint, that wins over picker words that
-    # may just be incidental quoted content near the bottom of the screen.
-    if any(p in footer for p in _patterns["busy"]):
-        return "working"
-    if any(p in footer for p in _patterns.get("waiting_footer", [])):
+    tail = "\n".join(nonblank[-STATUS_TAIL_LINES:]).lower()
+    footer = "\n".join(nonblank[-FOOTER_LINES:]).lower()
+
+    if any(p in tail for p in _patterns["error"]):
+        return "error"
+    if any(p in tail for p in _patterns["waiting"]):
         return "waiting"
-    if any(p in t for p in _patterns["busy"]):
+    # A genuine picker is NOT generating: if the live region shows the
+    # "esc to interrupt" / background-work hint, that wins over generic picker
+    # words that may be incidental near the bottom.
+    busy_now = any(p in tail for p in _patterns["busy"])
+    if not busy_now and any(p in footer for p in _patterns.get("waiting_footer", [])):
+        return "waiting"
+    if busy_now:
         return "working"
     return "idle"
 
