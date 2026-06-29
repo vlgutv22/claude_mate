@@ -25,7 +25,7 @@
  *   #define DRIVER_A4988     // NEMA17 + A4988 STEP/DIR
  *
  * PIN MAP (identical to the main firmware, Arduino Nano / ATmega328P):
- *   OLED SSD1306 128x64 over I2C: VCC->5V, GND->GND, SDA->A4, SCL->A5
+ *   OLED SSD1306 128x32 (0.91") over I2C: VCC->5V, GND->GND, SDA->A4, SCL->A5
  *     I2C address 0x3C is used here. If your module is unresponsive, try the
  *     common alternative 0x3D (change SCREEN_ADDRESS below). Many cheap
  *     SSD1306 boards are 0x3C; some are 0x3D depending on a solder jumper.
@@ -57,7 +57,7 @@
 
 // ---- OLED configuration ------------------------------------------------------
 #define SCREEN_WIDTH   128
-#define SCREEN_HEIGHT  64
+#define SCREEN_HEIGHT  32     // 0.91" SSD1306 (use 64 for a 0.96" panel)
 #define OLED_RESET     -1
 #define SCREEN_ADDRESS 0x3C    // fallback / common alternative: 0x3D
 
@@ -234,20 +234,14 @@ static void drawWord(uint8_t w) {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
 
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.print(F("selftest: wheel"));
-
+  // Big word on top (size 2), endstop state + position on the line below.
   display.setTextSize(2);
-  display.setCursor(0, 24);
+  display.setCursor(0, 0);
   display.print(wordLabel(w));
 
   display.setTextSize(1);
-  display.setCursor(0, 48);
-  display.print(F("endstop: "));
-  display.print((digitalRead(PIN_ENDSTOP) == LOW) ? F("DOWN") : F("up"));
-
-  display.setCursor(0, 56);
+  display.setCursor(0, 22);
+  display.print((digitalRead(PIN_ENDSTOP) == LOW) ? F("end:DOWN ") : F("end:up   "));
   display.print((uint8_t)(w + 1));
   display.print('/');
   display.print(WORD_COUNT);

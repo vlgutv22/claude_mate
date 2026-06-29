@@ -38,7 +38,7 @@ USB serial  (115200 8N1, ASCII lines, '|' delimited, '\n' terminated)
         v
 Arduino Nano (ATmega328P)
         |
-        +--> OLED SSD1306 128x64 (I2C, addr 0x3C)   shows the current session card
+        +--> OLED SSD1306 128x32 (I2C, addr 0x3C)   shows the current session card
         |                                            + the current word as text
         +--> stepper status wheel (ULN2003 or A4988) rotates to the word, homed
         |                                            to the D4 endstop at FREE

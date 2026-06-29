@@ -47,7 +47,7 @@ constraint).
 
 | Function                | Nano pin    | Notes |
 |-------------------------|-------------|-------|
-| OLED VCC                | 5V          | SSD1306 128x64, I2C |
+| OLED VCC                | 5V          | SSD1306 0.91" 128x32, I2C (module pin order: GND/VCC/SCK/SDA) |
 | OLED GND                | GND         | common ground |
 | OLED SDA                | **A4**      | I2C data (hardware SDA on the 328P) |
 | OLED SCL                | **A5**      | I2C clock (hardware SCL on the 328P) |
@@ -203,7 +203,7 @@ in-progress move continues toward its current target afterward.
 | Qty | Part                                             | Notes |
 |-----|--------------------------------------------------|-------|
 | 1   | Arduino Nano (ATmega328P)                        | 5 V; USB CDC serial |
-| 1   | I2C OLED 128x64 — SSD1306 (or SH1106 1.3")        | 4-pin VCC/GND/SDA/SCL; see driver note below |
+| 1   | I2C OLED 0.91" 128x32 — SSD1306                   | 4-pin GND/VCC/SCK(SCL)/SDA; a 0.96" 128x64 also works (set SCREEN_HEIGHT 64) |
 | 2   | Momentary push buttons (tactile)                 | FOCUS + NEXT |
 | 1   | Endstop microswitch (lever / optical)            | home switch at `FREE`; `INPUT_PULLUP`, LOW = pressed |
 | 1   | Stepper motor                                    | **28BYJ-48** (default, with ULN2003) or **NEMA17** (with A4988) |
@@ -241,7 +241,7 @@ Symptoms of brown-out (motor stutters, OLED flickers, board reboots and re-emits
 ### I2C address: 0x3C (alt 0x3D)
 
 The default I2C address used by the firmware is **0x3C**, which is by far the
-most common for these 128x64 modules. Some boards are strapped to **0x3D** (the
+most common for these 128x32 modules. Some boards are strapped to **0x3D** (the
 common alternative). If the screen stays blank, try 0x3D — many modules have a
 solder jumper labeled `0x78 / 0x7A` (the 8-bit forms of 0x3C / 0x3D). Change the
 address constant in the firmware to match.
@@ -250,7 +250,7 @@ address constant in the firmware to match.
 
 The pin map and I2C address are identical, but the **controller chip differs**:
 
-- **0.96" 128x64** modules are almost always **SSD1306**.
+- **0.91" 128x32** (this build's default) and **0.96" 128x64** modules are almost always **SSD1306**.
 - **1.3" 128x64** modules are often **SH1106**, not SSD1306.
 
 The SH1106 has a slightly different internal column offset (its RAM is 132 px

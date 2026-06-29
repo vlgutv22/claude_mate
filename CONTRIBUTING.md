@@ -21,8 +21,8 @@ By participating you agree to abide by our
 
 ## Building the firmware
 
-The firmware targets an **Arduino Nano (ATmega328P)** with an SSD1306 128×64
-I2C OLED. You can build it with either the Arduino IDE or `arduino-cli`.
+The firmware targets an **Arduino Nano (ATmega328P)** with an SSD1306 0.91"
+128×32 I2C OLED. You can build it with either the Arduino IDE or `arduino-cli`.
 
 ### Arduino IDE
 

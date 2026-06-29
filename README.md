@@ -91,7 +91,7 @@ or resubmitting a turn is intentionally **out of scope** (see
             ▼
    ┌───────────────────────────────────┐
    │   Arduino Nano (ATmega328P)       │
-   │   • SSD1306 128x64 OLED (I2C)     │
+   │   • SSD1306 128x32 OLED (I2C)     │
    │   • stepper status wheel          │
    │     (ULN2003/28BYJ-48 or A4988)   │
    │     homed to the D4 endstop       │
@@ -113,7 +113,7 @@ after any reconnect.
 | Qty | Part                                    | Notes                                  |
 |-----|-----------------------------------------|----------------------------------------|
 | 1   | Arduino Nano (ATmega328P)               | Any USB-serial Nano clone works        |
-| 1   | SSD1306 128×64 OLED, I2C                 | Address `0x3C` (some boards `0x3D`)    |
+| 1   | SSD1306 0.91" 128×32 OLED, I2C           | Address `0x3C` (some boards `0x3D`); 0.96" 128×64 also works |
 | 2   | Momentary push buttons                  | FOCUS and NEXT                         |
 | 1   | Endstop microswitch                     | Home switch at `FREE` (D4, LOW=pressed)|
 | 1   | Stepper motor                           | **28BYJ-48** (default) or **NEMA17**   |

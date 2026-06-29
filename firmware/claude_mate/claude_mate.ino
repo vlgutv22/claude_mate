@@ -3,7 +3,7 @@
  * ==================================================
  *
  * A USB hardware companion that shows the live status of Claude Code sessions.
- * This sketch drives a 128x64 SSD1306 I2C OLED, a STEPPER-DRIVEN STATUS WHEEL
+ * This sketch drives a 128x32 SSD1306 I2C OLED, a STEPPER-DRIVEN STATUS WHEEL
  * and two buttons. It speaks the daemon<->Arduino serial protocol over USB CDC
  * serial at 115200 baud, 8N1.
  *
@@ -30,7 +30,7 @@
  *   #define DRIVER_A4988     // alternative: NEMA17 + A4988/DRV8825 STEP/DIR
  *
  * PIN MAP (Arduino Nano, ATmega328P):
- *   OLED SSD1306 128x64 over I2C:
+ *   OLED SSD1306 128x32 (0.91") over I2C:
  *     VCC -> 5V, GND -> GND, SDA -> A4, SCL -> A5
  *     I2C address 0x3C (common alternative: 0x3D)
  *   Buttons (INPUT_PULLUP, other leg to GND):
@@ -93,7 +93,7 @@
 
 // ---- OLED configuration ------------------------------------------------------
 #define SCREEN_WIDTH   128
-#define SCREEN_HEIGHT  64
+#define SCREEN_HEIGHT  32     // 0.91" SSD1306 (use 64 for a 0.96" panel)
 #define OLED_RESET     -1      // share Arduino reset pin (no dedicated reset)
 #define SCREEN_ADDRESS 0x3C    // common alternative: 0x3D
 
@@ -375,69 +375,52 @@ static void homeWheel() {
 // Rendering
 // -----------------------------------------------------------------------------
 
-// Top-right corner: always show the current dial word as a text confirmation.
-static void drawWordBadge() {
-  // Right-align the word in a small size-1 strip at the very top.
-  const __FlashStringHelper *w = wordLabel(curWord);
-  // Width of a size-1 char is 6px; longest word "BLOCKED" = 7 chars = 42px.
-  display.setTextSize(1);
-  int16_t bx, by; uint16_t bw, bh;
-  display.getTextBounds(w, 0, 0, &bx, &by, &bw, &bh);
-  int16_t x = SCREEN_WIDTH - (int16_t)bw;
-  if (x < 0) x = 0;
+// Draw the current dial word large (size 2, top-left) -- mirrors the wheel so
+// the status is readable even mid-rotation.
+static void drawWordBig() {
+  display.setTextSize(2);
   display.setTextColor(SSD1306_WHITE);
-  display.setCursor(x, 0);
-  display.print(w);
+  display.setCursor(0, 0);
+  display.print(wordLabel(curWord));
 }
 
 static void drawIdle() {
   display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
+  drawWordBig();                       // word is FREE when idle
   display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.println(F("Claude Mate"));
-  display.setTextSize(2);
-  display.setCursor(0, 24);
-  display.println(F("idle"));
-  display.setTextSize(1);
-  display.setCursor(0, 56);
+  display.setCursor(0, 22);
   display.print(F("no sessions"));
-  drawWordBadge();
   display.display();
 }
 
 static void drawCard() {
   display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
 
-  // Dial word badge, top-right.
-  drawWordBadge();
+  // Top row: big status word (longest "BLOCKED" = 84px) on the left, with the
+  // idx/total counter right-aligned in the gap -- no overlap on the 128px panel.
+  drawWordBig();
 
-  // Big name on top (size 2 = 16px tall). Truncate defensively to fit width.
-  display.setTextSize(2);
-  display.setCursor(0, 0);
-  // 128px / 12px per size-2 char = 10 chars; name is already <=10.
-  display.print(curName);
-
-  // State line.
-  display.setTextSize(2);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 24);
-  display.print(stateLabel(curState));
-
-  // Runtime + limit line (size 1).
+  char pos[10];
+  snprintf(pos, sizeof(pos), "%u/%u", (unsigned)curIdx, (unsigned)curTotal);
   display.setTextSize(1);
-  display.setCursor(0, 46);
-  display.print(F("t "));
-  display.print(curRuntime[0] ? curRuntime : "-");
-  display.print(F("  lim "));
-  display.print(curLimit[0] ? curLimit : "-");
+  int16_t px = SCREEN_WIDTH - (int16_t)(strlen(pos) * 6);
+  if (px < 0) px = 0;
+  display.setCursor(px, 0);
+  display.print(pos);
 
-  // Small idx/total indicator, bottom-left.
-  display.setCursor(0, 56);
-  display.print(curIdx);
-  display.print('/');
-  display.print(curTotal);
+  // Bottom row: this session's detail (size 1) -- name, state, runtime, limit.
+  // Adafruit_GFX clips at the right edge, so an over-long line just truncates.
+  display.setTextSize(1);
+  display.setCursor(0, 22);
+  display.print(curName);
+  display.print(' ');
+  display.print(stateLabel(curState));
+  display.print(' ');
+  display.print(curRuntime[0] ? curRuntime : "-");
+  if (curLimit[0] && curLimit[0] != '-') {
+    display.print(' ');
+    display.print(curLimit);
+  }
 
   display.display();
 }
