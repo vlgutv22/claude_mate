@@ -160,10 +160,12 @@ def focus_self():
               end repeat
             end tell''')
     elif tp == "apple_terminal":
-        # Raise ONLY the matched tab's window by its TTY -- no app-wide `activate`,
-        # so the other Terminal windows stay where they are.
+        # Bring Terminal forward, then make THIS tab (matched by its TTY) the
+        # selected, front window. (macOS raises an app's windows as a group; we
+        # ensure ours ends up on top + focused.)
         _osa(f'''
             tell application "Terminal"
+              activate
               repeat with w in windows
                 repeat with t in tabs of w
                   try
