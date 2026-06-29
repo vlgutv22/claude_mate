@@ -17,9 +17,11 @@
  *   WTF      at least one session in error (StopFailure / API 5xx / timeout).
  *   Priority when several apply: WTF > BLOCKED > WIP > FREE.
  *
- * The vibration motor buzzes a short haptic pattern whenever the status word
- * CHANGES (it never re-buzzes on the daemon's ~15s keep-alive resend), so a
- * status escalation is felt as well as seen.
+ * The vibration motor is driven entirely by the daemon via V|<KIND> lines: it
+ * decides per session WHEN to buzz (job started / finished / needs-input /
+ * error) and at what repeating cadence, and which gentle, graduated pattern to
+ * play. The firmware just plays the pattern; the status word (D|) is visual
+ * only and never buzzes on its own.
  *
  * REQUIRED LIBRARIES (install via the Arduino Library Manager):
  *   - Adafruit GFX Library     (Adafruit_GFX)
@@ -51,8 +53,8 @@
  *         state = working | waiting | error | done | idle
  *     I                                              idle screen (no sessions)
  *     P                                              ping/keepalive (we reply H)
- *     V|<word>                                       buzz that pattern now (haptic
- *                                                    only; per-session alert)
+ *     V|<kind>                                       buzz now; kind = START|DONE|
+ *                                                    INPUT|ERROR (haptic only)
  *   Arduino -> Daemon:
  *     H                                              hello, sent once after boot
  *     B|<n>                                          n=1 FOCUS, n=2 NEXT, n=3 PREV
@@ -115,6 +117,7 @@ static uint8_t       vibroPulses   = 0;     // pulses remaining (incl. current)
 static bool          vibroOn       = false; // motor currently energised?
 static uint16_t      vibroOnMs     = 0;     // on-duration for the active pattern
 static uint16_t      vibroOffMs    = 0;     // gap between pulses
+static uint8_t       vibroDuty     = 255;   // PWM amplitude (0-255) of the pattern
 static unsigned long vibroPhaseMs  = 0;     // millis() at the last phase change
 
 // ---- Button debounce state ---------------------------------------------------
@@ -178,21 +181,24 @@ static uint8_t parseWord(const char *s) {
 // -----------------------------------------------------------------------------
 
 // Kick off a haptic pattern: `pulses` buzzes of `onMs` each, separated by
-// `offMs` gaps. Returns immediately; the pulses play out in pollVibro(). A new
-// call replaces any pattern already in progress.
-static void startBuzz(uint8_t pulses, uint16_t onMs, uint16_t offMs) {
+// `offMs` gaps, at PWM amplitude `duty` (0-255). Returns immediately; the
+// pulses play out in pollVibro(). A new call replaces any pattern in progress.
+// PIN_VIBRO (D5) is PWM-capable, so duty sets how hard the motor pushes --
+// lower = gentler. analogWrite on D5 does not disturb millis().
+static void startBuzz(uint8_t pulses, uint16_t onMs, uint16_t offMs, uint8_t duty) {
   if (pulses == 0) {                   // nothing to do -- make sure motor is off
     vibroPulses = 0;
     vibroOn = false;
-    digitalWrite(PIN_VIBRO, LOW);
+    analogWrite(PIN_VIBRO, 0);
     return;
   }
   vibroPulses  = pulses;
   vibroOnMs    = onMs;
   vibroOffMs   = offMs;
+  vibroDuty    = duty;
   vibroOn      = true;                  // start the first pulse now
   vibroPhaseMs = millis();
-  digitalWrite(PIN_VIBRO, HIGH);
+  analogWrite(PIN_VIBRO, duty);
 }
 
 // Advance the haptic state machine. Call every loop(); never blocks.
@@ -202,7 +208,7 @@ static void pollVibro() {
   if (vibroOn) {
     if ((now - vibroPhaseMs) >= vibroOnMs) {
       // End of the on-phase: drop the motor and start the gap (or finish).
-      digitalWrite(PIN_VIBRO, LOW);
+      analogWrite(PIN_VIBRO, 0);
       vibroOn = false;
       vibroPhaseMs = now;
       vibroPulses--;                   // this pulse is complete
@@ -210,23 +216,24 @@ static void pollVibro() {
     }
   } else {
     if ((now - vibroPhaseMs) >= vibroOffMs) {
-      // Gap elapsed: start the next pulse.
-      digitalWrite(PIN_VIBRO, HIGH);
+      // Gap elapsed: start the next pulse at the pattern's amplitude.
+      analogWrite(PIN_VIBRO, vibroDuty);
       vibroOn = true;
       vibroPhaseMs = now;
     }
   }
 }
 
-// Choose a haptic pattern for a status word. Higher escalation = more insistent.
-static void buzzForWord(uint8_t w) {
-  switch (w) {
-    // "Helicopter": a ~2s rapid stutter for the states that want your attention.
-    case W_BLOCKED: startBuzz(24, 45, 40); break;   // needs you -> helicopter ~2s
-    case W_FREE:    startBuzz(24, 45, 40); break;   // finished  -> helicopter ~2s
-    case W_WTF:     startBuzz(4, 220, 140); break;  // error -> distinct urgent burst
-    default:        /* W_WIP: silent */    break;
-  }
+// Daemon-driven haptic patterns, gentlest -> firmest. The daemon decides WHEN
+// to buzz (per session, with repeats) and sends V|<KIND>; the firmware only
+// plays the pattern. Amplitude is PWM duty, kept well below full power so even
+// the firmest is a nudge, not a jolt -- urgency reads as a bit more push and a
+// few more pulses, not a longer jarring buzz.
+static void buzzForKind(const char *k) {
+  if      (!strcmp(k, "START")) startBuzz(1, 25,   0,  70);  // job started: a tick
+  else if (!strcmp(k, "DONE"))  startBuzz(2, 40, 110, 100);  // finished  (repeats 15s)
+  else if (!strcmp(k, "INPUT")) startBuzz(3, 50,  80, 150);  // needs you (repeats 10s)
+  else if (!strcmp(k, "ERROR")) startBuzz(4, 60,  80, 200);  // error     (repeats 5s)
 }
 
 // -----------------------------------------------------------------------------
@@ -325,24 +332,18 @@ static void handleLine(char *line) {
       if (!bar || bar[1] == 0) break;
       uint8_t w = parseWord(bar + 1);
       if (w == 255) break;               // ignore unknown word
-      // Only buzz on a real CHANGE -- the daemon resends the same word every
-      // ~15s as a keep-alive and that must NOT re-trigger the haptic alert.
-      if (w != curWord) buzzForWord(w);
-      curWord = w;
+      curWord = w;                       // dial/word only; haptics come via V|
       render();                          // refresh the OLED word now
       break;
     }
 
-    case 'V': {                          // V|<WORD> -- buzz a pattern NOW (haptic only)
-      // Daemon-driven per-session alert (e.g. one of several sessions just
-      // finished while others keep working, so the aggregate word -- and the
-      // D| buzz -- never changes). Plays the pattern without touching curWord
-      // or the OLED, so the dial/screen stay truthful.
+    case 'V': {                          // V|<KIND> -- buzz a haptic pattern NOW
+      // The daemon owns all haptics: it decides per-session WHEN to buzz (job
+      // start, finish, needs-input, error) and at what cadence, and sends the
+      // KIND here. We just play it -- no change to the dial/OLED.
       char *bar = strchr(line, '|');
       if (!bar || bar[1] == 0) break;
-      uint8_t w = parseWord(bar + 1);
-      if (w == 255) break;               // ignore unknown word
-      buzzForWord(w);
+      buzzForKind(bar + 1);              // START | DONE | INPUT | ERROR
       break;
     }
 

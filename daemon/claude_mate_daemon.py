@@ -86,10 +86,19 @@ SESSION_IDLE_TTL = 600.0    # drop any stale session after this long
 # Card name length cap (the OLED is narrow).
 NAME_MAX = 20
 
-# State ordering for the carousel: most urgent first.
-STATE_ORDER = {"error": 0, "waiting": 1, "working": 2, "done": 3, "idle": 4}
+# Navigation / auto-show priority, most urgent first: a tab in error, then one
+# waiting for input, then a finished (done) tab needing acknowledgment, then
+# still-working, then idle. NEXT/PREV walk this order; the screen auto-shows the
+# most urgent unacknowledged tab.
+STATE_ORDER = {"error": 0, "waiting": 1, "done": 2, "working": 3, "idle": 4}
 
 VALID_STATES = set(STATE_ORDER.keys())
+
+# Per-state repeat-buzz cadence (seconds) and haptic kind. A tab keeps nagging
+# at this interval, gentler/less often as urgency drops, until acknowledged
+# (FOCUS) or it leaves the state. Job-start uses a one-shot "START" tick.
+ALERT_INTERVAL = {"error": 5.0, "waiting": 10.0, "done": 15.0}
+ALERT_KIND = {"error": "ERROR", "waiting": "INPUT", "done": "DONE"}
 
 
 def log(msg: str) -> None:
@@ -118,6 +127,7 @@ class Session:
     last_runtime: float = 0.0      # last completed turn duration (seconds)
     limit: str = "-"               # best-effort rate/usage string; "-" if unknown
     focus_ctrl: str = ""           # PTY-wrapper control socket for FOCUS (if any)
+    acked: bool = True             # alert (done/waiting/error) seen by the human?
 
     def runtime_seconds(self) -> float:
         """Timer value to show on the card, in seconds.
@@ -151,11 +161,15 @@ class Registry:
                focus_ctrl: str = "") -> Optional[str]:
         """Apply a status update from a hook, the PTY wrapper, or the mock injector.
 
-        Returns a per-session haptic word to buzz NOW (FREE/BLOCKED/WTF), or
-        None. This fires on the individual session's own transition, so a
-        session finishing buzzes even when other sessions keep the aggregate
-        status word unchanged (e.g. 3 sessions working, one finishes -> still
-        WIP overall, but the user still feels that one finish).
+        Returns the one-shot haptic KIND to buzz NOW for this session's own
+        transition (START/DONE/INPUT/ERROR), or None for a keepalive / silent
+        change. Per-session, so a single tab finishing or blocking is felt even
+        when other tabs keep the fleet busy. Repeated nagging while a tab stays
+        in an alert state is handled separately by the Carousel scheduler.
+
+        Models "finished but not yet acknowledged": a turn ending (working ->
+        idle) becomes 'done' and STAYS 'done' (alerting) until the user focuses
+        the tab; later idle keepalives must not clear it.
         """
         if state not in VALID_STATES:
             log(f"ignoring update with invalid state: {state!r}")
@@ -178,38 +192,68 @@ class Registry:
                 sess.focus_ctrl = focus_ctrl
             prev_state = sess.state
             sess.last_update_ts = now
-            # Stamp when this state began so idle/waiting/error can show a live
-            # "time in state" counter. Keepalives (same state) must not reset it.
-            if prev_state != state:
-                sess.state_since = now
 
-            # Manage runtime bookkeeping on state transitions.
-            if state == "working":
-                # Entering / continuing a turn: stamp start once.
+            # Resolve the EFFECTIVE state under the done-until-acknowledged model.
+            eff = state
+            if state == "idle":
+                if prev_state == "working":
+                    eff = "done"                 # just finished -> needs ack
+                elif prev_state == "done" and not sess.acked:
+                    eff = "done"                 # keepalive while unacknowledged
+
+            # Runtime bookkeeping keyed on the working turn.
+            if eff == "working":
                 if prev_state != "working" or sess.started_ts is None:
                     sess.started_ts = now
             else:
-                # Leaving 'working': record the completed turn duration.
                 if prev_state == "working" and sess.started_ts is not None:
                     sess.last_runtime = max(0.0, now - sess.started_ts)
                 sess.started_ts = None
-            sess.state = state
 
-            # Decide a per-session haptic for this transition (None = silent).
-            # Only on a real change; keepalives (same state) never buzz.
+            changed = (eff != prev_state)
+            if changed:
+                sess.state_since = now           # live "time in state" anchor
+            sess.state = eff
+
+            # Acknowledgment + one-shot haptic kind on a real transition.
             haptic: Optional[str] = None
-            if prev_state != state:
-                if state in ("idle", "done") and prev_state == "working":
-                    haptic = "FREE"      # a turn/task just finished
-                elif state == "waiting":
-                    haptic = "BLOCKED"   # now blocked, needs the human
-                elif state == "error":
-                    haptic = "WTF"       # just errored
+            if changed:
+                if eff in ALERT_INTERVAL:        # done/waiting/error: fresh alert
+                    sess.acked = False           # nag until focused
+                    haptic = ALERT_KIND[eff]
+                elif eff == "working":
+                    sess.acked = True
+                    haptic = "START"             # job (re)started: gentle tick
+                else:                            # idle
+                    sess.acked = True
             return haptic
 
     def remove(self, key: str) -> None:
         with self._lock:
             self._sessions.pop(key, None)
+
+    def acknowledge(self, sess: Optional["Session"]) -> None:
+        """FOCUS pressed: mark this tab's alert as seen. A finished (done) tab
+        becomes idle; a waiting/error tab is silenced but keeps its state (it
+        still shows, just stops nagging) until it changes on its own."""
+        if sess is None:
+            return
+        with self._lock:
+            sess.acked = True
+            if sess.state == "done":
+                sess.state = "idle"
+                sess.state_since = time.time()
+
+    def top_alert(self) -> Optional["Session"]:
+        """The most urgent unacknowledged tab needing the human (error >
+        waiting > done), or None. Drives auto-show + the repeat-buzz cadence."""
+        with self._lock:
+            items = [s for s in self._sessions.values()
+                     if s.state in ALERT_INTERVAL and not s.acked]
+        if not items:
+            return None
+        items.sort(key=lambda s: (STATE_ORDER.get(s.state, 99), s.name.lower()))
+        return items[0]
 
     def prune(self) -> None:
         """Drop stale/finished sessions so the carousel stays tidy."""
@@ -385,6 +429,7 @@ class Display:
         self._last_word: Optional[str] = None
         self._current_index = 0          # carousel position within ordered list
         self._current_session: Optional[Session] = None  # last shown card's session
+        self._buzz_last: Dict[str, float] = {}  # haptic kind -> last buzz time
 
     # ---- dial (stepper status wheel) ------------------------------------- #
 
@@ -397,15 +442,35 @@ class Display:
         if changed or force:
             self._link.write_line(f"D|{word}")
 
-    def push_buzz(self, word: str) -> None:
-        """Fire a one-shot haptic on the device for a per-session event.
+    def push_buzz(self, kind: str) -> None:
+        """Fire a haptic on the device: V|<KIND> (START/DONE/INPUT/ERROR).
 
-        Sends "V|<WORD>" which buzzes the pattern without changing the wheel
-        or OLED, so a single session's finish/block/error is felt even when the
-        aggregate status word (and thus the D| buzz) does not change.
+        Buzzes the pattern without touching the wheel/OLED, so a single tab's
+        job-start / finish / block / error is felt even when the aggregate
+        status word does not change. Records the time so the Carousel can pace
+        repeat nags (and so an initial buzz doesn't double-fire with a repeat).
         """
-        if word:
-            self._link.write_line(f"V|{word}")
+        if not kind:
+            return
+        with self._lock:
+            self._buzz_last[kind] = time.time()
+        self._link.write_line(f"V|{kind}")
+
+    def alert_due(self, kind: str, interval: float) -> bool:
+        """True if `kind` has not buzzed within `interval` seconds."""
+        with self._lock:
+            last = self._buzz_last.get(kind, 0.0)
+        return (time.time() - last) >= interval
+
+    def show_session(self, sess: Optional[Session]) -> None:
+        """Show a specific session's card (by key, tolerant of reordering)."""
+        if sess is None:
+            return
+        sessions = self._reg.ordered()
+        for i, s in enumerate(sessions):
+            if s.key == sess.key:
+                self.show_index(i)
+                return
 
     # ---- cards ----------------------------------------------------------- #
 
@@ -699,6 +764,7 @@ class ButtonReader(threading.Thread):
         self._display = display
         self._stop = threading.Event()
         self.on_next = None  # callback set by the app (carousel pause)
+        self.on_ack = None   # callback(sess): acknowledge a focused tab's alert
 
     def run(self) -> None:
         while not self._stop.is_set():
@@ -720,7 +786,12 @@ class ButtonReader(threading.Thread):
             if len(parts) >= 2 and parts[1].isdigit():
                 n = int(parts[1])
                 if n == 1:
-                    focus_session(self._display.current_session())
+                    sess = self._display.current_session()
+                    log(f"FOCUS button -> focus + acknowledge "
+                        f"{sess.name if sess else '-'}")
+                    focus_session(sess)
+                    if self.on_ack:
+                        self.on_ack(sess)   # focusing the window = acknowledged
                 elif n == 2:
                     log("NEXT button -> advancing carousel")
                     self._display.advance()
@@ -779,7 +850,8 @@ class SerialMaintainer(threading.Thread):
 
 
 class Carousel(threading.Thread):
-    """Rotates through cards ~every 3s and keeps the live runtime fresh."""
+    """Keeps the live card/dial fresh, auto-surfaces the most urgent tab, and
+    paces the repeat-buzz nags for unacknowledged alerts."""
 
     def __init__(self, display: Display, registry: Registry) -> None:
         super().__init__(name="carousel", daemon=True)
@@ -788,11 +860,11 @@ class Carousel(threading.Thread):
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._paused_until = 0.0
-        self._last_rotate = 0.0
         self._last_prune = 0.0
 
     def pause(self) -> None:
-        """Pause auto-rotation for NEXT_PAUSE seconds (after a manual NEXT)."""
+        """Pause auto-show for NEXT_PAUSE seconds (after a manual NEXT/PREV) so
+        the user can browse without the screen snapping back immediately."""
         with self._lock:
             self._paused_until = time.time() + NEXT_PAUSE
 
@@ -800,6 +872,15 @@ class Carousel(threading.Thread):
         """Called on any registry change: refresh dial + current card."""
         self._display.push_dial()
         self._display.refresh_current()
+
+    def _repeat_alert(self, target: Optional[Session]) -> None:
+        """Re-buzz the most urgent unacknowledged alert at its cadence."""
+        if target is None:
+            return
+        interval = ALERT_INTERVAL.get(target.state)
+        kind = ALERT_KIND.get(target.state)
+        if interval and kind and self._display.alert_due(kind, interval):
+            self._display.push_buzz(kind)
 
     def run(self) -> None:
         # Prime the display.
@@ -813,10 +894,20 @@ class Carousel(threading.Thread):
                 self._reg.prune()
                 self._last_prune = now
 
-            # No auto-rotation: only the NEXT/PREV buttons change which card is
-            # shown. Keep the current card's runtime + dial fresh in place.
-            self._display.refresh_current()
+            with self._lock:
+                paused = now < self._paused_until
+
+            # Auto-surface the most urgent unacknowledged tab; while the user is
+            # browsing (just pressed NEXT/PREV) hold their selection instead.
+            target = self._reg.top_alert()
+            if target is not None and not paused:
+                self._display.show_session(target)
+            else:
+                self._display.refresh_current()
             self._display.push_dial()
+
+            # Keep nagging the alert (independent of browsing/auto-show).
+            self._repeat_alert(target)
 
             self._stop.wait(1.0)
 
@@ -927,9 +1018,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     def on_update() -> None:
         carousel.notify_change()
 
+    def on_ack(sess) -> None:
+        registry.acknowledge(sess)
+        carousel.notify_change()
+
     socket_server = SocketServer(args.sock, registry, on_update, display.push_buzz)
     button_reader = ButtonReader(link, display)
     button_reader.on_next = carousel.pause
+    button_reader.on_ack = on_ack
     maintainer = SerialMaintainer(link, display)
 
     threads: List[threading.Thread] = [
