@@ -295,6 +295,17 @@ def real_claude():
         except OSError:
             pass
         return cand
+    # Last resort: the canonical install dir, so the wrapper still finds the real
+    # binary even when EVERY `claude` on PATH (incl. ~/.local/bin/claude) is our
+    # shim. Pick the newest version directory's executable.
+    vdir = os.path.expanduser("~/.local/share/claude/versions")
+    try:
+        for v in sorted(os.listdir(vdir), reverse=True):
+            cand = os.path.join(vdir, v)
+            if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                return cand
+    except OSError:
+        pass
     return "claude"  # last resort
 
 # --------------------------------------------------------------------------- #
