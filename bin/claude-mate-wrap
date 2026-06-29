@@ -50,7 +50,11 @@ SID = uuid.uuid4().hex[:8]
 NAME = (os.path.basename(os.getcwd()) or "claude")[:10]
 TERM_PROGRAM = os.environ.get("TERM_PROGRAM", "")
 CTRL_SOCK = f"/tmp/claude-mate-ctrl-{SID}.sock"
-TITLE = f"◆cm:{NAME}:{SID}"          # unique terminal title for focus matching
+TITLE = f"◆cm:{NAME}:{SID}"          # unique terminal title (generic-focus fallback)
+try:
+    MY_TTY = os.ttyname(0)           # this terminal's device — used for EXACT focus
+except OSError:
+    MY_TTY = ""
 
 # --------------------------------------------------------------------------- #
 # State-detection patterns  (TUNE THESE against your claude TUI — see DEBUG log)
@@ -136,30 +140,41 @@ def focus_self():
 
     tp = TERM_PROGRAM.lower()
     if tp == "iterm.app":
+        # Match the session by its TTY (exact), fall back to title.
         _osa(f'''
             tell application "iTerm2"
               activate
               repeat with w in windows
                 repeat with t in tabs of w
                   repeat with s in sessions of t
-                    if name of s contains "{TITLE}" then
-                      select w
-                      tell t to select
-                      select s
-                    end if
+                    try
+                      if (tty of s) is "{MY_TTY}" or (name of s contains "{TITLE}") then
+                        select w
+                        tell t to select
+                        select s
+                        return
+                      end if
+                    end try
                   end repeat
                 end repeat
               end repeat
             end tell''')
     elif tp == "apple_terminal":
+        # Match the tab by its TTY (exact) — robust even if claude overwrites the title.
         _osa(f'''
             tell application "Terminal"
               activate
               repeat with w in windows
-                if name of w contains "{TITLE}" then
-                  set frontmost of w to true
-                  set index of w to 1
-                end if
+                repeat with t in tabs of w
+                  try
+                    if (tty of t) is "{MY_TTY}" then
+                      set selected of t to true
+                      set frontmost of w to true
+                      set index of w to 1
+                      return
+                    end if
+                  end try
+                end repeat
               end repeat
             end tell''')
     elif tp == "vscode":
