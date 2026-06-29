@@ -12,7 +12,6 @@
     "connection error",
     "request timed out",
     "service is temporarily",
-    "rate limit",
     "rate_limit_error",
     "usage limit reached"
   ],

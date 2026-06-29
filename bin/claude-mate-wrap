@@ -69,7 +69,9 @@ DEFAULT_PATTERNS = {
         "internal server error", "connection error", "request timed out",
         "service is temporarily",
         # Rate / usage limits block the session and need you -> treat as error.
-        "rate limit", "rate_limit_error", "usage limit reached",
+        # Use the SPECIFIC strings (not bare "rate limit") so merely discussing
+        # rate limits in the conversation does not false-trigger the scrape.
+        "rate_limit_error", "usage limit reached",
     ],
     "waiting": [
         "do you want to proceed", "yes, and don't ask",
