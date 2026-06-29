@@ -1,0 +1,32 @@
+{
+  "_comment": "Live state-detection tuning for bin/claude-mate-wrap. Case-insensitive substrings matched against the rendered claude TUI screen. The wrapper hot-reloads this file (~every 0.25s) so edits take effect with NO restart. Order of precedence: error > waiting > busy > idle.",
+
+  "error": [
+    "api error",
+    "overloaded_error",
+    " 429",
+    " 500",
+    " 503",
+    " 529",
+    "internal server error",
+    "connection error",
+    "request timed out",
+    "service is temporarily"
+  ],
+
+  "waiting": [
+    "do you want to proceed",
+    "yes, and don't ask",
+    "tell claude what to do differently",
+    "no, and tell claude",
+    "press enter to continue"
+  ],
+
+  "busy": [
+    "esc to interrupt",
+    "esc to cancel",
+    "running in the background",
+    "workflow to finish",
+    "tool to finish"
+  ]
+}

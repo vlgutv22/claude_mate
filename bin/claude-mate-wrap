@@ -32,7 +32,7 @@ Config (env):
 Requires: pyte  (pip install pyte)
 """
 import os, sys, pty, tty, termios, fcntl, struct, signal, select, socket, \
-       threading, time, re, uuid, subprocess, shutil
+       threading, time, re, json, uuid, subprocess, shutil
 
 try:
     import pyte
@@ -57,27 +57,59 @@ except OSError:
     MY_TTY = ""
 
 # --------------------------------------------------------------------------- #
-# State-detection patterns  (TUNE THESE against your claude TUI — see DEBUG log)
-# Substrings are matched against the rendered screen text, case-insensitively.
+# State-detection patterns. Case-insensitive substrings matched against the
+# rendered screen. Defaults are deliberately TIGHT (only unambiguous signals) so
+# incidental words don't false-trigger. Override LIVE — no restart — by editing
+# the JSON at CLAUDE_MATE_PATTERNS (default: <repo>/patterns.json) with keys
+# "error" / "waiting" / "busy" -> lists of substrings.
 # --------------------------------------------------------------------------- #
-ERROR_PATTERNS = (
-    "api error", "overloaded", "rate limit", "rate_limit", "rate-limit",
-    " 429", " 500", " 503", " 529", "internal server error",
-    "connection error", "connection reset", "request timed out", "timed out",
-    "service is temporarily", "retrying", "overloaded_error",
+DEFAULT_PATTERNS = {
+    "error": [
+        "api error", "overloaded_error", " 429", " 500", " 503", " 529",
+        "internal server error", "connection error", "request timed out",
+        "service is temporarily",
+    ],
+    "waiting": [
+        "do you want to proceed", "yes, and don't ask",
+        "tell claude what to do differently", "no, and tell claude",
+        "press enter to continue",
+    ],
+    # Only signals that appear ONLY when genuinely busy: the interrupt hint shown
+    # while generating, and the explicit "still running in the background" footer.
+    "busy": [
+        "esc to interrupt", "esc to cancel", "running in the background",
+        "workflow to finish", "tool to finish",
+    ],
+}
+
+_PATTERNS_FILE = os.environ.get(
+    "CLAUDE_MATE_PATTERNS",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                 "patterns.json"),
 )
-WAITING_PATTERNS = (
-    "do you want to proceed", "do you want to", "yes, and don't ask",
-    "tell claude what to do differently", "no, and tell claude",
-    "allow this", "approve this", "approve?", "(y/n)", "[y/n]",
-    "press enter to", "1. yes", "❯ 1.", "would you like to",
-)
-# Busy indicators — generation in progress OR background work still running.
-BUSY_PATTERNS = (
-    "esc to interrupt", "to interrupt)", "dynamic workflow", "workflow to finish",
-    "running in the background", "thinking", "working…", "working...",
-    "processing", "compacting", "pondering", "tokens)", "↑ ", "esc to cancel",
-)
+_patterns = {k: [s.lower() for s in v] for k, v in DEFAULT_PATTERNS.items()}
+_patterns_mtime = [0.0]
+
+def load_patterns():
+    """Hot-reload patterns from the JSON file if it changed (live tuning)."""
+    try:
+        m = os.stat(_PATTERNS_FILE).st_mtime
+    except OSError:
+        return
+    if m == _patterns_mtime[0]:
+        return
+    try:
+        with open(_PATTERNS_FILE) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return
+    new = {k: [s.lower() for s in v] for k, v in DEFAULT_PATTERNS.items()}
+    for k in ("error", "waiting", "busy"):
+        if isinstance(data.get(k), list):
+            new[k] = [str(x).lower() for x in data[k]]
+    _patterns.clear()
+    _patterns.update(new)
+    _patterns_mtime[0] = m
 
 POLL_MS = 0.25            # re-evaluate the screen this often (quiescence)
 DEBOUNCE_S = 0.30         # require a state to persist before reporting it
@@ -229,11 +261,11 @@ def ctrl_listener():
 # --------------------------------------------------------------------------- #
 def detect_state(screen_text):
     t = screen_text.lower()
-    if any(p in t for p in ERROR_PATTERNS):
+    if any(p in t for p in _patterns["error"]):
         return "error"
-    if any(p in t for p in WAITING_PATTERNS):
+    if any(p in t for p in _patterns["waiting"]):
         return "waiting"
-    if any(p in t for p in BUSY_PATTERNS):
+    if any(p in t for p in _patterns["busy"]):
         return "working"
     return "idle"
 
@@ -319,6 +351,7 @@ def main():
         while True:
             time.sleep(POLL_MS)
             try:
+                load_patterns()   # hot-reload tuning without a restart
                 evaluate()
             except Exception:
                 pass
