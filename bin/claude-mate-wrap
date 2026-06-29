@@ -277,17 +277,36 @@ def real_claude():
     if explicit and os.path.exists(explicit):
         return explicit
     me = os.path.realpath(sys.argv[0])
+    wrapper = os.path.realpath(__file__)
     for d in os.environ.get("PATH", "").split(os.pathsep):
         cand = os.path.join(d, "claude")
-        if os.path.isfile(cand) and os.access(cand, os.X_OK) \
-                and os.path.realpath(cand) != me:
-            return cand
+        if not (os.path.isfile(cand) and os.access(cand, os.X_OK)):
+            continue
+        rp = os.path.realpath(cand)
+        if rp == me or rp == wrapper:
+            continue
+        # Skip our own shim (a tiny script that calls claude-mate-wrap) so a
+        # `claude` shim earlier on PATH can't cause infinite double-wrapping.
+        try:
+            if os.path.getsize(cand) < 8192:
+                with open(cand, "rb") as fh:
+                    if b"claude-mate-wrap" in fh.read():
+                        continue
+        except OSError:
+            pass
+        return cand
     return "claude"  # last resort
 
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def main():
+    # Non-interactive (piped / scripted) use: don't wrap, just be claude. This
+    # keeps a global `claude` shim safe for `claude -p ...`, CI, pipes, etc.
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        os.execvp(real_claude(), ["claude"] + sys.argv[1:])
+        os._exit(127)
+
     rows, cols = get_winsize(sys.stdin.fileno())
 
     pid, master_fd = pty.fork()
