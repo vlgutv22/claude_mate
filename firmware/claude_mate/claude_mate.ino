@@ -51,6 +51,8 @@
  *         state = working | waiting | error | done | idle
  *     I                                              idle screen (no sessions)
  *     P                                              ping/keepalive (we reply H)
+ *     V|<word>                                       buzz that pattern now (haptic
+ *                                                    only; per-session alert)
  *   Arduino -> Daemon:
  *     H                                              hello, sent once after boot
  *     B|<n>                                          n=1 FOCUS, n=2 NEXT, n=3 PREV
@@ -328,6 +330,19 @@ static void handleLine(char *line) {
       if (w != curWord) buzzForWord(w);
       curWord = w;
       render();                          // refresh the OLED word now
+      break;
+    }
+
+    case 'V': {                          // V|<WORD> -- buzz a pattern NOW (haptic only)
+      // Daemon-driven per-session alert (e.g. one of several sessions just
+      // finished while others keep working, so the aggregate word -- and the
+      // D| buzz -- never changes). Plays the pattern without touching curWord
+      // or the OLED, so the dial/screen stay truthful.
+      char *bar = strchr(line, '|');
+      if (!bar || bar[1] == 0) break;
+      uint8_t w = parseWord(bar + 1);
+      if (w == 255) break;               // ignore unknown word
+      buzzForWord(w);
       break;
     }
 

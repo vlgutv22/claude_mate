@@ -148,11 +148,18 @@ class Registry:
         self._sessions: Dict[str, Session] = {}
 
     def update(self, state: str, sid: str, name: str, cwd: str = "",
-               focus_ctrl: str = "") -> None:
-        """Apply a status update from a hook, the PTY wrapper, or the mock injector."""
+               focus_ctrl: str = "") -> Optional[str]:
+        """Apply a status update from a hook, the PTY wrapper, or the mock injector.
+
+        Returns a per-session haptic word to buzz NOW (FREE/BLOCKED/WTF), or
+        None. This fires on the individual session's own transition, so a
+        session finishing buzzes even when other sessions keep the aggregate
+        status word unchanged (e.g. 3 sessions working, one finishes -> still
+        WIP overall, but the user still feels that one finish).
+        """
         if state not in VALID_STATES:
             log(f"ignoring update with invalid state: {state!r}")
-            return
+            return None
         key = sid if sid else (name if name else "unknown")
         now = time.time()
         with self._lock:
@@ -187,6 +194,18 @@ class Registry:
                     sess.last_runtime = max(0.0, now - sess.started_ts)
                 sess.started_ts = None
             sess.state = state
+
+            # Decide a per-session haptic for this transition (None = silent).
+            # Only on a real change; keepalives (same state) never buzz.
+            haptic: Optional[str] = None
+            if prev_state != state:
+                if state in ("idle", "done") and prev_state == "working":
+                    haptic = "FREE"      # a turn/task just finished
+                elif state == "waiting":
+                    haptic = "BLOCKED"   # now blocked, needs the human
+                elif state == "error":
+                    haptic = "WTF"       # just errored
+            return haptic
 
     def remove(self, key: str) -> None:
         with self._lock:
@@ -378,6 +397,16 @@ class Display:
         if changed or force:
             self._link.write_line(f"D|{word}")
 
+    def push_buzz(self, word: str) -> None:
+        """Fire a one-shot haptic on the device for a per-session event.
+
+        Sends "V|<WORD>" which buzzes the pattern without changing the wheel
+        or OLED, so a single session's finish/block/error is felt even when the
+        aggregate status word (and thus the D| buzz) does not change.
+        """
+        if word:
+            self._link.write_line(f"V|{word}")
+
     # ---- cards ----------------------------------------------------------- #
 
     @staticmethod
@@ -557,11 +586,13 @@ def _which(prog: str) -> bool:
 class SocketServer(threading.Thread):
     """Unix-domain socket server: parses '<state>|<session_id>|<name>' lines."""
 
-    def __init__(self, sock_path: str, registry: Registry, on_update) -> None:
+    def __init__(self, sock_path: str, registry: Registry, on_update,
+                 on_haptic=None) -> None:
         super().__init__(name="socket-server", daemon=True)
         self._sock_path = sock_path
         self._reg = registry
         self._on_update = on_update
+        self._on_haptic = on_haptic   # called with a buzz word on session events
         self._stop = threading.Event()
         self._srv: Optional[socket.socket] = None
 
@@ -649,8 +680,10 @@ class SocketServer(threading.Thread):
                 self._on_update()
             return
         log(f"socket update: state={state} sid={sid or '-'} name={name or '-'}")
-        self._reg.update(state, sid, name, focus_ctrl=ctrl)
+        haptic = self._reg.update(state, sid, name, focus_ctrl=ctrl)
         self._on_update()
+        if haptic and self._on_haptic:
+            self._on_haptic(haptic)
 
     def stop(self) -> None:
         self._stop.set()
@@ -893,7 +926,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     def on_update() -> None:
         carousel.notify_change()
 
-    socket_server = SocketServer(args.sock, registry, on_update)
+    socket_server = SocketServer(args.sock, registry, on_update, display.push_buzz)
     button_reader = ButtonReader(link, display)
     button_reader.on_next = carousel.pause
     maintainer = SerialMaintainer(link, display)
