@@ -1,9 +1,9 @@
 # Claude Mate
 
 A tiny USB hardware companion that shows the **live status of your Claude Code
-sessions** on a small OLED, turns a **stepper-driven status wheel** to one of
-four words, and lets you **jump straight to the session that needs you** with a
-single button press.
+sessions** on a small OLED as a big word (FREE / WIP / BLOCKED / WTF), **buzzes a
+micro vibration motor** when that word changes, and lets you **jump straight to
+the session that needs you** with a single button press.
 
 Plug it into your Mac, run the daemon, drop in the Claude Code hooks, and the
 device becomes an ambient, always-on status pane for every Claude Code session
@@ -13,23 +13,24 @@ you have open in VS Code (and/or the terminal CLI).
             ┌──────────────────────────────┐
             │  ▓▓ api-server   working ▓▓   │   ← live status card
             │     02:14            71%      │
-            │  [1/3]            WIP         │   ← current wheel word (text echo)
+            │  [1/3]            WIP         │   ← big status word
             └──────────────────────────────┘
-                     ⟳  ( WIP )                 ← stepper status wheel
-              [ FOCUS ]   [ NEXT ]            ← two buttons
+                  ((•)) vibration motor          ← buzzes when the word changes
+          [ FOCUS ]  [ NEXT ]  [ PREV ]        ← three buttons
 
-      wheel words:  FREE → WIP → BLOCKED → WTF   (escalation order)
+      words:  FREE → WIP → BLOCKED → WTF   (priority: WTF > BLOCKED > WIP > FREE)
+      buzz:   WTF = 3 pulses · BLOCKED = 2 · FREE = 1 tick · WIP = silent
 ```
 
 ---
 
 ## What it is
 
-**Claude Mate** is an Arduino Nano + small I2C OLED + 2 buttons + a
-**stepper-driven status wheel**, paired with a lightweight Python daemon on your
-Mac and a set of Claude Code hooks. The hooks report session state changes; the
-daemon keeps the model of all your sessions, drives the display, and acts on
-button presses.
+**Claude Mate** is an Arduino Nano + small I2C OLED + 3 buttons + a **micro
+vibration motor**, paired with a lightweight Python daemon on your Mac and a set
+of Claude Code hooks. The hooks report session state changes; the daemon keeps
+the model of all your sessions, drives the display, buzzes the motor on word
+changes, and acts on button presses.
 
 The single must-have action is **FOCUS**: press a button and the VS Code window
 for the currently displayed session is raised so you can deal with it. Retrying
@@ -43,28 +44,27 @@ or resubmitting a turn is intentionally **out of scope** (see
 - **Live status carousel** — the daemon auto-rotates through all your active
   sessions (~every 3 s), showing one card at a time: project name, state,
   runtime, and a best-effort usage limit. Most urgent sessions are shown first.
-- **Stepper status wheel** — a dial that physically rotates to one of four words,
-  an at-a-glance system health signal (priority: **WTF > BLOCKED > WIP > FREE**):
+- **Big status word** — the OLED shows one of four words, an at-a-glance system
+  health signal (priority: **WTF > BLOCKED > WIP > FREE**):
   - **WTF** — at least one session is in error (StopFailure / API 5xx /
     overloaded / timeout).
   - **BLOCKED** — at least one session is waiting on your input (permission /
     question) and none errored.
   - **WIP** — something is working; nothing needs you right now.
-  - **FREE** — all clear (idle/done sessions, or no sessions). This is the home
-    position, set by a tab-on-wheel endstop and re-homed at boot.
-
-  The words are 90° apart in escalation order so rotation = the situation
-  escalating. Motion is non-blocking (AccelStepper). Two driver options sit
-  behind a `#define`: **ULN2003 + 28BYJ-48** (default) or **A4988 + NEMA17**.
+  - **FREE** — all clear (idle/done sessions, or no sessions).
+- **Vibration haptic** — a micro vibration motor buzzes **only when the word
+  changes**: **WTF = 3 pulses**, **BLOCKED = 2 pulses**, **FREE = 1 short tick**,
+  **WIP = silent**. So you feel an escalation without looking.
 - **One-button FOCUS** — press FOCUS to raise the VS Code window of the session
   currently on screen, via a VS Code deep link with a window-raise fallback.
-- **NEXT button** — advance the carousel immediately; auto-rotation pauses for
-  ~10 s so you can read.
+- **NEXT / PREV buttons** — step the carousel forward or back immediately;
+  auto-rotation pauses for ~10 s so you can read.
 - **Robust by design** — keeps the serial port open continuously, auto-detects
   and auto-reconnects to the device, never crashes on a missing port, and the
   hooks never block or fail a Claude turn.
-- **`--mock` demo mode** — run the whole display/wheel/carousel with fake
-  sessions (cycling through all four words), no Claude and no hooks required.
+- **`--mock` demo mode** — run the whole display/carousel with fake sessions
+  (cycling through all four words and buzzing the motor), no Claude and no hooks
+  required.
 
 ---
 
@@ -92,19 +92,18 @@ or resubmitting a turn is intentionally **out of scope** (see
    ┌───────────────────────────────────┐
    │   Arduino Nano (ATmega328P)       │
    │   • SSD1306 128x32 OLED (I2C)     │
-   │   • stepper status wheel          │
-   │     (ULN2003/28BYJ-48 or A4988)   │
-   │     homed to the D4 endstop       │
-   │   • FOCUS / NEXT buttons          │
+   │     big word + session card       │
+   │   • micro vibration motor (D5)    │
+   │     buzzes on each word change    │
+   │   • FOCUS / NEXT / PREV buttons   │
    └───────────────────────────────────┘
             │  buttons  "B|<n>\n"
             └──────────────► back to the daemon
 ```
 
-Opening the USB serial port resets the Nano (~1.5 s). On boot the Arduino
-re-homes the wheel and emits `H` (hello); the daemon responds by resending the
-full current state (dial word + current card), so the display recovers cleanly
-after any reconnect.
+Opening the USB serial port resets the Nano (~1.5 s). On boot the Arduino emits
+`H` (hello); the daemon responds by resending the full current state (word +
+current card), so the display recovers cleanly after any reconnect.
 
 ---
 
@@ -114,18 +113,16 @@ after any reconnect.
 |-----|-----------------------------------------|----------------------------------------|
 | 1   | Arduino Nano (ATmega328P)               | Any USB-serial Nano clone works        |
 | 1   | SSD1306 0.91" 128×32 OLED, I2C           | Address `0x3C` (some boards `0x3D`); 0.96" 128×64 also works |
-| 2   | Momentary push buttons                  | FOCUS and NEXT                         |
-| 1   | Endstop microswitch                     | Home switch at `FREE` (D4, LOW=pressed)|
-| 1   | Stepper motor                           | **28BYJ-48** (default) or **NEMA17**   |
-| 1   | Stepper driver board                    | **ULN2003** (28BYJ-48) or **A4988** (NEMA17) |
-| 1   | Wheel / dial face                       | FREE/WIP/BLOCKED/WTF + a home tab      |
-| 1   | Piezo buzzer *(optional)*               | Chirps on transition into WTF          |
+| 3   | Momentary push buttons                  | FOCUS, NEXT, PREV                      |
+| 1   | Micro vibration motor                   | coin/pager type; haptic alert on D5    |
+| 1   | NPN transistor + ~1 kΩ + 1N4148 diode   | D5 driver — **or** a 3-pin vibro module / a spare ULN2003 channel instead |
 | —   | Jumper wires, breadboard / perfboard    |                                        |
 | 1   | USB cable (to the Mac)                   | Data-capable, not charge-only          |
 
-> Power the motor from the **USB 5 V rail** (28BYJ-48 ~240 mA) or an **external
-> 12 V supply** (NEMA17/A4988) — **not** through the Nano's onboard regulator, to
-> avoid brown-out resets. See [docs/WIRING.md](docs/WIRING.md).
+> The vibration motor is tiny (tens of mA) so the **USB 5 V rail powers it
+> fine** — no brown-out concern. Don't drive it straight off D5: use a vibro
+> module, an NPN transistor (1 kΩ base + 1N4148 flyback), or a ULN2003 channel,
+> and keep all grounds common. See [docs/WIRING.md](docs/WIRING.md).
 
 Pinout summary (full details in [docs/WIRING.md](docs/WIRING.md)):
 
@@ -135,24 +132,20 @@ Pinout summary (full details in [docs/WIRING.md](docs/WIRING.md)):
 | OLED SCL             | A5        |
 | FOCUS button         | D2        |
 | NEXT button          | D3        |
-| ENDSTOP (home)       | D4        |
-| Stepper IN1 / STEP   | D5        |
-| Stepper IN2 / DIR    | D6        |
-| Stepper IN3 / EN     | D7        |
-| Stepper IN4          | D8 *(ULN2003 only)* |
-| Buzzer (optional)    | D9        |
+| PREV button          | D4        |
+| Vibration motor drive| D5        |
 
-Buttons and the endstop use `INPUT_PULLUP` (other leg to GND; pressed = LOW). The
-stepper sits on D5–D8 for ULN2003/28BYJ-48 or D5–D7 for A4988/NEMA17, picked with
-a one-line `#define` in the firmware.
+The three buttons use `INPUT_PULLUP` (other leg to GND; pressed = LOW). D5 drives
+the vibration motor through a module / NPN+1k+1N4148 / ULN2003 channel — never
+the motor directly.
 
 ---
 
 ## Quick start
 
 1. **Build & flash the firmware** onto the Arduino Nano. Install the firmware
-   libraries via the Arduino Library Manager: **AccelStepper** (Mike McCauley,
-   for non-blocking wheel motion), **Adafruit GFX**, and **Adafruit SSD1306**.
+   libraries via the Arduino Library Manager: **Adafruit GFX** and **Adafruit
+   SSD1306** (the OLED is the only thing that needs a library).
 2. **Run the daemon** on your Mac:
    ```sh
    python3 daemon/claude_mate_daemon.py
@@ -195,16 +188,17 @@ name if no id is provided). Each session is in one of these states:
 | `done`    | Stop                 | Turn completed OK                         |
 | `idle`    | Inactivity (TTL only)   | No active turn — no hook sets this        |
 
-The status wheel is recomputed on every change (priority **WTF > BLOCKED > WIP >
+The status word is recomputed on every change (priority **WTF > BLOCKED > WIP >
 FREE**):
 
 - **WTF** if any session is in `error`.
 - **BLOCKED** else if any session is `waiting`.
 - **WIP** else if any session is `working`.
-- **FREE** otherwise (all idle/done, or no sessions — the home position).
+- **FREE** otherwise (all idle/done, or no sessions).
 
-The daemon sends `D|<word>` to the Arduino whenever the word changes; the wheel
-rotates to it by the shortest path. Carousel ordering, most urgent first:
+The daemon sends `D|<word>` to the Arduino whenever the word changes; the OLED
+redraws the big word and the motor buzzes (WTF = 3 pulses, BLOCKED = 2, FREE =
+1 tick, WIP = silent). Carousel ordering, most urgent first:
 `error` → `waiting` → `working` → `done` → `idle`.
 
 ---
@@ -238,9 +232,9 @@ claude_mate/
 ## Limitations
 
 - **Retry/resubmit is out of scope.** When a turn ends on an error, Claude Mate
-  shows it (wheel to **WTF** + an `error` card) but does **not** offer a "retry"
-  action. Reliably resubmitting a turn from outside the GUI is not feasible, so
-  FOCUS — taking you to the session — is the intended response.
+  shows it (**WTF** word + the 3-pulse buzz + an `error` card) but does **not**
+  offer a "retry" action. Reliably resubmitting a turn from outside the GUI is not
+  feasible, so FOCUS — taking you to the session — is the intended response.
 - **Limits are best-effort.** The usage/rate limit field is shown as a short
   string (e.g. `71%`) when it can be obtained, and as `-` when it cannot. Claude
   Mate never fabricates limit numbers; treat this as an extension point.

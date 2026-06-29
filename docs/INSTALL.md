@@ -24,7 +24,8 @@ The project lives at `/Users/vlgutv/Projects/claude_mate` (referred to below as
 3. **Tools → Port →** select the Nano's port (a `/dev/cu.usbserial*` or
    `/dev/cu.usbmodem*` device).
 4. Install the **required libraries** via **Sketch → Include Library → Manage
-   Libraries…**:
+   Libraries…** (the OLED is the only thing that needs a library — there is no
+   stepper/AccelStepper dependency anymore):
    - **Adafruit SSD1306** (the OLED driver) — or **Adafruit SH1106 / U8g2** if
      you have a **1.3"** SH1106 panel (see the SSD1306-vs-SH1106 note in
      [WIRING.md](WIRING.md)).
@@ -76,7 +77,8 @@ python3 $REPO/daemon/claude_mate_daemon.py --mock
 ```
 
 `--mock` injects a few fake sessions that cycle through states so you can demo
-the OLED card, the status wheel, and the carousel without Claude or hooks.
+the OLED card, the status word + vibration haptic, and the carousel without
+Claude or hooks.
 
 ---
 
@@ -141,8 +143,9 @@ or break a Claude turn.
    event — see [PROTOCOL.md](PROTOCOL.md).
 
 3. Restart / reload Claude Code (or start a new session) so it picks up the
-   hooks. With the daemon running, submitting a prompt should turn the light
-   **YELLOW** (working) and show a card; a `Notification` turns it **RED**, etc.
+   hooks. With the daemon running, submitting a prompt should show the word
+   **WIP** (working) and a card; a `Notification` switches it to **BLOCKED** (and
+   the motor buzzes on each word change), etc.
 
 ---
 

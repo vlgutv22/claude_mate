@@ -27,13 +27,14 @@ input buffer and drops malformed/oversized lines).
 
 | Line                                                  | Meaning |
 |-------------------------------------------------------|---------|
-| `D\|<word>`                                           | Set the status wheel. `<word>` is one of `FREE`, `WIP`, `BLOCKED`, `WTF`. The Arduino rotates the dial to that word by the **shortest path** (either direction), non-blocking. |
+| `D\|<word>`                                           | Set the status word. `<word>` is one of `FREE`, `WIP`, `BLOCKED`, `WTF`. The Arduino draws the big word on the OLED **and** fires the vibration haptic **when the word changes** (WTF = 3 pulses, BLOCKED = 2 pulses, FREE = 1 short tick, WIP = silent). |
 | `S\|<idx>\|<total>\|<name>\|<state>\|<runtime>\|<limit>` | Show one session card (the carousel step). See field table below. |
 | `I`                                                   | Idle screen — no active sessions. The daemon also sends `D\|FREE` alongside it. |
 | `P`                                                   | Ping / keepalive. The Arduino MAY ignore it, or reply with `H`. |
 
-> The old `L|<color>` traffic-light command has been **removed**. The overall
-> indicator is now the stepper status wheel, set with `D|<word>`.
+> The old `L|<color>` traffic-light command and the stepper status wheel have
+> both been **removed**. The overall indicator is now the OLED word (drawn from
+> `D|<word>`), with the vibration motor buzzing on each word change.
 
 **`S` line fields:**
 
@@ -58,14 +59,15 @@ S|1|3|claude-mat|error|03:21|71%
 
 | Line       | Meaning |
 |------------|---------|
-| `H`        | Hello / handshake, sent **once** right after boot/reset. On receiving `H` the daemon **re-sends the full current state** (dial + current card). |
-| `B\|<n>`   | Button `n` was pressed. `n=1` → **FOCUS** (focus the current card's session). `n=2` → **NEXT** (advance the carousel). |
+| `H`        | Hello / handshake, sent **once** right after boot/reset (and as the reply to `P`). On receiving `H` the daemon **re-sends the full current state** (word + current card). |
+| `B\|1`     | **FOCUS** pressed (D2) — focus the current card's session's VS Code window. |
+| `B\|2`     | **NEXT** pressed (D3) — advance the carousel to the next card. |
+| `B\|3`     | **PREV** pressed (D4) — step the carousel to the previous card. |
 
 **Reset note:** opening the USB serial port resets the Nano (~1.5 s). The `H`
 handshake plus the daemon re-sending state on `H` is exactly what makes the
-display recover correctly after every reconnect. After a reset the firmware also
-re-homes the wheel against the endstop, then moves it to the word the daemon
-re-sends.
+display recover correctly after every reconnect. After a reset the firmware
+re-draws whatever word and card the daemon re-sends.
 
 ---
 
@@ -157,27 +159,22 @@ The daemon keeps a dictionary of sessions, **keyed by `session_id`**. If the
 
 The daemon maps the overall session state to one of **four words** and sends
 `D|<word>` whenever the word changes. This is the **single source of truth** for
-the wheel:
+the OLED word and the haptic:
 
 | Word      | Selected when                                                              |
 |-----------|---------------------------------------------------------------------------|
 | `WTF`     | ANY session in `error` (StopFailure / API 5xx / overloaded / timeout).    |
 | `BLOCKED` | ELSE ANY session `waiting` (Claude needs your input) and none errored.    |
 | `WIP`     | ELSE ANY session `working` and none blocked/errored.                      |
-| `FREE`    | OTHERWISE — all idle/done, or no sessions (also the HOME position).       |
+| `FREE`    | OTHERWISE — all idle/done, or no sessions.                                |
 
 **Priority (strict):** `WTF` > `BLOCKED` > `WIP` > `FREE`. A single `error`
 session forces `WTF` even if others are merely `working`.
 
-The four words are arranged around the wheel 90° apart in **escalation order**,
-so a clockwise turn = the situation getting worse:
-
-```
-FREE (0 deg, HOME endstop)  ->  WIP (90)  ->  BLOCKED (180)  ->  WTF (270)
-```
-
-The Arduino moves to the target word by the **shortest modular path** (CW or
-CCW), non-blocking, while buttons and serial stay responsive.
+On a word change the Arduino redraws the big word on the OLED and fires the
+vibration motor as a one-shot alert: **WTF = 3 pulses, BLOCKED = 2 pulses,
+FREE = 1 short tick, WIP = silent**. Buttons and serial stay responsive
+throughout.
 
 ### Carousel ordering (most urgent first)
 

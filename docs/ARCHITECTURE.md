@@ -1,9 +1,10 @@
 # Claude Mate — Architecture
 
 Claude Mate is a USB hardware companion for Claude Code. It is an Arduino Nano
-driving a small I2C OLED, two buttons, and a **stepper-driven status wheel** — a
-dial that physically rotates to point at one of four words (FREE / WIP / BLOCKED
-/ WTF). It shows the live status of one or more Claude Code sessions running in
+driving a small I2C OLED, three buttons, and a **micro vibration motor**. The
+OLED shows one of four big status words (FREE / WIP / BLOCKED / WTF) over a
+session-detail line, and the motor buzzes a haptic alert whenever that word
+changes. It shows the live status of one or more Claude Code sessions running in
 the VS Code native extension (and/or the terminal CLI) on a Mac, and lets you
 press a button to **focus** the VS Code window of a session that needs your
 attention.
@@ -39,28 +40,29 @@ USB serial  (115200 8N1, ASCII lines, '|' delimited, '\n' terminated)
 Arduino Nano (ATmega328P)
         |
         +--> OLED SSD1306 128x32 (I2C, addr 0x3C)   shows the current session card
-        |                                            + the current word as text
-        +--> stepper status wheel (ULN2003 or A4988) rotates to the word, homed
-        |                                            to the D4 endstop at FREE
-        +--> optional piezo buzzer                  one chirp on transition into WTF
+        |                                            + the current word (FREE/WIP/
+        |                                            BLOCKED/WTF) as the big status
+        +--> micro vibration motor (D5)             haptic buzz on each word change:
+        |                                            WTF=3, BLOCKED=2, FREE=1, WIP=0
 
 Buttons back (return path):
-        Button press (FOCUS=D2, NEXT=D3)
-        |   serial line:  B|1  (FOCUS)  or  B|2  (NEXT)
+        Button press (FOCUS=D2, NEXT=D3, PREV=D4)
+        |   serial line:  B|1 (FOCUS)  or  B|2 (NEXT)  or  B|3 (PREV)
         v
         Arduino  -->  serial  -->  daemon
         |
         +-- B|2 NEXT  : advance carousel immediately, pause auto-rotation ~10 s
+        +-- B|3 PREV  : step to the previous card, pause auto-rotation ~10 s
         +-- B|1 FOCUS : focus the VS Code session of the currently displayed card
                           primary  : macOS deep link  (open <FOCUS_URI_TEMPLATE>)
                           fallback : raise VS Code window for the workspace cwd
 ```
 
 A handshake byte closes the loop after every reset. Opening the USB serial port
-resets the Nano (~1.5 s), so on boot the Arduino **re-homes the wheel against the
-endstop** and emits `H`; the daemon answers `H` by **re-sending the full current
-state** (dial word + current card), and the wheel moves to it. This keeps the
-display correct across reconnects without any persistent storage on the device.
+resets the Nano (~1.5 s), so on boot the Arduino emits `H`; the daemon answers
+`H` by **re-sending the full current state** (word + current card), and the OLED
+redraws it. This keeps the display correct across reconnects without any
+persistent storage on the device.
 
 ---
 
@@ -98,22 +100,20 @@ display correct across reconnects without any persistent storage on the device.
  |                             +------------|------^----------+  |
  |                                          |      |             |
  +------------------------------------------|------|-------------+
-                                            | USB  | B|1 / B|2
+                                            | USB  | B|1 / B|2 / B|3
                               D|.. S|.. I/P | CDC  | H
                                             v      |
                               +-----------------------------------+
                               |        Arduino Nano (328P)        |
                               |                                   |
                               |  +--------+    +----------------+ |
-                              |  | OLED   |    | stepper wheel  | |
-                              |  | 0x3C   |    | FREE/WIP/      | |
-                              |  | I2C    |    | BLOCKED/WTF    | |
-                              |  +--------+    | D5-D8 (ULN2003)| |
-                              |               | or D5-D7(A4988)| |
-                              |               +----------------+ |
-                              |  [endstop D4 = home @ FREE]      |
-                              |  [FOCUS btn D2]  [NEXT btn D3]    |
-                              |  (opt. buzzer D9)                 |
+                              |  | OLED   |    | vibration motor| |
+                              |  | 0x3C   |    | D5, buzz on    | |
+                              |  | I2C    |    | word change:   | |
+                              |  | FREE/  |    | WTF=3 BLOCKED=2| |
+                              |  | WIP/.. |    | FREE=1 WIP=0   | |
+                              |  +--------+    +----------------+ |
+                              |  [FOCUS D2] [NEXT D3] [PREV D4]   |
                               +-----------------------------------+
 ```
 
@@ -123,11 +123,12 @@ daemon last sent and reports button presses.
 
 ---
 
-## Status-wheel logic
+## Status-word logic
 
-The status wheel reflects the **overall system state**, not a single session. The
+The status word reflects the **overall system state**, not a single session. The
 daemon recomputes a **word** on every state change and sends `D|<word>` to the
-Arduino whenever the word changes; the Arduino rotates the dial to it.
+Arduino whenever the word changes; the Arduino draws it on the OLED and buzzes
+the haptic.
 
 ```
 WTF      if ANY session is in {error}
@@ -137,43 +138,33 @@ BLOCKED  else if ANY session == waiting
 WIP      else if ANY session == working
          -> busy, but nothing needs you right now
 FREE     otherwise
-         -> all idle/done, or no sessions (also the HOME position)
+         -> all idle/done, or no sessions
 ```
 
 Priority order is strict: **WTF > BLOCKED > WIP > FREE**. A single `error`
 session forces WTF even if others are merely `working`. Only when there is nothing
-to act on and nothing in progress does the dial return to FREE.
+to act on and nothing in progress does the word return to FREE.
 
-### Physical wheel + homing
+### OLED word + vibration haptic
 
-The four words sit **90° apart** around the wheel, in escalation order so a turn
-toward "worse" is a consistent direction:
+The OLED is the **sole visual status**: it renders the big word
+(FREE / WIP / BLOCKED / WTF) over the session-detail line. There is no wheel, no
+dial, no homing, and no endstop.
+
+The **micro vibration motor on D5** is a haptic alert that fires **only when the
+word changes** — a one-shot, rising-edge buzz, never continuous:
 
 ```
-FREE (0 deg, home endstop) -> WIP (90) -> BLOCKED (180) -> WTF (270)
+WTF      3 pulses
+BLOCKED  2 pulses
+FREE     1 short tick
+WIP      silent
 ```
 
-- **Driver:** the stepper is driven by AccelStepper for **non-blocking** motion,
-  so the wheel can be turning while buttons and serial keep working. Two driver
-  options sit behind a `#define`: **ULN2003 + 28BYJ-48** (default, D5–D8) or
-  **A4988 + NEMA17** (STEP/DIR on D5–D7). See [WIRING.md](WIRING.md).
-- **Shortest path:** the Arduino maps the word to a target step and turns the
-  **shorter way** (CW or CCW) — a full wheel has no wire constraint.
-- **Endstop homing (boot):** a tab on the wheel clicks a microswitch on **D4** at
-  the FREE position. At boot the firmware homes against it (fast approach → back
-  off → slow re-approach) to define step 0. A guard aborts homing if the switch
-  never triggers within ~1.5 revolutions (it assumes FREE rather than spinning
-  forever).
-- **Drift self-correction (runtime):** in `loop()`, every time the tab presses the
-  endstop, the step counter is snapped back to the known home position modulo a
-  full revolution, so mechanical drift self-heals without interrupting the
-  in-progress move.
-
-The OLED also renders the current word (FREE/WIP/BLOCKED/WTF) as a text
-fallback/confirmation of the dial.
-
-The optional buzzer chirps **once** on the *transition into* WTF (a rising-edge
-alert), not continuously — see [WIRING.md](WIRING.md).
+The motor pulls more current than a GPIO can source, so D5 drives it through a
+small switch: a 3-pin vibro module, an NPN transistor (1 kΩ base resistor +
+1N4148 flyback diode), or a spare ULN2003 channel. It is powered from the USB
+5 V rail with common grounds — see [WIRING.md](WIRING.md).
 
 ---
 
@@ -185,15 +176,17 @@ shows the single card it was last told to show via an `S|...` line.
 - The daemon auto-rotates through the known sessions, sending one `S` line per
   step roughly **every 3 seconds**.
 - **Ordering — most urgent first:** `error` → `waiting` → `working` → `done` →
-  `idle`. This matches the status-wheel priority (WTF → BLOCKED → WIP → FREE) so
+  `idle`. This matches the status-word priority (WTF → BLOCKED → WIP → FREE) so
   the most actionable session surfaces first.
 - Pressing **NEXT** (`B|2`) advances to the next card immediately **and pauses
   auto-rotation for ~10 seconds**, giving you time to read a specific card
   before the rotation resumes.
+- Pressing **PREV** (`B|3`) steps to the previous card and likewise pauses
+  auto-rotation for ~10 seconds.
 - Pressing **FOCUS** (`B|1`) acts on the **currently displayed** card — it calls
   `focus()` for that session.
 - If there are **zero sessions**, the daemon sends `I` (idle screen) together
-  with `D|FREE` (wheel to home) instead of any `S` card.
+  with `D|FREE` instead of any `S` card.
 
 Each card carries: 1-based index, total count, truncated name (≤10 chars),
 state, runtime (`mm:ss` or `h:mm`), and a best-effort limit string (`"-"` when
@@ -249,9 +242,9 @@ These are deliberate, documented boundaries — not bugs:
 
 - **Retry / resubmit is not supported in the GUI.** Re-running a failed turn is
   not reliably possible from outside the VS Code GUI, so Claude Mate does not
-  attempt it. The hardware surfaces an `error` state and turns the wheel to
-  **WTF** so a human can act, but the only button action toward a session is
-  **FOCUS**.
+  attempt it. The hardware surfaces an `error` state and shows **WTF** (with the
+  3-pulse haptic) so a human can act, but the only button action toward a session
+  is **FOCUS**.
 - **Limits are best-effort.** The `limit` field is a short display string and
   defaults to `"-"`. If the daemon cannot reliably obtain rate/usage limits, it
   shows `"-"` and **never fabricates** numbers. Real limit reporting is an

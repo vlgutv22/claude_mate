@@ -40,8 +40,9 @@ arduino-cli compile --fqbn arduino:avr:nano firmware/claude_mate
 arduino-cli upload  --fqbn arduino:avr:nano -p /dev/cu.usbserial-XXXX firmware/claude_mate
 ```
 
-The optional buzzer is gated behind `#define ENABLE_BUZZER` — leave it commented
-out if you did not wire a buzzer.
+The only firmware library dependency is the OLED driver (**Adafruit SSD1306** +
+**Adafruit GFX**) — there is no AccelStepper/stepper anymore. The vibration
+motor on D5 is driven with plain `digitalWrite` timing, no library required.
 
 See [docs/WIRING.md](docs/WIRING.md) for the full pinout.
 
@@ -121,13 +122,14 @@ For end-to-end setup including the hooks, follow
 Validate changes from the bottom up, the same ladder used in
 [docs/TESTING.md](docs/TESTING.md):
 
-1. **Daemon in `--mock` mode** — exercises the display/wheel/carousel logic with
+1. **Daemon in `--mock` mode** — exercises the display/word/carousel logic with
    fake sessions and no hardware or Claude.
 2. **Serial loopback / protocol** — verify the `|`-delimited lines the daemon
    emits and the `H` / `B|<n>` lines it consumes (see
    [docs/PROTOCOL.md](docs/PROTOCOL.md)).
-3. **Firmware on the bench** — flash the Nano, confirm the OLED, the status wheel
-   (homes + cycles FREE/WIP/BLOCKED/WTF), the endstop, and both buttons respond.
+3. **Firmware on the bench** — flash the Nano, confirm the OLED cycles the word
+   (FREE/WIP/BLOCKED/WTF), the vibration motor buzzes on each change, and all
+   three buttons (FOCUS/NEXT/PREV) respond.
 4. **End-to-end** — run the daemon against real hardware, install the hooks, and
    drive real Claude Code sessions through `working → waiting → error → done`.
 
