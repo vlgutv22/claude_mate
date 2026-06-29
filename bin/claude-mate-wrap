@@ -68,6 +68,8 @@ DEFAULT_PATTERNS = {
         "api error", "overloaded_error", " 429", " 500", " 503", " 529",
         "internal server error", "connection error", "request timed out",
         "service is temporarily",
+        # Rate / usage limits block the session and need you -> treat as error.
+        "rate limit", "rate_limit_error", "usage limit reached",
     ],
     "waiting": [
         "do you want to proceed", "yes, and don't ask",
