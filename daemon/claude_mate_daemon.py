@@ -880,6 +880,8 @@ class Carousel(threading.Thread):
         interval = ALERT_INTERVAL.get(target.state)
         kind = ALERT_KIND.get(target.state)
         if interval and kind and self._display.alert_due(kind, interval):
+            log(f"haptic: re-nag {kind} for {target.name} "
+                f"(every {int(interval)}s until focused)")
             self._display.push_buzz(kind)
 
     def run(self) -> None:
