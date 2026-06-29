@@ -84,7 +84,7 @@ SESSION_DONE_TTL = 120.0    # drop a 'done' session after this long with no upda
 SESSION_IDLE_TTL = 600.0    # drop any stale session after this long
 
 # Card name length cap (the OLED is narrow).
-NAME_MAX = 10
+NAME_MAX = 20
 
 # State ordering for the carousel: most urgent first.
 STATE_ORDER = {"error": 0, "waiting": 1, "working": 2, "done": 3, "idle": 4}
@@ -760,21 +760,10 @@ class Carousel(threading.Thread):
                 self._reg.prune()
                 self._last_prune = now
 
-            with self._lock:
-                paused = now < self._paused_until
-
-            if paused:
-                # While paused, still keep the current card's runtime ticking.
-                self._display.refresh_current()
-                self._display.push_dial()
-            else:
-                if now - self._last_rotate >= CAROUSEL_PERIOD:
-                    self._display.advance()
-                    self._last_rotate = now
-                else:
-                    # Between rotations, refresh runtime/dial without advancing.
-                    self._display.refresh_current()
-                    self._display.push_dial()
+            # No auto-rotation: only the NEXT/PREV buttons change which card is
+            # shown. Keep the current card's runtime + dial fresh in place.
+            self._display.refresh_current()
+            self._display.push_dial()
 
             self._stop.wait(1.0)
 

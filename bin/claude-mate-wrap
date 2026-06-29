@@ -47,7 +47,7 @@ except ImportError:
 DAEMON_SOCK = os.environ.get("CLAUDE_MATE_SOCK", "/tmp/claude-mate.sock")
 DEBUG = os.environ.get("CLAUDE_MATE_DEBUG")
 SID = uuid.uuid4().hex[:8]
-NAME = (os.path.basename(os.getcwd()) or "claude")[:10]
+NAME = (os.path.basename(os.getcwd()) or "claude")[:20]
 TERM_PROGRAM = os.environ.get("TERM_PROGRAM", "")
 CTRL_SOCK = f"/tmp/claude-mate-ctrl-{SID}.sock"
 TITLE = f"◆cm:{NAME}:{SID}"          # unique terminal title (generic-focus fallback)
@@ -160,17 +160,16 @@ def focus_self():
               end repeat
             end tell''')
     elif tp == "apple_terminal":
-        # Match the tab by its TTY (exact) — robust even if claude overwrites the title.
+        # Raise ONLY the matched tab's window by its TTY -- no app-wide `activate`,
+        # so the other Terminal windows stay where they are.
         _osa(f'''
             tell application "Terminal"
-              activate
               repeat with w in windows
                 repeat with t in tabs of w
                   try
                     if (tty of t) is "{MY_TTY}" then
                       set selected of t to true
                       set frontmost of w to true
-                      set index of w to 1
                       return
                     end if
                   end try

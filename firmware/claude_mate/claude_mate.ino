@@ -97,7 +97,7 @@ static uint8_t lineLen = 0;
 static bool  lineOverflow = false;   // drop the rest of an over-long line
 
 // ---- Current display model ---------------------------------------------------
-static char  curName[11]  = {0};     // up to 10 chars + NUL
+static char  curName[21]  = {0};     // up to 20 chars + NUL
 static char  curRuntime[8] = {0};
 static char  curLimit[8]  = {0};
 static uint8_t curIdx   = 0;
@@ -219,10 +219,11 @@ static void pollVibro() {
 // Choose a haptic pattern for a status word. Higher escalation = more insistent.
 static void buzzForWord(uint8_t w) {
   switch (w) {
-    case W_WTF:     startBuzz(3, 200, 120); break;  // urgent
-    case W_BLOCKED: startBuzz(2, 150, 130); break;  // needs you
-    case W_FREE:    startBuzz(1,  90,   0); break;  // single short tick (done)
-    default:        /* W_WIP: no buzz */    break;
+    // "Helicopter": a ~2s rapid stutter for the states that want your attention.
+    case W_BLOCKED: startBuzz(24, 45, 40); break;   // needs you -> helicopter ~2s
+    case W_FREE:    startBuzz(24, 45, 40); break;   // finished  -> helicopter ~2s
+    case W_WTF:     startBuzz(4, 220, 140); break;  // error -> distinct urgent burst
+    default:        /* W_WIP: silent */    break;
   }
 }
 
@@ -230,51 +231,55 @@ static void buzzForWord(uint8_t w) {
 // Rendering
 // -----------------------------------------------------------------------------
 
-// Draw the current status word large (size 2, top-left).
-static void drawWordBig() {
-  display.setTextSize(2);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-  display.print(wordLabel(curWord));
+// Short, fixed state label so "STATUS time" fits on one size-2 row.
+static const __FlashStringHelper *shortState(uint8_t st) {
+  switch (st) {
+    case ST_WORKING: return F("WORK");
+    case ST_WAITING: return F("WAIT");
+    case ST_ERROR:   return F("ERR");
+    case ST_DONE:    return F("DONE");
+    default:         return F("IDLE");
+  }
 }
 
 static void drawIdle() {
   display.clearDisplay();
-  drawWordBig();                       // word is FREE when idle
+  display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
-  display.setCursor(0, 22);
-  display.print(F("no sessions"));
+  display.setCursor(0, 0);
+  display.print(F("claude-mate"));
+  display.setTextSize(2);
+  display.setCursor(0, 14);
+  display.print(F("IDLE"));
   display.display();
 }
 
 static void drawCard() {
   display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
 
-  // Top row: big status word (longest "BLOCKED" = 84px) on the left, with the
-  // idx/total counter right-aligned in the gap -- no overlap on the 128px panel.
-  drawWordBig();
-
-  char pos[10];
+  // ---- Top line (size 1): name (left, truncated) + idx/total (right) ----
+  char pos[12];
   snprintf(pos, sizeof(pos), "%u/%u", (unsigned)curIdx, (unsigned)curTotal);
   display.setTextSize(1);
   int16_t px = SCREEN_WIDTH - (int16_t)(strlen(pos) * 6);
   if (px < 0) px = 0;
+  uint8_t nameMax = (px > 6) ? (uint8_t)(px / 6 - 1) : 1;   // leave a 1-char gap
+  char nm[21];
+  uint8_t i = 0;
+  for (; curName[i] && i < nameMax && i < 20; i++) nm[i] = curName[i];
+  nm[i] = 0;
+  display.setCursor(0, 0);
+  display.print(nm);
   display.setCursor(px, 0);
   display.print(pos);
 
-  // Bottom row: this session's detail (size 1) -- name, state, runtime, limit.
-  // Adafruit_GFX clips at the right edge, so an over-long line just truncates.
-  display.setTextSize(1);
-  display.setCursor(0, 22);
-  display.print(curName);
-  display.print(' ');
-  display.print(stateLabel(curState));
+  // ---- Bottom line (size 2): STATUS + time ----
+  display.setTextSize(2);
+  display.setCursor(0, 14);
+  display.print(shortState(curState));
   display.print(' ');
   display.print(curRuntime[0] ? curRuntime : "-");
-  if (curLimit[0] && curLimit[0] != '-') {
-    display.print(' ');
-    display.print(curLimit);
-  }
 
   display.display();
 }
