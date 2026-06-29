@@ -146,7 +146,11 @@ class Session:
         if self.state == "working" and self.started_ts is not None:
             return max(0.0, now - self.started_ts)
         if self.state == "done":
-            return self.last_runtime
+            # The completed turn's duration; if we never tracked the turn (e.g.
+            # a hook reported 'done' with no preceding 'working'), fall back to
+            # time-in-state so the card isn't stuck at 00:00.
+            return self.last_runtime if self.last_runtime > 0 \
+                else max(0.0, now - self.state_since)
         return max(0.0, now - self.state_since)
 
 
@@ -469,7 +473,7 @@ class Display:
         sessions = self._reg.ordered()
         for i, s in enumerate(sessions):
             if s.key == sess.key:
-                self.show_index(i)
+                self.show_index(i, sessions)  # render from THIS snapshot
                 return
 
     # ---- cards ----------------------------------------------------------- #
@@ -495,9 +499,13 @@ class Display:
         line = f"S|{idx}|{total}|{name}|{sess.state}|{runtime}|{limit}"
         self._link.write_line(line)
 
-    def show_index(self, index: int) -> None:
-        """Show the card at ordered position `index` (wraps). Idle if empty."""
-        sessions = self._reg.ordered()
+    def show_index(self, index: int, sessions: Optional[List[Session]] = None) -> None:
+        """Show the card at ordered position `index` (wraps). Idle if empty.
+
+        Pass `sessions` to render from a caller's snapshot (avoids a second
+        ordered() that could have reordered between lookup and render)."""
+        if sessions is None:
+            sessions = self._reg.ordered()
         total = len(sessions)
         if total == 0:
             with self._lock:
@@ -794,14 +802,14 @@ class ButtonReader(threading.Thread):
                         self.on_ack(sess)   # focusing the window = acknowledged
                 elif n == 2:
                     log("NEXT button -> advancing carousel")
-                    self._display.advance()
                     if self.on_next:
-                        self.on_next()
+                        self.on_next()       # pause auto-show FIRST, then move
+                    self._display.advance()
                 elif n == 3:
                     log("PREV button -> previous card")
-                    self._display.retreat()
                     if self.on_next:
-                        self.on_next()  # reuse the auto-rotate pause
+                        self.on_next()       # pause auto-show FIRST, then move
+                    self._display.retreat()
                 else:
                     log(f"unknown button index: {n}")
             return
@@ -879,7 +887,14 @@ class Carousel(threading.Thread):
             return
         interval = ALERT_INTERVAL.get(target.state)
         kind = ALERT_KIND.get(target.state)
-        if interval and kind and self._display.alert_due(kind, interval):
+        if not (interval and kind):
+            return
+        # Require the alert to have existed for a full interval before nagging,
+        # so the one-shot buzz fired on the transition (which may land just after
+        # this tick reads alert_due) can't be doubled at onset.
+        if (time.time() - target.state_since) < interval:
+            return
+        if self._display.alert_due(kind, interval):
             log(f"haptic: re-nag {kind} for {target.name} "
                 f"(every {int(interval)}s until focused)")
             self._display.push_buzz(kind)
