@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+"""
+claude-mate-wrap — wrap `claude` in a PTY and report its live state.
+=====================================================================
+
+Run `claude` THROUGH this wrapper (alias claude=claude-mate-wrap). It:
+
+  1. Forks a pseudo-terminal and runs the real `claude` inside it, relaying
+     stdin/stdout transparently — you use Claude exactly as normal.
+  2. Mirrors the full TUI into a headless terminal emulator (pyte) and reads the
+     *current screen* every update, so it sees EVERYTHING: the spinner, API
+     errors/retries, permission prompts, and "Waiting for N dynamic workflow to
+     finish" (i.e. it knows the session is still busy after the turn "ends").
+  3. Reports state changes to the Claude Mate daemon over its Unix socket, and
+     auto-registers on start / removes on exit (the display mirrors your open
+     wrapped terminals).
+  4. Listens on a per-session control socket; when the daemon's FOCUS button is
+     pressed it raises THIS terminal window — auto-picking the method from
+     $TERM_PROGRAM (iTerm2 / Terminal.app / VS Code / tmux / generic).
+
+State model (matches the daemon): working | waiting | error | idle
+  working  TUI is generating, OR a background dynamic-workflow is still running.
+  waiting  a permission prompt / question is on screen (needs your input).
+  error    an API error / retry is visible.
+  idle     at the prompt, nothing pending.
+
+Config (env):
+  CLAUDE_MATE_SOCK   daemon socket (default /tmp/claude-mate.sock)
+  CLAUDE_MATE_DEBUG  if set to a path, append screen+state snapshots there
+  CLAUDE_REAL        explicit path to the real `claude` binary (else autodetected)
+
+Requires: pyte  (pip install pyte)
+"""
+import os, sys, pty, tty, termios, fcntl, struct, signal, select, socket, \
+       threading, time, re, uuid, subprocess, shutil
+
+try:
+    import pyte
+except ImportError:
+    sys.stderr.write("[claude-mate-wrap] ERROR: pyte not installed. Run: pip install pyte\n")
+    # Fall back to running claude directly so we never block the user.
+    os.execvp("claude", ["claude"] + sys.argv[1:])
+
+# --------------------------------------------------------------------------- #
+# Config / identity
+# --------------------------------------------------------------------------- #
+DAEMON_SOCK = os.environ.get("CLAUDE_MATE_SOCK", "/tmp/claude-mate.sock")
+DEBUG = os.environ.get("CLAUDE_MATE_DEBUG")
+SID = uuid.uuid4().hex[:8]
+NAME = (os.path.basename(os.getcwd()) or "claude")[:10]
+TERM_PROGRAM = os.environ.get("TERM_PROGRAM", "")
+CTRL_SOCK = f"/tmp/claude-mate-ctrl-{SID}.sock"
+TITLE = f"◆cm:{NAME}:{SID}"          # unique terminal title for focus matching
+
+# --------------------------------------------------------------------------- #
+# State-detection patterns  (TUNE THESE against your claude TUI — see DEBUG log)
+# Substrings are matched against the rendered screen text, case-insensitively.
+# --------------------------------------------------------------------------- #
+ERROR_PATTERNS = (
+    "api error", "overloaded", "rate limit", "rate_limit", "rate-limit",
+    " 429", " 500", " 503", " 529", "internal server error",
+    "connection error", "connection reset", "request timed out", "timed out",
+    "service is temporarily", "retrying", "overloaded_error",
+)
+WAITING_PATTERNS = (
+    "do you want to proceed", "do you want to", "yes, and don't ask",
+    "tell claude what to do differently", "no, and tell claude",
+    "allow this", "approve this", "approve?", "(y/n)", "[y/n]",
+    "press enter to", "1. yes", "❯ 1.", "would you like to",
+)
+# Busy indicators — generation in progress OR background work still running.
+BUSY_PATTERNS = (
+    "esc to interrupt", "to interrupt)", "dynamic workflow", "workflow to finish",
+    "running in the background", "thinking", "working…", "working...",
+    "processing", "compacting", "pondering", "tokens)", "↑ ", "esc to cancel",
+)
+
+POLL_MS = 0.25            # re-evaluate the screen this often (quiescence)
+DEBOUNCE_S = 0.30         # require a state to persist before reporting it
+KEEPALIVE_S = 20.0        # re-send current state periodically
+
+# --------------------------------------------------------------------------- #
+# Terminal size helpers
+# --------------------------------------------------------------------------- #
+def get_winsize(fd):
+    try:
+        data = fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8)
+        rows, cols, _, _ = struct.unpack("HHHH", data)
+        if rows and cols:
+            return rows, cols
+    except Exception:
+        pass
+    return 24, 80
+
+def set_winsize(fd, rows, cols):
+    try:
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    except Exception:
+        pass
+
+# --------------------------------------------------------------------------- #
+# Daemon reporting
+# --------------------------------------------------------------------------- #
+def send_daemon(state):
+    """Best-effort one-line report to the daemon. Never raises."""
+    try:
+        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        c.settimeout(0.5)
+        c.connect(DAEMON_SOCK)
+        c.sendall(f"{state}|{SID}|{NAME}|{CTRL_SOCK}\n".encode())
+        c.close()
+    except OSError:
+        pass
+
+# --------------------------------------------------------------------------- #
+# Focus: raise THIS terminal window, method chosen from $TERM_PROGRAM
+# --------------------------------------------------------------------------- #
+def _osa(script):
+    try:
+        subprocess.run(["osascript", "-e", script],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=4)
+    except Exception:
+        pass
+
+def focus_self():
+    # If we're inside tmux, also select our pane/window.
+    pane = os.environ.get("TMUX_PANE")
+    if os.environ.get("TMUX") and pane:
+        for args in (["tmux", "select-window", "-t", pane],
+                     ["tmux", "select-pane", "-t", pane]):
+            try:
+                subprocess.run(args, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=3)
+            except Exception:
+                pass
+
+    tp = TERM_PROGRAM.lower()
+    if tp == "iterm.app":
+        _osa(f'''
+            tell application "iTerm2"
+              activate
+              repeat with w in windows
+                repeat with t in tabs of w
+                  repeat with s in sessions of t
+                    if name of s contains "{TITLE}" then
+                      select w
+                      tell t to select
+                      select s
+                    end if
+                  end repeat
+                end repeat
+              end repeat
+            end tell''')
+    elif tp == "apple_terminal":
+        _osa(f'''
+            tell application "Terminal"
+              activate
+              repeat with w in windows
+                if name of w contains "{TITLE}" then
+                  set frontmost of w to true
+                  set index of w to 1
+                end if
+              end repeat
+            end tell''')
+    elif tp == "vscode":
+        # Can't target a specific integrated-terminal pane externally; raise VS Code.
+        _osa('tell application "Visual Studio Code" to activate')
+    elif tp == "ghostty":
+        _osa('tell application "Ghostty" to activate')
+    elif tp in ("warpterminal", "warp"):
+        _osa('tell application "Warp" to activate')
+    else:
+        # Generic: ask System Events to raise any window whose title matches.
+        _osa(f'''
+            tell application "System Events"
+              set procs to (every process whose background only is false)
+              repeat with p in procs
+                repeat with w in (windows of p)
+                  if name of w contains "{TITLE}" then
+                    set frontmost of p to true
+                    perform action "AXRaise" of w
+                  end if
+                end repeat
+              end repeat
+            end tell''')
+
+def ctrl_listener():
+    """Per-session socket: the daemon connects and sends 'focus'."""
+    try:
+        if os.path.exists(CTRL_SOCK):
+            os.unlink(CTRL_SOCK)
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(CTRL_SOCK)
+        os.chmod(CTRL_SOCK, 0o666)
+        srv.listen(4)
+    except OSError:
+        return
+    while True:
+        try:
+            conn, _ = srv.accept()
+        except OSError:
+            break
+        with conn:
+            try:
+                data = conn.recv(64).decode(errors="ignore").strip()
+            except OSError:
+                data = ""
+        if data.startswith("focus"):
+            focus_self()
+
+# --------------------------------------------------------------------------- #
+# State detection from the rendered screen
+# --------------------------------------------------------------------------- #
+def detect_state(screen_text):
+    t = screen_text.lower()
+    if any(p in t for p in ERROR_PATTERNS):
+        return "error"
+    if any(p in t for p in WAITING_PATTERNS):
+        return "waiting"
+    if any(p in t for p in BUSY_PATTERNS):
+        return "working"
+    return "idle"
+
+# --------------------------------------------------------------------------- #
+# Locate the real `claude` (avoid recursing into this wrapper)
+# --------------------------------------------------------------------------- #
+def real_claude():
+    explicit = os.environ.get("CLAUDE_REAL")
+    if explicit and os.path.exists(explicit):
+        return explicit
+    me = os.path.realpath(sys.argv[0])
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        cand = os.path.join(d, "claude")
+        if os.path.isfile(cand) and os.access(cand, os.X_OK) \
+                and os.path.realpath(cand) != me:
+            return cand
+    return "claude"  # last resort
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+def main():
+    rows, cols = get_winsize(sys.stdin.fileno())
+
+    pid, master_fd = pty.fork()
+    if pid == 0:
+        # Child: become the real claude.
+        os.execvp(real_claude(), ["claude"] + sys.argv[1:])
+        os._exit(127)
+
+    # Parent.
+    set_winsize(master_fd, rows, cols)
+
+    # Set our unique terminal title (for focus matching) — harmless if ignored.
+    try:
+        sys.stdout.write(f"\033]0;{TITLE}\007")
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+    screen = pyte.Screen(cols, rows)
+    stream = pyte.ByteStream(screen)
+    screen_lock = threading.Lock()
+
+    state = {"cur": "idle", "reported": None, "pending": None, "since": 0.0,
+             "last_sent": 0.0}
+    dbg = open(DEBUG, "a") if DEBUG else None
+
+    def evaluate():
+        with screen_lock:
+            text = "\n".join(screen.display)
+        new = detect_state(text)
+        now = time.monotonic()
+        if new != state["pending"]:
+            state["pending"] = new
+            state["since"] = now
+        # Promote a pending state once it has been stable long enough.
+        if state["pending"] != state["cur"] and (now - state["since"]) >= DEBOUNCE_S:
+            state["cur"] = state["pending"]
+        # Report on change, or as a periodic keepalive.
+        if state["cur"] != state["reported"] or (now - state["last_sent"]) >= KEEPALIVE_S:
+            state["reported"] = state["cur"]
+            state["last_sent"] = now
+            send_daemon(state["cur"])
+            if dbg:
+                dbg.write(f"\n===== {time.strftime('%H:%M:%S')} state={state['cur']} =====\n")
+                dbg.write(text + "\n")
+                dbg.flush()
+
+    # SIGWINCH: keep PTY + emulator sized to the real terminal.
+    def on_winch(signum, frame):
+        r, c = get_winsize(sys.stdin.fileno())
+        set_winsize(master_fd, r, c)
+        with screen_lock:
+            screen.resize(r, c)
+    signal.signal(signal.SIGWINCH, on_winch)
+
+    threading.Thread(target=ctrl_listener, daemon=True).start()
+    send_daemon("idle")  # register immediately on launch
+
+    # Periodic evaluator (catches quiescence after output stops).
+    def monitor():
+        while True:
+            time.sleep(POLL_MS)
+            try:
+                evaluate()
+            except Exception:
+                pass
+    threading.Thread(target=monitor, daemon=True).start()
+
+    old = None
+    try:
+        old = termios.tcgetattr(sys.stdin)
+        tty.setraw(sys.stdin.fileno())
+    except Exception:
+        old = None
+
+    try:
+        while True:
+            try:
+                r, _, _ = select.select([sys.stdin.fileno(), master_fd], [], [])
+            except (OSError, select.error):
+                break
+            if sys.stdin.fileno() in r:
+                try:
+                    data = os.read(sys.stdin.fileno(), 4096)
+                except OSError:
+                    data = b""
+                if data:
+                    os.write(master_fd, data)
+            if master_fd in r:
+                try:
+                    out = os.read(master_fd, 8192)
+                except OSError:
+                    out = b""
+                if not out:
+                    break
+                os.write(sys.stdout.fileno(), out)     # transparent passthrough
+                with screen_lock:
+                    try:
+                        stream.feed(out)               # mirror into the emulator
+                    except Exception:
+                        pass
+                try:
+                    evaluate()
+                except Exception:
+                    pass
+    finally:
+        if old is not None:
+            try:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
+            except Exception:
+                pass
+        send_daemon("end")                              # deregister this session
+        try:
+            if os.path.exists(CTRL_SOCK):
+                os.unlink(CTRL_SOCK)
+        except OSError:
+            pass
+        if dbg:
+            dbg.close()
+
+    # Propagate claude's exit code.
+    try:
+        _, status = os.waitpid(pid, 0)
+        sys.exit(os.waitstatus_to_exitcode(status))
+    except Exception:
+        sys.exit(0)
+
+if __name__ == "__main__":
+    main()

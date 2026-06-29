@@ -1,0 +1,1 @@
+pyte>=0.8.1   # terminal emulator used by bin/claude-mate-wrap

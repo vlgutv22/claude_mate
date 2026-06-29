@@ -116,6 +116,7 @@ class Session:
     started_ts: Optional[float] = None  # when current 'working' turn began
     last_runtime: float = 0.0      # last completed turn duration (seconds)
     limit: str = "-"               # best-effort rate/usage string; "-" if unknown
+    focus_ctrl: str = ""           # PTY-wrapper control socket for FOCUS (if any)
 
     def runtime_seconds(self) -> float:
         """Runtime to display: live while working, else last completed turn."""
@@ -131,8 +132,9 @@ class Registry:
         self._lock = threading.Lock()
         self._sessions: Dict[str, Session] = {}
 
-    def update(self, state: str, sid: str, name: str, cwd: str = "") -> None:
-        """Apply a status update from a hook (or mock injector)."""
+    def update(self, state: str, sid: str, name: str, cwd: str = "",
+               focus_ctrl: str = "") -> None:
+        """Apply a status update from a hook, the PTY wrapper, or the mock injector."""
         if state not in VALID_STATES:
             log(f"ignoring update with invalid state: {state!r}")
             return
@@ -150,6 +152,8 @@ class Registry:
                 sess.sid = sid
             if cwd:
                 sess.cwd = cwd
+            if focus_ctrl:
+                sess.focus_ctrl = focus_ctrl
             prev_state = sess.state
             sess.last_update_ts = now
 
@@ -444,7 +448,19 @@ def focus_session(sess: Optional[Session]) -> None:
 
     log(f"FOCUS -> {sess.name} (sid={sess.sid or '?'}, cwd={sess.cwd or '?'})")
 
-    # --- Primary: deep link -------------------------------------------------
+    # --- Best: ask the PTY wrapper to raise its own terminal window ----------
+    if sess.focus_ctrl and os.path.exists(sess.focus_ctrl):
+        try:
+            c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            c.settimeout(2.0)
+            c.connect(sess.focus_ctrl)
+            c.sendall(b"focus\n")
+            c.close()
+            return
+        except OSError as exc:
+            log(f"wrapper focus failed ({sess.focus_ctrl}): {exc}; using fallback")
+
+    # --- Primary: deep link (hook-based sessions only) ----------------------
     if sess.sid:
         uri = FOCUS_URI_TEMPLATE.format(
             session_id=urllib.parse.quote(sess.sid, safe="")
@@ -596,19 +612,25 @@ class SocketServer(threading.Thread):
             return
         if not line:
             return
-        # Expected: "<state>|<session_id>|<name>" ; tolerate extra trailing fields.
+        # Expected: "<state>|<session_id>|<name>|<ctrl_sock?>".
+        # state may be "end" (from the PTY wrapper) to remove the session.
         parts = line.split("|")
         state = parts[0].strip() if len(parts) > 0 else ""
         sid = parts[1].strip() if len(parts) > 1 else ""
         name = parts[2].strip() if len(parts) > 2 else ""
-        cwd = parts[3].strip() if len(parts) > 3 else ""  # optional extension
+        ctrl = parts[3].strip() if len(parts) > 3 else ""  # wrapper focus socket
         if not state:
             log(f"ignoring malformed socket line: {line!r}")
             return
-        if cwd and not name:
-            name = os.path.basename(cwd.rstrip("/"))
+        if state == "end":
+            key = sid if sid else name
+            if key:
+                self._reg.remove(key)
+                log(f"session ended: {name or sid}")
+                self._on_update()
+            return
         log(f"socket update: state={state} sid={sid or '-'} name={name or '-'}")
-        self._reg.update(state, sid, name, cwd)
+        self._reg.update(state, sid, name, focus_ctrl=ctrl)
         self._on_update()
 
     def stop(self) -> None:
