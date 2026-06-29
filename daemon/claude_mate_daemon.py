@@ -496,7 +496,10 @@ class Display:
         name = name.replace("|", "/").replace("\n", " ").strip() or "?"
         runtime = self._fmt_runtime(sess.runtime_seconds())
         limit = (sess.limit or "-").replace("|", "/")[:6] or "-"
-        line = f"S|{idx}|{total}|{name}|{sess.state}|{runtime}|{limit}"
+        # 8th field: acknowledged? (1/0). The firmware shows a blinking dot for
+        # an unacknowledged alert, a hollow dot once acknowledged (focused).
+        ack = "1" if sess.acked else "0"
+        line = f"S|{idx}|{total}|{name}|{sess.state}|{runtime}|{limit}|{ack}"
         self._link.write_line(line)
 
     def show_index(self, index: int, sessions: Optional[List[Session]] = None) -> None:

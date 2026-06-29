@@ -49,8 +49,10 @@
  * SERIAL PROTOCOL (115200 8N1, ASCII lines terminated by '\n', fields split '|')
  *   Daemon -> Arduino:
  *     D|<word>                                       word = FREE|WIP|BLOCKED|WTF
- *     S|<idx>|<total>|<name>|<state>|<runtime>|<limit>
+ *     S|<idx>|<total>|<name>|<state>|<runtime>|<limit>|<ack>
  *         state = working | waiting | error | done | idle
+ *         ack   = 1 acknowledged / 0 not (optional; alert states show a dot:
+ *                 filled+blinking = unacknowledged, hollow = acknowledged)
  *     I                                              idle screen (no sessions)
  *     P                                              ping/keepalive (we reply H)
  *     V|<kind>                                       buzz now; kind = START|DONE|
@@ -107,7 +109,9 @@ static char  curLimit[8]  = {0};
 static uint8_t curIdx   = 0;
 static uint8_t curTotal = 0;
 static uint8_t curState = ST_IDLE;
+static bool  curAck     = true;      // alert acknowledged (focused)? -> dot style
 static bool  showIdle   = true;      // true => idle screen, no card
+static bool  gBlinkOn   = true;      // blink phase for the unacknowledged dot
 
 // ---- Status word -------------------------------------------------------------
 static uint8_t curWord = W_FREE;     // current OLED word
@@ -271,9 +275,24 @@ static void drawIdle() {
   display.display();
 }
 
+// Alert states need your attention and carry an acknowledgment dot.
+static bool isAlertState(uint8_t s) {
+  return s == ST_DONE || s == ST_WAITING || s == ST_ERROR;
+}
+
 static void drawCard() {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
+
+  // ---- Acknowledgment dot (top-left), for alert states only ----
+  //   filled + blinking = UNacknowledged (needs you); hollow ring =
+  //   acknowledged (you focused it). Non-alert states show no dot.
+  int16_t nameX = 0;
+  if (isAlertState(curState)) {
+    if (curAck)             display.drawCircle(3, 3, 3, SSD1306_WHITE);  // seen
+    else if (gBlinkOn)      display.fillCircle(3, 3, 3, SSD1306_WHITE);  // needs you
+    nameX = 9;              // reserve the slot so the name doesn't overlap it
+  }
 
   // ---- Top line (size 1): name (left, truncated) + idx/total (right) ----
   char pos[12];
@@ -281,12 +300,13 @@ static void drawCard() {
   display.setTextSize(1);
   int16_t px = SCREEN_WIDTH - (int16_t)(strlen(pos) * 6);
   if (px < 0) px = 0;
-  uint8_t nameMax = (px > 6) ? (uint8_t)(px / 6 - 1) : 1;   // leave a 1-char gap
+  int16_t avail = px - nameX;                                // width left for name
+  uint8_t nameMax = (avail > 6) ? (uint8_t)(avail / 6 - 1) : 1;
   char nm[21];
   uint8_t i = 0;
   for (; curName[i] && i < nameMax && i < 20; i++) nm[i] = curName[i];
   nm[i] = 0;
-  display.setCursor(0, 0);
+  display.setCursor(nameX, 0);
   display.print(nm);
   display.setCursor(px, 0);
   display.print(pos);
@@ -355,13 +375,13 @@ static void handleLine(char *line) {
       break;
     }
 
-    case 'S': {                          // S|idx|total|name|state|runtime|limit
-      // Tokenize in place on '|'. We expect 7 tokens (type + 6 fields).
-      char *fields[7];
+    case 'S': {                          // S|idx|total|name|state|runtime|limit|ack
+      // Tokenize in place on '|'. 7 core tokens (type + 6) + optional 8th 'ack'.
+      char *fields[8];
       uint8_t n = 0;
       char *p = line;
       fields[n++] = p;                   // fields[0] = "S"
-      while (n < 7) {
+      while (n < 8) {
         char *bar = strchr(p, '|');
         if (!bar) break;
         *bar = 0;
@@ -375,6 +395,9 @@ static void handleLine(char *line) {
       curState = parseState(fields[4]);
       copyField(curRuntime, sizeof(curRuntime), fields[5]);
       copyField(curLimit,   sizeof(curLimit),   fields[6]);
+      // 8th field (if present): "1" acknowledged, "0" not. Default acknowledged
+      // so an older daemon (7 fields) never shows a spurious blinking dot.
+      curAck = (n < 8) || (fields[7][0] != '0');
       showIdle = false;
       render();
       break;
@@ -485,4 +508,12 @@ void loop() {
   pumpSerial();
   pollButtons();
   pollVibro();                           // advance the haptic state machine
+
+  // Blink the unacknowledged-alert dot (~every 400ms). Only that card actually
+  // changes with the blink phase, so re-render only then.
+  bool nb = (millis() / 400) & 1;
+  if (nb != gBlinkOn) {
+    gBlinkOn = nb;
+    if (!showIdle && isAlertState(curState) && !curAck) render();
+  }
 }
