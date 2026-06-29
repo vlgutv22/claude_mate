@@ -683,6 +683,7 @@ class SocketServer(threading.Thread):
         haptic = self._reg.update(state, sid, name, focus_ctrl=ctrl)
         self._on_update()
         if haptic and self._on_haptic:
+            log(f"haptic: buzz {haptic} for {name or sid} ({state})")
             self._on_haptic(haptic)
 
     def stop(self) -> None:
