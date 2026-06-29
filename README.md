@@ -1,109 +1,179 @@
 # Claude Mate
 
 A tiny USB hardware companion that shows the **live status of your Claude Code
-sessions** on a small OLED as a big word (FREE / WIP / BLOCKED / WTF), **buzzes a
-micro vibration motor** when that word changes, and lets you **jump straight to
-the session that needs you** with a single button press.
+sessions** on a small OLED, **buzzes a micro vibration motor** the moment one of
+them needs you — finishes, gets blocked, or errors — and lets you **jump
+straight to the session that needs you** with a single button press.
 
-Plug it into your Mac, run the daemon, drop in the Claude Code hooks, and the
-device becomes an ambient, always-on status pane for every Claude Code session
-you have open in VS Code (and/or the terminal CLI).
+Plug it into your Mac, run the daemon, and feed it either via the Claude Code
+**hooks** or via the new **PTY wrapper** (`claude-mate-wrap`). The device becomes
+an ambient, always-on status pane for every Claude Code session you have open —
+in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
 
 ```
-            ┌──────────────────────────────┐
-            │  ▓▓ api-server   working ▓▓   │   ← live status card
-            │     02:14            71%      │
-            │  [1/3]            WIP         │   ← big status word
-            └──────────────────────────────┘
-                  ((•)) vibration motor          ← buzzes when the word changes
-          [ FOCUS ]  [ NEXT ]  [ PREV ]        ← three buttons
+        ┌────────────────────────────────┐
+        │ ● api-server              2/4   │   ← ack dot · session name · card index
+        │ WAIT  04:12                     │   ← big STATE word · live time-in-state
+        └────────────────────────────────┘
+              ((•)) vibration motor             ← buzzes per session, when IT needs you
+          [ FOCUS ]   [ NEXT ]   [ PREV ]      ← three buttons
 
-      words:  FREE → WIP → BLOCKED → WTF   (priority: WTF > BLOCKED > WIP > FREE)
-      buzz:   WTF = 3 pulses · BLOCKED = 2 · FREE = 1 tick · WIP = silent
+   the dot:   ● blinking = unacknowledged (needs you)   ○ hollow = acknowledged (focused)
+   the buzz:  START tick · DONE soft→hard · INPUT 3× · ERROR 4×   (re-nags until you FOCUS)
 ```
 
 ---
 
 ## What it is
 
-**Claude Mate** is an Arduino Nano + small I2C OLED + 3 buttons + a **micro
-vibration motor**, paired with a lightweight Python daemon on your Mac and a set
-of Claude Code hooks. The hooks report session state changes; the daemon keeps
-the model of all your sessions, drives the display, buzzes the motor on word
-changes, and acts on button presses.
+**Claude Mate** is an Arduino Nano + 0.91" I2C OLED + 3 buttons + a **micro
+vibration motor**, paired with a lightweight Python daemon on your Mac.
 
-The single must-have action is **FOCUS**: press a button and the VS Code window
-for the currently displayed session is raised so you can deal with it. Retrying
-or resubmitting a turn is intentionally **out of scope** (see
+The daemon keeps a model of every Claude Code session, **auto-surfaces the one
+that most needs you**, drives the OLED card, and **buzzes the motor per session**
+— so a single tab finishing, blocking, or erroring is *felt* even while the rest
+of your fleet keeps working. It keeps nagging (gently) until you deal with it.
+
+The single must-have action is **FOCUS**: press a button and the window for the
+displayed session is raised so you can deal with it — the integrated VS Code
+panel *or* the actual terminal that session is running in (matched by TTY).
+Retrying or resubmitting a turn is intentionally **out of scope** (see
 [Limitations](#limitations)).
+
+---
+
+## Two ways to feed it
+
+You can drive the daemon from **either or both** of these — mix freely:
+
+| Path | What it is | What it can see |
+|------|-----------|-----------------|
+| **(a) Claude Code hooks** | `hooks/claude-status.sh`, wired to `UserPromptSubmit` / `Notification` / `Stop` / `StopFailure`. Fire-and-forget; never blocks or fails a turn. | Turn boundaries: started, needs-input, finished OK, finished on error. Works in the VS Code extension and the CLI. |
+| **(b) PTY wrapper** `bin/claude-mate-wrap` | Run `claude` *through* a wrapper (`alias claude=claude-mate-wrap`). It forks a pseudo-terminal, relays stdin/stdout transparently, and mirrors the TUI into a headless terminal emulator to read the **live screen**. | Everything on screen the hooks can't report: the spinner, **API errors/retries**, **permission prompts**, interactive option-pickers, and *"Waiting for N dynamic workflow to finish"* — i.e. it knows a session is **still busy after the turn "ends"**. |
+
+The wrapper is the more capable feed (true live state, plus terminal focus); the
+hooks are the zero-dependency feed. Use whichever fits each session.
 
 ---
 
 ## Features
 
-- **Live status carousel** — the daemon auto-rotates through all your active
-  sessions (~every 3 s), showing one card at a time: project name, state,
-  runtime, and a best-effort usage limit. Most urgent sessions are shown first.
-- **Big status word** — the OLED shows one of four words, an at-a-glance system
-  health signal (priority: **WTF > BLOCKED > WIP > FREE**):
-  - **WTF** — at least one session is in error (StopFailure / API 5xx /
-    overloaded / timeout).
-  - **BLOCKED** — at least one session is waiting on your input (permission /
-    question) and none errored.
-  - **WIP** — something is working; nothing needs you right now.
-  - **FREE** — all clear (idle/done sessions, or no sessions).
-- **Vibration haptic** — a micro vibration motor buzzes **only when the word
-  changes**: **WTF = 3 pulses**, **BLOCKED = 2 pulses**, **FREE = 1 short tick**,
-  **WIP = silent**. So you feel an escalation without looking.
-- **One-button FOCUS** — press FOCUS to raise the VS Code window of the session
-  currently on screen, via a VS Code deep link with a window-raise fallback.
-- **NEXT / PREV buttons** — step the carousel forward or back immediately;
-  auto-rotation pauses for ~10 s so you can read.
-- **Robust by design** — keeps the serial port open continuously, auto-detects
-  and auto-reconnects to the device, never crashes on a missing port, and the
-  hooks never block or fail a Claude turn.
-- **`--mock` demo mode** — run the whole display/carousel with fake sessions
-  (cycling through all four words and buzzing the motor), no Claude and no hooks
-  required.
+- **Auto-surface the urgent tab** — the daemon shows the single most urgent
+  session that needs you, ordered **error → waiting → done → working → idle**.
+  There is **no blind auto-carousel**; the screen holds the thing you should
+  look at. **NEXT / PREV** step the same urgent-first order manually and pause
+  auto-surfacing for ~10 s so you can browse.
+- **Per-session haptics** — the motor buzzes for *that session's own*
+  transition, not just an aggregate change:
+  - **START** — a job (re)started → one gentle tick.
+  - **DONE** — a turn finished → two pulses, **soft then hard**.
+  - **INPUT** — a session is waiting on you → three pulses.
+  - **ERROR** — a turn ended on an API error → four pulses (firmest).
+
+  Amplitude is PWM duty kept well below full power, so urgency reads as *a bit
+  more push and a few more pulses*, never a jarring jolt.
+- **Nag until acknowledged** — an unacknowledged alert keeps re-buzzing at a
+  per-state cadence — **error every 5 s, waiting every 10 s, done every 15 s** —
+  gentler/less often as urgency drops, until you **FOCUS** the session (or it
+  changes on its own).
+- **"Finished but not seen" model** — when a turn ends, the session becomes
+  **done** and *stays* done (alerting, with a blinking dot) until you focus it;
+  later idle keepalives don't silently clear it. Focusing acknowledges it.
+- **Acknowledge dot on the card** — alert states (done / waiting / error) carry a
+  dot top-left: **filled + blinking = unacknowledged**, **hollow ring =
+  acknowledged**. At a glance you know whether you've seen it.
+- **Live time-in-state** — the card's timer counts up live for every state
+  except `done`: an idle/blocked/errored tab shows *how long it has been sitting
+  there*, while a finished tab shows the completed turn's frozen duration.
+- **One-button FOCUS** — raises the session's window: first the **PTY wrapper's
+  own terminal** (iTerm2 / Terminal.app / VS Code / Ghostty / Warp / tmux,
+  matched by TTY), else a **VS Code deep link**, else the VS Code window for the
+  workspace folder.
+- **Hot-reloadable detection** — the wrapper's state patterns live in
+  [`patterns.json`](patterns.json) and reload live (~0.25 s, no restart), so you
+  can tune what counts as error/waiting/busy without touching code.
+- **Robust by design** — the daemon keeps the serial port open continuously,
+  auto-detects and auto-reconnects to the device, never crashes on a missing
+  port; the hooks never block a turn; the wrapper falls back to running `claude`
+  directly if anything is wrong.
+- **`--mock` demo mode** — run the whole display with fake sessions cycling
+  through every state, no Claude and no hardware required.
 
 ---
 
 ## Architecture
 
 ```
-   Claude Code (VS Code ext / CLI)
-            │  hook events
-            ▼
-   ~/.claude/hooks/claude-status.sh
-            │  "<state>|<session_id>|<name>\n"
-            ▼
-   Unix domain socket  /tmp/claude-mate.sock
-            │
-            ▼
-   ┌───────────────────────────────────┐
-   │   Python daemon (Mac)             │
-   │   • session state model           │
-   │   • status-word logic (D|<word>)  │
-   │   • carousel rotation             │
-   │   • FOCUS (deep link + fallback)  │
-   └───────────────────────────────────┘
-            │  USB serial 115200 8N1, "|"-delimited ASCII lines
-            ▼
-   ┌───────────────────────────────────┐
-   │   Arduino Nano (ATmega328P)       │
-   │   • SSD1306 128x32 OLED (I2C)     │
-   │     big word + session card       │
-   │   • micro vibration motor (D5)    │
-   │     buzzes on each word change    │
-   │   • FOCUS / NEXT / PREV buttons   │
-   └───────────────────────────────────┘
-            │  buttons  "B|<n>\n"
-            └──────────────► back to the daemon
+   Claude Code session
+   ├─ (a) hooks ─ ~/.claude/hooks/claude-status.sh
+   │                 "<state>|<sid>|<name>\n"
+   │
+   └─ (b) PTY wrapper ─ bin/claude-mate-wrap  (alias claude=claude-mate-wrap)
+                     "<state>|<sid>|<name>|<ctrl_sock>\n"   + screen-scrapes the live TUI
+                            │
+                            ▼
+              Unix domain socket  /tmp/claude-mate.sock
+                            │
+                            ▼
+   ┌──────────────────────────────────────────────┐
+   │   Python daemon (Mac)                        │
+   │   • session model + "done-until-acknowledged"│
+   │   • status word     D|<FREE/WIP/BLOCKED/WTF> │   (overall health / priority)
+   │   • per-session buzz V|<START/DONE/INPUT/ERR>│   + paced re-nags
+   │   • auto-surface the most-urgent session     │
+   │   • FOCUS: wrapper ctrl-sock → VS Code link  │
+   └──────────────────────────────────────────────┘
+                            │  USB serial 115200 8N1, "|"-delimited ASCII
+                            ▼
+   ┌──────────────────────────────────────────────┐
+   │   Arduino Nano (ATmega328P)                  │
+   │   • SSD1306 128x32 OLED — status card:       │
+   │     ack dot · name · idx/total · STATE · timer│
+   │   • micro vibration motor (D5) plays V|<KIND>│
+   │   • FOCUS / NEXT / PREV buttons → B|<n>       │
+   └──────────────────────────────────────────────┘
+                            │  H (hello on boot), B|<n> (buttons)
+                            └──────────────► back to the daemon
 ```
 
-Opening the USB serial port resets the Nano (~1.5 s). On boot the Arduino emits
-`H` (hello); the daemon responds by resending the full current state (word +
-current card), so the display recovers cleanly after any reconnect.
+Two control flows worth calling out:
+
+- **FOCUS round-trip.** Each wrapped session opens a per-session control socket
+  (`/tmp/claude-mate-ctrl-<id>.sock`) and tells the daemon about it. On a FOCUS
+  press the daemon connects to that socket and sends `focus`; the wrapper raises
+  *its own* terminal window using the right method for `$TERM_PROGRAM` (iTerm2
+  and Terminal.app match the exact tab by TTY). Hook-only sessions fall back to a
+  VS Code deep link / window raise.
+- **Reset recovery.** Opening the USB serial port resets the Nano (~1.5 s). On
+  boot the Arduino emits `H`; the daemon responds by re-sending the full current
+  state (status word + current card), so the display recovers cleanly after any
+  reconnect.
+
+> The aggregate **FREE / WIP / BLOCKED / WTF** word (priority **WTF > BLOCKED >
+> WIP > FREE**) is the daemon's overall health-and-priority model: it decides
+> which session is surfaced and how it buzzes. The OLED's *big text* is the
+> surfaced session's own **state** (WORKING / WAITING / ERROR / DONE / IDLE).
+
+---
+
+## Haptics & the acknowledge model
+
+Haptics are driven **entirely by the daemon** via `V|<KIND>` lines — the
+firmware just plays the pattern; the status word (`D|`) is visual only and never
+buzzes on its own. The daemon decides, **per session**, when to buzz and how
+often to repeat:
+
+| Event (per session) | `V|` kind | Pattern (gentlest → firmest) | Re-nag until focused |
+|---------------------|-----------|------------------------------|----------------------|
+| Job (re)started     | `START`   | 1 tick                        | — (one-shot)         |
+| Turn finished       | `DONE`    | 2 pulses, soft → **hard**     | every **15 s**       |
+| Waiting on you      | `INPUT`   | 3 pulses                      | every **10 s**       |
+| Error / retry       | `ERROR`   | 4 pulses (firmest)            | every **5 s**        |
+
+A turn ending (`working → idle`) becomes **done** and keeps alerting until you
+**FOCUS** the session — pressing FOCUS acknowledges it (a done tab becomes idle;
+a waiting/error tab goes quiet but keeps its state until it changes). The OLED's
+ack dot mirrors this: blinking while unacknowledged, hollow once seen.
 
 ---
 
@@ -126,26 +196,27 @@ current card), so the display recovers cleanly after any reconnect.
 
 Pinout summary (full details in [docs/WIRING.md](docs/WIRING.md)):
 
-| Signal               | Pin       |
-|----------------------|-----------|
-| OLED SDA             | A4        |
-| OLED SCL             | A5        |
-| FOCUS button         | D2        |
-| NEXT button          | D3        |
-| PREV button          | D4        |
-| Vibration motor drive| D5        |
+| Signal               | Pin       | Notes                                  |
+|----------------------|-----------|----------------------------------------|
+| OLED SDA             | A4        | I2C                                    |
+| OLED SCL             | A5        | I2C                                    |
+| FOCUS button         | D2        | `INPUT_PULLUP`, emits `B|1`            |
+| NEXT button          | D3        | `INPUT_PULLUP`, emits `B|2`            |
+| PREV button          | D4        | `INPUT_PULLUP`, emits `B|3`            |
+| Vibration motor drive| D5        | PWM-capable; never drive the motor directly |
 
 The three buttons use `INPUT_PULLUP` (other leg to GND; pressed = LOW). D5 drives
-the vibration motor through a module / NPN+1k+1N4148 / ULN2003 channel — never
-the motor directly.
+the vibration motor through a module / NPN+1k+1N4148 / ULN2003 channel. D5 is
+PWM-capable, which is how the firmware plays the graded (soft→hard) patterns.
 
 ---
 
 ## Quick start
 
-1. **Build & flash the firmware** onto the Arduino Nano. Install the firmware
-   libraries via the Arduino Library Manager: **Adafruit GFX** and **Adafruit
-   SSD1306** (the OLED is the only thing that needs a library).
+1. **Build & flash the firmware** (`firmware/claude_mate/claude_mate.ino`) onto
+   the Arduino Nano. Install the libraries via the Arduino Library Manager:
+   **Adafruit GFX** and **Adafruit SSD1306** (the OLED is the only thing that
+   needs a library).
 2. **Run the daemon** on your Mac:
    ```sh
    python3 daemon/claude_mate_daemon.py
@@ -154,7 +225,16 @@ the motor directly.
    ```sh
    python3 daemon/claude_mate_daemon.py --mock
    ```
-3. **Install the Claude Code hooks** so session events reach the daemon.
+3. **Feed it.** Pick either (or both):
+   - **Hooks:** install the Claude Code hooks so session events reach the daemon.
+   - **PTY wrapper:** `pip install pyte`, then run Claude through the wrapper:
+     ```sh
+     alias claude="$PWD/bin/claude-mate-wrap"
+     claude            # use Claude exactly as normal — now with live state + FOCUS
+     ```
+     The wrapper is safe to install as a global `claude` shim: non-interactive
+     (`claude -p …`, pipes, CI) execs the real binary, and it locates the real
+     `claude` even when every `claude` on `PATH` is your own shim.
 
 Step-by-step guides:
 
@@ -165,41 +245,58 @@ Step-by-step guides:
 
 ### Configuration
 
-The daemon reads these environment variables (all optional):
+**Daemon** environment variables (all optional):
 
 | Variable            | Default          | Meaning                                   |
 |---------------------|------------------|-------------------------------------------|
 | `CLAUDE_MATE_PORT`  | autodetect       | Serial device. Autodetects `/dev/cu.usbserial*` then `/dev/cu.usbmodem*` |
-| `CLAUDE_MATE_SOCK`  | `/tmp/claude-mate.sock` | Unix socket the hooks write to     |
+| `CLAUDE_MATE_SOCK`  | `/tmp/claude-mate.sock` | Unix socket the hooks/wrapper write to |
 | `CLAUDE_MATE_BAUD`  | `115200`         | Serial baud rate                          |
+
+**PTY wrapper** environment variables:
+
+| Variable               | Default               | Meaning                                |
+|------------------------|-----------------------|----------------------------------------|
+| `CLAUDE_MATE_SOCK`     | `/tmp/claude-mate.sock` | Daemon socket to report state to     |
+| `CLAUDE_MATE_PATTERNS` | `<repo>/patterns.json`  | Detection patterns file (hot-reloaded) |
+| `CLAUDE_MATE_DEBUG`    | unset                 | If set to a path, append screen + state snapshots there (debugging) |
+| `CLAUDE_REAL`          | autodetect            | Explicit path to the real `claude` binary |
+
+**Detection tuning** lives in [`patterns.json`](patterns.json) — case-insensitive
+substrings matched against the rendered TUI, grouped as `error` / `waiting` /
+`waiting_footer` / `busy` (precedence: error > waiting > waiting_footer > busy >
+idle). Matching is scoped to Claude's **live status region** (the bottom ~20
+non-empty lines) for error/waiting/busy, and to the **footer** (~4 lines) for the
+generic picker phrases — so the same keywords in scrollback, logs, code, or
+conversation above don't false-trigger.
 
 ---
 
 ## How the status maps to your sessions
 
-The daemon keeps one record per session (keyed by `session_id`, or by project
-name if no id is provided). Each session is in one of these states:
+The daemon keeps one record per session (keyed by `session_id`, or by name if no
+id is provided). Each session is in one of these states:
 
-| State     | Triggered by         | Meaning                                  |
-|-----------|----------------------|------------------------------------------|
-| `working` | UserPromptSubmit     | A turn is in progress                     |
-| `waiting` | Notification         | Needs permission / Claude asked something |
-| `error`   | StopFailure          | Turn ended on an API error (5xx/overloaded/timeout) |
-| `done`    | Stop                 | Turn completed OK                         |
-| `idle`    | Inactivity (TTL only)   | No active turn — no hook sets this        |
+| State     | Triggered by                          | Meaning                                  |
+|-----------|---------------------------------------|------------------------------------------|
+| `working` | `UserPromptSubmit` / wrapper "busy"   | A turn is in progress (or a background workflow is still running) |
+| `waiting` | `Notification` / wrapper prompt+picker | Needs permission, a question, or a menu choice |
+| `error`   | `StopFailure` / wrapper API-error      | Turn ended on an API error (5xx / overloaded / timeout / usage limit) |
+| `done`    | `Stop` (then held until acknowledged)  | Turn completed OK — keeps alerting until focused |
+| `idle`    | Inactivity (TTL) / acknowledged done   | No active turn                            |
 
-The status word is recomputed on every change (priority **WTF > BLOCKED > WIP >
-FREE**):
+The daemon recomputes the overall **status word** on every change (priority
+**WTF > BLOCKED > WIP > FREE**) and sends `D|<word>`:
 
 - **WTF** if any session is in `error`.
 - **BLOCKED** else if any session is `waiting`.
 - **WIP** else if any session is `working`.
 - **FREE** otherwise (all idle/done, or no sessions).
 
-The daemon sends `D|<word>` to the Arduino whenever the word changes; the OLED
-redraws the big word and the motor buzzes (WTF = 3 pulses, BLOCKED = 2, FREE =
-1 tick, WIP = silent). Carousel ordering, most urgent first:
-`error` → `waiting` → `working` → `done` → `idle`.
+That word is the **priority model**: it decides which session gets auto-surfaced
+and which buzz fires. Auto-surface and navigation order, most urgent first:
+`error → waiting → done → working → idle`. The OLED shows that surfaced session's
+card; with zero sessions it shows the `IDLE` screen.
 
 ---
 
@@ -208,23 +305,23 @@ redraws the big word and the motor buzzes (WTF = 3 pulses, BLOCKED = 2, FREE =
 ```
 claude_mate/
 ├── README.md
-├── LICENSE
-├── CONTRIBUTING.md
-├── CODE_OF_CONDUCT.md
-├── SECURITY.md
-├── .gitignore
-├── .editorconfig
+├── LICENSE · CONTRIBUTING.md · CODE_OF_CONDUCT.md · SECURITY.md
+├── patterns.json                  # hot-reloadable state-detection tuning
+├── bin/
+│   └── claude-mate-wrap           # PTY wrapper: live state + terminal FOCUS (pyte)
 ├── daemon/
-│   └── claude_mate_daemon.py     # Python daemon (pyserial only)
+│   └── claude_mate_daemon.py      # Python daemon (pyserial only)
 ├── firmware/
-│   └── claude_mate/              # Arduino sketch (.ino + helpers)
+│   ├── claude_mate/               # Arduino sketch (OLED card + vibration motor)
+│   └── selftest/                  # hardware self-test sketch
 ├── hooks/
-│   └── claude-status.sh          # installed to ~/.claude/hooks/
+│   ├── claude-status.sh           # installed to ~/.claude/hooks/
+│   └── settings.snippet.json      # the four hook wirings
+├── install/                       # install.sh / uninstall.sh / LaunchAgent plist
+├── packaging/                     # notarizable macOS .pkg installer
+├── tools/                         # feed.sh + e2e / wrapper / settings-merge tests
 └── docs/
-    ├── INSTALL.md
-    ├── WIRING.md
-    ├── PROTOCOL.md
-    └── TESTING.md
+    ├── INSTALL.md · WIRING.md · PROTOCOL.md · TESTING.md · ARCHITECTURE.md
 ```
 
 ---
@@ -232,20 +329,50 @@ claude_mate/
 ## Limitations
 
 - **Retry/resubmit is out of scope.** When a turn ends on an error, Claude Mate
-  shows it (**WTF** word + the 3-pulse buzz + an `error` card) but does **not**
-  offer a "retry" action. Reliably resubmitting a turn from outside the GUI is not
-  feasible, so FOCUS — taking you to the session — is the intended response.
-- **Limits are best-effort.** The usage/rate limit field is shown as a short
+  shows it (`error` card + the 4-pulse buzz, re-nagging every 5 s) but does
+  **not** offer a "retry" action. Reliably resubmitting a turn from outside the
+  GUI is not feasible, so FOCUS — taking you to the session — is the intended
+  response.
+- **Limits are best-effort.** The usage/rate-limit field is shown as a short
   string (e.g. `71%`) when it can be obtained, and as `-` when it cannot. Claude
   Mate never fabricates limit numbers; treat this as an extension point.
-- **FOCUS relies on a VS Code deep link with a window-raise fallback.** The
-  primary mechanism opens a VS Code deep link for the session id; if that is
-  unknown/stale or returns nonzero, the daemon falls back to raising the VS Code
-  window for the session's working directory (`open -a "Visual Studio Code"
-  <cwd>` / `code <cwd>`). The exact deep-link URI lives behind a single config
+- **FOCUS targets the wrapper's terminal first, then VS Code.** A wrapped session
+  raises its own terminal window (matched by TTY) reliably. Hook-only sessions
+  fall back to a VS Code deep link, then to raising the VS Code window for the
+  workspace folder — the exact deep-link URI lives behind a single config
   constant so it is trivial to update.
-- **macOS-focused.** The daemon targets a Mac (serial device naming, `open`,
-  VS Code activation). Other platforms would need port/focus adjustments.
+- **Detection is screen-scrape-based (wrapper).** State is inferred from the
+  rendered TUI using `patterns.json`. It is scoped to the live status region to
+  avoid false positives, but unusual terminal themes/locales may need a pattern
+  tweak — which you can do live, no restart.
+- **macOS-focused.** The daemon and wrapper target a Mac (serial device naming,
+  `open`, AppleScript focus). Other platforms would need port/focus adjustments.
+
+---
+
+## What changed (2026-06-29)
+
+A big iteration day. Highlights:
+
+- **Hardware redesign:** dropped the stepper-driven status wheel; the device is
+  now a **0.91" 128×32 OLED + micro vibration motor + 3 buttons**. The OLED shows
+  a per-session status card (state + live timer + acknowledge dot).
+- **New PTY wrapper** (`bin/claude-mate-wrap`): wrap `claude` to read its **live
+  TUI state** (errors, prompts, pickers, background-workflow "still busy") and to
+  raise the **exact terminal** on FOCUS (by TTY). Safe to install as a global
+  `claude` shim.
+- **Per-session haptics + acknowledge model:** the motor buzzes for *each
+  session's own* finish/block/error (`V|<KIND>`), re-nags at a per-state cadence
+  (5 / 10 / 15 s) until you FOCUS, and a finished turn stays "done" until seen.
+  The OLED carries a blinking/hollow ack dot.
+- **No blind auto-carousel:** the screen auto-surfaces the single most-urgent
+  unacknowledged tab; NEXT/PREV browse manually and pause auto-surface ~10 s.
+- **Tighter detection:** `patterns.json` (hot-reloadable), state matching scoped
+  to the live status region (bottom ~20 lines) + footer-only picker phrases,
+  option-pickers treated as **waiting**, and `usage limit reached` treated as
+  **error**.
+- **Live time-in-state** timer; graded **soft→hard** DONE buzz; assorted
+  reliability fixes (onset double-buzz race, handshake resend, nav-pause order).
 
 ---
 
