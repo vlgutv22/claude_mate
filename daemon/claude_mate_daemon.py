@@ -14,6 +14,7 @@ The "brain" of the Claude Mate USB hardware companion. It:
         H        -> handshake; the daemon resends the full current state.
         B|1      -> FOCUS the currently displayed session.
         B|2      -> NEXT (advance the carousel, pausing auto-rotation ~10s).
+        B|3      -> PREV (previous card, pausing auto-rotation ~10s).
   4. Drives a carousel that rotates through sessions (~3s/step, urgent-first)
      and sends one S card per step.
   5. Computes the overall status word (FREE/WIP/BLOCKED/WTF) and pushes it with
@@ -401,6 +402,12 @@ class Display:
             nxt = self._current_index + 1
         self.show_index(nxt)
 
+    def retreat(self) -> None:
+        """Move to the previous card (PREV button). show_index wraps negatives."""
+        with self._lock:
+            prv = self._current_index - 1
+        self.show_index(prv)
+
     def refresh_current(self) -> None:
         """Re-render whatever card is current (e.g. to update live runtime)."""
         with self._lock:
@@ -644,6 +651,11 @@ class ButtonReader(threading.Thread):
                     self._display.advance()
                     if self.on_next:
                         self.on_next()
+                elif n == 3:
+                    log("PREV button -> previous card")
+                    self._display.retreat()
+                    if self.on_next:
+                        self.on_next()  # reuse the auto-rotate pause
                 else:
                     log(f"unknown button index: {n}")
             return
