@@ -19,12 +19,15 @@
     "yes, and don't ask",
     "tell claude what to do differently",
     "no, and tell claude",
-    "press enter to continue"
+    "press enter to continue",
+    "enter to select",
+    "keys to navigate",
+    "esc to cancel",
+    "esc to go back"
   ],
 
   "busy": [
     "esc to interrupt",
-    "esc to cancel",
     "running in the background",
     "workflow to finish",
     "tool to finish"

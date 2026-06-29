@@ -73,11 +73,17 @@ DEFAULT_PATTERNS = {
         "do you want to proceed", "yes, and don't ask",
         "tell claude what to do differently", "no, and tell claude",
         "press enter to continue",
+        # Interactive option/menu pickers (AskUserQuestion, file/option selectors)
+        # are WAITING for your choice. Their footer is the reliable signal --
+        # "Enter to select · Tab/Arrow keys to navigate · Esc to cancel". Note
+        # "esc to cancel" lives HERE (not in busy): a picker is not generating.
+        "enter to select", "keys to navigate", "esc to cancel", "esc to go back",
     ],
-    # Only signals that appear ONLY when genuinely busy: the interrupt hint shown
-    # while generating, and the explicit "still running in the background" footer.
+    # Only signals that appear ONLY when genuinely generating: the interrupt hint
+    # ("esc to interrupt", distinct from a picker's "esc to cancel") and the
+    # explicit "still running in the background" footer.
     "busy": [
-        "esc to interrupt", "esc to cancel", "running in the background",
+        "esc to interrupt", "running in the background",
         "workflow to finish", "tool to finish",
     ],
 }
