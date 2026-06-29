@@ -113,16 +113,31 @@ class Session:
     sid: str = ""                  # session_id (may be empty)
     cwd: str = ""                  # working directory, if known
     last_update_ts: float = field(default_factory=time.time)
+    state_since: float = field(default_factory=time.time)  # when current state began
     started_ts: Optional[float] = None  # when current 'working' turn began
     last_runtime: float = 0.0      # last completed turn duration (seconds)
     limit: str = "-"               # best-effort rate/usage string; "-" if unknown
     focus_ctrl: str = ""           # PTY-wrapper control socket for FOCUS (if any)
 
     def runtime_seconds(self) -> float:
-        """Runtime to display: live while working, else last completed turn."""
+        """Timer value to show on the card, in seconds.
+
+        Live (keeps counting up on each refresh) for every state except
+        'done', so an idle/blocked/errored tab shows how long it has been
+        sitting there instead of freezing on the last turn's duration:
+
+            working -> elapsed of the current turn (since it began)
+            done    -> the last completed turn's duration (a frozen result)
+            idle    -> time spent idle so far
+            waiting -> time spent blocked on the human so far
+            error   -> time spent in the error state so far
+        """
+        now = time.time()
         if self.state == "working" and self.started_ts is not None:
-            return max(0.0, time.time() - self.started_ts)
-        return self.last_runtime
+            return max(0.0, now - self.started_ts)
+        if self.state == "done":
+            return self.last_runtime
+        return max(0.0, now - self.state_since)
 
 
 class Registry:
@@ -156,6 +171,10 @@ class Registry:
                 sess.focus_ctrl = focus_ctrl
             prev_state = sess.state
             sess.last_update_ts = now
+            # Stamp when this state began so idle/waiting/error can show a live
+            # "time in state" counter. Keepalives (same state) must not reset it.
+            if prev_state != state:
+                sess.state_since = now
 
             # Manage runtime bookkeeping on state transitions.
             if state == "working":
