@@ -493,13 +493,44 @@ def main():
                 dbg.write(text + "\n")
                 dbg.flush()
 
-    # SIGWINCH: keep PTY + emulator sized to the real terminal.
+    # SIGWINCH handling -- keep PTY + emulator sized to the real terminal.
+    #
+    # The terminal sends SIGWINCH on every resize (and many emulators raise it
+    # when you open/split a tab as the layout reflows). Python delivers signals
+    # on the MAIN thread, between bytecodes -- so a handler that takes
+    # `screen_lock` can SELF-DEADLOCK: if the resize lands while the main loop
+    # is inside `with screen_lock: stream.feed(...)` (very likely during heavy
+    # output) the handler runs on that same thread and blocks forever trying to
+    # re-acquire a non-reentrant lock the thread already holds. That froze the
+    # whole session on resize / new-tab, forcing a kill (and losing output).
+    #
+    # Fix: the handler does only what is async-signal-safe -- flip a flag (a
+    # single store) -- and `set_wakeup_fd` pokes a self-pipe so a blocked
+    # select() returns promptly. The ACTUAL resize (ioctl + pyte) runs back in
+    # the main loop, OUTSIDE signal context, where taking the lock is safe.
+    winch_pending = [False]
+    wake_r, wake_w = os.pipe()
+    os.set_blocking(wake_r, False)
+    os.set_blocking(wake_w, False)
+
     def on_winch(signum, frame):
-        r, c = get_winsize(sys.stdin.fileno())
-        set_winsize(master_fd, r, c)
-        with screen_lock:
-            screen.resize(r, c)
+        winch_pending[0] = True       # async-signal-safe: just flag it
     signal.signal(signal.SIGWINCH, on_winch)
+    try:
+        # Make any signal wake select() (main thread only); drop the byte if the
+        # pipe ever backs up rather than spamming stderr.
+        signal.set_wakeup_fd(wake_w, warn_on_full_buffer=False)
+    except (ValueError, OSError, TypeError):
+        pass
+
+    def apply_resize():
+        r, c = get_winsize(sys.stdin.fileno())
+        set_winsize(master_fd, r, c)          # resize PTY -> child claude reflows
+        with screen_lock:
+            try:
+                screen.resize(r, c)           # keep the emulator in step
+            except Exception:
+                pass
 
     threading.Thread(target=ctrl_listener, daemon=True).start()
     send_daemon("idle")  # register immediately on launch
@@ -524,10 +555,32 @@ def main():
 
     try:
         while True:
+            # Apply any resize requested by the SIGWINCH handler, on THIS thread
+            # (never inside the signal handler -> no self-deadlock on screen_lock).
+            if winch_pending[0]:
+                winch_pending[0] = False
+                try:
+                    apply_resize()
+                except Exception:
+                    pass
             try:
-                r, _, _ = select.select([sys.stdin.fileno(), master_fd], [], [])
+                # The self-pipe (set_wakeup_fd) normally wakes us instantly on a
+                # SIGWINCH. The 1s timeout is a belt-and-suspenders fallback: if
+                # set_wakeup_fd is ever unavailable, a pending resize is still
+                # applied (top of loop) within ~1s instead of never -- without
+                # busy-waiting when idle.
+                r, _, _ = select.select(
+                    [sys.stdin.fileno(), master_fd, wake_r], [], [], 1.0)
             except (OSError, select.error):
                 break
+            if wake_r in r:
+                # Drain the signal-wakeup pipe; the winch flag (checked at the
+                # top of the loop) carries the actual intent.
+                try:
+                    while os.read(wake_r, 4096):
+                        pass
+                except OSError:
+                    pass
             if sys.stdin.fileno() in r:
                 try:
                     data = os.read(sys.stdin.fileno(), 4096)
@@ -553,6 +606,15 @@ def main():
                 except Exception:
                     pass
     finally:
+        try:
+            signal.set_wakeup_fd(-1)
+        except Exception:
+            pass
+        for _fd in (wake_r, wake_w):
+            try:
+                os.close(_fd)
+            except OSError:
+                pass
         if old is not None:
             try:
                 termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
