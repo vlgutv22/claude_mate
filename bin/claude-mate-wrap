@@ -339,6 +339,23 @@ def parse_meta(screen_text):
 # --------------------------------------------------------------------------- #
 # State detection from the rendered screen
 # --------------------------------------------------------------------------- #
+# Claude Code's live ACTIVITY METER is shown in EVERY actively-working frame --
+# while generating, running tools, AND during the extended-thinking phase -- e.g.
+#   "✻ Forming… (14s · ↓ 610 tokens · thinking with xhigh effort)"
+#   "✻ Herding…  (2m 3s · ↑ 1,204 tokens · esc to interrupt)"
+# The spinner verb rotates and the "esc to interrupt" hint ROTATES OUT for a
+# "Tip:" line every few seconds, so keying "working" off "esc to interrupt"
+# alone mis-reads the thinking phase (and the tip frames) as idle -- which the
+# daemon then turns into a premature DONE buzz mid-turn. The meter itself is the
+# stable signal: an arrow+token counter, or an elapsed-timer parenthetical that
+# also carries "tokens", or the "thinking with <effort> effort" suffix. All three
+# are specific enough that idle/scrollback content essentially never matches.
+_WORKING_METER_RE = re.compile(
+    r'[↑↓]\s*[\d.,]+\s*tokens?\b'             # ↓ 610 tokens / ↑ 1,204 tokens
+    r'|\(\s*\d+\s*s\b[^)\n]*\btokens?\b'      # (14s · … 610 tokens …)
+    r'|\bthinking with\s+\w+\s+effort\b',     # thinking with xhigh effort
+    re.I)
+
 def detect_state(screen_text):
     # Read only Claude's LIVE STATUS REGION (the bottom of the visible screen),
     # not the whole scrollback. Error/prompt/generating chrome renders there, so
@@ -359,7 +376,8 @@ def detect_state(screen_text):
     # A genuine picker is NOT generating: if the live region shows the
     # "esc to interrupt" / background-work hint, that wins over generic picker
     # words that may be incidental near the bottom.
-    busy_now = any(p in tail for p in _patterns["busy"])
+    busy_now = (any(p in tail for p in _patterns["busy"])
+                or bool(_WORKING_METER_RE.search(tail)))
     if not busy_now and any(p in footer for p in _patterns.get("waiting_footer", [])):
         return ("waiting", "footer")
     if busy_now:
