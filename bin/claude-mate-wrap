@@ -308,10 +308,15 @@ def ctrl_listener():
 # model is captured at boot from the welcome box; effort is refreshed whenever
 # the pill is visible, e.g. after you change it). Both are scoped tightly so the
 # same words appearing in ordinary conversation/code can't be mistaken for them:
-#   - the model must sit inside the welcome box (between a "│" border and a "·").
+#   - the model must sit on the welcome-box header line specifically: inside a
+#     "│" border AND followed (same bordered segment) by the "Claude <plan>"
+#     badge it always carries -- e.g. "│ Opus 4.8 (1M context) with xhigh ·
+#     Claude Max · │". Requiring "Claude" rules out a bordered line that merely
+#     mentions a model, e.g. a /model picker row "│ 2. Opus 4.8 · capable │" or a
+#     markdown-table cell, which would otherwise overwrite the sticky cache.
 #   - the effort must directly follow the "◉" pill glyph and be a known level.
 _MODEL_RE = re.compile(
-    r'│[^│\n]*?\b((?:Opus|Sonnet|Haiku|Fable)\s+[0-9.]+)[^│\n]*·', re.I)
+    r'│[^│\n]*?\b((?:Opus|Sonnet|Haiku|Fable)\s+[0-9.]+)\b[^│\n]*?claude', re.I)
 _EFFORT_RE = re.compile(
     r'◉\s*(low|medium|high|xhigh|max|ultracode)\b', re.I)
 
