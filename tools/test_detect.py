@@ -53,6 +53,15 @@ CASES = [
      PROMPT, "idle"),
     ("idle, conversation merely MENTIONS tokens (no live meter)",
      "● The model used a few hundred tokens for that step.\n" + PROMPT, "idle"),
+    # Self-scrape regression: a message that QUOTES the live meter verbatim (e.g.
+    # design notes / research about the detector) scrolled up above the prompt must
+    # NOT read working. The quote sits outside the bottom busy region.
+    ("idle, a long message QUOTES the live meter verbatim (self-scrape)",
+     "● Here is the saved detection research:\n"
+     "  The spinner shows ↓ 610 tokens while it is busy.\n"
+     "  Full form: (14s · ↓ 610 tokens · thinking with xhigh effort), esc to interrupt.\n"
+     + "\n".join(f"  · detail line {i}" for i in range(10)) + "\n"
+     + PROMPT, "idle"),
     ("permission prompt stays waiting",
      "Do you want to proceed?\n 1. Yes\n 2. No", "waiting"),
     ("api error stays error",

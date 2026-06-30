@@ -149,7 +149,14 @@ KEEPALIVE_S = 20.0        # re-send current state periodically
 # How many non-empty bottom lines count as Claude's "live status region". State
 # signals (error/prompt/generating) are matched only here, so the same keywords
 # in scrollback / logs / code / conversation above don't false-trigger.
-STATUS_TAIL_LINES = 20    # error/waiting/busy region
+STATUS_TAIL_LINES = 20    # error/waiting region (error boxes & permission prompts
+                          # are genuinely multi-line, so they need the wider window)
+BUSY_TAIL_LINES = 8       # tighter region for the live spinner: the generating meter,
+                          # the 'esc to interrupt' hint, and background-agent notices
+                          # only ever render on the bottom status line(s). A narrow
+                          # window keeps a meter STRING quoted higher up in the
+                          # conversation (e.g. these very design notes) from reading
+                          # as "working" while the session is actually idle.
 FOOTER_LINES = 4          # tighter region for the generic picker-footer phrases
 
 # --------------------------------------------------------------------------- #
@@ -349,7 +356,10 @@ def parse_meta(screen_text):
 # daemon then turns into a premature DONE buzz mid-turn. The meter itself is the
 # stable signal: an arrow+token counter, or an elapsed-timer parenthetical that
 # also carries "tokens", or the "thinking with <effort> effort" suffix. All three
-# are specific enough that idle/scrollback content essentially never matches.
+# are specific enough that ordinary prose rarely matches -- and because the live
+# meter is matched only within the bottom BUSY_TAIL_LINES status region (see
+# detect_state), a meter string QUOTED higher up in the conversation (such as in
+# these comments) sits outside that window and no longer false-reads as "working".
 _WORKING_METER_RE = re.compile(
     r'[↑↓]\s*[\d.,]+\s*tokens?\b'             # ↓ 610 tokens / ↑ 1,204 tokens
     r'|\(\s*\d+\s*s\b[^)\n]*\btokens?\b'      # (14s · … 610 tokens …)
@@ -367,6 +377,7 @@ def detect_state(screen_text):
     # config dialog you open and dismiss can't buzz.
     nonblank = [ln for ln in screen_text.splitlines() if ln.strip()]
     tail = "\n".join(nonblank[-STATUS_TAIL_LINES:]).lower()
+    busy_tail = "\n".join(nonblank[-BUSY_TAIL_LINES:]).lower()
     footer = "\n".join(nonblank[-FOOTER_LINES:]).lower()
 
     if any(p in tail for p in _patterns["error"]):
@@ -375,9 +386,11 @@ def detect_state(screen_text):
         return ("waiting", "specific")
     # A genuine picker is NOT generating: if the live region shows the
     # "esc to interrupt" / background-work hint, that wins over generic picker
-    # words that may be incidental near the bottom.
-    busy_now = (any(p in tail for p in _patterns["busy"])
-                or bool(_WORKING_METER_RE.search(tail)))
+    # words that may be incidental near the bottom. The spinner/meter is a single
+    # bottom status line, so it's matched in the narrower BUSY_TAIL_LINES window --
+    # otherwise a meter string quoted earlier in the conversation reads as working.
+    busy_now = (any(p in busy_tail for p in _patterns["busy"])
+                or bool(_WORKING_METER_RE.search(busy_tail)))
     if not busy_now and any(p in footer for p in _patterns.get("waiting_footer", [])):
         return ("waiting", "footer")
     if busy_now:
