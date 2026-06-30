@@ -1,18 +1,17 @@
 {
-  "_comment": "Live state-detection tuning for bin/claude-mate-wrap. Case-insensitive substrings matched against the rendered claude TUI screen. Hot-reloaded (~0.25s), no restart. Precedence: error > waiting > waiting_footer > busy > idle. Matching is scoped to Claude's LIVE STATUS REGION (bottom ~20 non-empty lines) for error/waiting/busy, so error/prompt keywords in scrollback/logs/code/conversation above don't false-trigger. 'waiting_footer' holds GENERIC question/option-picker phrases matched ONLY in the last ~4 lines, AND (in the wrapper) must persist a few seconds before it counts as waiting, so a picker you open and dismiss doesn't buzz. NOTE: 'esc to cancel' / 'esc to go back' are deliberately NOT here — user-opened config dialogs (the /effort and /model sliders) share that footer, so matching it falsely buzzed the instant you typed /effort. A genuine AskUserQuestion picker carries 'to select' / 'to navigate', which those sliders do not.",
+  "_comment": "Live state-detection tuning for bin/claude-mate-wrap. Case-insensitive substrings matched against the rendered claude TUI screen. Hot-reloaded (~0.25s), no restart. Precedence: error > waiting > waiting_footer > busy > idle. Matching is scoped to Claude's LIVE STATUS REGION: strong 'error'/'waiting' in the bottom ~20 non-empty lines; the spinner 'busy' AND the content-prone 'error_footer' only in the bottom ~8, so error/prompt keywords in scrollback/logs/code/conversation above don't false-trigger. 'error' holds STRONG, specific error UI strings; 'error_footer' holds content-prone error PHRASES — scoped to the tight bottom region and ignored while the live meter shows work, so a phrase printed as content can't stick the session in 'error' (which nags every 5s and, via the keepalive, would never be pruned). Bare HTTP status codes (' 500' etc.) are intentionally absent: they collide with the live token meter ('↓ 500 tokens') and any on-screen number. 'waiting_footer' holds GENERIC question/option-picker phrases matched ONLY in the last ~4 lines, AND (in the wrapper) must persist a few seconds before it counts as waiting, so a picker you open and dismiss doesn't buzz. NOTE: 'esc to cancel' / 'esc to go back' are deliberately NOT here — user-opened config dialogs (the /effort and /model sliders) share that footer, so matching it falsely buzzed the instant you typed /effort. A genuine AskUserQuestion picker carries 'to select' / 'to navigate', which those sliders do not.",
 
   "error": [
     "api error",
     "overloaded_error",
-    " 429",
-    " 500",
-    " 503",
-    " 529",
-    "internal server error",
-    "connection error",
-    "request timed out",
     "service is temporarily",
     "usage limit reached"
+  ],
+
+  "error_footer": [
+    "internal server error",
+    "connection error",
+    "request timed out"
   ],
 
   "waiting": [

@@ -66,6 +66,31 @@ CASES = [
      "Do you want to proceed?\n 1. Yes\n 2. No", "waiting"),
     ("api error stays error",
      "✗ API Error: Overloaded (529). retrying…", "error"),
+    # #4 -- a content-prone error token (bare HTTP code / "connection error")
+    # quoted in scrollback ABOVE the live region must NOT stick the session in
+    # 'error'. Before the split, "connection error"/" 500" matched the whole
+    # 20-line tail; a printed/old code then nagged every 5s forever (the keepalive
+    # refreshes last_update_ts so prune never fires). Now they only match the
+    # tight bottom region.
+    ("idle, an OLD error code quoted in scrollback above the prompt (#4)",
+     "● Earlier the API returned a connection error (500) but it recovered.\n"
+     + "\n".join(f"  · followup line {i}" for i in range(12)) + "\n"
+     + PROMPT, "idle"),
+    # ...but a REAL error rendered on the live status line still reads error.
+    ("real API error on the live status line still errors (#4 no regression)",
+     "● The request failed.\n"
+     "✗ API Error · connection error (529). retrying…", "error"),
+    ("bare HTTP 500 on the bottom status line still errors via error_footer (#4)",
+     "● Running request…\n"
+     "  Request failed: 500 Internal Server Error", "error"),
+    # Meter/code collision (review finding): a WORKING frame whose token count is
+    # exactly an HTTP code (500/429/503/529) must read 'working', not 'error'.
+    # Bare codes were dropped from error_footer AND busy_now is computed first.
+    ("working meter showing '↓ 500 tokens' must NOT read error",
+     "● Generating the response…\n"
+     "✻ Forming… (10s · ↓ 500 tokens · thinking with xhigh effort)", "working"),
+    ("working meter '↑ 429 tokens · esc to interrupt' must NOT read error",
+     "✶ Working… (3s · ↑ 429 tokens · esc to interrupt)", "working"),
 ]
 
 fails = 0

@@ -32,14 +32,17 @@ Config (env):
 Requires: pyte  (pip install pyte)
 """
 import os, sys, pty, tty, termios, fcntl, struct, signal, select, socket, \
-       threading, time, re, json, uuid, subprocess, shutil
+       threading, time, re, json, uuid, subprocess, shutil, atexit
 
 try:
     import pyte
 except ImportError:
-    sys.stderr.write("[claude-mate-wrap] ERROR: pyte not installed. Run: pip install pyte\n")
-    # Fall back to running claude directly so we never block the user.
-    os.execvp("claude", ["claude"] + sys.argv[1:])
+    # Defer the fallback. The OLD code here did `os.execvp("claude", ...)`, but in
+    # the global-shim deployment `claude` IS this wrapper -> it re-exec'd itself
+    # forever (the "never block the user" path doing exactly that). main() instead
+    # execs real_claude() -- the same shim-skipping resolver the wrapped path uses
+    # -- before it touches anything pyte-dependent.
+    pyte = None
 
 # --------------------------------------------------------------------------- #
 # Config / identity
@@ -64,14 +67,25 @@ except OSError:
 # "error" / "waiting" / "busy" -> lists of substrings.
 # --------------------------------------------------------------------------- #
 DEFAULT_PATTERNS = {
+    # STRONG error signals -- specific enough to match in the wider status region
+    # (a real error box is multi-line). "api error" is Claude's own retry banner;
+    # the others are unambiguous UI strings. (Bare "rate limit" / "rate_limit_error"
+    # are deliberately NOT here: they are ordinary code/doc tokens that show up on
+    # screen as content and would false-trigger the whole-screen scrape.)
     "error": [
-        "api error", "overloaded_error", " 429", " 500", " 503", " 529",
-        "internal server error", "connection error", "request timed out",
+        "api error", "overloaded_error",
         "service is temporarily",
-        # Genuine block-state UI string. (Bare "rate limit" / "rate_limit_error"
-        # are deliberately NOT here: they are ordinary code/doc tokens that show
-        # up on screen as content and would false-trigger the whole-screen scrape.)
         "usage limit reached",
+    ],
+    # CONTENT-PRONE error PHRASES -- specific enough to mean a real failure but
+    # still possible in ordinary output, so matched ONLY in the tight live status
+    # region (bottom BUSY_TAIL_LINES) and only when NOT actively working. Bare HTTP
+    # status codes (" 500" etc.) are deliberately NOT here: they collide with the
+    # live token meter ("↓ 500 tokens") and with any number on screen, reading as a
+    # false 'error' that then nags every 5s. A genuine API error carries "api error"
+    # (the strong list above) or one of these phrases.
+    "error_footer": [
+        "internal server error", "connection error", "request timed out",
     ],
     # Specific prompt text -- safe to match anywhere on the screen.
     "waiting": [
@@ -127,11 +141,15 @@ def load_patterns():
     except (OSError, ValueError):
         return
     new = {k: [s.lower() for s in v] for k, v in DEFAULT_PATTERNS.items()}
-    for k in ("error", "waiting", "waiting_footer", "busy"):
+    for k in ("error", "error_footer", "waiting", "waiting_footer", "busy"):
         if isinstance(data.get(k), list):
             new[k] = [str(x).lower() for x in data[k]]
-    _patterns.clear()
-    _patterns.update(new)
+    # Atomic publish: rebind the module-global to the freshly built dict in one
+    # store, rather than clear()+update() (which a concurrent reader could observe
+    # half-empty). Detection now runs on a single thread (see monitor()), but the
+    # atomic swap keeps this correct regardless.
+    global _patterns
+    _patterns = new
     _patterns_mtime[0] = m
 
 POLL_MS = 0.25            # re-evaluate the screen this often (quiescence)
@@ -380,17 +398,27 @@ def detect_state(screen_text):
     busy_tail = "\n".join(nonblank[-BUSY_TAIL_LINES:]).lower()
     footer = "\n".join(nonblank[-FOOTER_LINES:]).lower()
 
+    # Is the session actively working? The live activity meter (token counter /
+    # elapsed timer / "thinking with <effort>") or the "esc to interrupt" /
+    # background-work hints render in the bottom BUSY_TAIL_LINES region. Compute
+    # this FIRST so it can gate the content-prone error/picker checks below: a
+    # working frame must never be mistaken for an error or a prompt.
+    busy_now = (any(p in busy_tail for p in _patterns["busy"])
+                or bool(_WORKING_METER_RE.search(busy_tail)))
+
+    # Strong, specific error strings win even mid-stream (a genuine API error
+    # replaces the spinner). Content-prone error phrases match ONLY in the tight
+    # bottom region AND never while the meter shows work in progress -- otherwise
+    # the meter's own digits (e.g. "↓ 500 tokens") or a number on screen would
+    # read as a false HTTP error that then nags every 5s.
     if any(p in tail for p in _patterns["error"]):
+        return ("error", "error")
+    if not busy_now and any(p in busy_tail for p in _patterns.get("error_footer", [])):
         return ("error", "error")
     if any(p in tail for p in _patterns["waiting"]):
         return ("waiting", "specific")
-    # A genuine picker is NOT generating: if the live region shows the
-    # "esc to interrupt" / background-work hint, that wins over generic picker
-    # words that may be incidental near the bottom. The spinner/meter is a single
-    # bottom status line, so it's matched in the narrower BUSY_TAIL_LINES window --
-    # otherwise a meter string quoted earlier in the conversation reads as working.
-    busy_now = (any(p in busy_tail for p in _patterns["busy"])
-                or bool(_WORKING_METER_RE.search(busy_tail)))
+    # A genuine picker is NOT generating: the live "esc to interrupt" / meter hint
+    # wins over generic picker words that may be incidental near the bottom.
     if not busy_now and any(p in footer for p in _patterns.get("waiting_footer", [])):
         return ("waiting", "footer")
     if busy_now:
@@ -434,28 +462,56 @@ def real_claude():
                 return cand
     except OSError:
         pass
-    return "claude"  # last resort
+    return None  # not found -- caller must handle (NEVER fall back to a bare
+                 # "claude": in a global-shim deploy that re-execs THIS wrapper
+                 # -> infinite re-exec loop, esp. on the pyte-missing path).
+
+def exec_real_claude(extra_argv):
+    """exec the real claude (skipping this shim) with our argv, or exit cleanly if
+    it can't be located. Never execs a bare "claude" -- that would re-enter the
+    wrapper and, when pyte is missing, spin forever."""
+    rc = real_claude()
+    if not rc:
+        sys.stderr.write("[claude-mate-wrap] could not locate the real `claude` "
+                         "binary; set CLAUDE_REAL=/path/to/claude.\n")
+        os._exit(127)
+    os.execvp(rc, ["claude"] + extra_argv)
+    os._exit(127)
 
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def main():
+    # pyte is required to mirror the TUI; without it we cannot wrap. Run the real
+    # claude unwrapped via real_claude() (which skips THIS shim) -- never bare
+    # "claude", which in the global-shim deployment would re-exec the wrapper
+    # forever (the import-time fallback's old bug).
+    if pyte is None:
+        sys.stderr.write("[claude-mate-wrap] pyte not installed (pip install pyte); "
+                         "running claude unwrapped.\n")
+        exec_real_claude(sys.argv[1:])
+
     # Non-interactive (piped / scripted) use: don't wrap, just be claude. This
     # keeps a global `claude` shim safe for `claude -p ...`, CI, pipes, etc.
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
-        os.execvp(real_claude(), ["claude"] + sys.argv[1:])
-        os._exit(127)
+        exec_real_claude(sys.argv[1:])
 
     rows, cols = get_winsize(sys.stdin.fileno())
 
     pid, master_fd = pty.fork()
     if pid == 0:
         # Child: become the real claude.
-        os.execvp(real_claude(), ["claude"] + sys.argv[1:])
-        os._exit(127)
+        exec_real_claude(sys.argv[1:])
 
     # Parent.
     set_winsize(master_fd, rows, cols)
+    # Non-blocking writes to the child's PTY (#3). A large paste while claude is
+    # busy can fill the PTY input buffer; a BLOCKING os.write(master_fd, ...) would
+    # then stall the relay -> the wrapper stops draining claude's output -> claude
+    # blocks on ITS write -> two-way deadlock. With the fd non-blocking we buffer
+    # the remainder (`pend`) and flush it when select() reports master_fd writable.
+    # Reads become non-blocking too, so master-side reads guard for BlockingIOError.
+    os.set_blocking(master_fd, False)
 
     # Set our unique terminal title (for focus matching) — harmless if ignored.
     try:
@@ -548,10 +604,16 @@ def main():
     threading.Thread(target=ctrl_listener, daemon=True).start()
     send_daemon("idle")  # register immediately on launch
 
-    # Periodic evaluator (catches quiescence after output stops).
+    # Periodic evaluator (catches quiescence after output stops). `_running` lets
+    # cleanup() stop it BEFORE it sends the final 'end', so the monitor can't fire
+    # a keepalive/state report afterwards and re-register the just-ended session
+    # (a ghost the daemon would then keep alive via last_update_ts).
+    _running = [True]
     def monitor():
-        while True:
+        while _running[0]:
             time.sleep(POLL_MS)
+            if not _running[0]:
+                break
             try:
                 load_patterns()   # hot-reload tuning without a restart
                 evaluate()
@@ -566,6 +628,133 @@ def main():
     except Exception:
         old = None
 
+    # --- Single cleanup path, run on normal exit AND on external termination ---
+    # Previously ALL teardown lived in the `finally` below, which `kill`, logout
+    # (SIGHUP) or a `kill -QUIT` skip by default -> the shell came back with no
+    # echo / no line editing (blind `reset` needed), the daemon kept showing the
+    # dead session for up to its TTL, and the ctrl socket leaked. Now one
+    # idempotent cleanup() restores the tty, tells the daemon, and unlinks the
+    # socket -- registered via atexit and the TERM/HUP/QUIT handlers below.
+    _cleaned = [False]
+    def cleanup():
+        if _cleaned[0]:
+            return
+        _cleaned[0] = True
+        _running[0] = False                             # stop the monitor (no post-end report)
+        try:
+            signal.set_wakeup_fd(-1)
+        except Exception:
+            pass
+        # CRITICAL teardown FIRST -- deregister and drop the socket before any
+        # terminal-touching step, so a wedged / flow-controlled (Ctrl-S) terminal
+        # can never leave a ghost session behind: the 'end' must always get out.
+        send_daemon("end")                              # deregister this session
+        try:
+            if os.path.exists(CTRL_SOCK):
+                os.unlink(CTRL_SOCK)
+        except OSError:
+            pass
+        # Hang up the child's PTY. If the relay broke while claude was still alive
+        # (e.g. our output terminal vanished), closing the master sends the child
+        # EOF/SIGHUP so it exits and the waitpid below can reap it instead of
+        # blocking forever.
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+        for _fd in (wake_r, wake_w):
+            try:
+                os.close(_fd)
+            except OSError:
+                pass
+        if dbg:
+            try:
+                dbg.close()
+            except Exception:
+                pass
+        # Restore the tty with TCSANOW (apply immediately). TCSADRAIN/TCSAFLUSH
+        # would BLOCK until the terminal's output queue drains -- exactly the
+        # wedged-terminal case this teardown must survive -- so they are wrong here.
+        if old is not None:
+            try:
+                termios.tcsetattr(sys.stdin, termios.TCSANOW, old)
+            except Exception:
+                pass
+        # Cosmetic title reset LAST and NON-BLOCKING: if the terminal's output
+        # buffer is full (no reader / Ctrl-S), a blocking write here would hang the
+        # entire exit. Best-effort only -- it must never stall teardown.
+        try:
+            ofd = sys.stdout.fileno()
+            fl = fcntl.fcntl(ofd, fcntl.F_GETFL)
+            fcntl.fcntl(ofd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+            try:
+                os.write(ofd, b"\033]0;\007")           # clear our title (#13)
+            except OSError:
+                pass
+            fcntl.fcntl(ofd, fcntl.F_SETFL, fl)
+        except Exception:
+            pass
+
+    def _on_term(signum, frame):
+        # External termination: run the same teardown as a clean exit, then
+        # re-raise the signal's default disposition so our exit status is correct
+        # and the child gets reaped. cleanup() never takes screen_lock, so (unlike
+        # the old SIGWINCH bug) running it from a signal handler can't deadlock.
+        cleanup()
+        try:
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+        except Exception:
+            os._exit(128 + signum)
+
+    for _sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
+        try:
+            signal.signal(_sig, _on_term)
+        except (ValueError, OSError):
+            pass
+    atexit.register(cleanup)
+
+    # Bytes queued for the child's PTY (master_fd), drained NON-BLOCKING so a big
+    # paste can never stall the relay (#3).
+    pend = bytearray()
+    def flush_to_child():
+        """Push as much of `pend` to the child as the PTY will accept right now.
+        Returns False on a fatal write error (caller should exit)."""
+        while pend:
+            try:
+                n = os.write(master_fd, pend)
+            except BlockingIOError:
+                return True          # PTY input full; keep remainder, retry on writable
+            except OSError:
+                return False         # child / PTY gone
+            if n <= 0:
+                return True
+            del pend[:n]
+        return True
+
+    out_fd = sys.stdout.fileno()
+    def write_all_stdout(buf):
+        """Write the WHOLE buffer to stdout, looping on the returned count. stdout
+        stays blocking, but a write interrupted by a signal (e.g. SIGWINCH) after
+        transferring some bytes returns a SHORT count -- CPython only auto-retries
+        an EINTR that moved zero bytes -- so a single os.write could silently drop
+        the tail (corrupting the visible TUI while pyte still sees the full buffer).
+        Returns False on a fatal terminal error (caller should exit)."""
+        mv = memoryview(buf)
+        while mv:
+            try:
+                n = os.write(out_fd, mv)
+            except InterruptedError:
+                continue
+            except OSError:
+                return False
+            if n <= 0:
+                return False
+            mv = mv[n:]
+        return True
+
+    stdin_fd = sys.stdin.fileno()
+    stdin_open = True
     try:
         while True:
             # Apply any resize requested by the SIGWINCH handler, on THIS thread
@@ -576,16 +765,21 @@ def main():
                     apply_resize()
                 except Exception:
                     pass
+
+            rset = [master_fd, wake_r]
+            if stdin_open:
+                rset.append(stdin_fd)
+            wset = [master_fd] if pend else []   # only wait for writable with a backlog
             try:
                 # The self-pipe (set_wakeup_fd) normally wakes us instantly on a
                 # SIGWINCH. The 1s timeout is a belt-and-suspenders fallback: if
                 # set_wakeup_fd is ever unavailable, a pending resize is still
                 # applied (top of loop) within ~1s instead of never -- without
                 # busy-waiting when idle.
-                r, _, _ = select.select(
-                    [sys.stdin.fileno(), master_fd, wake_r], [], [], 1.0)
+                r, w, _ = select.select(rset, wset, [], 1.0)
             except (OSError, select.error):
                 break
+
             if wake_r in r:
                 # Drain the signal-wakeup pipe; the winch flag (checked at the
                 # top of the loop) carries the actual intent.
@@ -594,56 +788,67 @@ def main():
                         pass
                 except OSError:
                     pass
-            if sys.stdin.fileno() in r:
+
+            if stdin_open and stdin_fd in r:
                 try:
-                    data = os.read(sys.stdin.fileno(), 4096)
+                    data = os.read(stdin_fd, 4096)
                 except OSError:
                     data = b""
-                if data:
-                    os.write(master_fd, data)
+                if not data:
+                    # stdin EOF (#7): stop selecting on it. The OLD loop only
+                    # forwarded `if data:` and never dropped stdin, so after EOF
+                    # select reported it readable forever -> 100% CPU busy-spin
+                    # (e.g. under nohup/disown where SIGHUP doesn't kill). We keep
+                    # relaying the child's output until the child itself exits.
+                    stdin_open = False
+                else:
+                    pend += data
+                    if not flush_to_child():
+                        break
+
+            if pend and master_fd in w:
+                if not flush_to_child():
+                    break
+
             if master_fd in r:
                 try:
                     out = os.read(master_fd, 8192)
+                except BlockingIOError:
+                    out = None                 # spurious readable; nothing to do
                 except OSError:
-                    out = b""
-                if not out:
                     break
-                os.write(sys.stdout.fileno(), out)     # transparent passthrough
-                with screen_lock:
-                    try:
-                        stream.feed(out)               # mirror into the emulator
-                    except Exception:
-                        pass
-                try:
-                    evaluate()
-                except Exception:
-                    pass
+                if out == b"":
+                    break                      # child closed the PTY -> exit
+                if out:
+                    if not write_all_stdout(out):      # full, partial-safe passthrough (#5)
+                        break                  # terminal gone: exit so we reap the child
+                    with screen_lock:
+                        try:
+                            stream.feed(out)   # mirror into the emulator
+                        except Exception:
+                            pass
+            # State evaluation is the monitor thread's job ONLY (sole evaluator, #9):
+            # no inline evaluate() here, so the two threads can't race the `state`
+            # dict / debounce or tear a g_meta read. The monitor re-evaluates every
+            # POLL_MS, which is plenty responsive for an away-from-keyboard alert.
     finally:
+        cleanup()
+
+    # Propagate claude's exit code. cleanup() has already closed master_fd, so a
+    # child still alive on an abnormal break path gets SIGHUP and exits; we poll
+    # briefly, then escalate to SIGKILL so the wrapper can NEVER block here forever
+    # (the old unconditional os.waitpid(pid, 0) hung if the child ignored the
+    # hangup). SystemExit from sys.exit() is not an Exception, so it propagates.
+    try:
+        for _ in range(50):                             # ~5s grace
+            wpid, status = os.waitpid(pid, os.WNOHANG)
+            if wpid:
+                sys.exit(os.waitstatus_to_exitcode(status))
+            time.sleep(0.1)
         try:
-            signal.set_wakeup_fd(-1)
-        except Exception:
-            pass
-        for _fd in (wake_r, wake_w):
-            try:
-                os.close(_fd)
-            except OSError:
-                pass
-        if old is not None:
-            try:
-                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
-            except Exception:
-                pass
-        send_daemon("end")                              # deregister this session
-        try:
-            if os.path.exists(CTRL_SOCK):
-                os.unlink(CTRL_SOCK)
+            os.kill(pid, signal.SIGKILL)
         except OSError:
             pass
-        if dbg:
-            dbg.close()
-
-    # Propagate claude's exit code.
-    try:
         _, status = os.waitpid(pid, 0)
         sys.exit(os.waitstatus_to_exitcode(status))
     except Exception:
