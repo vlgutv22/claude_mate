@@ -327,25 +327,32 @@ static void drawCard() {
     display.setTextSize(1);
     int16_t mx = 0;
     if (curModel[0]) {
-      display.setCursor(0, 8);
+      display.setCursor(0, 11);
       display.print(curModel);
       mx = (int16_t)strlen(curModel) * 6;
     }
     if (curModel[0] && curEffort[0]) {
-      display.fillCircle(mx + 2, 11, 1, SSD1306_WHITE);      // "·" separator
+      display.fillCircle(mx + 2, 14, 1, SSD1306_WHITE);      // "·" separator
       mx += 6;
     }
     if (curEffort[0]) {
-      display.setCursor(mx, 8);
+      display.setCursor(mx, 11);
       display.print(curEffort);
     }
   }
 
-  // ---- Bottom line (size 2): STATUS + time ----
-  // Sits at y=16 when a model row is present (3-line card), else keeps the
-  // original vertically-centred y=14 (2-line card).
-  display.setTextSize(2);
-  display.setCursor(0, hasMeta ? 16 : 14);
+  // ---- Status + time ----
+  // 3-line card (model row present): keep the status SMALL (size 1) too, so the
+  // three rows (name y0 / model·effort y11 / status y22) share the 32px panel
+  // evenly instead of the big size-2 word crowding/overflowing the others.
+  // 2-line card (no model row): the status stays big (size 2) and centred.
+  if (hasMeta) {
+    display.setTextSize(1);
+    display.setCursor(0, 22);
+  } else {
+    display.setTextSize(2);
+    display.setCursor(0, 14);
+  }
   display.print(shortState(curState));
   display.print(' ');
   display.print(curRuntime[0] ? curRuntime : "-");
