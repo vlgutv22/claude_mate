@@ -49,10 +49,14 @@
  * SERIAL PROTOCOL (115200 8N1, ASCII lines terminated by '\n', fields split '|')
  *   Daemon -> Arduino:
  *     D|<word>                                       word = FREE|WIP|BLOCKED|WTF
- *     S|<idx>|<total>|<name>|<state>|<runtime>|<limit>|<ack>
- *         state = working | waiting | error | done | idle
- *         ack   = 1 acknowledged / 0 not (optional; alert states show a dot:
- *                 filled+blinking = unacknowledged, hollow = acknowledged)
+ *     S|<idx>|<total>|<name>|<state>|<runtime>|<limit>|<ack>|<model>|<effort>
+ *         state  = working | waiting | error | done | idle
+ *         ack    = 1 acknowledged / 0 not (optional; alert states show a dot:
+ *                  filled+blinking = unacknowledged, hollow = acknowledged)
+ *         model  = model name, e.g. "Opus 4.8" (optional; PTY-wrapper sessions)
+ *         effort = effort level, e.g. "xhigh"  (optional; PTY-wrapper sessions)
+ *                  model/effort render as a small "model · effort" middle row;
+ *                  omitted/empty keeps the original two-line card.
  *     I                                              idle screen (no sessions)
  *     P                                              ping/keepalive (we reply H)
  *     V|<kind>                                       buzz now; kind = START|DONE|
@@ -86,7 +90,8 @@
 
 // ---- Protocol constants ------------------------------------------------------
 #define SERIAL_BAUD    115200
-#define LINE_MAX       72      // cap input line length to bound RAM use
+#define LINE_MAX       96      // cap input line length to bound RAM use
+                               // (fits S card + name + model + effort fields)
 #define DEBOUNCE_MS    200UL   // ~200ms button debounce
 
 // Status words. Index order matches escalation FREE<WIP<BLOCKED<WTF.
@@ -106,6 +111,8 @@ static bool  lineOverflow = false;   // drop the rest of an over-long line
 static char  curName[21]  = {0};     // up to 20 chars + NUL
 static char  curRuntime[8] = {0};
 static char  curLimit[8]  = {0};
+static char  curModel[14]  = {0};    // model name, e.g. "Opus 4.8" (may be empty)
+static char  curEffort[12] = {0};    // effort level, e.g. "xhigh"   (may be empty)
 static uint8_t curIdx   = 0;
 static uint8_t curTotal = 0;
 static uint8_t curState = ST_IDLE;
@@ -311,9 +318,34 @@ static void drawCard() {
   display.setCursor(px, 0);
   display.print(pos);
 
+  // ---- Middle line (size 1): "model · effort" (PTY-wrapper sessions only) ----
+  // Drawn only when we actually have model/effort, so hook-driven cards keep the
+  // original two-line look. The separator is a small filled dot to match the
+  // device's ack-dot aesthetic (the classic 6x8 font has no real middot glyph).
+  bool hasMeta = (curModel[0] || curEffort[0]);
+  if (hasMeta) {
+    display.setTextSize(1);
+    int16_t mx = 0;
+    if (curModel[0]) {
+      display.setCursor(0, 8);
+      display.print(curModel);
+      mx = (int16_t)strlen(curModel) * 6;
+    }
+    if (curModel[0] && curEffort[0]) {
+      display.fillCircle(mx + 2, 11, 1, SSD1306_WHITE);      // "·" separator
+      mx += 6;
+    }
+    if (curEffort[0]) {
+      display.setCursor(mx, 8);
+      display.print(curEffort);
+    }
+  }
+
   // ---- Bottom line (size 2): STATUS + time ----
+  // Sits at y=16 when a model row is present (3-line card), else keeps the
+  // original vertically-centred y=14 (2-line card).
   display.setTextSize(2);
-  display.setCursor(0, 14);
+  display.setCursor(0, hasMeta ? 16 : 14);
   display.print(shortState(curState));
   display.print(' ');
   display.print(curRuntime[0] ? curRuntime : "-");
@@ -375,13 +407,14 @@ static void handleLine(char *line) {
       break;
     }
 
-    case 'S': {                          // S|idx|total|name|state|runtime|limit|ack
-      // Tokenize in place on '|'. 7 core tokens (type + 6) + optional 8th 'ack'.
-      char *fields[8];
+    case 'S': {  // S|idx|total|name|state|runtime|limit|ack|model|effort
+      // Tokenize in place on '|'. 7 core tokens (type + 6), optional 8th 'ack',
+      // optional 9th 'model' and 10th 'effort'.
+      char *fields[10];
       uint8_t n = 0;
       char *p = line;
       fields[n++] = p;                   // fields[0] = "S"
-      while (n < 8) {
+      while (n < 10) {
         char *bar = strchr(p, '|');
         if (!bar) break;
         *bar = 0;
@@ -398,6 +431,10 @@ static void handleLine(char *line) {
       // 8th field (if present): "1" acknowledged, "0" not. Default acknowledged
       // so an older daemon (7 fields) never shows a spurious blinking dot.
       curAck = (n < 8) || (fields[7][0] != '0');
+      // 9th/10th fields (if present): model + effort. Empty when an older daemon
+      // or a hook-driven session omits them -- drawCard just skips the row then.
+      copyField(curModel,  sizeof(curModel),  (n > 8) ? fields[8] : "");
+      copyField(curEffort, sizeof(curEffort), (n > 9) ? fields[9] : "");
       showIdle = false;
       render();
       break;
@@ -493,6 +530,9 @@ void setup() {
 
   display.clearDisplay();
   display.display();
+  // Clip overflowing text at the screen edge instead of wrapping it onto the
+  // next row (which would corrupt the multi-line card layout).
+  display.setTextWrap(false);
 
   // Default to FREE and the idle screen until the daemon talks to us.
   curWord = W_FREE;

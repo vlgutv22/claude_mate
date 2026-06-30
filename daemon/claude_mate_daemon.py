@@ -126,6 +126,8 @@ class Session:
     started_ts: Optional[float] = None  # when current 'working' turn began
     last_runtime: float = 0.0      # last completed turn duration (seconds)
     limit: str = "-"               # best-effort rate/usage string; "-" if unknown
+    model: str = ""                # model in use, e.g. "Opus 4.8" (PTY wrapper)
+    effort: str = ""               # effort level, e.g. "xhigh" (PTY wrapper)
     focus_ctrl: str = ""           # PTY-wrapper control socket for FOCUS (if any)
     acked: bool = True             # alert (done/waiting/error) seen by the human?
 
@@ -162,7 +164,8 @@ class Registry:
         self._sessions: Dict[str, Session] = {}
 
     def update(self, state: str, sid: str, name: str, cwd: str = "",
-               focus_ctrl: str = "") -> Optional[str]:
+               focus_ctrl: str = "", model: str = "",
+               effort: str = "") -> Optional[str]:
         """Apply a status update from a hook, the PTY wrapper, or the mock injector.
 
         Returns the one-shot haptic KIND to buzz NOW for this session's own
@@ -194,6 +197,10 @@ class Registry:
                 sess.cwd = cwd
             if focus_ctrl:
                 sess.focus_ctrl = focus_ctrl
+            if model:
+                sess.model = model
+            if effort:
+                sess.effort = effort
             prev_state = sess.state
             sess.last_update_ts = now
 
@@ -499,7 +506,13 @@ class Display:
         # 8th field: acknowledged? (1/0). The firmware shows a blinking dot for
         # an unacknowledged alert, a hollow dot once acknowledged (focused).
         ack = "1" if sess.acked else "0"
-        line = f"S|{idx}|{total}|{name}|{sess.state}|{runtime}|{limit}|{ack}"
+        # 9th/10th fields: model + effort (PTY-wrapper sessions only; empty for
+        # hook-driven ones). Capped so the line stays within the firmware's
+        # LINE_MAX. The firmware draws them as a small "model · effort" row.
+        model = (sess.model or "").replace("|", "/").replace("\n", " ")[:12]
+        effort = (sess.effort or "").replace("|", "/").replace("\n", " ")[:10]
+        line = (f"S|{idx}|{total}|{name}|{sess.state}|{runtime}|{limit}|{ack}"
+                f"|{model}|{effort}")
         self._link.write_line(line)
 
     def show_index(self, index: int, sessions: Optional[List[Session]] = None) -> None:
@@ -738,13 +751,17 @@ class SocketServer(threading.Thread):
             return
         if not line:
             return
-        # Expected: "<state>|<session_id>|<name>|<ctrl_sock?>".
+        # Expected: "<state>|<session_id>|<name>|<ctrl_sock?>|<model?>|<effort?>".
+        # The hook path sends only the first three fields; the PTY wrapper adds
+        # the control socket and (when it has scraped them) the model + effort.
         # state may be "end" (from the PTY wrapper) to remove the session.
         parts = line.split("|")
         state = parts[0].strip() if len(parts) > 0 else ""
         sid = parts[1].strip() if len(parts) > 1 else ""
         name = parts[2].strip() if len(parts) > 2 else ""
         ctrl = parts[3].strip() if len(parts) > 3 else ""  # wrapper focus socket
+        model = parts[4].strip() if len(parts) > 4 else ""
+        effort = parts[5].strip() if len(parts) > 5 else ""
         if not state:
             log(f"ignoring malformed socket line: {line!r}")
             return
@@ -756,7 +773,8 @@ class SocketServer(threading.Thread):
                 self._on_update()
             return
         log(f"socket update: state={state} sid={sid or '-'} name={name or '-'}")
-        haptic = self._reg.update(state, sid, name, focus_ctrl=ctrl)
+        haptic = self._reg.update(state, sid, name, focus_ctrl=ctrl,
+                                  model=model, effort=effort)
         self._on_update()
         if haptic and self._on_haptic:
             log(f"haptic: buzz {haptic} for {name or sid} ({state})")
@@ -968,10 +986,18 @@ class MockInjector(threading.Thread):
         for (sid, name, cwd), st in zip(fakes, seeds):
             self._reg.update(st, sid, name, cwd)
             # Set a fake limit on one of them to exercise the field.
-        with self._reg._lock:  # set a demo limit string directly
+        demo_meta = {
+            "webapp": ("Opus 4.8", "xhigh"),
+            "api":    ("Sonnet 4.6", "high"),
+            "infra":  ("Haiku 4.5", "medium"),
+            "notes":  ("Opus 4.8", "max"),
+        }
+        with self._reg._lock:  # set demo limit / model / effort strings directly
             for s in self._reg._sessions.values():
                 if s.name == "webapp":
                     s.limit = "71%"
+                if s.name in demo_meta:
+                    s.model, s.effort = demo_meta[s.name]
         self._on_update()
 
         step = 0

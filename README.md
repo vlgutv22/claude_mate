@@ -13,6 +13,7 @@ in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
 ```
         ┌────────────────────────────────┐
         │ ● api-server              2/4   │   ← ack dot · session name · card index
+        │ Opus 4.8 · xhigh                │   ← model · effort (PTY-wrapper sessions)
         │ WAIT  04:12                     │   ← big STATE word · live time-in-state
         └────────────────────────────────┘
               ((•)) vibration motor             ← buzzes per session, when IT needs you
@@ -127,8 +128,8 @@ hooks are the zero-dependency feed. Use whichever fits each session.
                             ▼
    ┌──────────────────────────────────────────────┐
    │   Arduino Nano (ATmega328P)                  │
-   │   • SSD1306 128x32 OLED — status card:       │
-   │     ack dot · name · idx/total · STATE · timer│
+   │   • SSD1306 128x32 OLED — status card: ack    │
+   │     dot · name · idx · model·effort · STATE   │
    │   • micro vibration motor (D5) plays V|<KIND>│
    │   • FOCUS / NEXT / PREV buttons → B|<n>       │
    └──────────────────────────────────────────────┘
@@ -268,7 +269,11 @@ substrings matched against the rendered TUI, grouped as `error` / `waiting` /
 idle). Matching is scoped to Claude's **live status region** (the bottom ~20
 non-empty lines) for error/waiting/busy, and to the **footer** (~4 lines) for the
 generic picker phrases — so the same keywords in scrollback, logs, code, or
-conversation above don't false-trigger.
+conversation above don't false-trigger. The footer phrases are limited to
+`to select` / `to navigate` (a real question picker), and a footer-only `waiting`
+must **persist a couple of seconds** before it reports — so a config dialog you
+open and dismiss (the `/effort` or `/model` slider, whose footer is
+`… · Esc to cancel`) no longer buzzes the instant you open it.
 
 ---
 

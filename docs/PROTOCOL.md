@@ -28,7 +28,7 @@ input buffer and drops malformed/oversized lines).
 | Line                                                  | Meaning |
 |-------------------------------------------------------|---------|
 | `D\|<word>`                                           | Set the status word. `<word>` is one of `FREE`, `WIP`, `BLOCKED`, `WTF`. The Arduino draws the big word on the OLED **and** fires the vibration haptic **when the word changes** (WTF = 3 pulses, BLOCKED = 2 pulses, FREE = 1 short tick, WIP = silent). |
-| `S\|<idx>\|<total>\|<name>\|<state>\|<runtime>\|<limit>` | Show one session card (the carousel step). See field table below. |
+| `S\|<idx>\|<total>\|<name>\|<state>\|<runtime>\|<limit>\|<ack>\|<model>\|<effort>` | Show one session card (the carousel step). See field table below. `ack`/`model`/`effort` are optional trailing fields — older daemons omit them and the firmware copes. |
 | `I`                                                   | Idle screen — no active sessions. The daemon also sends `D\|FREE` alongside it. |
 | `P`                                                   | Ping / keepalive. The Arduino MAY ignore it, or reply with `H`. |
 
@@ -46,14 +46,23 @@ input buffer and drops malformed/oversized lines).
 | `state`   | One of: `working`, `waiting`, `error`, `done`, `idle`. |
 | `runtime` | Like `03:21` (mm:ss) or `1:04` (h:mm). |
 | `limit`   | Short string like `71%`, or `-` when unknown. |
+| `ack`     | `1` acknowledged / `0` not (optional). Alert states draw a top-left dot: filled+blinking = unacknowledged, hollow = acknowledged. |
+| `model`   | Model in use, e.g. `Opus 4.8` (optional; PTY-wrapper sessions only, ≤12 chars). |
+| `effort`  | Effort level, e.g. `xhigh` (optional; PTY-wrapper sessions only, ≤10 chars). |
+
+When `model`/`effort` are present the firmware draws a small `model · effort`
+row between the name and the big status word; when both are empty it keeps the
+original two-line card. They are scraped from Claude's TUI by the PTY wrapper
+(welcome-box header + the `◉ <effort>` pill) and cached per session.
 
 Example:
 
 ```
-S|1|3|claude-mat|error|03:21|71%
+S|1|3|claude-mat|error|03:21|-|0|Opus 4.8|xhigh
 ```
 
-(idx 1 of 3, name truncated to 10 chars, state `error`, runtime `03:21`, limit `71%`.)
+(idx 1 of 3, name truncated, state `error`, runtime `03:21`, no limit,
+unacknowledged, model `Opus 4.8`, effort `xhigh`.)
 
 ### 1b. Arduino → Daemon
 
@@ -78,14 +87,21 @@ re-draws whatever word and card the daemon re-sends.
 **Framing:** one **newline-terminated** line per message.
 
 ```
-<state>|<session_id>|<name>
+<state>|<session_id>|<name>[|<ctrl_sock>|<model>|<effort>]
 ```
 
 | Field        | Description |
 |--------------|-------------|
-| `state`      | One of: `working`, `waiting`, `done`, `error`. |
+| `state`      | One of: `working`, `waiting`, `done`, `error` (or `idle`/`end` from the PTY wrapper). |
 | `session_id` | The Claude Code session id. **MAY be empty** if not provided. |
 | `name`       | Basename of `cwd`. |
+| `ctrl_sock`  | (PTY wrapper) per-session control socket FOCUS connects to. Empty for hooks. |
+| `model`      | (PTY wrapper) model in use, e.g. `Opus 4.8`. Empty until scraped / for hooks. |
+| `effort`     | (PTY wrapper) effort level, e.g. `xhigh`. Empty until scraped / for hooks. |
+
+The hook path sends only the first three fields; the PTY wrapper appends the
+control socket and (once scraped) the model + effort. All trailing fields are
+optional — the daemon defaults missing ones to empty.
 
 The hook is **fire-and-forget**: it connects with a short timeout, writes one
 line, and exits **0** regardless of outcome. If the daemon/socket is down it

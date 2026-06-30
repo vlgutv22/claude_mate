@@ -1,5 +1,5 @@
 {
-  "_comment": "Live state-detection tuning for bin/claude-mate-wrap. Case-insensitive substrings matched against the rendered claude TUI screen. Hot-reloaded (~0.25s), no restart. Precedence: error > waiting > waiting_footer > busy > idle. Matching is scoped to Claude's LIVE STATUS REGION (bottom ~20 non-empty lines) for error/waiting/busy, so error/prompt keywords in scrollback/logs/code/conversation above don't false-trigger. 'waiting_footer' holds GENERIC picker phrases matched ONLY in the last ~4 lines.",
+  "_comment": "Live state-detection tuning for bin/claude-mate-wrap. Case-insensitive substrings matched against the rendered claude TUI screen. Hot-reloaded (~0.25s), no restart. Precedence: error > waiting > waiting_footer > busy > idle. Matching is scoped to Claude's LIVE STATUS REGION (bottom ~20 non-empty lines) for error/waiting/busy, so error/prompt keywords in scrollback/logs/code/conversation above don't false-trigger. 'waiting_footer' holds GENERIC question/option-picker phrases matched ONLY in the last ~4 lines, AND (in the wrapper) must persist a few seconds before it counts as waiting, so a picker you open and dismiss doesn't buzz. NOTE: 'esc to cancel' / 'esc to go back' are deliberately NOT here — user-opened config dialogs (the /effort and /model sliders) share that footer, so matching it falsely buzzed the instant you typed /effort. A genuine AskUserQuestion picker carries 'to select' / 'to navigate', which those sliders do not.",
 
   "error": [
     "api error",
@@ -25,9 +25,7 @@
 
   "waiting_footer": [
     "to select",
-    "to navigate",
-    "esc to cancel",
-    "esc to go back"
+    "to navigate"
   ],
 
   "busy": [

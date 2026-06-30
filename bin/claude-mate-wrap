@@ -83,9 +83,14 @@ DEFAULT_PATTERNS = {
     # selectors) mean WAITING for your choice -- e.g. "Enter to select ·
     # Tab/Arrow keys to navigate · Esc to cancel". These words are GENERIC, so
     # detect_state matches them ONLY in the footer (last few non-empty lines),
-    # never against conversation/file content higher up the screen.
+    # never against conversation/file content higher up the screen, AND a footer
+    # match must PERSIST (WAITING_FOOTER_DEBOUNCE_S) before it reports as waiting.
+    # NOTE: "esc to cancel" / "esc to go back" are intentionally absent -- the
+    # /effort and /model sliders carry that footer, so matching it buzzed the
+    # instant you opened one. A real question picker carries "to select" /
+    # "to navigate"; those config sliders do not.
     "waiting_footer": [
-        "to select", "to navigate", "esc to cancel", "esc to go back",
+        "to select", "to navigate",
     ],
     # Signals that appear ONLY when genuinely generating: the interrupt hint
     # ("esc to interrupt", distinct from a picker's "esc to cancel") and the
@@ -127,6 +132,14 @@ def load_patterns():
 
 POLL_MS = 0.25            # re-evaluate the screen this often (quiescence)
 DEBOUNCE_S = 0.30         # require a state to persist before reporting it
+# A "waiting" detected ONLY from the generic option-picker footer must persist
+# this long before we report it. A real AskUserQuestion/permission picker sits
+# there until you answer; a config dialog you open and dismiss (/effort, /model,
+# /config) is gone in ~1s -- so this debounce stops those transient pickers from
+# buzzing while still catching genuine prompts (just ~2.5s later, which is fine
+# for an away-from-keyboard alert). Specific waiting text (permission prompts)
+# is unaffected -- it still reports at DEBOUNCE_S.
+WAITING_FOOTER_DEBOUNCE_S = 2.5
 KEEPALIVE_S = 20.0        # re-send current state periodically
 
 # How many non-empty bottom lines count as Claude's "live status region". State
@@ -158,12 +171,18 @@ def set_winsize(fd, rows, cols):
 # Daemon reporting
 # --------------------------------------------------------------------------- #
 def send_daemon(state):
-    """Best-effort one-line report to the daemon. Never raises."""
+    """Best-effort one-line report to the daemon. Never raises.
+
+    Wire format: state|SID|NAME|CTRL_SOCK|MODEL|EFFORT  (model/effort may be
+    empty until captured from the screen; the daemon and firmware both treat
+    the trailing fields as optional, so older peers stay compatible)."""
+    model = g_meta["model"].replace("|", "/")
+    effort = g_meta["effort"].replace("|", "/")
     try:
         c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         c.settimeout(0.5)
         c.connect(DAEMON_SOCK)
-        c.sendall(f"{state}|{SID}|{NAME}|{CTRL_SOCK}\n".encode())
+        c.sendall(f"{state}|{SID}|{NAME}|{CTRL_SOCK}|{model}|{effort}\n".encode())
         c.close()
     except OSError:
         pass
@@ -277,6 +296,38 @@ def ctrl_listener():
             focus_self()
 
 # --------------------------------------------------------------------------- #
+# Model + effort capture from the rendered screen
+# --------------------------------------------------------------------------- #
+# Claude's TUI shows the model and effort in a couple of reliable spots:
+#   - the welcome box header line, e.g.
+#       "│   Opus 4.8 (1M context) with xhigh · Claude Max ·   │"
+#   - an effort "pill" above the prompt / in the /model dialog, e.g.
+#       "◉ xhigh · /effort"   /   "◉ xHigh effort ←/→ to adjust"
+# Neither is guaranteed to stay on-screen once a long conversation scrolls, so
+# we capture opportunistically and CACHE the last seen values per session (the
+# model is captured at boot from the welcome box; effort is refreshed whenever
+# the pill is visible, e.g. after you change it). Both are scoped tightly so the
+# same words appearing in ordinary conversation/code can't be mistaken for them:
+#   - the model must sit inside the welcome box (between a "│" border and a "·").
+#   - the effort must directly follow the "◉" pill glyph and be a known level.
+_MODEL_RE = re.compile(
+    r'│[^│\n]*?\b((?:Opus|Sonnet|Haiku|Fable)\s+[0-9.]+)[^│\n]*·', re.I)
+_EFFORT_RE = re.compile(
+    r'◉\s*(low|medium|high|xhigh|max|ultracode)\b', re.I)
+
+# Last-known model/effort for THIS session (sticky cache).
+g_meta = {"model": "", "effort": ""}
+
+def parse_meta(screen_text):
+    """Refresh g_meta from the current screen if model/effort are visible."""
+    m = _MODEL_RE.search(screen_text)
+    if m:
+        g_meta["model"] = " ".join(m.group(1).split())   # collapse stray spaces
+    e = _EFFORT_RE.search(screen_text)
+    if e:
+        g_meta["effort"] = e.group(1).lower()
+
+# --------------------------------------------------------------------------- #
 # State detection from the rendered screen
 # --------------------------------------------------------------------------- #
 def detect_state(screen_text):
@@ -284,23 +335,27 @@ def detect_state(screen_text):
     # not the whole scrollback. Error/prompt/generating chrome renders there, so
     # the same keywords appearing in conversation / logs / code / file content
     # higher up no longer false-trigger the state.
+    #
+    # Returns (state, source). `source` lets evaluate() debounce a footer-only
+    # "waiting" (generic picker) longer than a specific permission prompt, so a
+    # config dialog you open and dismiss can't buzz.
     nonblank = [ln for ln in screen_text.splitlines() if ln.strip()]
     tail = "\n".join(nonblank[-STATUS_TAIL_LINES:]).lower()
     footer = "\n".join(nonblank[-FOOTER_LINES:]).lower()
 
     if any(p in tail for p in _patterns["error"]):
-        return "error"
+        return ("error", "error")
     if any(p in tail for p in _patterns["waiting"]):
-        return "waiting"
+        return ("waiting", "specific")
     # A genuine picker is NOT generating: if the live region shows the
     # "esc to interrupt" / background-work hint, that wins over generic picker
     # words that may be incidental near the bottom.
     busy_now = any(p in tail for p in _patterns["busy"])
     if not busy_now and any(p in footer for p in _patterns.get("waiting_footer", [])):
-        return "waiting"
+        return ("waiting", "footer")
     if busy_now:
-        return "working"
-    return "idle"
+        return ("working", "busy")
+    return ("idle", "idle")
 
 # --------------------------------------------------------------------------- #
 # Locate the real `claude` (avoid recursing into this wrapper)
@@ -373,28 +428,41 @@ def main():
     stream = pyte.ByteStream(screen)
     screen_lock = threading.Lock()
 
-    state = {"cur": "idle", "reported": None, "pending": None, "since": 0.0,
-             "last_sent": 0.0}
+    state = {"cur": "idle", "reported": None, "pending": None,
+             "pending_src": "idle", "since": 0.0, "last_sent": 0.0,
+             "meta_reported": ("", "")}
     dbg = open(DEBUG, "a") if DEBUG else None
 
     def evaluate():
         with screen_lock:
             text = "\n".join(screen.display)
-        new = detect_state(text)
+        parse_meta(text)                       # refresh cached model/effort
+        new, src = detect_state(text)
         now = time.monotonic()
         if new != state["pending"]:
             state["pending"] = new
             state["since"] = now
+        state["pending_src"] = src             # latest source governs the hold
+        # A footer-only "waiting" must persist longer than a normal transition
+        # so a config dialog you open and dismiss (/effort, /model) never reports.
+        hold = (WAITING_FOOTER_DEBOUNCE_S
+                if (state["pending"] == "waiting" and src == "footer")
+                else DEBOUNCE_S)
         # Promote a pending state once it has been stable long enough.
-        if state["pending"] != state["cur"] and (now - state["since"]) >= DEBOUNCE_S:
+        if state["pending"] != state["cur"] and (now - state["since"]) >= hold:
             state["cur"] = state["pending"]
-        # Report on change, or as a periodic keepalive.
-        if state["cur"] != state["reported"] or (now - state["last_sent"]) >= KEEPALIVE_S:
+        # Report on a state change, when model/effort first become known (or
+        # change), or as a periodic keepalive.
+        meta = (g_meta["model"], g_meta["effort"])
+        if (state["cur"] != state["reported"] or meta != state["meta_reported"]
+                or (now - state["last_sent"]) >= KEEPALIVE_S):
             state["reported"] = state["cur"]
+            state["meta_reported"] = meta
             state["last_sent"] = now
             send_daemon(state["cur"])
             if dbg:
-                dbg.write(f"\n===== {time.strftime('%H:%M:%S')} state={state['cur']} =====\n")
+                dbg.write(f"\n===== {time.strftime('%H:%M:%S')} state={state['cur']} "
+                          f"model={meta[0]!r} effort={meta[1]!r} =====\n")
                 dbg.write(text + "\n")
                 dbg.flush()
 
