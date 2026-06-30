@@ -92,12 +92,16 @@ DEFAULT_PATTERNS = {
     "waiting_footer": [
         "to select", "to navigate",
     ],
-    # Signals that appear ONLY when genuinely generating: the interrupt hint
-    # ("esc to interrupt", distinct from a picker's "esc to cancel") and the
-    # explicit "still running in the background" footer.
+    # Signals that appear ONLY when genuinely generating, OR when the turn has
+    # "ended" but background work is still running: the interrupt hint ("esc to
+    # interrupt", distinct from a picker's "esc to cancel"), the "running in the
+    # background" footer, a pending dynamic workflow / tool, and a pending
+    # background agent ("Waiting for N background agent(s) to finish" -- the
+    # Explore/subagent status line, which carries no "esc to interrupt").
     "busy": [
         "esc to interrupt", "running in the background",
         "workflow to finish", "tool to finish",
+        "background agent", "agent to finish",
     ],
 }
 

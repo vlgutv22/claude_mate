@@ -32,6 +32,8 @@
     "esc to interrupt",
     "running in the background",
     "workflow to finish",
-    "tool to finish"
+    "tool to finish",
+    "background agent",
+    "agent to finish"
   ]
 }
