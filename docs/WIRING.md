@@ -37,8 +37,8 @@ buzz fires once on the transition into a new word, not while the state holds.
 |-------------------------|-------------|-------|
 | OLED VCC                | 5V          | SSD1306 0.91" 128x32, I2C (module pin order: GND/VCC/SCK/SDA) |
 | OLED GND                | GND         | common ground |
-| OLED SDA                | **A4**      | I2C data (hardware SDA on the 328P) |
-| OLED SCL                | **A5**      | I2C clock (hardware SCL on the 328P) |
+| OLED SDA                | **A4**      | I2C data |
+| OLED SCL                | **A3**      | I2C clock — **software (bit-banged) I2C** (hardware SCL A5 was damaged; the 328P's TWI is fixed to A4/A5 and can't be remapped, so SCL moved to the plain GPIO A3). See `firmware/claude_mate/softssd1306.h`. |
 | FOCUS button            | **D2**      | `INPUT_PULLUP`; other leg to GND |
 | NEXT button             | **D3**      | `INPUT_PULLUP`; other leg to GND |
 | PREV button             | **D4**      | `INPUT_PULLUP`; other leg to GND |
@@ -154,7 +154,7 @@ That's the whole story — no separate supply, no homing, no endstop.
         Arduino Nano (ATmega328P)
         +-----------------------+
    5V --| 5V              A4(SDA)|---- OLED SDA
-  GND --| GND             A5(SCL)|---- OLED SCL
+  GND --| GND             A3(SCL)|---- OLED SCL  (software I2C; A5 was damaged)
         |                       |
         |                    D2 |---- FOCUS button --- GND   (INPUT_PULLUP)
         |                    D3 |---- NEXT  button --- GND   (INPUT_PULLUP)
@@ -164,7 +164,7 @@ That's the whole story — no separate supply, no homing, no endstop.
         |                       |       (module, or NPN+1k+1N4148, or ULN2003 ch.)
         +-----------------------+
 
-  OLED module: VCC->5V, GND->GND, SDA->A4, SCL->A5   (I2C addr 0x3C)
+  OLED module: VCC->5V, GND->GND, SDA->A4, SCL->A3   (software I2C, addr 0x3C)
   Vibration motor: powered from the USB 5V rail, common ground, flyback diode
   across the motor. The motor buzzes only when the status word changes.
 ```

@@ -29,8 +29,8 @@
  *   Adafruit GFX/SSD1306 pull in Adafruit BusIO + Wire (bundled with the IDE).
  *
  * PIN MAP (Arduino Nano, ATmega328P):
- *   OLED SSD1306 128x32 (0.91") over I2C:
- *     VCC -> 5V, GND -> GND, SDA -> A4, SCL -> A5
+ *   OLED SSD1306 128x32 (0.91") over SOFTWARE I2C (hardware SCL A5 was damaged):
+ *     VCC -> 5V, GND -> GND, SDA -> A4, SCL -> A3  (bit-banged; see softssd1306.h)
  *     I2C address 0x3C (common alternative: 0x3D)
  *   Buttons (INPUT_PULLUP, other leg to GND):
  *     FOCUS button -> D2   (emits "B|1")
@@ -72,14 +72,17 @@
  * literals, and avoid String churn in loop().
  */
 
-#include <Wire.h>
 #include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+// Hardware I2C SCL (A5) was damaged, so the OLED runs on SOFTWARE I2C with SCL on
+// A3 (a plain GPIO; the 328P's TWI is fixed to A4/A5 and can't be remapped) and
+// SDA on A4. softssd1306.h is a drop-in Adafruit_GFX subclass, so all the drawing
+// code below is unchanged. To go back to hardware I2C (A4/A5), restore the
+// Adafruit_SSD1306 + <Wire.h> include and the matching constructor.
+#include "softssd1306.h"      // defines OLED_SW_SCL=A3, OLED_SW_SDA=A4
 
 // ---- OLED configuration ------------------------------------------------------
 #define SCREEN_WIDTH   128
 #define SCREEN_HEIGHT  32     // 0.91" SSD1306 (use 64 for a 0.96" panel)
-#define OLED_RESET     -1      // share Arduino reset pin (no dedicated reset)
 #define SCREEN_ADDRESS 0x3C    // common alternative: 0x3D
 
 // ---- Pin map -----------------------------------------------------------------
@@ -100,7 +103,7 @@ enum Word { W_FREE = 0, W_WIP, W_BLOCKED, W_WTF };
 // Session states (parsed from the S command)
 enum State { ST_IDLE = 0, ST_WORKING, ST_WAITING, ST_ERROR, ST_DONE };
 
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+SoftSSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT);   // software I2C on A3(SCL)/A4(SDA)
 
 // ---- Serial line assembly ----------------------------------------------------
 static char  lineBuf[LINE_MAX];
