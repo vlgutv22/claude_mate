@@ -387,8 +387,8 @@ def parse_meta(screen_text):
 # detect_state), a meter string QUOTED higher up in the conversation (such as in
 # these comments) sits outside that window and no longer false-reads as "working".
 _WORKING_METER_RE = re.compile(
-    r'[↑↓]\s*[\d.,]+\s*tokens?\b'             # ↓ 610 tokens / ↑ 1,204 tokens
-    r'|\(\s*\d+\s*s\b[^)\n]*\btokens?\b'      # (14s · … 610 tokens …)
+    r'[↑↓]\s*[\d.,]+\s*[kKmM]?\s*tokens?\b'   # ↓ 610 tokens / ↓ 79.9k tokens / ↑ 1,204 tokens
+    r'|\(\s*\d+\s*[hms]\b[^)\n]*\btokens?\b'  # (14s · … tokens …) / (1h 4m 30s · … tokens)
     r'|\bthinking with\s+\w+\s+effort\b',     # thinking with xhigh effort
     re.I)
 
@@ -415,7 +415,7 @@ _WORKING_METER_RE = re.compile(
 _LIVE_SPINNER_RE = re.compile(
     r'^[ \t]*[^\w\s]?[ \t]*'                   # line start: optional indent + one glyph
     r'\w+[ \t]*(?:…|\.\.\.)[ \t]*'             # a spinner verb + ellipsis: "Forming…"
-    r'\(\s*\d+\s*[ms]\b[^)\n]*?'               # "(14s …" -- a running elapsed timer
+    r'\(\s*\d+\s*[hms]\b[^)\n]*?'              # "(14s …" / "(1h 4m …" running elapsed timer
     r'(?:[↑↓]\s*[\d.,]+\s*[kKmM]?\s*tokens?'   # … then an arrow token meter, OR
     r'|thinking with\s+\w+\s+effort)',         # … the thinking-effort hint
     re.I | re.M)

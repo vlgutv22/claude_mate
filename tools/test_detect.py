@@ -109,6 +109,17 @@ CASES = [
      "· Hatching… (5m 2s · ↓ 15.3k tokens)\n"
      + "\n".join(f"  agent output line {i}" for i in range(12)) + "\n"
      + "  final line of the streamed output", "working"),
+    # Long-running work: an elapsed timer with an HOURS component ("1h 4m 30s") and
+    # a k-abbreviated token count must still read working (both regexes handle h and
+    # k/M now) -- else a >1h agent re-opens the original false-idle bug.
+    ("long-running subagent, hours-format timer + k tokens",
+     "· Hatching… (1h 4m 30s · ↓ 15.3k tokens)\n"
+     "  Tip: /agents lets you spin up specialists.", "working"),
+    # A bare k-abbreviated arrow meter in the bottom region (an agents row, no
+    # parenthetical spinner) must read working -- the meter regex now allows k/M.
+    ("agent row with k-abbreviated tokens in the bottom region",
+     "● Running agents…\n"
+     "○ Explore  Scanning ETL mappings   45s · ↓ 79.9k tokens", "working"),
     # Guard: once agents have FINISHED (no live spinner), the session is idle again.
     ("agents finished, no live spinner -> idle",
      "● Agent \"Find tour UI\" finished · 3m 30s\n"
