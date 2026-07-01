@@ -66,10 +66,10 @@ hooks are the zero-dependency feed. Use whichever fits each session.
   look at. **NEXT** and **MODE (short)** step the same urgent-first order manually
   and pause auto-surfacing for ~10 s so you can browse.
 - **Two UI modes** — a long-press of **MODE** toggles between **SCROLL** (the
-  one-card carousel above) and **LIST** (a scrolling list of *all* tabs with a
-  state glyph each: `W`/`?`/`!`/`D`/`-`). In LIST, **NEXT** / **MODE-short** move
-  the highlight and **SUBMIT** focuses the highlighted tab. Buttons are snappy
-  (~40 ms debounce; ~500 ms hold = long-press).
+  one-card carousel above) and **LIST** (a scrolling list of *all* tabs, each with
+  a status label — `WIP`/`WAIT`/`ERR`/`DONE`/`IDLE` — and its name). In LIST,
+  **NEXT** / **MODE-short** move the highlight and **SUBMIT** focuses the
+  highlighted tab. Buttons are snappy (~40 ms debounce; ~500 ms hold = long-press).
 - **Per-session haptics** — the motor buzzes for *that session's own*
   transition, not just an aggregate change:
   - **START** — a job (re)started → three gentle 0.3 s ticks (one-shot).

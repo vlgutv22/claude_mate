@@ -60,7 +60,8 @@
  *                  omitted/empty keeps the original two-line card.
  *     I                                              idle screen (no sessions)
  *     T|<total>|<sel>|<row>|<row>|...                LIST-mode frame (up to 4 rows);
- *                                                    row = <name>;<stateChar>;<hl>
+ *                                                    row = <name>;<status>;<hl>
+ *                                                    status = WIP|WAIT|ERR|DONE|IDLE
  *                                                    total = tab count, sel = 0-based
  *                                                    highlighted index (scrollbar),
  *                                                    hl = 1 for the highlighted row.
@@ -155,8 +156,9 @@ static bool  gBlinkOn   = true;      // blink phase for the unacknowledged dot
 // The daemon owns the tab list + selection and sends a pre-windowed frame of up
 // to LIST_ROWS visible rows; we just draw it. Highlighted row is drawn inverted.
 #define LIST_ROWS 4                  // 128x32 fits 4 size-1 text rows (8px each)
+#define LIST_NAME_X 30               // x where the name column starts (after status)
 static char    listName[LIST_ROWS][19] = {{0}};  // per-row name (18 chars + NUL)
-static char    listState[LIST_ROWS]    = {0};    // per-row state glyph (W/?/!/D/-)
+static char    listStatus[LIST_ROWS][6] = {{0}}; // per-row status label (WIP/WAIT/...)
 static bool    listHl[LIST_ROWS]       = {false};// per-row highlighted?
 static uint8_t listRows  = 0;        // visible rows in the frame (0..LIST_ROWS)
 static uint8_t listTotal = 0;        // total tabs (for the scrollbar)
@@ -470,8 +472,8 @@ static void drawList() {
     }
     display.setTextSize(1);
     display.setCursor(1, y);
-    display.print(listState[r] ? listState[r] : ' ');
-    display.print(' ');
+    display.print(listStatus[r]);                  // status label (WIP/WAIT/...)
+    display.setCursor(LIST_NAME_X, y);             // aligned name column
     display.print(listName[r]);                    // clipped at the edge (no wrap)
   }
 
@@ -541,22 +543,21 @@ static void handleLine(char *line) {
       listSel   = (uint8_t)atoi(fields[2]);
       listRows  = 0;
       for (uint8_t f = 3; f < n && listRows < LIST_ROWS; f++) {
-        // Each row is "name;state;hl". Split on ';' in place.
+        // Each row is "name;status;hl". Split on ';' in place.
         char *row = fields[f];
+        char *nm  = row;
+        char *st  = "";
+        bool  hl  = false;
         char *s1 = strchr(row, ';');
-        char *nm = row;
-        char sc = ' ';
-        bool hl = false;
         if (s1) {
           *s1 = 0;
-          char *st = s1 + 1;
+          st = s1 + 1;
           char *s2 = strchr(st, ';');
           if (s2) { *s2 = 0; hl = (s2[1] == '1'); }
-          sc = st[0] ? st[0] : ' ';
         }
-        copyField(listName[listRows], sizeof(listName[0]), nm);
-        listState[listRows] = sc;
-        listHl[listRows]    = hl;
+        copyField(listName[listRows],   sizeof(listName[0]),   nm);
+        copyField(listStatus[listRows], sizeof(listStatus[0]), st);
+        listHl[listRows] = hl;
         listRows++;
       }
       showList = true;

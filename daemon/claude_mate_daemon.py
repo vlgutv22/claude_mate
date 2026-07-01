@@ -93,9 +93,11 @@ NAME_MAX = 20
 # LIST-mode (all-tabs) frame. The 128x32 OLED fits 4 size-1 rows; names are capped
 # tighter so the whole packed T| line stays under the firmware's 96-char LINE_MAX.
 LIST_ROWS = 4
-LIST_NAME_MAX = 14
-# One-char state glyph shown per tab row in LIST mode.
-STATE_GLYPH = {"working": "W", "waiting": "?", "error": "!", "done": "D", "idle": "-"}
+LIST_NAME_MAX = 12
+# Short, readable status label shown in a left column per tab row in LIST mode
+# (the tab status is what matters most there). Kept <=4 chars so names still fit.
+STATE_LABEL = {"working": "WIP", "waiting": "WAIT", "error": "ERR",
+               "done": "DONE", "idle": "IDLE"}
 
 # Navigation / auto-show priority, most urgent first: a tab in error, then one
 # waiting for input, then a finished (done) tab needing acknowledgment, then
@@ -740,8 +742,8 @@ class Display:
             gidx = top + i
             name = (s.name or "?")[:LIST_NAME_MAX]
             name = name.replace("|", "/").replace(";", ",").replace("\n", " ").strip() or "?"
-            glyph = STATE_GLYPH.get(s.state, "-")
-            parts.append(f"{name};{glyph};{'1' if gidx == sel else '0'}")
+            label = STATE_LABEL.get(s.state, "IDLE")
+            parts.append(f"{name};{label};{'1' if gidx == sel else '0'}")
         self._link.write_line("|".join(parts))
 
     def resend_full_state(self) -> None:

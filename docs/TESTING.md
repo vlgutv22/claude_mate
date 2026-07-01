@@ -135,14 +135,14 @@ Flash the **real firmware**. Open the Arduino IDE **Serial Monitor** at
 4. Send a **LIST-mode** frame (all-tabs list) and the idle screen + a ping:
 
    ```
-   T|3|1|webapp;W;0|api;!;1|infra;?;0
+   T|3|1|webapp;WIP;0|api;ERR;1|infra;WAIT;0
    I
    P
    ```
 
-   → `T|…` shows a 3-row list with the middle row (`api`, error `!`) highlighted
-   (inverted) and a scrollbar; `I` returns to the idle screen; `P` may be ignored
-   or answered with `H`.
+   → `T|…` shows a 3-row list (a status label — `WIP`/`ERR`/`WAIT` — then the name)
+   with the middle row (`api`, `ERR`) highlighted (inverted) and a scrollbar; `I`
+   returns to the idle screen; `P` may be ignored or answered with `H`.
 
 5. Press the physical buttons and confirm the Serial Monitor prints:
 
@@ -180,8 +180,9 @@ python3 $REPO/daemon/claude_mate_daemon.py --mock
   looping `V|DONE`/`V|ERROR` alarm, a re-tapped `V|INPUT`), independent of the word.
 - Press **NEXT** → the carousel advances immediately and pauses ~10 s.
 - Press **MODE** (short) → the carousel steps back one card and pauses ~10 s.
-- **Long-press MODE** (~0.5 s) → switches to **LIST** mode (all tabs, one glyph
-  each); NEXT / MODE-short move the highlight; long-press again returns to SCROLL.
+- **Long-press MODE** (~0.5 s) → switches to **LIST** mode (all tabs, each with a
+  status label: WIP/WAIT/ERR/DONE/IDLE); NEXT / MODE-short move the highlight;
+  long-press again returns to SCROLL.
 - Press **SUBMIT** → the daemon attempts to focus the selected session (in mock,
   watch the daemon log for the focus call).
 
