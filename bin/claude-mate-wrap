@@ -177,6 +177,14 @@ BUSY_TAIL_LINES = 8       # tighter region for the live spinner: the generating 
                           # as "working" while the session is actually idle.
 FOOTER_LINES = 4          # tighter region for the generic picker-footer phrases
 
+# Claude's IDLE-at-prompt footer hint. It shows only when the session is waiting
+# for input; a genuinely working frame -- foreground OR a running agents panel --
+# shows "esc to interrupt" instead, never this. So when it is in the bottom footer
+# we know the session is idle, and a spinner-SHAPED line elsewhere on screen (a
+# pasted status line, docs/blockquotes about the meter, this repo's own test
+# fixtures) is quoted content, not a live spinner -- it must not read as working.
+_IDLE_FOOTER = ("? for shortcuts",)
+
 # --------------------------------------------------------------------------- #
 # Terminal size helpers
 # --------------------------------------------------------------------------- #
@@ -435,7 +443,17 @@ def detect_state(screen_text):
     #     fills the screen below), which otherwise mis-reads as idle.
     # Compute this FIRST so it gates the content-prone error/picker checks below:
     # a working frame must never be mistaken for an error or a prompt.
-    busy_now = (any(p in busy_tail for p in _patterns["busy"])
+    #
+    # None of these count while Claude's IDLE-at-prompt footer is showing: a live
+    # spinner/meter and a QUOTED one are textually identical, so the robust tell is
+    # that the idle prompt ("? for shortcuts") is only present when the session is
+    # waiting for input -- a real working frame (foreground OR a running agents
+    # panel) never shows it. Gating the whole signal on `not idle_prompt` kills the
+    # meter-quote false positives (a pasted status line, a README blockquote, this
+    # repo's own fixtures) whether they land in the bottom region or higher up.
+    idle_prompt = any(p in footer for p in _IDLE_FOOTER)
+    busy_now = (not idle_prompt) and (
+                any(p in busy_tail for p in _patterns["busy"])
                 or bool(_WORKING_METER_RE.search(busy_tail))
                 or bool(_LIVE_SPINNER_RE.search(full)))
 

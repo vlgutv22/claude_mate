@@ -145,6 +145,25 @@ CASES = [
      "● The live meter reads \"✻ Forming… (14s · ↓ 610 tokens)\" while busy.\n"
      + "\n".join(f"  note line {i}" for i in range(12)) + "\n"
      + PROMPT, "idle"),
+    # A spinner line reproduced verbatim on its OWN line (pasted bug report, README
+    # blockquote, this repo's fixtures) is textually a live spinner -- the ONLY tell
+    # is that it sits above Claude's idle prompt ("? for shortcuts"). These lock the
+    # idle-prompt gate that suppresses the whole-screen spinner signal when idle.
+    ("idle, a spinner FRAME pasted on its own line in a bug report",
+     "● Got it -- here is the frozen status line from the bug report:\n"
+     "✻ Forming… (14s · ↓ 610 tokens · thinking with xhigh effort)\n"
+     "  I reproduced the freeze and traced it to the render loop.\n"
+     + PROMPT, "idle"),
+    ("idle, a README blockquote of the spinner",
+     "● From the README \"How the status bar looks\":\n"
+     "> Working… (3s · ↑ 429 tokens · esc to interrupt)\n"
+     "  The blockquote above is the busy indicator.\n"
+     + PROMPT, "idle"),
+    ("idle, a summarised log line shaped like a spinner",
+     "● Here is the deploy log you asked me to summarise:\n"
+     "  Deploying… (30s · ↓ 5k tokens saved)\n"
+     "  Release v2.4.0 is live on all regions.\n"
+     + PROMPT, "idle"),
 ]
 
 fails = 0
