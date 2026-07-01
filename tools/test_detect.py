@@ -91,6 +91,30 @@ CASES = [
      "✻ Forming… (10s · ↓ 500 tokens · thinking with xhigh effort)", "working"),
     ("working meter '↑ 429 tokens · esc to interrupt' must NOT read error",
      "✶ Working… (3s · ↑ 429 tokens · esc to interrupt)", "working"),
+    # Background agents: the live agent-progress line ("○ <name> … Ns · ↓ N tokens")
+    # or a "Hatching…" spinner sits ABOVE the agent's transcript, which fills the
+    # bottom of the screen. Keying "working" only off the bottom BUSY_TAIL_LINES
+    # read this busy multi-agent session as IDLE (-> premature DONE). The glyph-
+    # prefixed live-line signal (matched over the whole screen) must catch it.
+    ("running subagent, live agent line above a long transcript (agents panel)",
+     "● Agent \"Find tour UI\" finished · 3m 30s\n"
+     "  bypass permissions on · esc to interrupt · ← for agents · ↓ to manage\n"
+     "● main\n"
+     "○ Explore  Scanning Genie ETL mappings.    3m 30s · ↓ 79.9k tokens\n"
+     + "\n".join(f"  based on my exploration, line {i}" for i in range(14)) + "\n"
+     + "  they render as header badges in the UI.", "working"),
+    ("subagent hatching, spinner line pushed up by output below",
+     "· Hatching… (5m 2s · ↓ 15.3k tokens)\n"
+     + "\n".join(f"  agent output line {i}" for i in range(12)) + "\n"
+     + "  final line of the streamed output", "working"),
+    # Guard: once agents have FINISHED (no live timer+meter line), the session is
+    # idle again -- a finished-agent line ("● … finished · 3m 30s") has no ↑/↓
+    # token meter and its glyph is a done marker, so it must NOT read working.
+    ("agents finished, no live line -> idle",
+     "● Agent \"Find tour UI\" finished · 3m 30s\n"
+     "● main · done\n"
+     + "\n".join(f"  result summary line {i}" for i in range(8)) + "\n"
+     + PROMPT, "idle"),
 ]
 
 fails = 0

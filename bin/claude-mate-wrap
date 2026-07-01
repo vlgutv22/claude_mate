@@ -384,6 +384,26 @@ _WORKING_METER_RE = re.compile(
     r'|\bthinking with\s+\w+\s+effort\b',     # thinking with xhigh effort
     re.I)
 
+# A LIVE status / agent-progress line, matched over the WHOLE visible screen (not
+# just the bottom region). Claude renders these while generating AND while a
+# background agent/workflow runs -- a spinner/agent glyph at the START of the line,
+# then a running elapsed timer AND an arrow token meter, e.g.
+#   "✻ Forming… (14s · ↓ 610 tokens · thinking with xhigh effort)"
+#   "○ Explore  Scanning ETL mappings.   3m 30s · ↓ 79.9k tokens"   (agents panel)
+#   "· Hatching… (5m 2s · ↓ 15.3k tokens)"
+# When a background agent's transcript fills the screen BELOW it, that live line
+# sits ABOVE the bottom BUSY_TAIL_LINES window -- so keying "working" only off the
+# bottom region mis-read a busy multi-agent session as idle (-> premature DONE).
+# This stays quote-resistant WITHOUT a region limit: prose that merely mentions a
+# meter is not glyph-prefixed (fails [^\w\s] at line start), and the leading glyph
+# must NOT be a completed/error marker (● ✓ ✗ …) so a *finished*-agent line
+# ("● Agent … finished · 3m 30s") won't match (it also lacks the ↑/↓ token meter).
+_LIVE_LINE_RE = re.compile(
+    r'^[ \t]*(?![●✓✔✗✘✅❌])[^\w\s]'           # leading glyph, not a done/error marker
+    r'.*?\b\d+\s*[ms]\b'                       # a running elapsed timer (14s / 2m / 30s)
+    r'.*?[↑↓]\s*[\d.,]+\s*[kKmM]?\s*tokens?\b',# an arrow token meter (↓ 79.9k tokens)
+    re.I | re.M)
+
 def detect_state(screen_text):
     # Read only Claude's LIVE STATUS REGION (the bottom of the visible screen),
     # not the whole scrollback. Error/prompt/generating chrome renders there, so
@@ -397,14 +417,19 @@ def detect_state(screen_text):
     tail = "\n".join(nonblank[-STATUS_TAIL_LINES:]).lower()
     busy_tail = "\n".join(nonblank[-BUSY_TAIL_LINES:]).lower()
     footer = "\n".join(nonblank[-FOOTER_LINES:]).lower()
+    full = "\n".join(nonblank)               # whole visible screen (for live lines)
 
-    # Is the session actively working? The live activity meter (token counter /
-    # elapsed timer / "thinking with <effort>") or the "esc to interrupt" /
-    # background-work hints render in the bottom BUSY_TAIL_LINES region. Compute
-    # this FIRST so it can gate the content-prone error/picker checks below: a
-    # working frame must never be mistaken for an error or a prompt.
+    # Is the session actively working? Two signals:
+    #  1. The live activity meter / "esc to interrupt" / background-work hints in
+    #     the bottom BUSY_TAIL_LINES region (the normal foreground spinner spot).
+    #  2. A glyph-prefixed LIVE status/agent line ANYWHERE on screen -- a running
+    #     agent panel pushes the spinner above the bottom region (its transcript
+    #     fills the screen below), which otherwise mis-reads as idle.
+    # Compute this FIRST so it gates the content-prone error/picker checks below:
+    # a working frame must never be mistaken for an error or a prompt.
     busy_now = (any(p in busy_tail for p in _patterns["busy"])
-                or bool(_WORKING_METER_RE.search(busy_tail)))
+                or bool(_WORKING_METER_RE.search(busy_tail))
+                or bool(_LIVE_LINE_RE.search(full)))
 
     # Strong, specific error strings win even mid-stream (a genuine API error
     # replaces the spinner). Content-prone error phrases match ONLY in the tight
