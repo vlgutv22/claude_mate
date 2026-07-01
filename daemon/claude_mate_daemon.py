@@ -86,6 +86,13 @@ SESSION_IDLE_TTL = 600.0    # drop any stale session after this long
 # Card name length cap (the OLED is narrow).
 NAME_MAX = 20
 
+# LIST-mode (all-tabs) frame. The 128x32 OLED fits 4 size-1 rows; names are capped
+# tighter so the whole packed T| line stays under the firmware's 96-char LINE_MAX.
+LIST_ROWS = 4
+LIST_NAME_MAX = 14
+# One-char state glyph shown per tab row in LIST mode.
+STATE_GLYPH = {"working": "W", "waiting": "?", "error": "!", "done": "D", "idle": "-"}
+
 # Navigation / auto-show priority, most urgent first: a tab in error, then one
 # waiting for input, then a finished (done) tab needing acknowledgment, then
 # still-working, then idle. NEXT/PREV walk this order; the screen auto-shows the
@@ -462,6 +469,13 @@ class Display:
         # sentinel so the first resolve emits V|OFF and clears any stale loop.
         self._loop_kind: Optional[str] = _LOOP_UNSET
         self._last_wait_tap = 0.0        # time of the last gentle needs-input tap
+        # UI mode: "scroll" = the carousel (auto-surface + browse one card at a
+        # time), "list" = a scrolling list of ALL tabs to pick from. MODE long-press
+        # toggles it. `_list_sel` = highlighted global index into ordered(); the
+        # `_list_top` window keeps the selection on screen.
+        self._mode = "scroll"
+        self._list_sel = 0
+        self._list_top = 0
 
     # ---- dial (stepper status wheel) ------------------------------------- #
 
@@ -632,6 +646,86 @@ class Display:
             idx = self._current_index
         self.show_index(idx)
 
+    # ---- UI mode (scroll carousel <-> all-tabs list) --------------------- #
+
+    def current_mode(self) -> str:
+        with self._lock:
+            return self._mode
+
+    def toggle_mode(self) -> None:
+        """MODE long-press: flip between the scroll carousel and the all-tabs
+        list. Entering LIST seeds the highlight on the card you were viewing."""
+        sessions = self._reg.ordered()
+        with self._lock:
+            self._mode = "list" if self._mode == "scroll" else "scroll"
+            mode = self._mode
+            cur = self._current_session
+            if mode == "list":
+                sel = 0
+                if cur is not None:
+                    for i, s in enumerate(sessions):
+                        if s.key == cur.key:
+                            sel = i
+                            break
+                self._list_sel = sel
+                self._list_top = 0
+        if mode == "list":
+            log("mode -> LIST (all tabs)")
+            self.render_list()
+        else:
+            log("mode -> SCROLL (carousel)")
+            self.refresh_current()
+
+    def list_nav(self, delta: int) -> None:
+        """Move the LIST highlight by `delta` (wraps), then re-render."""
+        total = len(self._reg.ordered())
+        if total > 0:
+            with self._lock:
+                self._list_sel = (self._list_sel + delta) % total
+        self.render_list()
+
+    def list_selected_session(self) -> Optional[Session]:
+        """The tab currently highlighted in LIST mode (SUBMIT focuses it)."""
+        sessions = self._reg.ordered()
+        if not sessions:
+            return None
+        with self._lock:
+            sel = self._list_sel
+        sel = max(0, min(sel, len(sessions) - 1))
+        return sessions[sel]
+
+    def render_list(self) -> None:
+        """Send a LIST-mode frame: `T|<total>|<sel>|<row>|...` with up to
+        LIST_ROWS windowed rows (`name;glyph;hl`). Empty -> idle screen."""
+        sessions = self._reg.ordered()
+        total = len(sessions)
+        if total == 0:
+            with self._lock:
+                self._current_session = None
+                self._list_sel = 0
+                self._list_top = 0
+            self._link.write_line("I")
+            self._link.write_line("D|FREE")
+            return
+        with self._lock:
+            sel = max(0, min(self._list_sel, total - 1))
+            self._list_sel = sel
+            top = self._list_top
+            if sel < top:
+                top = sel
+            elif sel >= top + LIST_ROWS:
+                top = sel - LIST_ROWS + 1
+            top = max(0, min(top, total - LIST_ROWS)) if total > LIST_ROWS else 0
+            self._list_top = top
+        parts = [f"T|{total}|{sel}"]
+        for i, s in enumerate(sessions[top:top + LIST_ROWS]):
+            gidx = top + i
+            name = (s.name or "?")[:LIST_NAME_MAX]
+            name = name.replace("|", "/").replace(";", ",").replace("\n", " ").strip() or "?"
+            glyph = STATE_GLYPH.get(s.state, "-")
+            parts.append(f"{name};{glyph};{'1' if gidx == sel else '0'}")
+        self._link.write_line("|".join(parts))
+
     def resend_full_state(self) -> None:
         """On handshake (H) / reconnect: push dial (force) + current card AND
         re-arm the motor from scratch.
@@ -644,7 +738,10 @@ class Display:
         re-drive the motor from the current alert state."""
         log("handshake H -> resending full state")
         self.push_dial(force=True)
-        self.refresh_current()
+        if self.current_mode() == "list":
+            self.render_list()
+        else:
+            self.refresh_current()
         with self._lock:
             self._loop_kind = _LOOP_UNSET      # firmware was reset -> forget it
         self.update_haptics(self._reg.top_alert())
@@ -902,23 +999,38 @@ class ButtonReader(threading.Thread):
             parts = line.split("|")
             if len(parts) >= 2 and parts[1].isdigit():
                 n = int(parts[1])
-                if n == 1:
-                    sess = self._display.current_session()
-                    log(f"FOCUS button -> focus + acknowledge "
+                mode = self._display.current_mode()
+                if n == 1:                       # SUBMIT: focus the selected tab
+                    if mode == "list":
+                        sess = self._display.list_selected_session()
+                    else:
+                        sess = self._display.current_session()
+                    log(f"SUBMIT button -> focus + acknowledge "
                         f"{sess.name if sess else '-'}")
                     focus_session(sess)
                     if self.on_ack:
-                        self.on_ack(sess)   # focusing the window = acknowledged
-                elif n == 2:
-                    log("NEXT button -> advancing carousel")
-                    if self.on_next:
-                        self.on_next()       # pause auto-show FIRST, then move
-                    self._display.advance()
-                elif n == 3:
-                    log("PREV button -> previous card")
-                    if self.on_next:
-                        self.on_next()       # pause auto-show FIRST, then move
-                    self._display.retreat()
+                        self.on_ack(sess)        # focusing the window = acknowledged
+                elif n == 2:                     # NEXT: highlight down / next card
+                    if mode == "list":
+                        log("NEXT button -> highlight next tab")
+                        self._display.list_nav(+1)
+                    else:
+                        log("NEXT button -> advancing carousel")
+                        if self.on_next:
+                            self.on_next()       # pause auto-show FIRST, then move
+                        self._display.advance()
+                elif n == 3:                     # MODE short: highlight up / prev card
+                    if mode == "list":
+                        log("MODE short -> highlight previous tab")
+                        self._display.list_nav(-1)
+                    else:
+                        log("MODE short -> previous card")
+                        if self.on_next:
+                            self.on_next()       # pause auto-show FIRST, then move
+                        self._display.retreat()
+                elif n == 4:                     # MODE long: toggle scroll <-> list
+                    log("MODE long-press -> toggle mode")
+                    self._display.toggle_mode()
                 else:
                     log(f"unknown button index: {n}")
             return
@@ -986,9 +1098,12 @@ class Carousel(threading.Thread):
             self._paused_until = time.time() + NEXT_PAUSE
 
     def notify_change(self) -> None:
-        """Called on any registry change: refresh dial + current card + haptics."""
+        """Called on any registry change: refresh dial + display + haptics."""
         self._display.push_dial()
-        self._display.refresh_current()
+        if self._display.current_mode() == "list":
+            self._display.render_list()
+        else:
+            self._display.refresh_current()
         self._display.update_haptics(self._reg.top_alert())
 
     def run(self) -> None:
@@ -1006,10 +1121,13 @@ class Carousel(threading.Thread):
             with self._lock:
                 paused = now < self._paused_until
 
-            # Auto-surface the most urgent unacknowledged tab; while the user is
-            # browsing (just pressed NEXT/PREV) hold their selection instead.
+            # LIST mode: keep the all-tabs list fresh (state glyphs update live);
+            # no auto-surfacing. SCROLL mode: auto-surface the most urgent
+            # unacknowledged tab, unless the user is browsing (just pressed a nav).
             target = self._reg.top_alert()
-            if target is not None and not paused:
+            if self._display.current_mode() == "list":
+                self._display.render_list()
+            elif target is not None and not paused:
                 self._display.show_session(target)
             else:
                 self._display.refresh_current()

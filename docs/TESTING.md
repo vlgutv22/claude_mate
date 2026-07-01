@@ -77,8 +77,9 @@ sketch (`firmware/selftest/selftest.ino`) and watch the board. On boot it now:
 - The **OLED** lights up and shows text + the current word → I2C + display OK
   (if blank, try address **0x3D**; if it's a 1.3" panel, you may need the
   **SH1106** driver — see [WIRING.md](WIRING.md)).
-- Pressing **FOCUS (D2)**, **NEXT (D3)**, and **PREV (D4)** is printed over serial
-  → buttons OK.
+- Pressing **SUBMIT (D2)**, **NEXT (D3)**, and **MODE (D4)** is printed over serial
+  → buttons OK. (The standalone selftest uses simple press events; the long-press
+  / LIST-mode behavior lives in the real firmware, Level 2.)
 
 This validates OLED + vibration motor + buttons with **no Mac software**.
 
@@ -131,27 +132,30 @@ Flash the **real firmware**. Open the Arduino IDE **Serial Monitor** at
    → the OLED shows the card: name `demo`, state `error`, runtime `03:21`,
    limit `71%`, position `1/1`.
 
-4. Send the idle screen and a ping:
+4. Send a **LIST-mode** frame (all-tabs list) and the idle screen + a ping:
 
    ```
+   T|3|1|webapp;W;0|api;!;1|infra;?;0
    I
    P
    ```
 
-   → idle screen; `P` may be ignored or answered with `H`.
+   → `T|…` shows a 3-row list with the middle row (`api`, error `!`) highlighted
+   (inverted) and a scrollbar; `I` returns to the idle screen; `P` may be ignored
+   or answered with `H`.
 
-5. Press the physical **FOCUS**, **NEXT**, and **PREV** buttons and confirm the
-   Serial Monitor prints:
+5. Press the physical buttons and confirm the Serial Monitor prints:
 
    ```
-   B|1
-   B|2
-   B|3
+   B|1     ← SUBMIT (D2)
+   B|2     ← NEXT (D3)
+   B|3     ← MODE (D4), short press
+   B|4     ← MODE (D4), held ≥ ~0.5 s (long press)
    ```
 
-Pass criterion: `H` on boot, cards render, the word (`D|`) updates and the
-haptics (`V|`, incl. the looping `V|DONE`/`V|ERROR` stopped by `V|OFF`) play from
-typed lines, button presses emit `B|1` / `B|2` / `B|3`.
+Pass criterion: `H` on boot, cards + `T|` lists render, the word (`D|`) updates
+and the haptics (`V|`, incl. the looping `V|DONE`/`V|ERROR` stopped by `V|OFF`)
+play from typed lines, buttons emit `B|1`/`B|2`/`B|3` and MODE long-press emits `B|4`.
 
 > When done, **close the Serial Monitor** so the daemon can use the port.
 
@@ -175,8 +179,10 @@ python3 $REPO/daemon/claude_mate_daemon.py --mock
 - The **motor** buzzes per session as tabs transition (a `V|START` tick, a
   looping `V|DONE`/`V|ERROR` alarm, a re-tapped `V|INPUT`), independent of the word.
 - Press **NEXT** → the carousel advances immediately and pauses ~10 s.
-- Press **PREV** → the carousel steps back one card and pauses ~10 s.
-- Press **FOCUS** → the daemon attempts to focus that card's session (in mock,
+- Press **MODE** (short) → the carousel steps back one card and pauses ~10 s.
+- **Long-press MODE** (~0.5 s) → switches to **LIST** mode (all tabs, one glyph
+  each); NEXT / MODE-short move the highlight; long-press again returns to SCROLL.
+- Press **SUBMIT** → the daemon attempts to focus the selected session (in mock,
   watch the daemon log for the focus call).
 
 Also confirm robustness: **unplug** the Nano mid-run — the daemon should not
@@ -234,9 +240,10 @@ and the hooks merged (see [INSTALL.md](INSTALL.md)):
 5. Open multiple sessions and confirm the carousel orders them most-urgent-first
    (`error` → `waiting` → `working` → `done` → `idle`) and the OLED shows the
    highest-priority word (WTF > BLOCKED > WIP > FREE).
-6. Press **FOCUS** on a card → VS Code focuses that session via the deep link, or
+6. Press **SUBMIT** on a card → VS Code focuses that session via the deep link, or
    raises the workspace window as a fallback (see the focus Limitations in
-   [ARCHITECTURE.md](ARCHITECTURE.md)). Use **NEXT** / **PREV** to step cards.
+   [ARCHITECTURE.md](ARCHITECTURE.md)). Use **NEXT** / **MODE-short** to step
+   cards, or long-press **MODE** for the all-tabs LIST.
 7. End a session (`SessionEnd`) → it drops to `idle` / disappears; with zero
    sessions the display shows the idle screen and the word returns to **FREE**.
 
@@ -257,4 +264,5 @@ FOCUS brings up the right session.
 | Motor never buzzes | Haptics come from `V|<kind>` (not the word). Confirm a session actually transitioned (start/wait/done/error). Test the motor directly by typing `V|ERROR` in the Serial Monitor (Level 2). Check the D5 driver wiring (module IN / NPN base via 1k / ULN2003 IN1), common ground, and the flyback diode (see [WIRING.md](WIRING.md)). |
 | Motor buzzes forever | Send `V|OFF` (FOCUS does this). A loop also self-stops ~30 s after the daemon goes silent. |
 | Motor buzzes weakly or not at all | D5 can't drive the motor directly — it needs the transistor/module/ULN2003 channel; verify the motor is on the 5 V rail, not a GPIO. |
-| Buttons do nothing in the daemon | Confirm Level 2 first (`B|1`/`B|2`/`B|3` over serial), then check the daemon's button thread/logs. |
+| Buttons do nothing in the daemon | Confirm Level 2 first (`B|1`/`B|2`/`B|3`, and `B|4` on a MODE long-press, over serial), then check the daemon's button thread/logs. |
+| MODE long-press never toggles LIST | Hold ≥ ~0.5 s; a quick tap emits `B|3` (prev/highlight-up), only a held press emits `B|4`. |

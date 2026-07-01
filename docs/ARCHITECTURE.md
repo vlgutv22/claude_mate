@@ -45,15 +45,17 @@ Arduino Nano (ATmega328P)
         +--> micro vibration motor (D5)             per-session haptic via V|<kind>:
         |                                            START/INPUT one-shot, DONE/ERROR loop
 
-Buttons back (return path):
-        Button press (FOCUS=D2, NEXT=D3, PREV=D4)
-        |   serial line:  B|1 (FOCUS)  or  B|2 (NEXT)  or  B|3 (PREV)
+Buttons back (return path) -- layout MODE | SUBMIT | NEXT:
+        Button press (SUBMIT=D2, NEXT=D3, MODE=D4)
+        |   serial line: B|1 SUBMIT · B|2 NEXT · B|3 MODE-short · B|4 MODE-long
         v
         Arduino  -->  serial  -->  daemon
         |
-        +-- B|2 NEXT  : advance carousel immediately, pause auto-rotation ~10 s
-        +-- B|3 PREV  : step to the previous card, pause auto-rotation ~10 s
-        +-- B|1 FOCUS : focus the VS Code session of the currently displayed card
+        +-- B|2 NEXT   : SCROLL -> next card (pause auto-show ~10 s) ; LIST -> highlight down
+        +-- B|3 MODE(short): SCROLL -> previous card (pause ~10 s)   ; LIST -> highlight up
+        +-- B|4 MODE(long) : toggle UI mode (SCROLL <-> LIST)
+        +-- B|1 SUBMIT : focus the VS Code session of the selected tab
+                          (current card in SCROLL, highlighted row in LIST)
                           primary  : macOS deep link  (open <FOCUS_URI_TEMPLATE>)
                           fallback : raise VS Code window for the workspace cwd
 ```
@@ -100,8 +102,8 @@ persistent storage on the device.
  |                             +------------|------^----------+  |
  |                                          |      |             |
  +------------------------------------------|------|-------------+
-                                            | USB  | B|1 / B|2 / B|3
-                              D|.. S|.. I/P | CDC  | H
+                                            | USB  | B|1 / B|2 / B|3 / B|4
+                          D|.. S|.. T|.. I/P | CDC  | H
                                             v      |
                               +-----------------------------------+
                               |        Arduino Nano (328P)        |
@@ -113,7 +115,7 @@ persistent storage on the device.
                               |  | FREE/  |    | DONE/ERROR loop| |
                               |  | WIP/.. |    | OFF = stop     | |
                               |  +--------+    +----------------+ |
-                              |  [FOCUS D2] [NEXT D3] [PREV D4]   |
+                              |  [MODE D4] [SUBMIT D2] [NEXT D3]  |
                               +-----------------------------------+
 ```
 
@@ -190,12 +192,16 @@ shows the single card it was last told to show via an `S|...` line.
 - Pressing **NEXT** (`B|2`) advances to the next card immediately **and pauses
   auto-rotation for ~10 seconds**, giving you time to read a specific card
   before the rotation resumes.
-- Pressing **PREV** (`B|3`) steps to the previous card and likewise pauses
-  auto-rotation for ~10 seconds.
-- Pressing **FOCUS** (`B|1`) acts on the **currently displayed** card — it calls
-  `focus()` for that session.
+- Pressing **MODE** short (`B|3`) steps to the previous card and likewise pauses
+  auto-rotation for ~10 seconds. A **long** press (`B|4`) instead toggles into
+  **LIST mode** — a scrolling list of *all* tabs (`T` frames), where NEXT /
+  MODE-short move the highlight and SUBMIT focuses it; long-press again returns
+  to the scroll carousel.
+- Pressing **SUBMIT** (`B|1`) acts on the **selected** tab (the currently
+  displayed card in SCROLL, the highlighted row in LIST) — it calls `focus()`
+  for that session.
 - If there are **zero sessions**, the daemon sends `I` (idle screen) together
-  with `D|FREE` instead of any `S` card.
+  with `D|FREE` instead of any `S`/`T` frame.
 
 Each card carries: 1-based index, total count, truncated name (≤10 chars),
 state, runtime (`mm:ss` or `h:mm`), and a best-effort limit string (`"-"` when
@@ -205,8 +211,8 @@ unknown). The exact line format is in [PROTOCOL.md](PROTOCOL.md).
 
 ## Focus mechanism
 
-FOCUS is the single must-have action. When you press the FOCUS button on a card,
-the daemon tries to bring you to that exact Claude Code session:
+Focus is the single must-have action. When you press the **SUBMIT** button on a
+card, the daemon tries to bring you to that exact Claude Code session:
 
 1. **Primary — VS Code deep link.** The daemon runs the macOS `open` command
    against a URI built from a configurable `FOCUS_URI_TEMPLATE` constant,

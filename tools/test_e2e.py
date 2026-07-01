@@ -127,6 +127,23 @@ with display_lock:
     idx_before_H = len(display)
 arduino_send("H"); time.sleep(1.5)
 
+print("\n-- phase 5b: MODE long-press -> LIST mode, navigate + submit --")
+# 3 tabs live (sid-2 error, sid-3 waiting, sid-1 working). Toggle to LIST, move
+# the highlight down one, SUBMIT to focus it, then toggle back to SCROLL.
+with display_lock:
+    idx_before_list = len(display)
+arduino_send("B|4"); time.sleep(1.2)     # MODE long -> LIST mode (expect T| frame)
+arduino_send("B|2"); time.sleep(0.8)     # NEXT -> highlight next tab
+arduino_send("B|1"); time.sleep(1.2)     # SUBMIT -> focus highlighted tab
+with display_lock:
+    saw_T = any(l.startswith("T|") for l in display[idx_before_list:])
+    list_totals = [int(l.split("|")[1]) for l in display[idx_before_list:]
+                   if l.startswith("T|") and len(l.split("|")) > 1 and l.split("|")[1].isdigit()]
+arduino_send("B|4"); time.sleep(1.2)     # MODE long -> back to SCROLL (S| resumes)
+with display_lock:
+    idx_after_scroll = len(display)
+feed("working|sid-1|webapp"); time.sleep(1.5)  # nudge a refresh in scroll mode
+
 print("\n-- phase 6: everything finishes (expect FREE) --")
 feed("done|sid-2|api"); feed("done|sid-3|infra")
 feed("done|sid-1|webapp"); time.sleep(3.0)
@@ -174,6 +191,13 @@ check("V|DONE loop when a turn finishes (until acknowledged)",
       saw(lambda l: l == "V|DONE"))
 check("handshake H re-arms the active loop haptic (V|ERROR/V|DONE re-sent after reset)",
       saw_after(idx_before_H, lambda l: l in ("V|ERROR", "V|DONE")))
+check("MODE long-press (B|4) enters LIST mode -> T| frame sent", saw_T)
+check("LIST frame lists all live tabs (total >= 3)",
+      any(t >= 3 for t in list_totals))
+check("SUBMIT (B|1) in LIST mode focuses the highlighted (2nd) tab -> sid-3",
+      any("session=sid-3" in l for l in focus_lines))
+check("MODE long-press again returns to SCROLL -> S| card resumes",
+      saw_after(idx_after_scroll, lambda l: l.startswith("S|")))
 
 ok = all(checks)
 print("\n  focus.log:", [l.strip() for l in focus_lines] or "(empty)")

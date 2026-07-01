@@ -42,24 +42,27 @@ There is no wheel, no dial, no homing, and no endstop — those are gone. See
 | OLED GND                | GND         | common ground |
 | OLED SDA                | **A4**      | I2C data |
 | OLED SCL                | **A3**      | I2C clock — **software (bit-banged) I2C** (hardware SCL A5 was damaged; the 328P's TWI is fixed to A4/A5 and can't be remapped, so SCL moved to the plain GPIO A3). See `firmware/claude_mate/softssd1306.h`. |
-| FOCUS button            | **D2**      | `INPUT_PULLUP`; other leg to GND |
+| SUBMIT button           | **D2**      | `INPUT_PULLUP`; other leg to GND |
 | NEXT button             | **D3**      | `INPUT_PULLUP`; other leg to GND |
-| PREV button             | **D4**      | `INPUT_PULLUP`; other leg to GND |
+| MODE button             | **D4**      | `INPUT_PULLUP`; other leg to GND |
 | Vibration motor (drive) | **D5**      | drives a vibro-motor module / NPN transistor / ULN2003 channel (see below) — **not** the motor directly |
 
 > There are **no LED pins** and **no stepper pins**. The old traffic-light LEDs
 > and the stepper status wheel (with its ULN2003 driver and D4 endstop) are both
-> gone. D5 now drives the vibration motor; D4 is the PREV button.
+> gone. D5 now drives the vibration motor; D4 is the MODE button.
 
 ### Buttons
 
-Each button connects its **D2 / D3 / D4 pin to one leg** and **GND to the other
-leg**. With `INPUT_PULLUP`, an unpressed button reads **HIGH** and a pressed
-button reads **LOW**. The firmware debounces presses (~200 ms).
+Layout left→right is **MODE | SUBMIT | NEXT**. Each button connects its
+**D2 / D3 / D4 pin to one leg** and **GND to the other leg**. With `INPUT_PULLUP`,
+an unpressed button reads **HIGH** and a pressed button reads **LOW**. The
+firmware debounces presses (~40 ms — snappy).
 
-- **D2 = FOCUS** → emits `B|1` (focus the current card's session's VS Code window).
-- **D3 = NEXT** → emits `B|2` (advance carousel, pause auto-rotation ~10 s).
-- **D4 = PREV** → emits `B|3` (previous card, pause auto-rotation ~10 s).
+- **D2 = SUBMIT** → emits `B|1` (focus/proceed to the selected tab).
+- **D3 = NEXT** → emits `B|2` (SCROLL: next card / LIST: highlight down).
+- **D4 = MODE** → emits `B|3` on a **short** press (SCROLL: previous card /
+  LIST: highlight up) and `B|4` on a **long** press ≥ ~500 ms (toggle
+  SCROLL ⇄ LIST mode).
 
 ---
 
@@ -159,9 +162,9 @@ That's the whole story — no separate supply, no homing, no endstop.
    5V --| 5V              A4(SDA)|---- OLED SDA
   GND --| GND             A3(SCL)|---- OLED SCL  (software I2C; A5 was damaged)
         |                       |
-        |                    D2 |---- FOCUS button --- GND   (INPUT_PULLUP)
-        |                    D3 |---- NEXT  button --- GND   (INPUT_PULLUP)
-        |                    D4 |---- PREV  button --- GND   (INPUT_PULLUP)
+        |                    D2 |---- SUBMIT button -- GND   (INPUT_PULLUP)
+        |                    D3 |---- NEXT   button -- GND   (INPUT_PULLUP)
+        |                    D4 |---- MODE   button -- GND   (INPUT_PULLUP)
         |                       |
         |                    D5 |---- vibro driver IN -> motor (+5V / GND)
         |                       |       (module, or NPN+1k+1N4148, or ULN2003 ch.)
@@ -180,7 +183,7 @@ That's the whole story — no separate supply, no homing, no endstop.
 |-----|--------------------------------------------------|-------|
 | 1   | Arduino Nano (ATmega328P)                        | 5 V; USB CDC serial |
 | 1   | I2C OLED 0.91" 128x32 — SSD1306                   | 4-pin GND/VCC/SCK(SCL)/SDA; a 0.96" 128x64 also works (set SCREEN_HEIGHT 64) |
-| 3   | Momentary push buttons (tactile)                 | FOCUS + NEXT + PREV |
+| 3   | Momentary push buttons (tactile)                 | MODE + SUBMIT + NEXT |
 | 1   | Micro vibration motor                            | coin/pager type; haptic alert on D5, per-session buzz via V|<kind> |
 | 1   | NPN transistor (2N2222 / S8050)                  | Option B driver — *or* use a 3-pin vibro module / a spare ULN2003 channel instead |
 | 1   | Resistor ~1 kΩ                                    | Option B — base resistor on D5 |

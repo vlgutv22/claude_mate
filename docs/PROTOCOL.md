@@ -30,6 +30,7 @@ input buffer and drops malformed/oversized lines).
 | `D\|<word>`                                           | Set the status word. `<word>` is one of `FREE`, `WIP`, `BLOCKED`, `WTF`. The Arduino draws the big word on the OLED. **Visual only** — the word never buzzes on its own; all haptics come via `V\|`. |
 | `S\|<idx>\|<total>\|<name>\|<state>\|<runtime>\|<limit>\|<ack>\|<model>\|<effort>` | Show one session card (the carousel step). See field table below. `ack`/`model`/`effort` are optional trailing fields — older daemons omit them and the firmware copes. |
 | `V\|<kind>`                                           | Haptic control (motor only; never touches the OLED). `<kind>` is `START`, `INPUT`, `DONE`, `ERROR`, or `OFF`. See **Haptics** below. |
+| `T\|<total>\|<sel>\|<row>\|<row>\|…`                  | **LIST-mode** frame (sent only in LIST mode). `<total>` = total tab count, `<sel>` = 0-based index of the highlighted tab (drives the scrollbar). Then up to **4** windowed rows, each `<name>;<glyph>;<hl>` where `glyph` is a one-char state (`W` working / `?` waiting / `!` error / `D` done / `-` idle) and `hl` is `1` for the highlighted row. Names are capped so the whole line stays under the firmware's 96-char limit. |
 | `I`                                                   | Idle screen — no active sessions. The daemon also sends `D\|FREE` alongside it. |
 | `P`                                                   | Ping / keepalive. The Arduino MAY ignore it, or reply with `H`. |
 
@@ -89,17 +90,28 @@ unacknowledged, model `Opus 4.8`, effort `xhigh`.)
 
 ### 1b. Arduino → Daemon
 
+The three buttons are, left→right, **MODE | SUBMIT | NEXT**. Debounce is ~40 ms
+(snappy taps); the MODE button additionally distinguishes a short press from a
+long press (held ≥ ~500 ms).
+
 | Line       | Meaning |
 |------------|---------|
-| `H`        | Hello / handshake, sent **once** right after boot/reset (and as the reply to `P`). On receiving `H` the daemon **re-sends the full current state** (word + current card). |
-| `B\|1`     | **FOCUS** pressed (D2) — focus the current card's session's VS Code window. |
-| `B\|2`     | **NEXT** pressed (D3) — advance the carousel to the next card. |
-| `B\|3`     | **PREV** pressed (D4) — step the carousel to the previous card. |
+| `H`        | Hello / handshake, sent **once** right after boot/reset (and as the reply to `P`). On receiving `H` the daemon **re-sends the full current state** (word + current display + re-arms haptics). |
+| `B\|1`     | **SUBMIT** pressed (D2) — focus/proceed to the selected tab (the current card in SCROLL mode, the highlighted row in LIST mode). |
+| `B\|2`     | **NEXT** pressed (D3) — SCROLL: next card. LIST: move the highlight **down**. |
+| `B\|3`     | **MODE** short-press (D4) — SCROLL: previous card. LIST: move the highlight **up**. |
+| `B\|4`     | **MODE** long-press (D4, held ≥ ~500 ms) — **toggle** the UI mode (SCROLL ⇄ LIST). Fires once when the hold crosses the threshold; the release is then swallowed. |
+
+**UI modes.** The daemon owns the mode. **SCROLL** is the carousel (auto-surface
+the most-urgent tab + browse one card at a time via `S` frames). **LIST** shows a
+scrolling list of *all* tabs via `T` frames; NEXT / MODE-short move the highlight,
+SUBMIT focuses it. Haptics (`V|`) are unaffected by the mode.
 
 **Reset note:** opening the USB serial port resets the Nano (~1.5 s). The `H`
 handshake plus the daemon re-sending state on `H` is exactly what makes the
 display recover correctly after every reconnect. After a reset the firmware
-re-draws whatever word and card the daemon re-sends.
+re-draws whatever word + display frame the daemon re-sends, and the daemon
+re-arms any active haptic loop.
 
 ---
 

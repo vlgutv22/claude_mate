@@ -32,10 +32,11 @@
  *   OLED SSD1306 128x32 (0.91") over SOFTWARE I2C (hardware SCL A5 was damaged):
  *     VCC -> 5V, GND -> GND, SDA -> A4, SCL -> A3  (bit-banged; see softssd1306.h)
  *     I2C address 0x3C (common alternative: 0x3D)
- *   Buttons (INPUT_PULLUP, other leg to GND):
- *     FOCUS button -> D2   (emits "B|1")
- *     NEXT  button -> D3   (emits "B|2")
- *     PREV  button -> D4   (emits "B|3")
+ *   Buttons (INPUT_PULLUP, other leg to GND) -- layout MODE | SUBMIT | NEXT:
+ *     SUBMIT button -> D2  (emits "B|1"; focus/proceed to the selected tab)
+ *     NEXT   button -> D3  (emits "B|2"; next card / highlight down)
+ *     MODE   button -> D4  (emits "B|3" on a short press, "B|4" on a long press;
+ *                          short = prev card / highlight up, long = switch mode)
  *   Micro vibration motor (haptic alert):
  *     VIBRO        -> D5   (OUTPUT; drive via an NPN transistor or one ULN2003
  *                          channel -- do NOT drive the motor straight off a pin.
@@ -58,6 +59,11 @@
  *                  model/effort render as a small "model · effort" middle row;
  *                  omitted/empty keeps the original two-line card.
  *     I                                              idle screen (no sessions)
+ *     T|<total>|<sel>|<row>|<row>|...                LIST-mode frame (up to 4 rows);
+ *                                                    row = <name>;<stateChar>;<hl>
+ *                                                    total = tab count, sel = 0-based
+ *                                                    highlighted index (scrollbar),
+ *                                                    hl = 1 for the highlighted row.
  *     P                                              ping/keepalive (we reply H)
  *     V|<kind>                                       haptic control (motor only):
  *                                                    START one-shot start tick,
@@ -68,7 +74,8 @@
  *                                                    stop/silence the motor now
  *   Arduino -> Daemon:
  *     H                                              hello, sent once after boot
- *     B|<n>                                          n=1 FOCUS, n=2 NEXT, n=3 PREV
+ *     B|<n>                                          n=1 SUBMIT, n=2 NEXT,
+ *                                                    n=3 MODE short, n=4 MODE long
  *
  * NOTE: opening the USB serial port resets the Nano (~1.5s). That is why we emit
  * H once in setup() so the daemon can (re)send the full current state.
@@ -91,16 +98,18 @@
 #define SCREEN_ADDRESS 0x3C    // common alternative: 0x3D
 
 // ---- Pin map -----------------------------------------------------------------
-#define PIN_BTN_FOCUS  2       // D2, INPUT_PULLUP, emits B|1
-#define PIN_BTN_NEXT   3       // D3, INPUT_PULLUP, emits B|2
-#define PIN_BTN_PREV   4       // D4, INPUT_PULLUP, emits B|3
+// Physical layout (left -> right): MODE | SUBMIT | NEXT.
+#define PIN_BTN_SUBMIT 2       // D2, INPUT_PULLUP, emits B|1 (focus/proceed)
+#define PIN_BTN_NEXT   3       // D3, INPUT_PULLUP, emits B|2 (next / highlight down)
+#define PIN_BTN_MODE   4       // D4, INPUT_PULLUP, emits B|3 short / B|4 long
 #define PIN_VIBRO      5       // D5, OUTPUT, drives the vibration motor (HIGH=on)
 
 // ---- Protocol constants ------------------------------------------------------
 #define SERIAL_BAUD    115200
 #define LINE_MAX       96      // cap input line length to bound RAM use
                                // (fits S card + name + model + effort fields)
-#define DEBOUNCE_MS    200UL   // ~200ms button debounce
+#define DEBOUNCE_MS    40UL    // ~40ms button debounce (snappy short taps)
+#define LONGPRESS_MS   500UL   // MODE held this long -> long-press (mode toggle)
 
 // ---- Haptic tuning -----------------------------------------------------------
 // PWM amplitude (0-255) per pattern, kept "graduated but soft": urgency reads as
@@ -139,7 +148,19 @@ static uint8_t curTotal = 0;
 static uint8_t curState = ST_IDLE;
 static bool  curAck     = true;      // alert acknowledged (focused)? -> dot style
 static bool  showIdle   = true;      // true => idle screen, no card
+static bool  showList   = false;     // true => LIST-mode frame (overrides card)
 static bool  gBlinkOn   = true;      // blink phase for the unacknowledged dot
+
+// ---- LIST-mode model (T| frame) ----------------------------------------------
+// The daemon owns the tab list + selection and sends a pre-windowed frame of up
+// to LIST_ROWS visible rows; we just draw it. Highlighted row is drawn inverted.
+#define LIST_ROWS 4                  // 128x32 fits 4 size-1 text rows (8px each)
+static char    listName[LIST_ROWS][19] = {{0}};  // per-row name (18 chars + NUL)
+static char    listState[LIST_ROWS]    = {0};    // per-row state glyph (W/?/!/D/-)
+static bool    listHl[LIST_ROWS]       = {false};// per-row highlighted?
+static uint8_t listRows  = 0;        // visible rows in the frame (0..LIST_ROWS)
+static uint8_t listTotal = 0;        // total tabs (for the scrollbar)
+static uint8_t listSel   = 0;        // highlighted global index (for the scrollbar)
 
 // ---- Status word -------------------------------------------------------------
 static uint8_t curWord = W_FREE;     // current OLED word
@@ -164,15 +185,21 @@ static unsigned long lastRxMs       = 0;     // millis() of the last serial byte
                                              // (loop watchdog: daemon liveness)
 
 // ---- Button debounce state ---------------------------------------------------
-static bool          focusStable = true;   // pull-up idle = HIGH (released)
-static bool          nextStable  = true;
-static bool          prevStable  = true;
-static unsigned long focusEdgeMs = 0;
-static unsigned long nextEdgeMs  = 0;
-static unsigned long prevEdgeMs  = 0;
-static int           focusLastRaw = HIGH;
-static int           nextLastRaw  = HIGH;
-static int           prevLastRaw  = HIGH;
+// SUBMIT + NEXT are simple press-edge buttons (emit on press). MODE distinguishes
+// a short press (emit B|3 on release) from a long press (emit B|4 once at the
+// LONGPRESS_MS threshold, then swallow the release).
+static bool          submitStable = true;  // pull-up idle = HIGH (released)
+static bool          nextStable   = true;
+static unsigned long submitEdgeMs = 0;
+static unsigned long nextEdgeMs   = 0;
+static int           submitLastRaw = HIGH;
+static int           nextLastRaw   = HIGH;
+
+static bool          modeStable   = true;  // released?
+static int           modeLastRaw  = HIGH;
+static unsigned long modeEdgeMs   = 0;     // debounce edge time
+static unsigned long modePressMs  = 0;     // when the current press began
+static bool          modeLongFired = false;// long-press already emitted this hold?
 
 // -----------------------------------------------------------------------------
 // Helpers
@@ -425,9 +452,44 @@ static void drawCard() {
   display.display();
 }
 
+// LIST mode: draw up to LIST_ROWS tab rows (glyph + name), the highlighted row
+// inverted, and a scrollbar on the right when there are more tabs than fit.
+static void drawList() {
+  display.clearDisplay();
+  const bool hasBar = (listTotal > LIST_ROWS);
+  const int16_t barX = SCREEN_WIDTH - 3;          // 3px scrollbar strip on the right
+  const int16_t rowW = hasBar ? barX - 1 : SCREEN_WIDTH;
+
+  for (uint8_t r = 0; r < listRows && r < LIST_ROWS; r++) {
+    int16_t y = (int16_t)r * 8;
+    if (listHl[r]) {                               // highlighted row: inverted bar
+      display.fillRect(0, y, rowW, 8, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK);
+    } else {
+      display.setTextColor(SSD1306_WHITE);
+    }
+    display.setTextSize(1);
+    display.setCursor(1, y);
+    display.print(listState[r] ? listState[r] : ' ');
+    display.print(' ');
+    display.print(listName[r]);                    // clipped at the edge (no wrap)
+  }
+
+  if (hasBar) {                                    // scrollbar: track + thumb
+    display.drawFastVLine(barX + 1, 0, SCREEN_HEIGHT, SSD1306_WHITE);
+    uint8_t denom = (listTotal > 1) ? (listTotal - 1) : 1;
+    int16_t thumbH = 6;
+    int16_t ty = (int16_t)listSel * (SCREEN_HEIGHT - thumbH) / denom;
+    display.fillRect(barX, ty, 3, thumbH, SSD1306_WHITE);
+  }
+
+  display.display();
+}
+
 static void render() {
-  if (showIdle) drawIdle();
-  else          drawCard();
+  if      (showList) drawList();
+  else if (showIdle) drawIdle();
+  else               drawCard();
 }
 
 // -----------------------------------------------------------------------------
@@ -455,9 +517,53 @@ static void handleLine(char *line) {
 
     case 'I':                            // idle screen
       showIdle = true;
+      showList = false;
       curState = ST_IDLE;
       render();
       break;
+
+    case 'T': {  // T|total|sel|<name;st;hl>|<name;st;hl>|...  -- LIST-mode frame
+      // The daemon owns the tab list + selection and windows it to <=LIST_ROWS
+      // visible rows. Tokenize on '|': fields[1]=total, [2]=sel, [3..]=rows.
+      char *fields[3 + LIST_ROWS];
+      uint8_t n = 0;
+      char *p = line;
+      fields[n++] = p;                   // fields[0] = "T"
+      while (n < (uint8_t)(3 + LIST_ROWS)) {
+        char *bar = strchr(p, '|');
+        if (!bar) break;
+        *bar = 0;
+        p = bar + 1;
+        fields[n++] = p;
+      }
+      if (n < 3) break;                  // malformed: need at least total + sel
+      listTotal = (uint8_t)atoi(fields[1]);
+      listSel   = (uint8_t)atoi(fields[2]);
+      listRows  = 0;
+      for (uint8_t f = 3; f < n && listRows < LIST_ROWS; f++) {
+        // Each row is "name;state;hl". Split on ';' in place.
+        char *row = fields[f];
+        char *s1 = strchr(row, ';');
+        char *nm = row;
+        char sc = ' ';
+        bool hl = false;
+        if (s1) {
+          *s1 = 0;
+          char *st = s1 + 1;
+          char *s2 = strchr(st, ';');
+          if (s2) { *s2 = 0; hl = (s2[1] == '1'); }
+          sc = st[0] ? st[0] : ' ';
+        }
+        copyField(listName[listRows], sizeof(listName[0]), nm);
+        listState[listRows] = sc;
+        listHl[listRows]    = hl;
+        listRows++;
+      }
+      showList = true;
+      showIdle = false;
+      render();
+      break;
+    }
 
     case 'D': {                          // D|<WORD> -- set the status word
       char *bar = strchr(line, '|');
@@ -508,6 +614,7 @@ static void handleLine(char *line) {
       copyField(curModel,  sizeof(curModel),  (n > 8) ? fields[8] : "");
       copyField(curEffort, sizeof(curEffort), (n > 9) ? fields[9] : "");
       showIdle = false;
+      showList = false;                  // a card frame leaves LIST mode
       render();
       break;
     }
@@ -545,9 +652,9 @@ static void pumpSerial() {
 // Buttons
 // -----------------------------------------------------------------------------
 
-// Debounce one button. Emits "B|<n>" on a press (HIGH->LOW transition).
-static void pollButton(uint8_t pin, uint8_t n, bool &stable,
-                       int &lastRaw, unsigned long &edgeMs) {
+// Simple press-edge button (SUBMIT, NEXT): debounce, emit "B|<n>" on press.
+static void pollPressButton(uint8_t pin, uint8_t n, bool &stable,
+                            int &lastRaw, unsigned long &edgeMs) {
   int raw = digitalRead(pin);
   unsigned long now = millis();
   if (raw != lastRaw) {
@@ -557,19 +664,45 @@ static void pollButton(uint8_t pin, uint8_t n, bool &stable,
   if ((now - edgeMs) >= DEBOUNCE_MS) {
     bool pressedNow = (raw == LOW);      // pull-up: LOW = pressed
     bool wasPressed = !stable;
-    if (pressedNow && !wasPressed) {
-      // Edge into pressed -> emit event.
+    if (pressedNow && !wasPressed) {      // edge into pressed -> emit
       Serial.print(F("B|"));
       Serial.println(n);
     }
-    stable = !pressedNow ? true : false; // stable=true means released
+    stable = !pressedNow;                 // stable=true means released
+  }
+}
+
+// MODE button: emit "B|3" on a SHORT press (released before LONGPRESS_MS) or
+// "B|4" once when the hold crosses LONGPRESS_MS (the release is then swallowed).
+static void pollModeButton() {
+  int raw = digitalRead(PIN_BTN_MODE);
+  unsigned long now = millis();
+  if (raw != modeLastRaw) {
+    modeLastRaw = raw;
+    modeEdgeMs = now;
+  }
+  if ((now - modeEdgeMs) >= DEBOUNCE_MS) {
+    bool pressedNow = (raw == LOW);
+    bool wasPressed = !modeStable;
+    if (pressedNow && !wasPressed) {      // press edge: start timing the hold
+      modePressMs = now;
+      modeLongFired = false;
+    } else if (!pressedNow && wasPressed) {
+      if (!modeLongFired) Serial.println(F("B|3"));   // short press on release
+    }
+    modeStable = !pressedNow;
+  }
+  // Long-press fires while still held, once the threshold is crossed.
+  if (!modeStable && !modeLongFired && (now - modePressMs) >= LONGPRESS_MS) {
+    Serial.println(F("B|4"));
+    modeLongFired = true;
   }
 }
 
 static void pollButtons() {
-  pollButton(PIN_BTN_FOCUS, 1, focusStable, focusLastRaw, focusEdgeMs);
-  pollButton(PIN_BTN_NEXT,  2, nextStable,  nextLastRaw,  nextEdgeMs);
-  pollButton(PIN_BTN_PREV,  3, prevStable,  prevLastRaw,  prevEdgeMs);
+  pollPressButton(PIN_BTN_SUBMIT, 1, submitStable, submitLastRaw, submitEdgeMs);
+  pollPressButton(PIN_BTN_NEXT,   2, nextStable,   nextLastRaw,   nextEdgeMs);
+  pollModeButton();
 }
 
 // -----------------------------------------------------------------------------
@@ -577,10 +710,10 @@ static void pollButtons() {
 // -----------------------------------------------------------------------------
 
 void setup() {
-  pinMode(PIN_BTN_FOCUS, INPUT_PULLUP);
-  pinMode(PIN_BTN_NEXT,  INPUT_PULLUP);
-  pinMode(PIN_BTN_PREV,  INPUT_PULLUP);
-  pinMode(PIN_VIBRO,     OUTPUT);
+  pinMode(PIN_BTN_SUBMIT, INPUT_PULLUP);
+  pinMode(PIN_BTN_NEXT,   INPUT_PULLUP);
+  pinMode(PIN_BTN_MODE,   INPUT_PULLUP);
+  pinMode(PIN_VIBRO,      OUTPUT);
   digitalWrite(PIN_VIBRO, LOW);          // motor off at boot
   lastRxMs = millis();                   // seed the haptic loop watchdog
 
@@ -628,6 +761,6 @@ void loop() {
   bool nb = (millis() / 400) & 1;
   if (nb != gBlinkOn) {
     gBlinkOn = nb;
-    if (!showIdle && isAlertState(curState) && !curAck) render();
+    if (!showIdle && !showList && isAlertState(curState) && !curAck) render();
   }
 }

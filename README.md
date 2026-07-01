@@ -17,10 +17,11 @@ in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
         │ WAIT  04:12                     │   ← big STATE word · live time-in-state
         └────────────────────────────────┘
               ((•)) vibration motor             ← buzzes per session, when IT needs you
-          [ FOCUS ]   [ NEXT ]   [ PREV ]      ← three buttons
+          [ MODE ]   [ SUBMIT ]   [ NEXT ]     ← three buttons
+   MODE: short = prev / list-up · long = switch SCROLL↔LIST   SUBMIT: focus tab   NEXT: next / list-down
 
    the dot:   ● blinking = unacknowledged (needs you)   ○ hollow = acknowledged (focused)
-   the buzz:  START 3 soft ticks · INPUT gentle tap · DONE heartbeat-loop · ERROR alarm-loop  (loops/re-taps until you FOCUS)
+   the buzz:  START 3 soft ticks · INPUT gentle tap · DONE heartbeat-loop · ERROR alarm-loop  (loops/re-taps until you SUBMIT)
 ```
 
 ---
@@ -62,8 +63,13 @@ hooks are the zero-dependency feed. Use whichever fits each session.
 - **Auto-surface the urgent tab** — the daemon shows the single most urgent
   session that needs you, ordered **error → waiting → done → working → idle**.
   There is **no blind auto-carousel**; the screen holds the thing you should
-  look at. **NEXT / PREV** step the same urgent-first order manually and pause
-  auto-surfacing for ~10 s so you can browse.
+  look at. **NEXT** and **MODE (short)** step the same urgent-first order manually
+  and pause auto-surfacing for ~10 s so you can browse.
+- **Two UI modes** — a long-press of **MODE** toggles between **SCROLL** (the
+  one-card carousel above) and **LIST** (a scrolling list of *all* tabs with a
+  state glyph each: `W`/`?`/`!`/`D`/`-`). In LIST, **NEXT** / **MODE-short** move
+  the highlight and **SUBMIT** focuses the highlighted tab. Buttons are snappy
+  (~40 ms debounce; ~500 ms hold = long-press).
 - **Per-session haptics** — the motor buzzes for *that session's own*
   transition, not just an aggregate change:
   - **START** — a job (re)started → three gentle 0.3 s ticks (one-shot).
@@ -136,7 +142,7 @@ hooks are the zero-dependency feed. Use whichever fits each session.
    │   • SSD1306 128x32 OLED — status card: ack    │
    │     dot · name · idx · model·effort · STATE   │
    │   • micro vibration motor (D5) plays V|<KIND>│
-   │   • FOCUS / NEXT / PREV buttons → B|<n>       │
+   │   • SUBMIT/NEXT/MODE buttons → B|1..B|4       │
    └──────────────────────────────────────────────┘
                             │  H (hello on boot), B|<n> (buttons)
                             └──────────────► back to the daemon
@@ -179,7 +185,7 @@ rhythm, not raw force:
 
 `DONE` and `ERROR` **loop** in the firmware until the daemon sends `V|OFF`;
 `INPUT` re-taps on a timer. A turn ending (`working → idle`) becomes **done** and
-keeps looping until you **FOCUS** the session — pressing FOCUS acknowledges it
+keeps looping until you focus the session — pressing **SUBMIT** acknowledges it
 (sending `V|OFF` to silence the motor: a done tab becomes idle; a waiting/error
 tab goes quiet but keeps its state until it changes). The OLED's ack dot mirrors
 this: blinking while unacknowledged, hollow once seen. If the daemon ever dies
@@ -193,7 +199,7 @@ mid-alert, the firmware stops the loop on its own after ~30 s of serial silence.
 |-----|-----------------------------------------|----------------------------------------|
 | 1   | Arduino Nano (ATmega328P)               | Any USB-serial Nano clone works        |
 | 1   | SSD1306 0.91" 128×32 OLED, I2C           | Address `0x3C` (some boards `0x3D`); 0.96" 128×64 also works |
-| 3   | Momentary push buttons                  | FOCUS, NEXT, PREV                      |
+| 3   | Momentary push buttons                  | MODE, SUBMIT, NEXT                     |
 | 1   | Micro vibration motor                   | coin/pager type; haptic alert on D5    |
 | 1   | NPN transistor + ~1 kΩ + 1N4148 diode   | D5 driver — **or** a 3-pin vibro module / a spare ULN2003 channel instead |
 | —   | Jumper wires, breadboard / perfboard    |                                        |
@@ -210,9 +216,9 @@ Pinout summary (full details in [docs/WIRING.md](docs/WIRING.md)):
 |----------------------|-----------|----------------------------------------|
 | OLED SDA             | A4        | I2C                                    |
 | OLED SCL             | A5        | I2C                                    |
-| FOCUS button         | D2        | `INPUT_PULLUP`, emits `B|1`            |
-| NEXT button          | D3        | `INPUT_PULLUP`, emits `B|2`            |
-| PREV button          | D4        | `INPUT_PULLUP`, emits `B|3`            |
+| SUBMIT button        | D2        | `INPUT_PULLUP`, emits `B|1` (focus selected tab) |
+| NEXT button          | D3        | `INPUT_PULLUP`, emits `B|2` (next / highlight down) |
+| MODE button          | D4        | `INPUT_PULLUP`, emits `B|3` short / `B|4` long (prev / mode toggle) |
 | Vibration motor drive| D5        | PWM-capable; never drive the motor directly |
 
 The three buttons use `INPUT_PULLUP` (other leg to GND; pressed = LOW). D5 drives
