@@ -91,14 +91,16 @@ CASES = [
      "✻ Forming… (10s · ↓ 500 tokens · thinking with xhigh effort)", "working"),
     ("working meter '↑ 429 tokens · esc to interrupt' must NOT read error",
      "✶ Working… (3s · ↑ 429 tokens · esc to interrupt)", "working"),
-    # Background agents: the live agent-progress line ("○ <name> … Ns · ↓ N tokens")
-    # or a "Hatching…" spinner sits ABOVE the agent's transcript, which fills the
-    # bottom of the screen. Keying "working" only off the bottom BUSY_TAIL_LINES
-    # read this busy multi-agent session as IDLE (-> premature DONE). The glyph-
-    # prefixed live-line signal (matched over the whole screen) must catch it.
-    ("running subagent, live agent line above a long transcript (agents panel)",
+    # Background agents (the reported bug): the live spinner ("· Hatching… (Ns · ↓
+    # N tokens)") sits ABOVE the agent's transcript, which fills the bottom of the
+    # screen. Keying "working" only off the bottom BUSY_TAIL_LINES read this busy
+    # multi-agent session as IDLE (-> premature DONE). The whole-screen live-spinner
+    # signal must catch it (faithful to the reported screenshot: a Hatching spinner
+    # and a running "○ Explore" row, then the agent's streamed findings below).
+    ("running subagents, live spinner above a long transcript (agents panel)",
      "● Agent \"Find tour UI\" finished · 3m 30s\n"
      "  bypass permissions on · esc to interrupt · ← for agents · ↓ to manage\n"
+     "· Hatching… (5m 2s · ↓ 15.3k tokens)\n"
      "● main\n"
      "○ Explore  Scanning Genie ETL mappings.    3m 30s · ↓ 79.9k tokens\n"
      + "\n".join(f"  based on my exploration, line {i}" for i in range(14)) + "\n"
@@ -107,13 +109,41 @@ CASES = [
      "· Hatching… (5m 2s · ↓ 15.3k tokens)\n"
      + "\n".join(f"  agent output line {i}" for i in range(12)) + "\n"
      + "  final line of the streamed output", "working"),
-    # Guard: once agents have FINISHED (no live timer+meter line), the session is
-    # idle again -- a finished-agent line ("● … finished · 3m 30s") has no ↑/↓
-    # token meter and its glyph is a done marker, so it must NOT read working.
-    ("agents finished, no live line -> idle",
+    # Guard: once agents have FINISHED (no live spinner), the session is idle again.
+    ("agents finished, no live spinner -> idle",
      "● Agent \"Find tour UI\" finished · 3m 30s\n"
      "● main · done\n"
      + "\n".join(f"  result summary line {i}" for i in range(8)) + "\n"
+     + PROMPT, "idle"),
+    # False-positive guards (from an adversarial probe): idle sessions whose visible
+    # screen merely CONTAINS meter-like text must NOT read working. The live-spinner
+    # regex requires a "verb…(timer…meter)" shape at a line start, which none of
+    # these have.
+    ("idle, a markdown TABLE pairs a duration and token column (benchmark)",
+     "● Benchmark from BENCH.md:\n"
+     "  | Model    | Wall time | Meter          |\n"
+     "  | -------- | --------- | -------------- |\n"
+     "  | Opus 4.8 | 2m 30s    | ↓ 79.9k tokens |\n"
+     "  | Sonnet   | 45s       | ↓ 40.1k tokens |\n"
+     + PROMPT, "idle"),
+    ("idle, a bulleted note quotes a timer and a token meter",
+     "● Here is what I learned about the detector:\n"
+     "  - I ran the probe agent for 3m 30s and it logged ↓ 79.9k tokens total.\n"
+     "  - The bottom-region scrape is what should govern the state.\n"
+     + PROMPT, "idle"),
+    ("idle, a FINISHED agent recap row keeps its token tally (hollow glyph)",
+     "● I ran the exploration agents; summary:\n"
+     "○ Explore ETL   done · 3m 30s · ↓ 79.9k tokens\n"
+     "  It mapped every Genie source table to its Snowflake sink.\n"
+     + PROMPT, "idle"),
+    # ...and even a full spinner string QUOTED mid-sentence (scrolled above the
+    # bottom region) stays idle: the new whole-screen signal rejects it because the
+    # spinner is not at a line start, so writing prose ABOUT the meter doesn't self-
+    # trigger. (Padding keeps the quote out of the bottom BUSY_TAIL_LINES so this
+    # isolates the new line-anchored regex, not the pre-existing bottom-meter check.)
+    ("idle, prose quotes a full spinner string mid-sentence (self-scrape)",
+     "● The live meter reads \"✻ Forming… (14s · ↓ 610 tokens)\" while busy.\n"
+     + "\n".join(f"  note line {i}" for i in range(12)) + "\n"
      + PROMPT, "idle"),
 ]
 

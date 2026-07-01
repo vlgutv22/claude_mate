@@ -384,24 +384,32 @@ _WORKING_METER_RE = re.compile(
     r'|\bthinking with\s+\w+\s+effort\b',     # thinking with xhigh effort
     re.I)
 
-# A LIVE status / agent-progress line, matched over the WHOLE visible screen (not
-# just the bottom region). Claude renders these while generating AND while a
-# background agent/workflow runs -- a spinner/agent glyph at the START of the line,
-# then a running elapsed timer AND an arrow token meter, e.g.
+# A LIVE SPINNER line, matched over the WHOLE visible screen (not just the bottom
+# region). Claude renders one while generating AND while a background agent /
+# workflow runs -- a spinner VERB ending in an ellipsis, then a parenthetical with
+# a running elapsed timer and either an arrow token meter or the thinking hint:
 #   "✻ Forming… (14s · ↓ 610 tokens · thinking with xhigh effort)"
-#   "○ Explore  Scanning ETL mappings.   3m 30s · ↓ 79.9k tokens"   (agents panel)
-#   "· Hatching… (5m 2s · ↓ 15.3k tokens)"
-# When a background agent's transcript fills the screen BELOW it, that live line
-# sits ABOVE the bottom BUSY_TAIL_LINES window -- so keying "working" only off the
-# bottom region mis-read a busy multi-agent session as idle (-> premature DONE).
-# This stays quote-resistant WITHOUT a region limit: prose that merely mentions a
-# meter is not glyph-prefixed (fails [^\w\s] at line start), and the leading glyph
-# must NOT be a completed/error marker (● ✓ ✗ …) so a *finished*-agent line
-# ("● Agent … finished · 3m 30s") won't match (it also lacks the ↑/↓ token meter).
-_LIVE_LINE_RE = re.compile(
-    r'^[ \t]*(?![●✓✔✗✘✅❌])[^\w\s]'           # leading glyph, not a done/error marker
-    r'.*?\b\d+\s*[ms]\b'                       # a running elapsed timer (14s / 2m / 30s)
-    r'.*?[↑↓]\s*[\d.,]+\s*[kKmM]?\s*tokens?\b',# an arrow token meter (↓ 79.9k tokens)
+#   "· Hatching… (5m 2s · ↓ 15.3k tokens)"       (a subagent spawning)
+#   "✶ Working… (3s · ↑ 429 tokens · esc to interrupt)"
+# When a background agent's transcript fills the screen BELOW it, that spinner sits
+# ABOVE the bottom BUSY_TAIL_LINES window -- so keying "working" only off the bottom
+# region mis-read a busy multi-agent session as idle (-> premature DONE).
+#
+# It stays quote-resistant WITHOUT a region limit via TWO structural requirements
+# an adversarial review found necessary (a bare "glyph + timer + meter" match false-
+# fired on markdown tables `| Opus | 2m 30s | ↓ 79.9k tokens |`, bulleted meter
+# quotes `- … 3m 30s … ↓ 79.9k tokens`, and finished-agent recap rows):
+#   1. a spinner VERB immediately followed by an ellipsis then "(<timer> …" -- prose,
+#      tables, bullets and "○ … done · …" recaps have no "word…(timer" shape;
+#   2. it must sit at the LINE START (only optional indent + one spinner glyph) --
+#      so a spinner string QUOTED mid-sentence ('the meter reads "✻ Forming… (14s…)"')
+#      is not at a line start and does not match.
+_LIVE_SPINNER_RE = re.compile(
+    r'^[ \t]*[^\w\s]?[ \t]*'                   # line start: optional indent + one glyph
+    r'\w+[ \t]*(?:…|\.\.\.)[ \t]*'             # a spinner verb + ellipsis: "Forming…"
+    r'\(\s*\d+\s*[ms]\b[^)\n]*?'               # "(14s …" -- a running elapsed timer
+    r'(?:[↑↓]\s*[\d.,]+\s*[kKmM]?\s*tokens?'   # … then an arrow token meter, OR
+    r'|thinking with\s+\w+\s+effort)',         # … the thinking-effort hint
     re.I | re.M)
 
 def detect_state(screen_text):
@@ -429,7 +437,7 @@ def detect_state(screen_text):
     # a working frame must never be mistaken for an error or a prompt.
     busy_now = (any(p in busy_tail for p in _patterns["busy"])
                 or bool(_WORKING_METER_RE.search(busy_tail))
-                or bool(_LIVE_LINE_RE.search(full)))
+                or bool(_LIVE_SPINNER_RE.search(full)))
 
     # Strong, specific error strings win even mid-stream (a genuine API error
     # replaces the spinner). Content-prone error phrases match ONLY in the tight
