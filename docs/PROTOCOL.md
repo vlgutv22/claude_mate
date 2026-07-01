@@ -27,14 +27,37 @@ input buffer and drops malformed/oversized lines).
 
 | Line                                                  | Meaning |
 |-------------------------------------------------------|---------|
-| `D\|<word>`                                           | Set the status word. `<word>` is one of `FREE`, `WIP`, `BLOCKED`, `WTF`. The Arduino draws the big word on the OLED **and** fires the vibration haptic **when the word changes** (WTF = 3 pulses, BLOCKED = 2 pulses, FREE = 1 short tick, WIP = silent). |
+| `D\|<word>`                                           | Set the status word. `<word>` is one of `FREE`, `WIP`, `BLOCKED`, `WTF`. The Arduino draws the big word on the OLED. **Visual only** — the word never buzzes on its own; all haptics come via `V\|`. |
 | `S\|<idx>\|<total>\|<name>\|<state>\|<runtime>\|<limit>\|<ack>\|<model>\|<effort>` | Show one session card (the carousel step). See field table below. `ack`/`model`/`effort` are optional trailing fields — older daemons omit them and the firmware copes. |
+| `V\|<kind>`                                           | Haptic control (motor only; never touches the OLED). `<kind>` is `START`, `INPUT`, `DONE`, `ERROR`, or `OFF`. See **Haptics** below. |
 | `I`                                                   | Idle screen — no active sessions. The daemon also sends `D\|FREE` alongside it. |
 | `P`                                                   | Ping / keepalive. The Arduino MAY ignore it, or reply with `H`. |
 
 > The old `L|<color>` traffic-light command and the stepper status wheel have
 > both been **removed**. The overall indicator is now the OLED word (drawn from
-> `D|<word>`), with the vibration motor buzzing on each word change.
+> `D|<word>`, visual only); the vibration motor is driven **independently** by the
+> daemon per session via `V|<kind>` (see **Haptics**).
+
+#### Haptics — `V|<kind>`
+
+The daemon owns **all** haptics and decides, per session, when to buzz; the
+firmware just plays the pattern it is told. Amplitude (PWM duty) stays well below
+full power — urgency reads as **rhythm**, not raw force.
+
+| `<kind>` | When the daemon sends it | Firmware pattern | Repeat |
+|----------|--------------------------|------------------|--------|
+| `START`  | A job (re)started, and nothing else needs you. | 3 gentle 0.3 s pulses. | one-shot |
+| `INPUT`  | A session started `waiting` (Claude needs input). | soft double-tap. | daemon re-taps every ~10 s until focused |
+| `DONE`   | A turn finished (`done`, unacknowledged). | 5×0.2 s "heartbeat", gaps 0.2/0.4 s, then a rest. | **loops** until `V\|OFF` |
+| `ERROR`  | A turn ended on an API error (`error`). | 0.4 s on / 0.2 s off. | **loops** until `V\|OFF` |
+| `OFF`    | The alert was acknowledged (FOCUS) or cleared. | stops the motor now. | — |
+
+`DONE` and `ERROR` are **continuous loops**: the firmware repeats the pattern on
+its own until it receives `V|OFF` (sent on FOCUS/clear). The daemon (re)sends the
+loop `<kind>` only when the desired loop *changes*, so the link is not spammed. As
+a failsafe the firmware stops any loop if the daemon goes fully silent for ~30 s
+(it pings `P` every 15 s and streams `S` cards ~1/s, so this only trips when the
+daemon has died). `OFF` (alias `STOP`) silences the motor immediately.
 
 **`S` line fields:**
 
@@ -187,10 +210,11 @@ the OLED word and the haptic:
 **Priority (strict):** `WTF` > `BLOCKED` > `WIP` > `FREE`. A single `error`
 session forces `WTF` even if others are merely `working`.
 
-On a word change the Arduino redraws the big word on the OLED and fires the
-vibration motor as a one-shot alert: **WTF = 3 pulses, BLOCKED = 2 pulses,
-FREE = 1 short tick, WIP = silent**. Buttons and serial stay responsive
-throughout.
+On a word change the Arduino redraws the big word on the OLED — **visual only**.
+The word does **not** buzz. Haptics are driven separately and per session via
+`V|<kind>` (see **Haptics** in §1a): the daemon decides when a *specific* tab
+started, finished, blocked, or errored, so a single tab's event is felt even when
+the aggregate word does not change. Buttons and serial stay responsive throughout.
 
 ### Carousel ordering (most urgent first)
 

@@ -145,7 +145,7 @@ or break a Claude turn.
 3. Restart / reload Claude Code (or start a new session) so it picks up the
    hooks. With the daemon running, submitting a prompt should show the word
    **WIP** (working) and a card; a `Notification` switches it to **BLOCKED** (and
-   the motor buzzes on each word change), etc.
+   the motor gives a gentle per-session buzz as sessions start/wait/finish/error), etc.
 
 ---
 

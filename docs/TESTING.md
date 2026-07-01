@@ -98,16 +98,29 @@ Flash the **real firmware**. Open the Arduino IDE **Serial Monitor** at
    H
    ```
 
-2. Now **send** lines by hand and watch the display + motor. Set the word:
+2. Now **send** lines by hand and watch the display. Set the word:
 
    ```
    D|WTF
    ```
 
-   → the OLED shows the big word **WTF** and the motor buzzes **3 pulses** (this
-   is a transition into WTF). Try `D|BLOCKED` (2 pulses), `D|FREE` (1 short
-   tick), and `D|WIP` (silent) — each redraws the word, and the buzz fires only
-   when the word actually changes.
+   → the OLED shows the big word **WTF**. Try `D|BLOCKED`, `D|FREE`, `D|WIP` —
+   each just redraws the word. **The word is visual only and never buzzes** in
+   the real firmware; haptics come from `V|` (next step).
+
+   Buzz the motor with `V|<kind>` and feel each pattern:
+
+   ```
+   V|START     3 gentle 0.3s ticks, then stops (one-shot)
+   V|INPUT     a soft double-tap, then stops (one-shot)
+   V|DONE      a 5-pulse heartbeat that LOOPS — send V|OFF to stop it
+   V|ERROR     a 0.4s-on/0.2s-off alarm that LOOPS — send V|OFF to stop it
+   V|OFF       stops any looping/playing pattern immediately
+   ```
+
+   Confirm `V|DONE` / `V|ERROR` keep repeating until you send `V|OFF`, and that
+   with no serial at all a loop self-stops after ~30 s (the daemon-silence
+   watchdog).
 
 3. Send a full session card:
 
@@ -136,8 +149,9 @@ Flash the **real firmware**. Open the Arduino IDE **Serial Monitor** at
    B|3
    ```
 
-Pass criterion: `H` on boot, cards render and the word + buzz update from typed
-lines, button presses emit `B|1` / `B|2` / `B|3`.
+Pass criterion: `H` on boot, cards render, the word (`D|`) updates and the
+haptics (`V|`, incl. the looping `V|DONE`/`V|ERROR` stopped by `V|OFF`) play from
+typed lines, button presses emit `B|1` / `B|2` / `B|3`.
 
 > When done, **close the Serial Monitor** so the daemon can use the port.
 
@@ -157,8 +171,9 @@ python3 $REPO/daemon/claude_mate_daemon.py --mock
 - The **carousel** rotates through cards roughly every 3 seconds.
 - The **status word** follows the logic: **WTF** when any session is `error`,
   **BLOCKED** else if any is `waiting`, **WIP** else if any is `working`, **FREE**
-  otherwise. It should visit all four words as the mock states cycle, with the
-  motor buzzing on each change.
+  otherwise. It should visit all four words as the mock states cycle.
+- The **motor** buzzes per session as tabs transition (a `V|START` tick, a
+  looping `V|DONE`/`V|ERROR` alarm, a re-tapped `V|INPUT`), independent of the word.
 - Press **NEXT** → the carousel advances immediately and pauses ~10 s.
 - Press **PREV** → the carousel steps back one card and pauses ~10 s.
 - Press **FOCUS** → the daemon attempts to focus that card's session (in mock,
@@ -189,10 +204,10 @@ the socket format `<state>|<session_id>|<name>` (here:
 `working|abc123|demo`). Try each state — `working`, `waiting`, `done`, `error` —
 and watch the card and the status word update accordingly:
 
-- `error` → **WTF** (3-pulse buzz).
-- `waiting` (and nothing errored) → **BLOCKED** (2-pulse buzz).
-- `working` (and nothing waiting/errored) → **WIP** (silent).
-- `done` / nothing pending → **FREE** (1 short tick).
+- `error` → **WTF** + a looping `V|ERROR` alarm (until you FOCUS / it clears).
+- `waiting` (and nothing errored) → **BLOCKED** + a gentle `V|INPUT` tap (re-tapped ~10 s).
+- `working` (and nothing waiting/errored) → **WIP** + a one-shot `V|START` tick.
+- `done` / nothing pending → **FREE** + a looping `V|DONE` heartbeat (until FOCUS).
 
 Pass criterion: feeding socket lines drives the card and the status word + haptic
 per [PROTOCOL.md](PROTOCOL.md).
@@ -205,15 +220,17 @@ Finally, exercise the whole pipeline with Claude Code. With the daemon running
 and the hooks merged (see [INSTALL.md](INSTALL.md)):
 
 1. Open a Claude Code session (VS Code extension or CLI) and **submit a prompt**
-   (`UserPromptSubmit`) → word changes to **WIP** (silent), a card appears as
-   `working`.
+   (`UserPromptSubmit`) → word changes to **WIP**, a card appears as `working`,
+   and a one-shot `V|START` tick fires (if nothing else needs you).
 2. Trigger a **Notification** (e.g. a permission prompt) → word changes to
-   **BLOCKED** (2-pulse buzz), card shows `waiting`.
+   **BLOCKED**, card shows `waiting`, and a gentle `V|INPUT` tap fires (re-tapped
+   ~10 s until you FOCUS).
 3. Let a turn **complete** (`Stop`) → card shows `done`; word returns to
-   **FREE** (1 tick) if nothing else needs you.
-4. Cause an **API error** (`StopFailure`) → card shows `error`, word to **WTF**
-   (3-pulse buzz). (`StopFailure` fires instead of `Stop` on API errors — they
-   never both fire.)
+   **FREE** if nothing else needs you, and a `V|DONE` heartbeat **loops** until
+   you FOCUS the tab.
+4. Cause an **API error** (`StopFailure`) → card shows `error`, word to **WTF**,
+   and a `V|ERROR` alarm **loops** until you FOCUS. (`StopFailure` fires instead
+   of `Stop` on API errors — they never both fire.)
 5. Open multiple sessions and confirm the carousel orders them most-urgent-first
    (`error` → `waiting` → `working` → `done` → `idle`) and the OLED shows the
    highest-priority word (WTF > BLOCKED > WIP > FREE).
@@ -237,6 +254,7 @@ FOCUS brings up the right session.
 | OLED blank | Wrong I2C address (try 0x3D) or SH1106 1.3" panel needs the SH1106 driver. |
 | Display blanks ~1.5 s when daemon reconnects | Expected — USB open resets the Nano; the `H` handshake restores state. |
 | Word never reaches BLOCKED on a question | Check the `Notification` hook is wired and the daemon is running. |
-| Motor never buzzes | It buzzes only on a word *change*; confirm the word actually changed. Check the D5 driver wiring (module IN / NPN base via 1k / ULN2003 IN1), common ground, and the flyback diode (see [WIRING.md](WIRING.md)). |
+| Motor never buzzes | Haptics come from `V|<kind>` (not the word). Confirm a session actually transitioned (start/wait/done/error). Test the motor directly by typing `V|ERROR` in the Serial Monitor (Level 2). Check the D5 driver wiring (module IN / NPN base via 1k / ULN2003 IN1), common ground, and the flyback diode (see [WIRING.md](WIRING.md)). |
+| Motor buzzes forever | Send `V|OFF` (FOCUS does this). A loop also self-stops ~30 s after the daemon goes silent. |
 | Motor buzzes weakly or not at all | D5 can't drive the motor directly — it needs the transistor/module/ULN2003 channel; verify the motor is on the 5 V rail, not a GPIO. |
 | Buttons do nothing in the daemon | Confirm Level 2 first (`B|1`/`B|2`/`B|3` over serial), then check the daemon's button thread/logs. |

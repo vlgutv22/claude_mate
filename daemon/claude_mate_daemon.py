@@ -94,11 +94,28 @@ STATE_ORDER = {"error": 0, "waiting": 1, "done": 2, "working": 3, "idle": 4}
 
 VALID_STATES = set(STATE_ORDER.keys())
 
-# Per-state repeat-buzz cadence (seconds) and haptic kind. A tab keeps nagging
-# at this interval, gentler/less often as urgency drops, until acknowledged
-# (FOCUS) or it leaves the state. Job-start uses a one-shot "START" tick.
-ALERT_INTERVAL = {"error": 5.0, "waiting": 10.0, "done": 15.0}
+# Alert states nag the human until acknowledged (FOCUS) or the state changes.
+ALERT_STATES = {"error", "waiting", "done"}
+
+# Haptic kind emitted on a fresh transition INTO each state (used for logging and
+# to route the immediate one-shot buzz). Job-start uses a one-shot "START" tick.
 ALERT_KIND = {"error": "ERROR", "waiting": "INPUT", "done": "DONE"}
+
+# Two "until acknowledged" alerts play as a CONTINUOUS firmware loop: a finished
+# turn (DONE) and a hard error (ERROR). The firmware repeats the pattern until we
+# send V|OFF (on FOCUS/clear); the daemon only (re)sends the kind when the desired
+# loop changes, so the serial link is never spammed.
+LOOP_KIND = {"error": "ERROR", "done": "DONE"}
+
+# 'waiting' (Claude needs your input) is instead a GENTLE, paced re-tap -- a soft
+# one-shot double-tap every WAIT_NAG_INTERVAL seconds until you focus it, rather
+# than a continuous alarm.
+WAIT_NAG_KIND = "INPUT"
+WAIT_NAG_INTERVAL = 10.0
+
+# Sentinel for "we have not told the firmware a loop state yet", so the first
+# resolve always emits (V|OFF) and clears any stale loop left by a prior daemon.
+_LOOP_UNSET = "\x00unset"
 
 
 def log(msg: str) -> None:
@@ -229,7 +246,7 @@ class Registry:
             # Acknowledgment + one-shot haptic kind on a real transition.
             haptic: Optional[str] = None
             if changed:
-                if eff in ALERT_INTERVAL:        # done/waiting/error: fresh alert
+                if eff in ALERT_STATES:          # done/waiting/error: fresh alert
                     sess.acked = False           # nag until focused
                     haptic = ALERT_KIND[eff]
                 elif eff == "working":
@@ -260,7 +277,7 @@ class Registry:
         waiting > done), or None. Drives auto-show + the repeat-buzz cadence."""
         with self._lock:
             items = [s for s in self._sessions.values()
-                     if s.state in ALERT_INTERVAL and not s.acked]
+                     if s.state in ALERT_STATES and not s.acked]
         if not items:
             return None
         items.sort(key=lambda s: (STATE_ORDER.get(s.state, 99), s.name.lower()))
@@ -440,7 +457,11 @@ class Display:
         self._last_word: Optional[str] = None
         self._current_index = 0          # carousel position within ordered list
         self._current_session: Optional[Session] = None  # last shown card's session
-        self._buzz_last: Dict[str, float] = {}  # haptic kind -> last buzz time
+        # Haptic state. `_loop_kind` = what continuous loop the firmware is playing
+        # ("ERROR"/"DONE"/None), so we only (re)send V| when it changes. Starts at a
+        # sentinel so the first resolve emits V|OFF and clears any stale loop.
+        self._loop_kind: Optional[str] = _LOOP_UNSET
+        self._last_wait_tap = 0.0        # time of the last gentle needs-input tap
 
     # ---- dial (stepper status wheel) ------------------------------------- #
 
@@ -453,25 +474,65 @@ class Display:
         if changed or force:
             self._link.write_line(f"D|{word}")
 
-    def push_buzz(self, kind: str) -> None:
-        """Fire a haptic on the device: V|<KIND> (START/DONE/INPUT/ERROR).
+    def update_haptics(self, top: Optional[Session]) -> None:
+        """Single source of truth for the motor, given the most-urgent
+        unacknowledged alert (or None):
 
-        Buzzes the pattern without touching the wheel/OLED, so a single tab's
-        job-start / finish / block / error is felt even when the aggregate
-        status word does not change. Records the time so the Carousel can pace
-        repeat nags (and so an initial buzz doesn't double-fire with a repeat).
+          * error / done -> a CONTINUOUS loop (V|ERROR / V|DONE); the firmware
+            repeats it until we send V|OFF. Emitted only when the desired loop
+            changes.
+          * waiting      -> a gentle re-tap (V|INPUT) every WAIT_NAG_INTERVAL,
+            with the continuous loop held OFF so the taps aren't drowned out.
+          * nothing      -> V|OFF, silence.
+
+        Idempotent: V| lines go out only on a loop change or a due re-tap.
+        Called on every registry change and once per carousel tick (~1s), so a
+        loop clears promptly on FOCUS and a wait-tap stays paced.
         """
-        if not kind:
-            return
+        desired = LOOP_KIND.get(top.state) if top is not None else None
+        self._set_loop(desired)
+
+        # Gentle needs-input tap: only while 'waiting' is the loudest alert, and
+        # only after it has persisted a full interval (a picker opened+dismissed
+        # in a couple seconds never taps).
+        if top is not None and top.state == "waiting":
+            now = time.time()
+            if (now - top.state_since) >= WAIT_NAG_INTERVAL and \
+               (now - self._last_wait_tap) >= WAIT_NAG_INTERVAL:
+                log(f"haptic: needs-input tap for {top.name} "
+                    f"(every {int(WAIT_NAG_INTERVAL)}s until focused)")
+                self._tap(WAIT_NAG_KIND)
+
+    def _set_loop(self, kind: Optional[str]) -> None:
+        """Drive the firmware's continuous-loop state. Sends V|<kind> to start a
+        loop or V|OFF to stop it, but only when the desired state changes."""
         with self._lock:
-            self._buzz_last[kind] = time.time()
+            if kind == self._loop_kind:
+                return
+            self._loop_kind = kind
+        if kind:
+            log(f"haptic: loop {kind} until acknowledged")
+            self._link.write_line(f"V|{kind}")
+        else:
+            self._link.write_line("V|OFF")
+
+    def _tap(self, kind: str) -> None:
+        """Fire a one-shot haptic (V|<kind>) without touching the loop tracker.
+        The firmware plays it once; any active loop was already held OFF by the
+        caller, so nothing is clobbered."""
+        with self._lock:
+            self._last_wait_tap = time.time()
         self._link.write_line(f"V|{kind}")
 
-    def alert_due(self, kind: str, interval: float) -> bool:
-        """True if `kind` has not buzzed within `interval` seconds."""
-        with self._lock:
-            last = self._buzz_last.get(kind, 0.0)
-        return (time.time() - last) >= interval
+    def start_tick(self) -> None:
+        """One-shot START tick (a job (re)started). The caller fires this only
+        when nothing needs you, so it never interrupts an alert loop/tap."""
+        self._link.write_line("V|START")
+
+    def wait_tap(self) -> None:
+        """Immediate needs-input tap on the 'waiting' transition (before the
+        paced re-taps take over), so a fresh question is felt at once."""
+        self._tap(WAIT_NAG_KIND)
 
     def show_session(self, sess: Optional[Session]) -> None:
         """Show a specific session's card (by key, tolerant of reordering)."""
@@ -777,7 +838,7 @@ class SocketServer(threading.Thread):
                                   model=model, effort=effort)
         self._on_update()
         if haptic and self._on_haptic:
-            log(f"haptic: buzz {haptic} for {name or sid} ({state})")
+            log(f"haptic: {haptic} transition for {name or sid} ({state})")
             self._on_haptic(haptic)
 
     def stop(self) -> None:
@@ -898,27 +959,10 @@ class Carousel(threading.Thread):
             self._paused_until = time.time() + NEXT_PAUSE
 
     def notify_change(self) -> None:
-        """Called on any registry change: refresh dial + current card."""
+        """Called on any registry change: refresh dial + current card + haptics."""
         self._display.push_dial()
         self._display.refresh_current()
-
-    def _repeat_alert(self, target: Optional[Session]) -> None:
-        """Re-buzz the most urgent unacknowledged alert at its cadence."""
-        if target is None:
-            return
-        interval = ALERT_INTERVAL.get(target.state)
-        kind = ALERT_KIND.get(target.state)
-        if not (interval and kind):
-            return
-        # Require the alert to have existed for a full interval before nagging,
-        # so the one-shot buzz fired on the transition (which may land just after
-        # this tick reads alert_due) can't be doubled at onset.
-        if (time.time() - target.state_since) < interval:
-            return
-        if self._display.alert_due(kind, interval):
-            log(f"haptic: re-nag {kind} for {target.name} "
-                f"(every {int(interval)}s until focused)")
-            self._display.push_buzz(kind)
+        self._display.update_haptics(self._reg.top_alert())
 
     def run(self) -> None:
         # Prime the display.
@@ -944,8 +988,9 @@ class Carousel(threading.Thread):
                 self._display.refresh_current()
             self._display.push_dial()
 
-            # Keep nagging the alert (independent of browsing/auto-show).
-            self._repeat_alert(target)
+            # Drive the motor from the loudest alert: continuous loops for
+            # done/error, paced taps for waiting, silence otherwise.
+            self._display.update_haptics(target)
 
             self._stop.wait(1.0)
 
@@ -1068,7 +1113,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         registry.acknowledge(sess)
         carousel.notify_change()
 
-    socket_server = SocketServer(args.sock, registry, on_update, display.push_buzz)
+    def on_haptic(kind: str) -> None:
+        """Immediate one-shots on a fresh transition. on_update() ran first, so
+        the DONE/ERROR continuous loops and the paced waiting taps are already
+        handled by update_haptics(); here we only add buzzes that must be felt at
+        once, and only when they won't stomp a louder alert."""
+        top = registry.top_alert()
+        if kind == "START":
+            if top is None:              # began work, nothing else needs you
+                display.start_tick()
+        elif kind == "INPUT":
+            if top is not None and top.state == "waiting":
+                display.wait_tap()       # feel a fresh question immediately
+
+    socket_server = SocketServer(args.sock, registry, on_update, on_haptic)
     button_reader = ButtonReader(link, display)
     button_reader.on_next = carousel.pause
     button_reader.on_ack = on_ack
@@ -1104,8 +1162,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             stop = getattr(t, "stop", None)
             if callable(stop):
                 stop()
-        # Best-effort: blank the display by sending idle (also homes the wheel).
+        # Best-effort: silence the motor and blank the display on the way out.
         try:
+            link.write_line("V|OFF")
             link.write_line("I")
             link.write_line("D|FREE")
         except Exception:

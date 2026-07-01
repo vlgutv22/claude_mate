@@ -3,8 +3,8 @@
 Claude Mate is a USB hardware companion for Claude Code. It is an Arduino Nano
 driving a small I2C OLED, three buttons, and a **micro vibration motor**. The
 OLED shows one of four big status words (FREE / WIP / BLOCKED / WTF) over a
-session-detail line, and the motor buzzes a haptic alert whenever that word
-changes. It shows the live status of one or more Claude Code sessions running in
+session-detail line, and the motor buzzes a per-session haptic alert (driven by
+the daemon) when a session needs you. It shows the live status of one or more Claude Code sessions running in
 the VS Code native extension (and/or the terminal CLI) on a Mac, and lets you
 press a button to **focus** the VS Code window of a session that needs your
 attention.
@@ -42,8 +42,8 @@ Arduino Nano (ATmega328P)
         +--> OLED SSD1306 128x32 (I2C, addr 0x3C)   shows the current session card
         |                                            + the current word (FREE/WIP/
         |                                            BLOCKED/WTF) as the big status
-        +--> micro vibration motor (D5)             haptic buzz on each word change:
-        |                                            WTF=3, BLOCKED=2, FREE=1, WIP=0
+        +--> micro vibration motor (D5)             per-session haptic via V|<kind>:
+        |                                            START/INPUT one-shot, DONE/ERROR loop
 
 Buttons back (return path):
         Button press (FOCUS=D2, NEXT=D3, PREV=D4)
@@ -108,10 +108,10 @@ persistent storage on the device.
                               |                                   |
                               |  +--------+    +----------------+ |
                               |  | OLED   |    | vibration motor| |
-                              |  | 0x3C   |    | D5, buzz on    | |
-                              |  | I2C    |    | word change:   | |
-                              |  | FREE/  |    | WTF=3 BLOCKED=2| |
-                              |  | WIP/.. |    | FREE=1 WIP=0   | |
+                              |  | 0x3C   |    | D5, V|<kind>:  | |
+                              |  | I2C    |    | START/INPUT 1shot| |
+                              |  | FREE/  |    | DONE/ERROR loop| |
+                              |  | WIP/.. |    | OFF = stop     | |
                               |  +--------+    +----------------+ |
                               |  [FOCUS D2] [NEXT D3] [PREV D4]   |
                               +-----------------------------------+
@@ -127,8 +127,9 @@ daemon last sent and reports button presses.
 
 The status word reflects the **overall system state**, not a single session. The
 daemon recomputes a **word** on every state change and sends `D|<word>` to the
-Arduino whenever the word changes; the Arduino draws it on the OLED and buzzes
-the haptic.
+Arduino whenever the word changes; the Arduino draws it on the OLED (visual only).
+Haptics are separate — driven per session via `V|<kind>` (see the OLED word +
+vibration haptic section above).
 
 ```
 WTF      if ANY session is in {error}
@@ -151,15 +152,23 @@ The OLED is the **sole visual status**: it renders the big word
 (FREE / WIP / BLOCKED / WTF) over the session-detail line. There is no wheel, no
 dial, no homing, and no endstop.
 
-The **micro vibration motor on D5** is a haptic alert that fires **only when the
-word changes** — a one-shot, rising-edge buzz, never continuous:
+The **micro vibration motor on D5** is a haptic alert driven **entirely by the
+daemon, per session**, via `V|<kind>` lines — *not* by the word. The word (`D|`)
+is visual only. The daemon decides when a specific tab started, is waiting,
+finished, or errored, and sends the matching kind; the firmware just plays it at
+a **graduated-but-soft** PWM amplitude (urgency reads as rhythm, not force):
 
 ```
-WTF      3 pulses
-BLOCKED  2 pulses
-FREE     1 short tick
-WIP      silent
+START   3 gentle 0.3s ticks                          one-shot
+INPUT   soft double-tap                               re-tapped ~every 10s
+DONE    5×0.2s heartbeat (gaps 0.2/0.4s), then rest   LOOPS until V|OFF
+ERROR   0.4s on / 0.2s off alarm                      LOOPS until V|OFF
+OFF     stop the motor                                (sent on FOCUS / clear)
 ```
+
+`DONE` and `ERROR` loop in the firmware until the daemon sends `V|OFF` (on FOCUS
+or when the alert clears); a firmware watchdog also stops any loop if the daemon
+goes silent for ~30 s. See [PROTOCOL.md](PROTOCOL.md) for the exact contract.
 
 The motor pulls more current than a GPIO can source, so D5 drives it through a
 small switch: a 3-pin vibro module, an NPN transistor (1 kΩ base resistor +
@@ -243,8 +252,8 @@ These are deliberate, documented boundaries — not bugs:
 - **Retry / resubmit is not supported in the GUI.** Re-running a failed turn is
   not reliably possible from outside the VS Code GUI, so Claude Mate does not
   attempt it. The hardware surfaces an `error` state and shows **WTF** (with the
-  3-pulse haptic) so a human can act, but the only button action toward a session
-  is **FOCUS**.
+  looping `V|ERROR` alarm haptic) so a human can act, but the only button action
+  toward a session is **FOCUS**.
 - **Limits are best-effort.** The `limit` field is a short display string and
   defaults to `"-"`. If the daemon cannot reliably obtain rate/usage limits, it
   shows `"-"` and **never fabricates** numbers. Real limit reporting is an

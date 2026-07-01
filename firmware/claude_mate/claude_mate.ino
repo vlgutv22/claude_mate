@@ -59,8 +59,13 @@
  *                  omitted/empty keeps the original two-line card.
  *     I                                              idle screen (no sessions)
  *     P                                              ping/keepalive (we reply H)
- *     V|<kind>                                       buzz now; kind = START|DONE|
- *                                                    INPUT|ERROR (haptic only)
+ *     V|<kind>                                       haptic control (motor only):
+ *                                                    START one-shot start tick,
+ *                                                    INPUT one-shot needs-input
+ *                                                    tap, DONE/ERROR looping
+ *                                                    "until acknowledged" alerts
+ *                                                    (repeat until V|OFF), OFF
+ *                                                    stop/silence the motor now
  *   Arduino -> Daemon:
  *     H                                              hello, sent once after boot
  *     B|<n>                                          n=1 FOCUS, n=2 NEXT, n=3 PREV
@@ -97,6 +102,19 @@
                                // (fits S card + name + model + effort fields)
 #define DEBOUNCE_MS    200UL   // ~200ms button debounce
 
+// ---- Haptic tuning -----------------------------------------------------------
+// PWM amplitude (0-255) per pattern, kept "graduated but soft": urgency reads as
+// rhythm + a little more push, never full-power buzz. Start/Done are the gentlest.
+#define VIBRO_MAX_STEPS   6       // longest pattern (DONE's 5-pulse heartbeat)
+#define DUTY_SOFT         80      // START tick + DONE heartbeat (gentlest)
+#define DUTY_INPUT       120      // needs-input double-tap (a touch firmer)
+#define DUTY_ALERT       160      // ERROR / warning loop (firmest; never 255)
+// A looping pattern (DONE/ERROR) repeats until the daemon sends V|OFF. As a
+// failsafe, if the daemon goes silent (no serial at all) for this long we stop
+// on our own so a crashed daemon can't leave the motor buzzing. The daemon pings
+// (P) every ~15s and streams S cards ~1/s, so this only trips when it is gone.
+#define VIBRO_WATCHDOG_MS 30000UL
+
 // Status words. Index order matches escalation FREE<WIP<BLOCKED<WTF.
 enum Word { W_FREE = 0, W_WIP, W_BLOCKED, W_WTF };
 
@@ -127,13 +145,23 @@ static bool  gBlinkOn   = true;      // blink phase for the unacknowledged dot
 static uint8_t curWord = W_FREE;     // current OLED word
 
 // ---- Vibration (haptic) state machine ----------------------------------------
-static uint8_t       vibroPulses   = 0;     // pulses remaining (incl. current)
-static bool          vibroOn       = false; // motor currently energised?
-static uint16_t      vibroOnMs     = 0;     // on-duration for the active pattern
-static uint16_t      vibroOffMs    = 0;     // gap between pulses
-static uint8_t       vibroDuty     = 255;   // PWM amplitude (0-255) of the pattern
-static uint8_t       vibroDutyLast = 255;   // amplitude of the FINAL pulse (accent)
-static unsigned long vibroPhaseMs  = 0;     // millis() at the last phase change
+// A pattern is a short list of ON pulses; each pulse has an on-duration and the
+// gap that FOLLOWS it. All pulses in a pattern share one PWM amplitude (duty).
+// A pattern either plays once or LOOPS (repeats until V|OFF / a new pattern /
+// the daemon-silence watchdog). This step form lets us do the gentle alternating
+// "heartbeat" DONE rhythm and the looping "until acknowledged" alerts, which the
+// old single-gap engine could not.
+struct VibroStep { uint16_t onMs; uint16_t offMs; };
+static VibroStep     vibroSteps[VIBRO_MAX_STEPS];
+static uint8_t       vibroStepCount = 0;     // pulses in the active pattern
+static uint8_t       vibroStepIdx   = 0;     // pulse currently playing
+static uint8_t       vibroDuty      = 0;     // PWM amplitude of this pattern
+static bool          vibroLoop      = false; // repeat the pattern until stopped?
+static bool          vibroActive    = false; // a pattern is playing
+static bool          vibroOn        = false; // motor energised right now?
+static unsigned long vibroPhaseMs   = 0;     // millis() at the last phase change
+static unsigned long lastRxMs       = 0;     // millis() of the last serial byte
+                                             // (loop watchdog: daemon liveness)
 
 // ---- Button debounce state ---------------------------------------------------
 static bool          focusStable = true;   // pull-up idle = HIGH (released)
@@ -195,67 +223,101 @@ static uint8_t parseWord(const char *s) {
 // Vibration motor (non-blocking haptic engine)
 // -----------------------------------------------------------------------------
 
-// Kick off a haptic pattern: `pulses` buzzes of `onMs` each, separated by
-// `offMs` gaps, at PWM amplitude `duty` (0-255). Returns immediately; the
-// pulses play out in pollVibro(). A new call replaces any pattern in progress.
-// PIN_VIBRO (D5) is PWM-capable, so duty sets how hard the motor pushes --
-// lower = gentler. analogWrite on D5 does not disturb millis().
-// `duty` is the amplitude of every pulse except the LAST, which uses `dutyLast`
-// -- so a pattern can be e.g. soft then hard ("felt") in one buzz.
-static void startBuzz(uint8_t pulses, uint16_t onMs, uint16_t offMs,
-                      uint8_t duty, uint8_t dutyLast) {
-  if (pulses == 0) {                   // nothing to do -- make sure motor is off
-    vibroPulses = 0;
-    vibroOn = false;
-    analogWrite(PIN_VIBRO, 0);
-    return;
-  }
-  vibroPulses   = pulses;
-  vibroOnMs     = onMs;
-  vibroOffMs    = offMs;
-  vibroDuty     = duty;
-  vibroDutyLast = dutyLast;
-  vibroOn       = true;                 // start the first pulse now
-  vibroPhaseMs  = millis();
-  // First pulse: if it is also the last (pulses==1) use the accent amplitude.
-  analogWrite(PIN_VIBRO, pulses == 1 ? dutyLast : duty);
+// Stop any haptic immediately and leave the motor off.
+static void stopBuzz() {
+  vibroActive    = false;
+  vibroOn        = false;
+  vibroStepCount = 0;
+  analogWrite(PIN_VIBRO, 0);
+}
+
+// Begin a haptic pattern: `count` pulses copied from `steps`, all at PWM
+// amplitude `duty` (0-255). If `loop` is true the sequence repeats until
+// stopBuzz() / a new pattern / the daemon-silence watchdog; otherwise it plays
+// once. Returns immediately; the pulses play out in pollVibro(). A new call
+// replaces any pattern in progress. PIN_VIBRO (D5) is PWM-capable, so duty sets
+// how hard the motor pushes (lower = gentler); analogWrite does not disturb millis().
+static void startPattern(const VibroStep *steps, uint8_t count,
+                         uint8_t duty, bool loop) {
+  if (count == 0) { stopBuzz(); return; }
+  if (count > VIBRO_MAX_STEPS) count = VIBRO_MAX_STEPS;
+  for (uint8_t i = 0; i < count; i++) vibroSteps[i] = steps[i];
+  vibroStepCount = count;
+  vibroStepIdx   = 0;
+  vibroDuty      = duty;
+  vibroLoop      = loop;
+  vibroActive    = true;
+  vibroOn        = true;                // start the first pulse now
+  vibroPhaseMs   = millis();
+  analogWrite(PIN_VIBRO, duty);
 }
 
 // Advance the haptic state machine. Call every loop(); never blocks.
 static void pollVibro() {
-  if (vibroPulses == 0) return;        // idle: nothing playing
+  if (!vibroActive) return;            // idle: nothing playing
   unsigned long now = millis();
+
+  // Loop failsafe: if we are repeating a pattern but the daemon has gone silent
+  // (no serial for VIBRO_WATCHDOG_MS), stop -- a crashed daemon must not leave
+  // the motor buzzing forever. One-shots are short, so they need no watchdog.
+  if (vibroLoop && (now - lastRxMs) >= VIBRO_WATCHDOG_MS) {
+    stopBuzz();
+    return;
+  }
+
+  const VibroStep &step = vibroSteps[vibroStepIdx];
   if (vibroOn) {
-    if ((now - vibroPhaseMs) >= vibroOnMs) {
-      // End of the on-phase: drop the motor and start the gap (or finish).
-      analogWrite(PIN_VIBRO, 0);
+    if ((now - vibroPhaseMs) >= step.onMs) {
+      analogWrite(PIN_VIBRO, 0);       // end of on-phase -> start this step's gap
       vibroOn = false;
       vibroPhaseMs = now;
-      vibroPulses--;                   // this pulse is complete
-      if (vibroPulses == 0) return;    // last pulse done -- stay off
     }
   } else {
-    if ((now - vibroPhaseMs) >= vibroOffMs) {
-      // Gap elapsed: start the next pulse. The final pulse gets the accent
-      // amplitude (vibroPulses == 1 means the one we're about to play is last).
-      analogWrite(PIN_VIBRO, vibroPulses == 1 ? vibroDutyLast : vibroDuty);
+    if ((now - vibroPhaseMs) >= step.offMs) {
+      // Gap elapsed: advance to the next pulse, looping or finishing at the end.
+      vibroStepIdx++;
+      if (vibroStepIdx >= vibroStepCount) {
+        if (!vibroLoop) { stopBuzz(); return; }   // one-shot complete -- stay off
+        vibroStepIdx = 0;                          // loop back to the first pulse
+      }
+      analogWrite(PIN_VIBRO, vibroDuty);
       vibroOn = true;
       vibroPhaseMs = now;
     }
   }
 }
 
-// Daemon-driven haptic patterns, gentlest -> firmest. The daemon decides WHEN
-// to buzz (per session, with repeats) and sends V|<KIND>; the firmware only
-// plays the pattern. Amplitude is PWM duty, kept well below full power so even
-// the firmest is a nudge, not a jolt -- urgency reads as a bit more push and a
-// few more pulses, not a longer jarring buzz.
+// Daemon-driven haptic patterns, gentlest -> firmest. The daemon decides WHEN to
+// buzz and how the "until acknowledged" alerts repeat; the firmware just plays
+// what it is told. Amplitude (PWM duty) stays well below full power so urgency
+// reads as rhythm + a little more push, never a jarring jolt.
+//
+//   START  job (re)started : 3 gentle 0.3s pulses               (one-shot)
+//   DONE   turn finished   : 5x0.2s heartbeat, gaps 0.2/0.4, then rest; LOOPS
+//   INPUT  needs your input: soft double-tap                    (daemon re-taps ~10s)
+//   ERROR  API error/alert : 0.4s on / 0.2s off               ; LOOPS until ack
+//   OFF    (or STOP)       : end any pattern now (daemon sends on acknowledge/clear)
 static void buzzForKind(const char *k) {
-  //                              pulses onMs offMs duty dutyLast
-  if      (!strcmp(k, "START")) startBuzz(1, 25,   0,  70,  70);  // job started: a tick
-  else if (!strcmp(k, "DONE"))  startBuzz(2, 70,  45,  90, 255);  // finished: soft then HARD
-  else if (!strcmp(k, "INPUT")) startBuzz(3, 50,  80, 150, 150);  // needs you (repeats 10s)
-  else if (!strcmp(k, "ERROR")) startBuzz(4, 60,  80, 200, 200);  // error     (repeats 5s)
+  if (!strcmp(k, "START")) {
+    // 3 gentle pulses of 0.3s, ~0.18s apart. One-shot.
+    const VibroStep s[] = {{300, 180}, {300, 180}, {300, 0}};
+    startPattern(s, 3, DUTY_SOFT, false);
+  } else if (!strcmp(k, "DONE")) {
+    // 5 pulses of 0.2s with alternating 0.2/0.4 gaps (a soft heartbeat), then a
+    // 0.9s rest before it repeats. Loops until the daemon sends OFF (you focus).
+    const VibroStep s[] = {{200, 200}, {200, 400}, {200, 200}, {200, 400}, {200, 900}};
+    startPattern(s, 5, DUTY_SOFT, true);
+  } else if (!strcmp(k, "INPUT")) {
+    // Soft double-tap. One-shot; the daemon re-taps every ~10s until you focus.
+    const VibroStep s[] = {{90, 150}, {90, 0}};
+    startPattern(s, 2, DUTY_INPUT, false);
+  } else if (!strcmp(k, "ERROR")) {
+    // 0.4s buzz, 0.2s pause, forever. Loops until the daemon sends OFF.
+    const VibroStep s[] = {{400, 200}};
+    startPattern(s, 1, DUTY_ALERT, true);
+  } else if (!strcmp(k, "OFF") || !strcmp(k, "STOP")) {
+    stopBuzz();
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -460,6 +522,7 @@ static void handleLine(char *line) {
 static void pumpSerial() {
   while (Serial.available() > 0) {
     char c = (char)Serial.read();
+    lastRxMs = millis();                  // feed the haptic loop watchdog
     if (c == '\n' || c == '\r') {
       if (!lineOverflow && lineLen > 0) {
         lineBuf[lineLen] = 0;
@@ -519,6 +582,7 @@ void setup() {
   pinMode(PIN_BTN_PREV,  INPUT_PULLUP);
   pinMode(PIN_VIBRO,     OUTPUT);
   digitalWrite(PIN_VIBRO, LOW);          // motor off at boot
+  lastRxMs = millis();                   // seed the haptic loop watchdog
 
   Serial.begin(SERIAL_BAUD);
 

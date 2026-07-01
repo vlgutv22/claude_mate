@@ -20,7 +20,7 @@ in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
           [ FOCUS ]   [ NEXT ]   [ PREV ]      ← three buttons
 
    the dot:   ● blinking = unacknowledged (needs you)   ○ hollow = acknowledged (focused)
-   the buzz:  START tick · DONE soft→hard · INPUT 3× · ERROR 4×   (re-nags until you FOCUS)
+   the buzz:  START 3 soft ticks · INPUT gentle tap · DONE heartbeat-loop · ERROR alarm-loop  (loops/re-taps until you FOCUS)
 ```
 
 ---
@@ -66,17 +66,22 @@ hooks are the zero-dependency feed. Use whichever fits each session.
   auto-surfacing for ~10 s so you can browse.
 - **Per-session haptics** — the motor buzzes for *that session's own*
   transition, not just an aggregate change:
-  - **START** — a job (re)started → one gentle tick.
-  - **DONE** — a turn finished → two pulses, **soft then hard**.
-  - **INPUT** — a session is waiting on you → three pulses.
-  - **ERROR** — a turn ended on an API error → four pulses (firmest).
+  - **START** — a job (re)started → three gentle 0.3 s ticks (one-shot).
+  - **INPUT** — a session is waiting on you → a soft double-tap, re-tapped
+    gently every ~10 s until you focus it.
+  - **DONE** — a turn finished → a 5-pulse "heartbeat" (0.2 s pulses, gaps
+    alternating 0.2 / 0.4 s), **looping** until you focus it.
+  - **ERROR** — a turn ended on an API error → a 0.4 s-on / 0.2 s-off alarm,
+    **looping** until you focus it.
 
-  Amplitude is PWM duty kept well below full power, so urgency reads as *a bit
-  more push and a few more pulses*, never a jarring jolt.
-- **Nag until acknowledged** — an unacknowledged alert keeps re-buzzing at a
-  per-state cadence — **error every 5 s, waiting every 10 s, done every 15 s** —
-  gentler/less often as urgency drops, until you **FOCUS** the session (or it
-  changes on its own).
+  Amplitude is PWM duty kept **graduated but soft** — Start/Done gentlest, the
+  error alarm firmest but never full power — so urgency reads as *rhythm and
+  repetition*, never a jarring jolt.
+- **Loop / re-tap until acknowledged** — the DONE and ERROR alerts **loop
+  continuously** in the firmware, and the waiting alert re-taps every ~10 s, until
+  you **FOCUS** the session (which sends `V|OFF` to silence the motor) or it
+  changes on its own. If the daemon dies mid-alert the firmware stops the loop on
+  its own after ~30 s of silence.
 - **"Finished but not seen" model** — when a turn ends, the session becomes
   **done** and *stays* done (alerting, with a blinking dot) until you focus it;
   later idle keepalives don't silently clear it. Focusing acknowledges it.
@@ -120,7 +125,7 @@ hooks are the zero-dependency feed. Use whichever fits each session.
    │   Python daemon (Mac)                        │
    │   • session model + "done-until-acknowledged"│
    │   • status word     D|<FREE/WIP/BLOCKED/WTF> │   (overall health / priority)
-   │   • per-session buzz V|<START/DONE/INPUT/ERR>│   + paced re-nags
+   │   • per-session buzz V|<START/INPUT/DONE/ERR>│   loops + V|OFF on focus
    │   • auto-surface the most-urgent session     │
    │   • FOCUS: wrapper ctrl-sock → VS Code link  │
    └──────────────────────────────────────────────┘
@@ -161,20 +166,24 @@ Two control flows worth calling out:
 
 Haptics are driven **entirely by the daemon** via `V|<KIND>` lines — the
 firmware just plays the pattern; the status word (`D|`) is visual only and never
-buzzes on its own. The daemon decides, **per session**, when to buzz and how
-often to repeat:
+buzzes on its own. The daemon decides, **per session**, when to buzz and how it
+repeats. Amplitude (PWM duty) is **graduated but soft** — urgency reads as
+rhythm, not raw force:
 
-| Event (per session) | `V|` kind | Pattern (gentlest → firmest) | Re-nag until focused |
-|---------------------|-----------|------------------------------|----------------------|
-| Job (re)started     | `START`   | 1 tick                        | — (one-shot)         |
-| Turn finished       | `DONE`    | 2 pulses, soft → **hard**     | every **15 s**       |
-| Waiting on you      | `INPUT`   | 3 pulses                      | every **10 s**       |
-| Error / retry       | `ERROR`   | 4 pulses (firmest)            | every **5 s**        |
+| Event (per session) | `V|` kind | Pattern | Repeat until focused |
+|---------------------|-----------|---------|----------------------|
+| Job (re)started     | `START`   | 3 gentle 0.3 s ticks | — (one-shot) |
+| Waiting on you      | `INPUT`   | soft double-tap | re-taps every **~10 s** |
+| Turn finished       | `DONE`    | 5×0.2 s heartbeat (gaps 0.2/0.4 s) | **loops** continuously |
+| Error / retry       | `ERROR`   | 0.4 s on / 0.2 s off alarm | **loops** continuously |
 
-A turn ending (`working → idle`) becomes **done** and keeps alerting until you
-**FOCUS** the session — pressing FOCUS acknowledges it (a done tab becomes idle;
-a waiting/error tab goes quiet but keeps its state until it changes). The OLED's
-ack dot mirrors this: blinking while unacknowledged, hollow once seen.
+`DONE` and `ERROR` **loop** in the firmware until the daemon sends `V|OFF`;
+`INPUT` re-taps on a timer. A turn ending (`working → idle`) becomes **done** and
+keeps looping until you **FOCUS** the session — pressing FOCUS acknowledges it
+(sending `V|OFF` to silence the motor: a done tab becomes idle; a waiting/error
+tab goes quiet but keeps its state until it changes). The OLED's ack dot mirrors
+this: blinking while unacknowledged, hollow once seen. If the daemon ever dies
+mid-alert, the firmware stops the loop on its own after ~30 s of serial silence.
 
 ---
 
@@ -208,7 +217,8 @@ Pinout summary (full details in [docs/WIRING.md](docs/WIRING.md)):
 
 The three buttons use `INPUT_PULLUP` (other leg to GND; pressed = LOW). D5 drives
 the vibration motor through a module / NPN+1k+1N4148 / ULN2003 channel. D5 is
-PWM-capable, which is how the firmware plays the graded (soft→hard) patterns.
+PWM-capable, which is how the firmware keeps the patterns gentle (amplitude well
+below full power).
 
 ---
 
@@ -334,8 +344,8 @@ claude_mate/
 ## Limitations
 
 - **Retry/resubmit is out of scope.** When a turn ends on an error, Claude Mate
-  shows it (`error` card + the 4-pulse buzz, re-nagging every 5 s) but does
-  **not** offer a "retry" action. Reliably resubmitting a turn from outside the
+  shows it (`error` card + the looping 0.4/0.2 s alarm buzz until you focus it)
+  but does **not** offer a "retry" action. Reliably resubmitting a turn from outside the
   GUI is not feasible, so FOCUS — taking you to the session — is the intended
   response.
 - **Limits are best-effort.** The usage/rate-limit field is shown as a short
@@ -367,17 +377,19 @@ A big iteration day. Highlights:
   raise the **exact terminal** on FOCUS (by TTY). Safe to install as a global
   `claude` shim.
 - **Per-session haptics + acknowledge model:** the motor buzzes for *each
-  session's own* finish/block/error (`V|<KIND>`), re-nags at a per-state cadence
-  (5 / 10 / 15 s) until you FOCUS, and a finished turn stays "done" until seen.
-  The OLED carries a blinking/hollow ack dot.
+  session's own* start/finish/block/error (`V|<KIND>`). The DONE and ERROR alerts
+  **loop** in the firmware (waiting re-taps every ~10 s) until you FOCUS, which
+  sends `V|OFF`; a finished turn stays "done" until seen. The OLED carries a
+  blinking/hollow ack dot.
 - **No blind auto-carousel:** the screen auto-surfaces the single most-urgent
   unacknowledged tab; NEXT/PREV browse manually and pause auto-surface ~10 s.
 - **Tighter detection:** `patterns.json` (hot-reloadable), state matching scoped
   to the live status region (bottom ~20 lines) + footer-only picker phrases,
   option-pickers treated as **waiting**, and `usage limit reached` treated as
   **error**.
-- **Live time-in-state** timer; graded **soft→hard** DONE buzz; assorted
-  reliability fixes (onset double-buzz race, handshake resend, nav-pause order).
+- **Live time-in-state** timer; gentle **looping** DONE/ERROR haptics (soft
+  heartbeat / alarm) that stop on FOCUS via `V|OFF`; assorted reliability fixes
+  (loop-idempotent sends, daemon-silence watchdog, handshake resend, nav-pause order).
 
 ---
 

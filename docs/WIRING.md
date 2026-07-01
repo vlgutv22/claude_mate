@@ -16,18 +16,20 @@ The OLED is the **sole visual status**: a large word (FREE / WIP / BLOCKED /
 WTF) on top of a session-detail line. The daemon picks the word and sends it; the
 Arduino renders it.
 
-A **micro vibration motor on D5** is the haptic alert. It buzzes **only when the
-status word changes** (a rising-edge alert, never continuously):
+A **micro vibration motor on D5** is the haptic alert. The word (`D|`) is
+**visual only** — it never buzzes. Haptics are driven **per session** by the
+daemon via `V|<kind>`, at a graduated-but-soft PWM amplitude:
 
-| Word      | Haptic on change | Meaning |
-|-----------|------------------|---------|
-| `WTF`     | **3 pulses**     | At least one session in error (StopFailure / API 5xx / overloaded / timeout). |
-| `BLOCKED` | **2 pulses**     | At least one session waiting on your input; none errored. |
-| `FREE`    | **1 short tick** | No session needs you — all idle/done, or no sessions. |
-| `WIP`     | **silent**       | At least one session working; none blocked/errored. |
+| `V|` kind | Haptic | Repeat |
+|-----------|--------|--------|
+| `START`   | 3 gentle 0.3 s ticks | one-shot |
+| `INPUT`   | soft double-tap | re-tapped ~every 10 s until FOCUS |
+| `DONE`    | 5×0.2 s heartbeat (gaps 0.2/0.4 s) | **loops** until `V|OFF` |
+| `ERROR`   | 0.4 s on / 0.2 s off alarm | **loops** until `V|OFF` |
+| `OFF`     | stop the motor | sent on FOCUS / clear |
 
-There is no wheel, no dial, no homing, and no endstop — those are gone. The
-buzz fires once on the transition into a new word, not while the state holds.
+There is no wheel, no dial, no homing, and no endstop — those are gone. See
+[PROTOCOL.md](PROTOCOL.md) for the exact haptic contract.
 
 ---
 
@@ -166,7 +168,7 @@ That's the whole story — no separate supply, no homing, no endstop.
 
   OLED module: VCC->5V, GND->GND, SDA->A4, SCL->A3   (software I2C, addr 0x3C)
   Vibration motor: powered from the USB 5V rail, common ground, flyback diode
-  across the motor. The motor buzzes only when the status word changes.
+  across the motor. The motor buzzes per session via V|<kind> (not the word).
 ```
 
 ---
@@ -178,7 +180,7 @@ That's the whole story — no separate supply, no homing, no endstop.
 | 1   | Arduino Nano (ATmega328P)                        | 5 V; USB CDC serial |
 | 1   | I2C OLED 0.91" 128x32 — SSD1306                   | 4-pin GND/VCC/SCK(SCL)/SDA; a 0.96" 128x64 also works (set SCREEN_HEIGHT 64) |
 | 3   | Momentary push buttons (tactile)                 | FOCUS + NEXT + PREV |
-| 1   | Micro vibration motor                            | coin/pager type; haptic alert on D5, buzzes on word change |
+| 1   | Micro vibration motor                            | coin/pager type; haptic alert on D5, per-session buzz via V|<kind> |
 | 1   | NPN transistor (2N2222 / S8050)                  | Option B driver — *or* use a 3-pin vibro module / a spare ULN2003 channel instead |
 | 1   | Resistor ~1 kΩ                                    | Option B — base resistor on D5 |
 | 1   | Diode 1N4148                                     | Option B — flyback across the motor (built in to a module / ULN2003) |

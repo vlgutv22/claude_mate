@@ -149,6 +149,21 @@ check("FOCUS opened a vscode deep link",
 check("FOCUS targeted live session sid-1",
       any("session=sid-1" in l for l in focus_lines))
 
+# ---- haptics (V|<KIND>) ----------------------------------------------------
+# The fake-Arduino reader captures V| lines too. Assert the new haptic model:
+# a start tick, a needs-input tap, a looping error alert, a looping done alert,
+# and that the daemon clears the firmware loop to a known state (V|OFF).
+check("V|OFF clears the loop (startup / on error->done)",
+      saw(lambda l: l == "V|OFF"))
+check("V|START tick when a job starts with nothing else pending",
+      saw(lambda l: l == "V|START"))
+check("V|INPUT tap when a session starts waiting",
+      saw(lambda l: l == "V|INPUT"))
+check("V|ERROR loop when an API error arrives",
+      saw(lambda l: l == "V|ERROR"))
+check("V|DONE loop when a turn finishes (until acknowledged)",
+      saw(lambda l: l == "V|DONE"))
+
 ok = all(checks)
 print("\n  focus.log:", [l.strip() for l in focus_lines] or "(empty)")
 print("  display frames:", len(display))
