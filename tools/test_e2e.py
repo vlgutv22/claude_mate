@@ -127,14 +127,18 @@ with display_lock:
     idx_before_H = len(display)
 arduino_send("H"); time.sleep(1.5)
 
-print("\n-- phase 5b: MODE long-press -> LIST mode, navigate + submit --")
-# 3 tabs live (sid-2 error, sid-3 waiting, sid-1 working). Toggle to LIST, move
-# the highlight down one, SUBMIT to focus it, then toggle back to SCROLL.
+print("\n-- phase 5b: LIST mode, key-stable highlight across a re-sort --")
+# 3 tabs live: sid-2 api(error), sid-3 infra(waiting), sid-1 webapp(working).
+# ordered() = [api, infra, webapp]. Enter LIST (seeds on the shown card = api),
+# NEXT to highlight infra (sid-3). Then RE-SORT the fleet (webapp -> error, so
+# ordered() becomes [api, webapp, infra]) and SUBMIT: the highlight is tracked by
+# KEY, so it must still focus infra (sid-3), NOT whatever slid into its old slot.
 with display_lock:
     idx_before_list = len(display)
 arduino_send("B|4"); time.sleep(1.2)     # MODE long -> LIST mode (expect T| frame)
-arduino_send("B|2"); time.sleep(0.8)     # NEXT -> highlight next tab
-arduino_send("B|1"); time.sleep(1.2)     # SUBMIT -> focus highlighted tab
+arduino_send("B|2"); time.sleep(0.8)     # NEXT -> highlight infra (sid-3)
+feed("error|sid-1|webapp"); time.sleep(1.5)   # re-sort: webapp jumps into slot 1
+arduino_send("B|1"); time.sleep(1.2)     # SUBMIT -> must still focus infra (sid-3)
 with display_lock:
     saw_T = any(l.startswith("T|") for l in display[idx_before_list:])
     list_totals = [int(l.split("|")[1]) for l in display[idx_before_list:]
@@ -194,8 +198,8 @@ check("handshake H re-arms the active loop haptic (V|ERROR/V|DONE re-sent after 
 check("MODE long-press (B|4) enters LIST mode -> T| frame sent", saw_T)
 check("LIST frame lists all live tabs (total >= 3)",
       any(t >= 3 for t in list_totals))
-check("SUBMIT (B|1) in LIST mode focuses the highlighted (2nd) tab -> sid-3",
-      any("session=sid-3" in l for l in focus_lines))
+check("SUBMIT in LIST focuses the highlighted tab BY KEY, stable across a re-sort -> sid-3",
+      bool(focus_lines) and "session=sid-3" in focus_lines[-1])
 check("MODE long-press again returns to SCROLL -> S| card resumes",
       saw_after(idx_after_scroll, lambda l: l.startswith("S|")))
 

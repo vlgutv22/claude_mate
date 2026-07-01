@@ -10,11 +10,15 @@ The "brain" of the Claude Mate USB hardware companion. It:
   2. Manages a single, continuously-open USB serial connection to the Arduino
      Nano. It auto-detects the port (/dev/cu.usbserial* then /dev/cu.usbmodem*),
      opens it once, keeps it open, and auto-reconnects if it disappears.
-  3. Reads button events from the Arduino on a background thread:
+  3. Reads button events from the Arduino on a background thread (buttons
+     MODE | SUBMIT | NEXT; MODE distinguishes a short vs long press):
         H        -> handshake; the daemon resends the full current state.
-        B|1      -> FOCUS the currently displayed session.
-        B|2      -> NEXT (advance the carousel, pausing auto-rotation ~10s).
-        B|3      -> PREV (previous card, pausing auto-rotation ~10s).
+        B|1      -> SUBMIT: focus the selected tab (current card in SCROLL,
+                    highlighted row in LIST).
+        B|2      -> NEXT: SCROLL next card / LIST highlight down.
+        B|3      -> MODE short: SCROLL previous card / LIST highlight up.
+        B|4      -> MODE long (>=500ms): toggle UI mode (SCROLL <-> LIST, an
+                    all-tabs picker list).
   4. Drives a carousel that rotates through sessions (~3s/step, urgent-first)
      and sends one S card per step.
   5. Computes the overall status word (FREE/WIP/BLOCKED/WTF) and pushes it with
@@ -95,7 +99,7 @@ STATE_GLYPH = {"working": "W", "waiting": "?", "error": "!", "done": "D", "idle"
 
 # Navigation / auto-show priority, most urgent first: a tab in error, then one
 # waiting for input, then a finished (done) tab needing acknowledgment, then
-# still-working, then idle. NEXT/PREV walk this order; the screen auto-shows the
+# still-working, then idle. NEXT / MODE-short walk this order; the screen auto-shows the
 # most urgent unacknowledged tab.
 STATE_ORDER = {"error": 0, "waiting": 1, "done": 2, "working": 3, "idle": 4}
 
@@ -471,10 +475,11 @@ class Display:
         self._last_wait_tap = 0.0        # time of the last gentle needs-input tap
         # UI mode: "scroll" = the carousel (auto-surface + browse one card at a
         # time), "list" = a scrolling list of ALL tabs to pick from. MODE long-press
-        # toggles it. `_list_sel` = highlighted global index into ordered(); the
-        # `_list_top` window keeps the selection on screen.
+        # toggles it. The highlight is tracked by session KEY (not a positional
+        # index) so it follows the same tab when ordered() re-sorts on a state
+        # change / add / prune; `_list_top` windows it onto the 4-row screen.
         self._mode = "scroll"
-        self._list_sel = 0
+        self._list_sel_key: Optional[str] = None
         self._list_top = 0
 
     # ---- dial (stepper status wheel) ------------------------------------- #
@@ -635,7 +640,7 @@ class Display:
         self.show_index(nxt)
 
     def retreat(self) -> None:
-        """Move to the previous card (PREV button). show_index wraps negatives."""
+        """Move to the previous card (MODE short-press). show_index wraps negatives."""
         with self._lock:
             prv = self._current_index - 1
         self.show_index(prv)
@@ -652,6 +657,15 @@ class Display:
         with self._lock:
             return self._mode
 
+    @staticmethod
+    def _index_of_key(sessions: List[Session], key: Optional[str]) -> int:
+        """Position of `key` in `sessions`, or 0 if absent (e.g. it was pruned)."""
+        if key is not None:
+            for i, s in enumerate(sessions):
+                if s.key == key:
+                    return i
+        return 0
+
     def toggle_mode(self) -> None:
         """MODE long-press: flip between the scroll carousel and the all-tabs
         list. Entering LIST seeds the highlight on the card you were viewing."""
@@ -661,13 +675,8 @@ class Display:
             mode = self._mode
             cur = self._current_session
             if mode == "list":
-                sel = 0
-                if cur is not None:
-                    for i, s in enumerate(sessions):
-                        if s.key == cur.key:
-                            sel = i
-                            break
-                self._list_sel = sel
+                self._list_sel_key = (cur.key if cur is not None
+                                      else (sessions[0].key if sessions else None))
                 self._list_top = 0
         if mode == "list":
             log("mode -> LIST (all tabs)")
@@ -677,39 +686,48 @@ class Display:
             self.refresh_current()
 
     def list_nav(self, delta: int) -> None:
-        """Move the LIST highlight by `delta` (wraps), then re-render."""
-        total = len(self._reg.ordered())
+        """Move the LIST highlight by `delta` (wraps) to the neighbouring tab,
+        tracked by key so it stays put when the list re-sorts, then re-render."""
+        sessions = self._reg.ordered()
+        total = len(sessions)
         if total > 0:
             with self._lock:
-                self._list_sel = (self._list_sel + delta) % total
+                idx = (self._index_of_key(sessions, self._list_sel_key) + delta) % total
+                self._list_sel_key = sessions[idx].key
         self.render_list()
 
     def list_selected_session(self) -> Optional[Session]:
-        """The tab currently highlighted in LIST mode (SUBMIT focuses it)."""
+        """The tab currently highlighted in LIST mode (SUBMIT focuses it),
+        resolved by key so SUBMIT always acts on the tab you actually highlighted.
+        Falls back to the first tab if the selection was pruned."""
         sessions = self._reg.ordered()
         if not sessions:
             return None
         with self._lock:
-            sel = self._list_sel
-        sel = max(0, min(sel, len(sessions) - 1))
-        return sessions[sel]
+            key = self._list_sel_key
+        if key is not None:
+            for s in sessions:
+                if s.key == key:
+                    return s
+        return sessions[0]
 
     def render_list(self) -> None:
         """Send a LIST-mode frame: `T|<total>|<sel>|<row>|...` with up to
-        LIST_ROWS windowed rows (`name;glyph;hl`). Empty -> idle screen."""
+        LIST_ROWS windowed rows (`name;glyph;hl`). Empty -> idle screen. The
+        highlight follows the selected key across re-sorts."""
         sessions = self._reg.ordered()
         total = len(sessions)
         if total == 0:
             with self._lock:
                 self._current_session = None
-                self._list_sel = 0
+                self._list_sel_key = None
                 self._list_top = 0
             self._link.write_line("I")
             self._link.write_line("D|FREE")
             return
         with self._lock:
-            sel = max(0, min(self._list_sel, total - 1))
-            self._list_sel = sel
+            sel = self._index_of_key(sessions, self._list_sel_key)
+            self._list_sel_key = sessions[sel].key   # re-anchor (handles pruned key)
             top = self._list_top
             if sel < top:
                 top = sel
@@ -1092,7 +1110,7 @@ class Carousel(threading.Thread):
         self._last_prune = 0.0
 
     def pause(self) -> None:
-        """Pause auto-show for NEXT_PAUSE seconds (after a manual NEXT/PREV) so
+        """Pause auto-show for NEXT_PAUSE seconds (after a manual NEXT / MODE-short) so
         the user can browse without the screen snapping back immediately."""
         with self._lock:
             self._paused_until = time.time() + NEXT_PAUSE
