@@ -6,7 +6,8 @@ All grounds are common. The OLED runs on 5 V over I2C. The three buttons use the
 internal pull-ups (`INPUT_PULLUP`) so they need no external resistors. The
 overall-status indicator is the **OLED itself** — it shows a big word (FREE /
 WIP / BLOCKED / WTF) plus a session-detail line. A **micro vibration motor**
-provides a haptic alert whenever that word changes.
+provides a per-session haptic alert, driven by the daemon via `V|<kind>` (the
+word itself is visual only and never buzzes).
 
 ---
 

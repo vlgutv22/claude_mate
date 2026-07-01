@@ -494,35 +494,48 @@ class Display:
 
         # Gentle needs-input tap: only while 'waiting' is the loudest alert, and
         # only after it has persisted a full interval (a picker opened+dismissed
-        # in a couple seconds never taps).
+        # in a couple seconds never taps). The due-check is claimed atomically so
+        # concurrent ticks/updates can't double-tap.
         if top is not None and top.state == "waiting":
             now = time.time()
             if (now - top.state_since) >= WAIT_NAG_INTERVAL and \
-               (now - self._last_wait_tap) >= WAIT_NAG_INTERVAL:
+               self._claim_wait_tap(now):
                 log(f"haptic: needs-input tap for {top.name} "
                     f"(every {int(WAIT_NAG_INTERVAL)}s until focused)")
-                self._tap(WAIT_NAG_KIND)
+                self._link.write_line(f"V|{WAIT_NAG_KIND}")
 
     def _set_loop(self, kind: Optional[str]) -> None:
         """Drive the firmware's continuous-loop state. Sends V|<kind> to start a
-        loop or V|OFF to stop it, but only when the desired state changes."""
+        loop or V|OFF to stop it, but only when the desired state changes.
+
+        The check, the write, and the tracker commit are all done under the lock,
+        and the commit is gated on a SUCCESSFUL write. That guarantees:
+          * concurrent callers (carousel tick vs. socket/FOCUS updates) can't
+            interleave so the wire order disagrees with the tracker, and
+          * a failed write (port momentarily closed) never marks the tracker as
+            "looping X" when the firmware never got it -- which would suppress the
+            resend and drop the alert. On failure the tracker is left stale so the
+            next tick retries.
+        """
         with self._lock:
             if kind == self._loop_kind:
                 return
+            line = f"V|{kind}" if kind else "V|OFF"
+            if not self._link.write_line(line):
+                return                        # keep tracker stale -> retry next tick
             self._loop_kind = kind
-        if kind:
-            log(f"haptic: loop {kind} until acknowledged")
-            self._link.write_line(f"V|{kind}")
-        else:
-            self._link.write_line("V|OFF")
+            if kind:
+                log(f"haptic: loop {kind} until acknowledged")
 
-    def _tap(self, kind: str) -> None:
-        """Fire a one-shot haptic (V|<kind>) without touching the loop tracker.
-        The firmware plays it once; any active loop was already held OFF by the
-        caller, so nothing is clobbered."""
+    def _claim_wait_tap(self, now: float) -> bool:
+        """Atomically decide whether a gentle needs-input tap is due and, if so,
+        record it. Only the single caller that wins the interval gets True, so a
+        concurrent carousel tick + socket update can't double-tap the same beat."""
         with self._lock:
-            self._last_wait_tap = time.time()
-        self._link.write_line(f"V|{kind}")
+            if (now - self._last_wait_tap) >= WAIT_NAG_INTERVAL:
+                self._last_wait_tap = now
+                return True
+            return False
 
     def start_tick(self) -> None:
         """One-shot START tick (a job (re)started). The caller fires this only
@@ -531,8 +544,11 @@ class Display:
 
     def wait_tap(self) -> None:
         """Immediate needs-input tap on the 'waiting' transition (before the
-        paced re-taps take over), so a fresh question is felt at once."""
-        self._tap(WAIT_NAG_KIND)
+        paced re-taps take over), so a fresh question is felt at once. Records the
+        time under the lock so the paced auto-tap doesn't double-buzz right after."""
+        with self._lock:
+            self._last_wait_tap = time.time()
+        self._link.write_line(f"V|{WAIT_NAG_KIND}")
 
     def show_session(self, sess: Optional[Session]) -> None:
         """Show a specific session's card (by key, tolerant of reordering)."""
@@ -617,10 +633,21 @@ class Display:
         self.show_index(idx)
 
     def resend_full_state(self) -> None:
-        """On handshake (H): push dial (force) + current card from scratch."""
+        """On handshake (H) / reconnect: push dial (force) + current card AND
+        re-arm the motor from scratch.
+
+        A handshake means the Nano just (re)booted (opening the port resets it,
+        and a replug does too) motor-off, having lost any loop it was playing. If
+        we kept our loop tracker, `_set_loop` would see the desired loop already
+        "sent" and never re-emit it -- so an unacknowledged done/error alert would
+        go permanently silent after a routine replug. So we forget the tracker and
+        re-drive the motor from the current alert state."""
         log("handshake H -> resending full state")
         self.push_dial(force=True)
         self.refresh_current()
+        with self._lock:
+            self._loop_kind = _LOOP_UNSET      # firmware was reset -> forget it
+        self.update_haptics(self._reg.top_alert())
 
     def current_session(self) -> Optional[Session]:
         with self._lock:

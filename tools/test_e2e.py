@@ -101,6 +101,10 @@ def saw(pred):
     with display_lock:
         return any(pred(l) for l in display)
 
+def saw_after(idx, pred):
+    with display_lock:
+        return any(pred(l) for l in display[idx:])
+
 time.sleep(2.5)
 
 print("\n-- phase 1: one working session (expect WIP) --")
@@ -115,7 +119,12 @@ feed("waiting|sid-3|infra"); time.sleep(3.5)
 print("\n-- phase 4: an API error arrives (expect WTF) --")
 feed("error|sid-2|api"); time.sleep(3.5)
 
-print("\n-- phase 5: handshake H -> full resend --")
+print("\n-- phase 5: handshake H -> full resend (must RE-ARM the motor loop) --")
+# Snapshot the frame count so we can prove the handshake re-emits the looping
+# alert haptic (a Nano reset/replug reboots motor-off; the daemon must re-arm it,
+# else an unacknowledged error/done alert goes silent forever).
+with display_lock:
+    idx_before_H = len(display)
 arduino_send("H"); time.sleep(1.5)
 
 print("\n-- phase 6: everything finishes (expect FREE) --")
@@ -163,6 +172,8 @@ check("V|ERROR loop when an API error arrives",
       saw(lambda l: l == "V|ERROR"))
 check("V|DONE loop when a turn finishes (until acknowledged)",
       saw(lambda l: l == "V|DONE"))
+check("handshake H re-arms the active loop haptic (V|ERROR/V|DONE re-sent after reset)",
+      saw_after(idx_before_H, lambda l: l in ("V|ERROR", "V|DONE")))
 
 ok = all(checks)
 print("\n  focus.log:", [l.strip() for l in focus_lines] or "(empty)")

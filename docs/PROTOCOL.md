@@ -65,7 +65,7 @@ daemon has died). `OFF` (alias `STOP`) silences the motor immediately.
 |-----------|-------------|
 | `idx`     | 1-based position in the carousel. |
 | `total`   | Total number of sessions currently known. |
-| `name`    | Session name (cwd basename), **up to 10 chars** — the **daemon truncates** before sending. |
+| `name`    | Session name (cwd basename), **up to 20 chars** (`NAME_MAX`) — the **daemon truncates** before sending; the firmware buffer holds 20 + NUL. |
 | `state`   | One of: `working`, `waiting`, `error`, `done`, `idle`. |
 | `runtime` | Like `03:21` (mm:ss) or `1:04` (h:mm). |
 | `limit`   | Short string like `71%`, or `-` when unknown. |
@@ -84,7 +84,7 @@ Example:
 S|1|3|claude-mat|error|03:21|-|0|Opus 4.8|xhigh
 ```
 
-(idx 1 of 3, name truncated, state `error`, runtime `03:21`, no limit,
+(idx 1 of 3, name `claude-mat`, state `error`, runtime `03:21`, no limit,
 unacknowledged, model `Opus 4.8`, effort `xhigh`.)
 
 ### 1b. Arduino → Daemon
