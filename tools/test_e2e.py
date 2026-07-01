@@ -152,6 +152,22 @@ print("\n-- phase 6: everything finishes (expect FREE) --")
 feed("done|sid-2|api"); feed("done|sid-3|infra")
 feed("done|sid-1|webapp"); time.sleep(3.0)
 
+print("\n-- phase 7: SCROLL ack stays on the acknowledged tab (no jump) --")
+# Clean slate, then webapp2(working) + beta(done). beta is the top alert so it
+# auto-surfaces as the current card. Acknowledging (SUBMIT) turns it done->idle,
+# which re-sorts it BELOW webapp2 -- the view must STAY on beta, not jump to the
+# top tab. (Last phase: on_ack's auto-surface pause can't affect earlier phases.)
+for s in ("sid-1|webapp", "sid-2|api", "sid-3|infra"):
+    feed("end|" + s)
+time.sleep(1.0)
+feed("working|sidW|webapp2"); feed("done|sidB|beta"); time.sleep(2.2)
+with display_lock:
+    idx_before_ack = len(display)
+arduino_send("B|1"); time.sleep(1.5)          # SUBMIT: ack beta -> must stay on beta
+with display_lock:
+    cards_after_ack = [l for l in display[idx_before_ack:] if l.startswith("S|")]
+first_card_after_ack = cards_after_ack[0] if cards_after_ack else ""
+
 proc.terminate()
 try:
     proc.wait(timeout=5)
@@ -199,9 +215,12 @@ check("MODE long-press (B|4) enters LIST mode -> T| frame sent", saw_T)
 check("LIST frame lists all live tabs (total >= 3)",
       any(t >= 3 for t in list_totals))
 check("SUBMIT in LIST focuses the highlighted tab BY KEY, stable across a re-sort -> sid-3",
-      bool(focus_lines) and "session=sid-3" in focus_lines[-1])
+      any("session=sid-3" in l for l in focus_lines))  # sid-3 is focused only in the LIST phase
 check("MODE long-press again returns to SCROLL -> S| card resumes",
       saw_after(idx_after_scroll, lambda l: l.startswith("S|")))
+check("SCROLL: acknowledging a tab stays on it, no jump to the top tab "
+      f"(first card after ack = beta, got {first_card_after_ack!r})",
+      "|beta|" in first_card_after_ack)
 
 ok = all(checks)
 print("\n  focus.log:", [l.strip() for l in focus_lines] or "(empty)")

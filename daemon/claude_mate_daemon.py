@@ -648,10 +648,21 @@ class Display:
         self.show_index(prv)
 
     def refresh_current(self) -> None:
-        """Re-render whatever card is current (e.g. to update live runtime)."""
+        """Re-render the current card, anchored to the current SESSION by key so
+        it stays on the same tab when ordered() re-sorts -- e.g. acknowledging a
+        'done' tab drops it to 'idle', sliding it down the list; a positional
+        index would then land on whatever shifted up (the top/'first' tab).
+        Falls back to the index only if that session is gone (pruned)."""
         with self._lock:
+            sess = self._current_session
             idx = self._current_index
-        self.show_index(idx)
+        sessions = self._reg.ordered()
+        if sess is not None:
+            for i, s in enumerate(sessions):
+                if s.key == sess.key:
+                    self.show_index(i, sessions)
+                    return
+        self.show_index(idx, sessions)
 
     # ---- UI mode (scroll carousel <-> all-tabs list) --------------------- #
 
@@ -1276,6 +1287,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     def on_ack(sess) -> None:
         registry.acknowledge(sess)
+        # Stay on the tab you just acknowledged: in SCROLL you always ack the
+        # CURRENT card, and refresh_current is now key-stable, so it keeps the
+        # view on that tab even though acknowledging a 'done' tab drops it to
+        # 'idle' and re-sorts it down the list (it used to jump to the top tab).
         carousel.notify_change()
 
     def on_haptic(kind: str) -> None:
