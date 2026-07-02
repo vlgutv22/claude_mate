@@ -32,8 +32,7 @@
  *     VCC -> 5V, GND -> GND, SDA -> A4, SCL -> A3  (bit-banged; see softssd1306.h)
  *     I2C address 0x3C (common alternative: 0x3D)
  *   Buttons (INPUT_PULLUP, other leg to GND) -- layout MODE | SUBMIT | NEXT:
- *     SUBMIT button -> D2  (short "B|1" = focus/proceed; long-HOLD 2s "B|5" =
- *                          toggle quiet mode, which turns the indication LED off)
+ *     SUBMIT button -> D2  (emits "B|1"; focus/proceed; double-click opens LIST detail)
  *     NEXT   button -> D3  (emits "B|2"; next card / highlight down)
  *     MODE   button -> D4  (emits "B|3" on a short press, "B|4" on a long press;
  *                          short = prev card / highlight up, long = switch mode)
@@ -72,9 +71,8 @@
  *                                                    stop/darken the LED now
  *   Arduino -> Daemon:
  *     H                                              hello, sent once after boot
- *     B|<n>                                          n=1 SUBMIT short, n=2 NEXT,
- *                                                    n=3 MODE short, n=4 MODE long,
- *                                                    n=5 SUBMIT long (quiet toggle)
+ *     B|<n>                                          n=1 SUBMIT, n=2 NEXT,
+ *                                                    n=3 MODE short, n=4 MODE long
  *
  * NOTE: opening the USB serial port resets the Nano (~1.5s). That is why we emit
  * H once in setup() so the daemon can (re)send the full current state.
@@ -111,8 +109,6 @@
                                // (fits S card + name + model + effort fields)
 #define DEBOUNCE_MS    40UL    // ~40ms button debounce (snappy short taps)
 #define LONGPRESS_MS   500UL   // MODE held this long -> long-press (mode toggle)
-#define MUTE_HOLD_MS   2000UL  // SUBMIT held this long -> mute toggle. Deliberately
-                               // long so focusing a tab (a quick tap) never mutes.
 
 // ---- Alert-indicator tuning --------------------------------------------------
 // The alert output is now just the LED on D8 (digital on/off) -- no vibration
@@ -187,9 +183,9 @@ static unsigned long lastRxMs       = 0;     // millis() of the last serial byte
                                              // (loop watchdog: daemon liveness)
 
 // ---- Button debounce state ---------------------------------------------------
-// NEXT is a simple press-edge button. SUBMIT and MODE each distinguish a SHORT
-// press (emit on release) from a LONG press (emit once at LONGPRESS_MS, then
-// swallow the release). SUBMIT long-press ALSO toggles quiet mode locally.
+// SUBMIT + NEXT are simple press-edge buttons (emit on press). MODE distinguishes
+// a SHORT press (emit B|3 on release) from a LONG press (emit B|4 once at
+// LONGPRESS_MS, then swallow the release).
 struct BtnLong {
   bool          stable;     // released?
   int           lastRaw;
@@ -197,15 +193,13 @@ struct BtnLong {
   unsigned long pressMs;    // when the current press began
   bool          longFired;  // long-press already emitted this hold?
 };
-static BtnLong submitBtn = {true, HIGH, 0, 0, false};
 static BtnLong modeBtn   = {true, HIGH, 0, 0, false};
-static bool          nextStable   = true;  // pull-up idle = HIGH (released)
+static bool          submitStable = true;  // pull-up idle = HIGH (released)
+static int           submitLastRaw = HIGH;
+static unsigned long submitEdgeMs = 0;
+static bool          nextStable   = true;
 static int           nextLastRaw  = HIGH;
 static unsigned long nextEdgeMs   = 0;
-
-// ---- Quiet mode (LED indication off) --------------------------------------
-static bool quietMode = false;              // SUBMIT long-press toggles this
-static unsigned long quietToastUntil = 0;   // show the ON/OFF toast until this ms
 
 // -----------------------------------------------------------------------------
 // Helpers
@@ -256,17 +250,12 @@ static uint8_t parseWord(const char *s) {
 // Alert output: indication LED (D8), non-blocking engine
 // -----------------------------------------------------------------------------
 // The pattern engine blinks the LED (on during each pulse's on-phase, off in the
-// gaps). Quiet mode keeps it dark; because the pattern keeps running underneath,
-// un-muting simply re-lights it mid-pattern.
+// gaps). It always indicates -- there is no mute.
 
-// Energise the ON-phase: light the LED (unless muted by quiet mode).
-static inline void alertOn() {
-  digitalWrite(PIN_LED, quietMode ? LOW : HIGH);
-}
+// Energise the ON-phase: light the LED.
+static inline void alertOn()  { digitalWrite(PIN_LED, HIGH); }
 // LED off (gap between pulses / stopped).
-static inline void alertOff() {
-  digitalWrite(PIN_LED, LOW);
-}
+static inline void alertOff() { digitalWrite(PIN_LED, LOW); }
 
 // Stop any alert immediately and leave both outputs off.
 static void stopBuzz() {
@@ -357,17 +346,6 @@ static void buzzForKind(const char *k) {
   } else if (!strcmp(k, "OFF") || !strcmp(k, "STOP")) {
     stopBuzz();
   }
-}
-
-// Toggle quiet mode (SUBMIT long-press, 2s): turn the indication LED off/on. The
-// alert pattern keeps running underneath, so un-muting resumes the blinking
-// mid-pattern (if a tab still needs you, the light comes back at once).
-static void toggleQuiet() {
-  quietMode = !quietMode;
-  // Apply the LED gate NOW (mid-pulse), so it doesn't wait for the next phase.
-  digitalWrite(PIN_LED, (!quietMode && vibroActive && vibroOn) ? HIGH : LOW);
-  quietToastUntil = millis() + 1200;  // confirm the toggle with a brief toast
-  render();
 }
 
 // -----------------------------------------------------------------------------
@@ -515,24 +493,7 @@ static void drawList() {
   display.display();
 }
 
-// Full-screen toggle toast, shown for ~1.2s after a quiet-mode toggle (SUBMIT
-// long-press) to confirm it -- instead of a persistent corner badge, which would
-// clobber the card's idx/total counter and the list scrollbar and cost a second
-// slow software-I2C frame push on every render.
-static void drawQuietToast() {
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-  display.setTextSize(1);
-  display.setCursor(0, 2);
-  display.print(F("INDICATOR"));
-  display.setTextSize(2);
-  display.setCursor(0, 14);
-  display.print(quietMode ? F("OFF") : F("ON"));
-  display.display();
-}
-
 static void render() {
-  if (quietToastUntil && millis() < quietToastUntil) { drawQuietToast(); return; }
   if      (showList) drawList();
   else if (showIdle) drawIdle();
   else               drawCard();
@@ -724,10 +685,9 @@ static void pollPressButton(uint8_t pin, uint8_t n, bool &stable,
   }
 }
 
-// Short/long-press button (SUBMIT, MODE): emit "B|<shortN>" on a SHORT press
-// (released before LONGPRESS_MS) or "B|<longN>" once when the hold crosses
-// LONGPRESS_MS (the release is then swallowed). Returns true on the ONE tick the
-// long-press fires, so the caller can also act locally (SUBMIT toggles quiet).
+// Short/long-press button (MODE): emit "B|<shortN>" on a SHORT press (released
+// before longMs) or "B|<longN>" once when the hold crosses longMs (the release is
+// then swallowed). Returns true on the ONE tick the long-press fires.
 static bool pollLongButton(uint8_t pin, uint8_t shortN, uint8_t longN,
                            unsigned long longMs, BtnLong &b) {
   bool longEdge = false;
@@ -758,9 +718,9 @@ static bool pollLongButton(uint8_t pin, uint8_t shortN, uint8_t longN,
 }
 
 static void pollButtons() {
-  // SUBMIT: short = B|1 (focus/proceed), long HOLD (2s) = B|5 (+ toggle quiet mode).
-  if (pollLongButton(PIN_BTN_SUBMIT, 1, 5, MUTE_HOLD_MS, submitBtn)) toggleQuiet();
-  pollPressButton(PIN_BTN_NEXT, 2, nextStable, nextLastRaw, nextEdgeMs);
+  // SUBMIT: B|1 (focus/proceed; a double-click opens LIST detail, daemon-side).
+  pollPressButton(PIN_BTN_SUBMIT, 1, submitStable, submitLastRaw, submitEdgeMs);
+  pollPressButton(PIN_BTN_NEXT,   2, nextStable,   nextLastRaw,   nextEdgeMs);
   // MODE: short = B|3 (prev / list-up), long (0.5s) = B|4 (toggle SCROLL/LIST mode).
   pollLongButton(PIN_BTN_MODE, 3, 4, LONGPRESS_MS, modeBtn);
 }
@@ -815,12 +775,6 @@ void loop() {
   pumpSerial();
   pollButtons();
   pollVibro();                           // advance the haptic state machine
-
-  // Restore the normal screen when the quiet-toggle toast expires.
-  if (quietToastUntil && millis() >= quietToastUntil) {
-    quietToastUntil = 0;
-    render();
-  }
 
   // Blink the unacknowledged-alert dot (~every 400ms) -- on the card, or on any
   // unacknowledged row in the LIST. Re-render only when a blinking dot is shown.
