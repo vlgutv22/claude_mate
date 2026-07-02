@@ -17,17 +17,19 @@ The OLED is the **sole visual status**: a large word (FREE / WIP / BLOCKED /
 WTF) on top of a session-detail line. The daemon picks the word and sends it; the
 Arduino renders it.
 
-A **micro vibration motor on D5** is the haptic alert. The word (`D|`) is
-**visual only** — it never buzzes. Haptics are driven **per session** by the
-daemon via `V|<kind>`, at a graduated-but-soft PWM amplitude:
+The **indication LED on D8** is the alert output (the vibration motor was
+retired). The word (`D|`) is **visual only** — it never blinks the LED. Alerts
+are driven **per session** by the daemon via `V|<kind>`. Because the output is a
+light, each state has its own glanceable blink rhythm and every "act now" state
+blinks until you FOCUS the tab:
 
-| `V|` kind | Haptic | Repeat |
-|-----------|--------|--------|
-| `START`   | 3 gentle 0.3 s ticks | one-shot |
-| `INPUT`   | soft double-tap | re-tapped ~every 10 s until FOCUS |
-| `DONE`    | 5×0.2 s heartbeat (gaps 0.2/0.4 s) | **loops** until `V|OFF` |
-| `ERROR`   | 0.4 s on / 0.2 s off alarm | **loops** until `V|OFF` |
-| `OFF`     | stop the motor | sent on FOCUS / clear |
+| `V|` kind | LED pattern | Repeat |
+|-----------|-------------|--------|
+| `START`   | one long 1 s blink, then dark | one-shot |
+| `INPUT`   | aggressive even blink (~2.8 Hz) | **loops** until `V|OFF` |
+| `ERROR`   | super-aggressive fast strobe (~7 Hz) | **loops** until `V|OFF` |
+| `DONE`    | cascade — 4 quick blinks, then a pause | **loops** until `V|OFF` |
+| `OFF`     | LED off | sent on FOCUS / clear |
 
 There is no wheel, no dial, no homing, and no endstop — those are gone. See
 [PROTOCOL.md](PROTOCOL.md) for the exact haptic contract.

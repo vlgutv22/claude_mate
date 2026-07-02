@@ -29,7 +29,7 @@ input buffer and drops malformed/oversized lines).
 |-------------------------------------------------------|---------|
 | `D\|<word>`                                           | Set the status word. `<word>` is one of `FREE`, `WIP`, `BLOCKED`, `WTF`. The Arduino draws the big word on the OLED. **Visual only** — the word never buzzes on its own; all haptics come via `V\|`. |
 | `S\|<idx>\|<total>\|<name>\|<state>\|<runtime>\|<limit>\|<ack>\|<model>\|<effort>` | Show one session card (the carousel step). See field table below. `ack`/`model`/`effort` are optional trailing fields — older daemons omit them and the firmware copes. |
-| `V\|<kind>`                                           | Haptic control (motor only; never touches the OLED). `<kind>` is `START`, `INPUT`, `DONE`, `ERROR`, or `OFF`. See **Haptics** below. |
+| `V\|<kind>`                                           | Alert control (indication LED only; never touches the OLED). `<kind>` is `START`, `INPUT`, `DONE`, `ERROR`, or `OFF`. See **Haptics** below. |
 | `T\|<total>\|<sel>\|<row>\|<row>\|…`                  | **LIST-mode** frame (sent only in LIST mode). `<total>` = total tab count, `<sel>` = 0-based index of the highlighted tab (drives the scrollbar). Then up to **4** windowed rows, each `<name>;<status>;<hl>;<ack>` where `status` is a short label shown in a left column (`WIP` working / `WAIT` waiting / `ERR` error / `DONE` done / `IDLE` idle), `hl` is `1` for the highlighted row, and `ack` is `0` for an **unacknowledged alert** (the firmware draws a blinking dot in that row) else `1`. Names are capped (`LIST_NAME_MAX`) so the whole line stays under the firmware's 96-char limit. The daemon may instead send an `S` card for the highlighted tab when the LIST **detail** sub-view is open (double-click SUBMIT). |
 | `I`                                                   | Idle screen — no active sessions. The daemon also sends `D\|FREE` alongside it. |
 | `P`                                                   | Ping / keepalive. The Arduino MAY ignore it, or reply with `H`. |
@@ -41,24 +41,28 @@ input buffer and drops malformed/oversized lines).
 
 #### Haptics — `V|<kind>`
 
-The daemon owns **all** haptics and decides, per session, when to buzz; the
-firmware just plays the pattern it is told. Amplitude (PWM duty) stays well below
-full power — urgency reads as **rhythm**, not raw force.
+The daemon owns **all** haptics and decides, per session, when to signal; the
+firmware just plays the pattern it is told. The output is now the **indication LED
+on D8** (the motor was retired), so urgency reads at a **glance** — each state has
+its own unmistakable blink rhythm, and every "you need to act" state blinks until
+you acknowledge it (FOCUS the tab).
 
 | `<kind>` | When the daemon sends it | Firmware pattern | Repeat |
 |----------|--------------------------|------------------|--------|
-| `START`  | A job (re)started, and nothing else needs you. | 3 gentle 0.3 s pulses. | one-shot |
-| `INPUT`  | A session started `waiting` (Claude needs input). | soft double-tap. | daemon re-taps every ~10 s until focused |
-| `DONE`   | A turn finished (`done`, unacknowledged). | 5×0.2 s "heartbeat", gaps 0.2/0.4 s, then a rest. | **loops** until `V\|OFF` |
-| `ERROR`  | A turn ended on an API error (`error`). | 0.4 s on / 0.2 s off. | **loops** until `V\|OFF` |
-| `OFF`    | The alert was acknowledged (FOCUS) or cleared. | stops the motor now. | — |
+| `START`  | A job (re)started, and nothing else needs you. | one long **1 s** blink, then dark. | one-shot |
+| `INPUT`  | A session started `waiting` (Claude needs input). | aggressive even blink (~2.8 Hz). | **loops** until `V\|OFF` |
+| `ERROR`  | A turn ended on an API error (`error`). | super-aggressive fast strobe (~7 Hz). | **loops** until `V\|OFF` |
+| `DONE`   | A turn finished (`done`, unacknowledged). | cascade — 4 quick blinks, then a pause. | **loops** until `V\|OFF` |
+| `OFF`    | The alert was acknowledged (FOCUS) or cleared. | LED off now. | — |
 
-`DONE` and `ERROR` are **continuous loops**: the firmware repeats the pattern on
-its own until it receives `V|OFF` (sent on FOCUS/clear). The daemon (re)sends the
-loop `<kind>` only when the desired loop *changes*, so the link is not spammed. As
-a failsafe the firmware stops any loop if the daemon goes fully silent for ~30 s
-(it pings `P` every 15 s and streams `S` cards ~1/s, so this only trips when the
-daemon has died). `OFF` (alias `STOP`) silences the motor immediately.
+`INPUT`, `ERROR`, and `DONE` are **continuous loops**: the firmware repeats the
+pattern on its own until it receives `V|OFF` (sent on FOCUS/clear). `START` is the
+only calm, one-shot signal (you just kicked something off, nothing is wrong). The
+daemon (re)sends the loop `<kind>` only when the desired loop *changes*, so the
+link is not spammed. As a failsafe the firmware stops any loop if the daemon goes
+fully silent for ~30 s (it pings `P` every 15 s and streams `S` cards ~1/s, so
+this only trips when the daemon has died). `OFF` (alias `STOP`) darkens the LED
+immediately.
 
 **`S` line fields:**
 

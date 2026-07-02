@@ -317,32 +317,33 @@ static void pollVibro() {
   }
 }
 
-// Daemon-driven alert patterns (blinked on the LED). The daemon decides WHEN to
-// alert and how the "until acknowledged" alerts repeat; the firmware just plays
-// what it is told. Urgency reads through the rhythm of the pulses.
+// Daemon-driven alert patterns (blinked on the LED). Since the output is a LIGHT
+// (not a buzz) the urgency has to read at a GLANCE, so each state has its own
+// unmistakable rhythm and the "you need to act" states blink until acknowledged:
 //
-//   START  job (re)started : 3x0.3s pulses                       (one-shot)
-//   DONE   turn finished   : 5x0.2s heartbeat, gaps 0.2/0.4, then rest; LOOPS
-//   INPUT  needs your input: double-tap                          (daemon re-taps ~10s)
-//   ERROR  API error/alert : 0.4s on / 0.2s off                ; LOOPS until ack
+//   START  job (re)started : one long 1 s blink, then dark            (one-shot)
+//   INPUT  needs your input: aggressive even blink (~2.8 Hz)          ; LOOPS until ack
+//   ERROR  API error/alert : super-aggressive fast strobe (~7 Hz)     ; LOOPS until ack
+//   DONE   turn finished   : cascade -- 4 quick blinks then a pause   ; LOOPS until ack
 //   OFF    (or STOP)       : end any pattern now (daemon sends on acknowledge/clear)
+//
+// START is the only calm, one-shot signal (you just kicked something off, nothing
+// is wrong). Everything that wants your attention keeps going until you focus the
+// tab (the daemon sends V|OFF on FOCUS/clear); the firmware's silence watchdog
+// still stops a loop if the daemon dies.
 static void buzzForKind(const char *k) {
   if (!strcmp(k, "START")) {
-    const VibroStep s[] = {{300, 180}, {300, 180}, {300, 0}};
-    startPattern(s, 3, false);
-  } else if (!strcmp(k, "DONE")) {
-    // 5 pulses of 0.2s with alternating 0.2/0.4 gaps (a heartbeat), then a 0.9s
-    // rest before it repeats. Loops until the daemon sends OFF (you focus).
-    const VibroStep s[] = {{200, 200}, {200, 400}, {200, 200}, {200, 400}, {200, 900}};
-    startPattern(s, 5, true);
+    const VibroStep s[] = {{1000, 0}};                       // one long blink: job started
+    startPattern(s, 1, false);
   } else if (!strcmp(k, "INPUT")) {
-    // Double-tap. One-shot; the daemon re-taps every ~10s until you focus.
-    const VibroStep s[] = {{90, 150}, {90, 0}};
-    startPattern(s, 2, false);
-  } else if (!strcmp(k, "ERROR")) {
-    // 0.4s buzz, 0.2s pause, forever. Loops until the daemon sends OFF.
-    const VibroStep s[] = {{400, 200}};
+    const VibroStep s[] = {{180, 180}};                      // aggressive even blink: needs you
     startPattern(s, 1, true);
+  } else if (!strcmp(k, "ERROR")) {
+    const VibroStep s[] = {{70, 70}};                        // frantic strobe: error
+    startPattern(s, 1, true);
+  } else if (!strcmp(k, "DONE")) {
+    const VibroStep s[] = {{110, 90}, {110, 90}, {110, 90}, {110, 650}}; // cascade burst + pause: finished
+    startPattern(s, 4, true);
   } else if (!strcmp(k, "OFF") || !strcmp(k, "STOP")) {
     stopBuzz();
   }
