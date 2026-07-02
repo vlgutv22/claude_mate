@@ -420,6 +420,30 @@ _LIVE_SPINNER_RE = re.compile(
     r'|thinking with\s+\w+\s+effort)',         # … the thinking-effort hint
     re.I | re.M)
 
+# Claude's END-OF-TURN BACKGROUND-WORK banner. The foreground reply has finished
+# (the prompt is available again) but real work is STILL running -- a dynamic
+# workflow, background agents, or a tool. Claude shows a live line like
+#   "Waiting for 1 dynamic workflow to finish"
+#   "Waiting for 2 background agents to finish"
+# that CLEARS the instant the work completes, so it is a trustworthy "still
+# working" tell. Two things make it different from the foreground spinner, and
+# both matter here:
+#   1. it can sit FAR above the bottom region -- the task panel + the prompt box
+#      push it up, well outside BUSY_TAIL_LINES -- so it is matched over the WHOLE
+#      screen (this is exactly why a genuinely-busy session was mis-read idle ->
+#      premature DONE);
+#   2. it COEXISTS with the idle prompt ("? for shortcuts" shows while background
+#      work runs), so it must NOT be suppressed by the idle-prompt gate.
+# Quote-resistance is structural instead: it must sit at a LINE START (optional
+# indent + one glyph) and match the exact "Waiting for <N> ... to finish" shape,
+# so prose about background work ("still waiting for the agent to finish") never
+# fires -- there is no leading count, or "waiting" is not the first word.
+_BG_WORK_RE = re.compile(
+    r'^[ \t]*[^\w\s]?[ \t]*'                   # line start: optional indent + one glyph
+    r'waiting for\s+\d+\s+'                    # "Waiting for 1 " (a live count)
+    r'[^\n]*?\bto finish\b',                   # "... dynamic workflow / agents / tool to finish"
+    re.I | re.M)
+
 def detect_state(screen_text):
     # Read only Claude's LIVE STATUS REGION (the bottom of the visible screen),
     # not the whole scrollback. Error/prompt/generating chrome renders there, so
@@ -452,10 +476,17 @@ def detect_state(screen_text):
     # meter-quote false positives (a pasted status line, a README blockquote, this
     # repo's own fixtures) whether they land in the bottom region or higher up.
     idle_prompt = any(p in footer for p in _IDLE_FOOTER)
-    busy_now = (not idle_prompt) and (
+    live_work = (not idle_prompt) and (
                 any(p in busy_tail for p in _patterns["busy"])
                 or bool(_WORKING_METER_RE.search(busy_tail))
                 or bool(_LIVE_SPINNER_RE.search(full)))
+    # Background work (a dynamic workflow / agents / a tool still running) keeps
+    # the session "working" even though the foreground turn ended and the prompt is
+    # idle. Its banner is a live line that clears on completion, so -- unlike the
+    # quote-prone spinner/meter -- it is read over the whole screen and is NOT
+    # gated on the idle prompt (which shows WHILE the background work runs).
+    bg_work = bool(_BG_WORK_RE.search(full))
+    busy_now = live_work or bg_work
 
     # Strong, specific error strings win even mid-stream (a genuine API error
     # replaces the spinner). Content-prone error phrases match ONLY in the tight

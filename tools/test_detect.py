@@ -175,6 +175,34 @@ CASES = [
      "  Deploying… (30s · ↓ 5k tokens saved)\n"
      "  Release v2.4.0 is live on all regions.\n"
      + PROMPT, "idle"),
+    # END-OF-TURN BACKGROUND WORK (the reported bug): the foreground reply finished
+    # and the prompt is available (idle footer shows), but a dynamic workflow / CI /
+    # background agents are STILL running. Claude's "Waiting for N ... to finish"
+    # banner sits ABOVE the task panel + prompt box (far outside BUSY_TAIL_LINES) and
+    # coexists with the idle prompt -- so it must read WORKING, not idle -> DONE.
+    ("turn ended, a dynamic workflow still running in the background (idle prompt)",
+     "● Both the code review workflow and CI watch are running in the background.\n"
+     "  - Implementation complete; build green; awaiting review + CI.\n"
+     "Waiting for 1 dynamic workflow to finish\n"
+     "  4 tasks (3 done, 1 in progress, 0 open)\n"
+     + "\n".join(f"  ✓ task line {i}" for i in range(4)) + "\n"
+     + PROMPT, "working"),
+    ("turn ended, background agents still running below a long task panel",
+     "● Kicked off the explorers; I'll summarise when they return.\n"
+     "Waiting for 2 background agents to finish\n"
+     + "\n".join(f"  ✓ done item {i}" for i in range(10)) + "\n"
+     + PROMPT, "working"),
+    # Guard: PROSE about background work is not the banner -- no leading live count
+    # ("waiting for the workflow"), or "waiting" is not the first word on the line.
+    # These must stay idle (the \d+ + line-start-"waiting for" shape rejects them).
+    ("idle, prose mentions waiting for the workflow to finish (no live count)",
+     "● I'll keep going once you confirm; I was waiting for the workflow to finish.\n"
+     "  - Everything else is already merged.\n"
+     + PROMPT, "idle"),
+    ("idle, a bullet notes still waiting for an agent to finish (not line-anchored)",
+     "● Recap of the last run:\n"
+     "  - I'm still waiting for 1 agent to finish reviewing the diff.\n"
+     + PROMPT, "idle"),
 ]
 
 fails = 0
