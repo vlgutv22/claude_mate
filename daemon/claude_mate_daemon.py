@@ -717,14 +717,20 @@ class Display:
 
     def render_list_view(self) -> None:
         """Render the LIST-mode display: the highlighted tab's full card when the
-        detail sub-view is open (double-click SUBMIT), else the scrolling list."""
+        detail sub-view is open (double-click SUBMIT), else the scrolling list.
+        If the detailed tab has ended/been pruned, auto-close detail back to the
+        list (don't silently show a different tab's card)."""
         with self._lock:
             detail = self._list_detail
+            key = self._list_sel_key
         if detail:
-            sess = self.list_selected_session()
+            sessions = self._reg.ordered()
+            sess = next((s for s in sessions if s.key == key), None)  # STRICT: no fallback
             if sess is not None:
                 self.show_session(sess)
                 return
+            with self._lock:
+                self._list_detail = False        # selected tab gone -> close detail
         self.render_list()
 
     def toggle_list_detail(self) -> None:
@@ -1041,7 +1047,10 @@ class ButtonReader(threading.Thread):
         self.on_ack = None   # callback(sess): acknowledge a focused tab's alert
         # LIST-mode SUBMIT double-click: a single click (focus) is deferred briefly
         # so a second click within the window instead opens/closes the detail card.
+        # `_submit_gen` invalidates a pending deferred single-click so the boundary
+        # race (Timer.cancel can't stop a timer already firing) can't double-fire.
         self._submit_timer: Optional[threading.Timer] = None
+        self._submit_gen = 0
         self._submit_lock = threading.Lock()
 
     def run(self) -> None:
@@ -1106,18 +1115,24 @@ class ButtonReader(threading.Thread):
             return
         with self._submit_lock:
             if self._submit_timer is not None:       # second click -> double-click
+                self._submit_gen += 1                # invalidate the pending single
                 self._submit_timer.cancel()
                 self._submit_timer = None
                 self._display.toggle_list_detail()
                 return
-            t = threading.Timer(DOUBLE_CLICK_S, self._submit_single_fire)
+            self._submit_gen += 1
+            gen = self._submit_gen
+            t = threading.Timer(DOUBLE_CLICK_S, self._submit_single_fire, args=(gen,))
             t.daemon = True
             self._submit_timer = t
             t.start()
 
-    def _submit_single_fire(self) -> None:
-        """The deferred LIST single-click fired (no double came): focus the tab."""
+    def _submit_single_fire(self, gen: int) -> None:
+        """The deferred LIST single-click fired: focus the tab -- unless a second
+        click already superseded this generation (the cancel-vs-fire boundary race)."""
         with self._submit_lock:
+            if gen != self._submit_gen:              # cancelled/superseded -> do nothing
+                return
             self._submit_timer = None
         self._focus(self._display.list_selected_session())
 

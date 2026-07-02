@@ -190,6 +190,18 @@ with display_lock:
     cards_after_ack = [l for l in display[idx_before_ack:] if l.startswith("S|")]
 first_card_after_ack = cards_after_ack[0] if cards_after_ack else ""
 
+print("\n-- phase 8: LIST detail auto-closes when the detailed tab ends --")
+# beta is the current card; enter LIST (seeds on beta), double-click to open its
+# detail, then END beta: detail must auto-close back to the list (not stick on a
+# stale card).
+arduino_send("B|4"); time.sleep(1.2)          # SCROLL -> LIST (seeds highlight on beta)
+arduino_send("B|1"); time.sleep(0.15); arduino_send("B|1"); time.sleep(1.0)  # dbl-click -> detail
+with display_lock:
+    idx_before_end = len(display)
+feed("end|sidB|beta"); time.sleep(1.5)        # end the detailed tab
+with display_lock:
+    detail_autoclosed = any(l.startswith("T|") for l in display[idx_before_end:])
+
 proc.terminate()
 try:
     proc.wait(timeout=5)
@@ -244,6 +256,8 @@ check("double-click SUBMIT in LIST opens the highlighted tab's detail card (infr
       detail_opened)
 check("double-click SUBMIT again closes detail -> the T| list resumes",
       detail_closed)
+check("LIST detail auto-closes when the detailed tab ends (no stuck stale card)",
+      detail_autoclosed)
 check("MODE long-press again returns to SCROLL -> S| card resumes",
       saw_after(idx_after_scroll, lambda l: l.startswith("S|")))
 check("SCROLL: acknowledging a tab stays on it, no jump to the top tab "

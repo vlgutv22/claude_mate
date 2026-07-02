@@ -213,6 +213,7 @@ static unsigned long nextEdgeMs   = 0;
 static bool quietMode = false;              // SUBMIT long-press toggles this
 static char lastLoopKind[8] = {0};          // last DONE/ERROR loop the daemon set;
                                             // replayed on un-mute, cleared by OFF.
+static unsigned long quietToastUntil = 0;   // show the ON/OFF toast until this ms
 
 // -----------------------------------------------------------------------------
 // Helpers
@@ -382,7 +383,8 @@ static void toggleQuiet() {
   } else if (lastLoopKind[0]) {
     buzzForKind(lastLoopKind);  // resume the pending alert ("buzz if unacked")
   }
-  render();                     // refresh the muted indicator
+  quietToastUntil = millis() + 1200;  // confirm the toggle with a brief toast
+  render();
 }
 
 // -----------------------------------------------------------------------------
@@ -530,22 +532,27 @@ static void drawList() {
   display.display();
 }
 
-// Small "muted" badge drawn in the top-right corner whenever quiet mode is on, so
-// the mute state is visible at a glance on every screen. A bell outline with a
-// slash. Drawn LAST (over any content) as an overlay.
-static void drawQuietBadge() {
-  const int16_t bx = SCREEN_WIDTH - 8, by = 0;     // 8x8 top-right
-  // clear a small backing box so it stays legible over inverted rows / text
-  display.fillRect(bx, by, 8, 8, SSD1306_BLACK);
-  display.drawCircle(bx + 3, by + 3, 3, SSD1306_WHITE);   // bell-ish body
-  display.drawLine(bx, by + 7, bx + 7, by, SSD1306_WHITE); // the "muted" slash
+// Full-screen toggle toast, shown for ~1.2s after a quiet-mode toggle (SUBMIT
+// long-press) to confirm it -- instead of a persistent corner badge, which would
+// clobber the card's idx/total counter and the list scrollbar and cost a second
+// slow software-I2C frame push on every render.
+static void drawQuietToast() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 2);
+  display.print(F("VIBRATION"));
+  display.setTextSize(2);
+  display.setCursor(0, 14);
+  display.print(quietMode ? F("OFF") : F("ON"));
+  display.display();
 }
 
 static void render() {
+  if (quietToastUntil && millis() < quietToastUntil) { drawQuietToast(); return; }
   if      (showList) drawList();
   else if (showIdle) drawIdle();
   else               drawCard();
-  if (quietMode) { drawQuietBadge(); display.display(); }
 }
 
 // -----------------------------------------------------------------------------
@@ -578,7 +585,7 @@ static void handleLine(char *line) {
       render();
       break;
 
-    case 'T': {  // T|total|sel|<name;st;hl>|<name;st;hl>|...  -- LIST-mode frame
+    case 'T': {  // T|total|sel|<name;st;hl;ack>|...  -- LIST-mode frame
       // The daemon owns the tab list + selection and windows it to <=LIST_ROWS
       // visible rows. Tokenize on '|': fields[1]=total, [2]=sel, [3..]=rows.
       char *fields[3 + LIST_ROWS];
@@ -824,6 +831,12 @@ void loop() {
   pumpSerial();
   pollButtons();
   pollVibro();                           // advance the haptic state machine
+
+  // Restore the normal screen when the quiet-toggle toast expires.
+  if (quietToastUntil && millis() >= quietToastUntil) {
+    quietToastUntil = 0;
+    render();
+  }
 
   // Blink the unacknowledged-alert dot (~every 400ms) -- on the card, or on any
   // unacknowledged row in the LIST. Re-render only when a blinking dot is shown.
