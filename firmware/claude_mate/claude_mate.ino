@@ -127,10 +127,16 @@
 // ---- Haptic tuning -----------------------------------------------------------
 // PWM amplitude (0-255) per pattern, kept "graduated but soft": urgency reads as
 // rhythm + a little more push, never full-power buzz. Start/Done are the gentlest.
+// A coin/pager motor won't reliably START spinning at these gentle duties, so each
+// pulse is KICK-STARTED at full power for VIBRO_KICK_MS, then dropped to its duty
+// (the hold threshold is well below the start threshold, so it keeps spinning).
+// The sustain floors are a bit above the old values so the motor doesn't stall
+// once the kick ends.
 #define VIBRO_MAX_STEPS   6       // longest pattern (DONE's 5-pulse heartbeat)
-#define DUTY_SOFT         80      // START tick + DONE heartbeat (gentlest)
-#define DUTY_INPUT       120      // needs-input double-tap (a touch firmer)
-#define DUTY_ALERT       160      // ERROR / warning loop (firmest; never 255)
+#define VIBRO_KICK_MS     45      // full-power kick at the start of every pulse
+#define DUTY_SOFT        110      // START tick + DONE heartbeat (gentlest sustain)
+#define DUTY_INPUT       150      // needs-input double-tap (a touch firmer)
+#define DUTY_ALERT       200      // ERROR / warning loop (firmest; never full 255)
 // A looping pattern (DONE/ERROR) repeats until the daemon sends V|OFF. As a
 // failsafe, if the daemon goes silent (no serial at all) for this long we stop
 // on our own so a crashed daemon can't leave the motor buzzing. The daemon pings
@@ -196,6 +202,7 @@ static uint8_t       vibroDuty      = 0;     // PWM amplitude of this pattern
 static bool          vibroLoop      = false; // repeat the pattern until stopped?
 static bool          vibroActive    = false; // a pattern is playing
 static bool          vibroOn        = false; // motor energised right now?
+static bool          vibroKicked    = false; // this pulse past its full-power kick?
 static unsigned long vibroPhaseMs   = 0;     // millis() at the last phase change
 static unsigned long lastRxMs       = 0;     // millis() of the last serial byte
                                              // (loop watchdog: daemon liveness)
@@ -274,10 +281,13 @@ static uint8_t parseWord(const char *s) {
 // the LED is the only indication. Because the pattern keeps running in quiet mode
 // (for the LED), un-muting simply re-enables the motor mid-pattern -- no replay.
 
-// Energise the ON-phase: LED always; motor at its PWM amplitude unless muted.
+// Energise the ON-phase: LED always; motor KICK-STARTED at full power (unless
+// muted) so a gentle-duty coin motor reliably starts spinning. pollVibro() drops
+// it to vibroDuty after VIBRO_KICK_MS.
 static inline void alertOn() {
   digitalWrite(PIN_LED, HIGH);
-  analogWrite(PIN_VIBRO, quietMode ? 0 : vibroDuty);
+  analogWrite(PIN_VIBRO, quietMode ? 0 : 255);   // full-power kick
+  vibroKicked = false;
 }
 // Both outputs off (gap between pulses / stopped).
 static inline void alertOff() {
@@ -329,10 +339,16 @@ static void pollVibro() {
 
   const VibroStep &step = vibroSteps[vibroStepIdx];
   if (vibroOn) {
-    if ((now - vibroPhaseMs) >= step.onMs) {
+    unsigned long onFor = now - vibroPhaseMs;
+    if (onFor >= step.onMs) {
       alertOff();                      // end of on-phase -> start this step's gap
       vibroOn = false;
       vibroPhaseMs = now;
+    } else if (!vibroKicked && onFor >= VIBRO_KICK_MS) {
+      // Kick done: drop the motor from full to its gentle sustain duty (LED stays
+      // on). Skip while muted -- the motor is already off.
+      vibroKicked = true;
+      if (!quietMode) analogWrite(PIN_VIBRO, vibroDuty);
     }
   } else {
     if ((now - vibroPhaseMs) >= step.offMs) {
@@ -389,8 +405,10 @@ static void buzzForKind(const char *k) {
 // un-muting resumes it mid-pattern (if a tab still needs you, you feel it at once).
 static void toggleQuiet() {
   quietMode = !quietMode;
-  // Apply the motor gate NOW (mid-pulse), so it doesn't wait for the next phase.
-  analogWrite(PIN_VIBRO, (quietMode || !(vibroActive && vibroOn)) ? 0 : vibroDuty);
+  // Apply the motor gate NOW (mid-pulse). On un-mute during a pulse, drive what the
+  // engine would: the full kick if still within it, else the sustain duty.
+  if (quietMode || !(vibroActive && vibroOn)) analogWrite(PIN_VIBRO, 0);
+  else analogWrite(PIN_VIBRO, vibroKicked ? vibroDuty : 255);
   quietToastUntil = millis() + 1200;  // confirm the toggle with a brief toast
   render();
 }
