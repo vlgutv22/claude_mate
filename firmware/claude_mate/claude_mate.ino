@@ -111,7 +111,9 @@
 #define PIN_BTN_SUBMIT 2       // D2, INPUT_PULLUP, emits B|1 (focus/proceed)
 #define PIN_BTN_NEXT   3       // D3, INPUT_PULLUP, emits B|2 (next / highlight down)
 #define PIN_BTN_MODE   4       // D4, INPUT_PULLUP, emits B|3 short / B|4 long
-#define PIN_VIBRO      5       // D5, OUTPUT, drives the vibration motor (HIGH=on)
+#define PIN_VIBRO      9       // D9, OUTPUT, drives the vibration motor (HIGH=on).
+                               // Moved off D5 (suspected damaged by direct inductive
+                               // drive with no flyback diode). Add a flyback diode!
 #define PIN_LED        8       // D8, OUTPUT, indication LED (add a ~220-1k series
                                // resistor to GND). Mirrors the alert pattern: it
                                // blinks with every buzz in normal mode, and is the
