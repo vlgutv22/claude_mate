@@ -46,6 +46,7 @@ There is no wheel, no dial, no homing, and no endstop — those are gone. See
 | NEXT button             | **D3**      | `INPUT_PULLUP`; other leg to GND |
 | MODE button             | **D4**      | `INPUT_PULLUP`; other leg to GND |
 | Vibration motor (drive) | **D5**      | drives a vibro-motor module / NPN transistor / ULN2003 channel (see below) — **not** the motor directly |
+| Indication LED          | **D8**      | LED + **~220 Ω–1 kΩ series resistor** to GND. Blinks the alert pattern with the motor; in quiet mode it's the only output. |
 
 > There are **no LED pins** and **no stepper pins**. The old traffic-light LEDs
 > and the stepper status wheel (with its ULN2003 driver and D4 endstop) are both
@@ -168,11 +169,14 @@ That's the whole story — no separate supply, no homing, no endstop.
         |                       |
         |                    D5 |---- vibro driver IN -> motor (+5V / GND)
         |                       |       (module, or NPN+1k+1N4148, or ULN2003 ch.)
+        |                    D8 |---- LED +anode, -cathode -> [~220-1k R] -> GND
         +-----------------------+
 
   OLED module: VCC->5V, GND->GND, SDA->A4, SCL->A3   (software I2C, addr 0x3C)
   Vibration motor: powered from the USB 5V rail, common ground, flyback diode
   across the motor. The motor buzzes per session via V|<kind> (not the word).
+  Indication LED on D8 blinks the same alert pattern (and is the only output in
+  quiet mode); always use a series resistor so the pin isn't over-driven.
 ```
 
 ---
@@ -185,6 +189,7 @@ That's the whole story — no separate supply, no homing, no endstop.
 | 1   | I2C OLED 0.91" 128x32 — SSD1306                   | 4-pin GND/VCC/SCK(SCL)/SDA; a 0.96" 128x64 also works (set SCREEN_HEIGHT 64) |
 | 3   | Momentary push buttons (tactile)                 | MODE + SUBMIT + NEXT |
 | 1   | Micro vibration motor                            | coin/pager type; haptic alert on D5, per-session buzz via V|<kind> |
+| 1   | Indication LED + ~220 Ω–1 kΩ resistor            | on D8; blinks the alert pattern with the motor (only output in quiet mode) |
 | 1   | NPN transistor (2N2222 / S8050)                  | Option B driver — *or* use a 3-pin vibro module / a spare ULN2003 channel instead |
 | 1   | Resistor ~1 kΩ                                    | Option B — base resistor on D5 |
 | 1   | Diode 1N4148                                     | Option B — flyback across the motor (built in to a module / ULN2003) |

@@ -42,6 +42,10 @@
  *     VIBRO        -> D5   (OUTPUT; drive via an NPN transistor or one ULN2003
  *                          channel -- do NOT drive the motor straight off a pin.
  *                          Add a flyback diode across the motor.)
+ *   Indication LED:
+ *     LED          -> D8   (OUTPUT; LED + ~220-1k series resistor to GND). Blinks
+ *                          the alert pattern alongside the motor; in QUIET mode it
+ *                          is the only output (motor muted).
  *
  * POWER:
  *   The vibration motor is tiny (tens of mA) and is switched through a
@@ -108,6 +112,10 @@
 #define PIN_BTN_NEXT   3       // D3, INPUT_PULLUP, emits B|2 (next / highlight down)
 #define PIN_BTN_MODE   4       // D4, INPUT_PULLUP, emits B|3 short / B|4 long
 #define PIN_VIBRO      5       // D5, OUTPUT, drives the vibration motor (HIGH=on)
+#define PIN_LED        8       // D8, OUTPUT, indication LED (add a ~220-1k series
+                               // resistor to GND). Mirrors the alert pattern: it
+                               // blinks with every buzz in normal mode, and is the
+                               // ONLY output in quiet mode (motor muted).
 
 // ---- Protocol constants ------------------------------------------------------
 #define SERIAL_BAUD    115200
@@ -209,10 +217,8 @@ static bool          nextStable   = true;  // pull-up idle = HIGH (released)
 static int           nextLastRaw  = HIGH;
 static unsigned long nextEdgeMs   = 0;
 
-// ---- Quiet mode (haptics muted) ----------------------------------------------
+// ---- Quiet mode (motor muted; LED still indicates) ---------------------------
 static bool quietMode = false;              // SUBMIT long-press toggles this
-static char lastLoopKind[8] = {0};          // last DONE/ERROR loop the daemon set;
-                                            // replayed on un-mute, cleared by OFF.
 static unsigned long quietToastUntil = 0;   // show the ON/OFF toast until this ms
 
 // -----------------------------------------------------------------------------
@@ -261,15 +267,30 @@ static uint8_t parseWord(const char *s) {
 }
 
 // -----------------------------------------------------------------------------
-// Vibration motor (non-blocking haptic engine)
+// Alert outputs: vibration motor (D5) + indication LED (D8), non-blocking engine
 // -----------------------------------------------------------------------------
+// The pattern engine drives BOTH outputs. The LED mirrors every pulse (on during
+// the on-phase); the motor does too EXCEPT in quiet mode, where it stays off so
+// the LED is the only indication. Because the pattern keeps running in quiet mode
+// (for the LED), un-muting simply re-enables the motor mid-pattern -- no replay.
 
-// Stop any haptic immediately and leave the motor off.
+// Energise the ON-phase: LED always; motor at its PWM amplitude unless muted.
+static inline void alertOn() {
+  digitalWrite(PIN_LED, HIGH);
+  analogWrite(PIN_VIBRO, quietMode ? 0 : vibroDuty);
+}
+// Both outputs off (gap between pulses / stopped).
+static inline void alertOff() {
+  digitalWrite(PIN_LED, LOW);
+  analogWrite(PIN_VIBRO, 0);
+}
+
+// Stop any alert immediately and leave both outputs off.
 static void stopBuzz() {
   vibroActive    = false;
   vibroOn        = false;
   vibroStepCount = 0;
-  analogWrite(PIN_VIBRO, 0);
+  alertOff();
 }
 
 // Begin a haptic pattern: `count` pulses copied from `steps`, all at PWM
@@ -290,7 +311,7 @@ static void startPattern(const VibroStep *steps, uint8_t count,
   vibroActive    = true;
   vibroOn        = true;                // start the first pulse now
   vibroPhaseMs   = millis();
-  analogWrite(PIN_VIBRO, duty);
+  alertOn();
 }
 
 // Advance the haptic state machine. Call every loop(); never blocks.
@@ -309,7 +330,7 @@ static void pollVibro() {
   const VibroStep &step = vibroSteps[vibroStepIdx];
   if (vibroOn) {
     if ((now - vibroPhaseMs) >= step.onMs) {
-      analogWrite(PIN_VIBRO, 0);       // end of on-phase -> start this step's gap
+      alertOff();                      // end of on-phase -> start this step's gap
       vibroOn = false;
       vibroPhaseMs = now;
     }
@@ -321,7 +342,7 @@ static void pollVibro() {
         if (!vibroLoop) { stopBuzz(); return; }   // one-shot complete -- stay off
         vibroStepIdx = 0;                          // loop back to the first pulse
       }
-      analogWrite(PIN_VIBRO, vibroDuty);
+      alertOn();
       vibroOn = true;
       vibroPhaseMs = now;
     }
@@ -339,18 +360,8 @@ static void pollVibro() {
 //   ERROR  API error/alert : 0.4s on / 0.2s off               ; LOOPS until ack
 //   OFF    (or STOP)       : end any pattern now (daemon sends on acknowledge/clear)
 static void buzzForKind(const char *k) {
-  // Remember the current continuous-loop kind (DONE/ERROR) so quiet mode can
-  // resume it on un-mute; OFF/one-shots clear it.
-  if (!strcmp(k, "DONE") || !strcmp(k, "ERROR")) {
-    uint8_t i = 0;
-    for (; k[i] && i < sizeof(lastLoopKind) - 1; i++) lastLoopKind[i] = k[i];
-    lastLoopKind[i] = 0;
-  } else if (!strcmp(k, "OFF") || !strcmp(k, "STOP")) {
-    lastLoopKind[0] = 0;
-  }
-  // Muted: swallow every buzz (OFF/STOP still stop the motor).
-  if (quietMode && strcmp(k, "OFF") && strcmp(k, "STOP")) return;
-
+  // Always start the pattern -- the engine gates only the MOTOR on quiet mode; the
+  // LED plays it either way, and a running loop's motor resumes on un-mute.
   if (!strcmp(k, "START")) {
     // 3 gentle pulses of 0.3s, ~0.18s apart. One-shot.
     const VibroStep s[] = {{300, 180}, {300, 180}, {300, 0}};
@@ -373,16 +384,13 @@ static void buzzForKind(const char *k) {
   }
 }
 
-// Toggle quiet mode (SUBMIT long-press). Muting silences immediately; un-muting
-// resumes any alert loop the daemon set while we were muted, so if a tab still
-// needs you (unacknowledged done/error) you feel it right away.
+// Toggle quiet mode (SUBMIT long-press). Only the MOTOR is gated -- the alert
+// pattern (and the LED) keeps running -- so muting just drops the motor and
+// un-muting resumes it mid-pattern (if a tab still needs you, you feel it at once).
 static void toggleQuiet() {
   quietMode = !quietMode;
-  if (quietMode) {
-    stopBuzz();                 // silence now
-  } else if (lastLoopKind[0]) {
-    buzzForKind(lastLoopKind);  // resume the pending alert ("buzz if unacked")
-  }
+  // Apply the motor gate NOW (mid-pulse), so it doesn't wait for the next phase.
+  analogWrite(PIN_VIBRO, (quietMode || !(vibroActive && vibroOn)) ? 0 : vibroDuty);
   quietToastUntil = millis() + 1200;  // confirm the toggle with a brief toast
   render();
 }
@@ -790,21 +798,24 @@ void setup() {
   pinMode(PIN_BTN_NEXT,   INPUT_PULLUP);
   pinMode(PIN_BTN_MODE,   INPUT_PULLUP);
   pinMode(PIN_VIBRO,      OUTPUT);
+  pinMode(PIN_LED,        OUTPUT);
   digitalWrite(PIN_VIBRO, LOW);          // motor off at boot
+  digitalWrite(PIN_LED,   LOW);          // LED off at boot
   lastRxMs = millis();                   // seed the haptic loop watchdog
 
   Serial.begin(SERIAL_BAUD);
 
-  // Init the OLED. If it fails, buzz the vibro motor so a wiring fault is FELT.
+  // Init the OLED. If it fails, buzz the motor + blink the LED so a wiring fault
+  // is FELT and SEEN.
   if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
     Serial.println(F("OLED init FAILED (try 0x3D)"));
     for (;;) {
-      // A few short buzzes, then a pause -- repeats forever. Hand-rolled here
-      // (the haptic engine is not pumped in this dead-end loop).
+      // A few short buzzes/blinks, then a pause -- repeats forever. Hand-rolled
+      // here (the haptic engine is not pumped in this dead-end loop).
       for (uint8_t i = 0; i < 3; i++) {
-        digitalWrite(PIN_VIBRO, HIGH);
+        digitalWrite(PIN_VIBRO, HIGH); digitalWrite(PIN_LED, HIGH);
         delay(80);
-        digitalWrite(PIN_VIBRO, LOW);
+        digitalWrite(PIN_VIBRO, LOW);  digitalWrite(PIN_LED, LOW);
         delay(120);
       }
       delay(600);

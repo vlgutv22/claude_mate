@@ -103,9 +103,11 @@ press (held ≥ ~500 ms).
 | `B\|4`     | **MODE** long-press (D4, held ≥ ~500 ms) — **toggle** the UI mode (SCROLL ⇄ LIST). |
 | `B\|5`     | **SUBMIT** long-press (D2, held ≥ ~500 ms) — **toggle quiet mode** (mutes all haptics). Handled **locally on the firmware**; this line is informational (the daemon logs it). |
 
-**Quiet mode** is firmware-local: while muted the Arduino swallows every `V|` buzz
-(except `V|OFF`), shows a small muted badge, and on **un-mute** replays any alert
-loop the daemon set while muted (so an unacknowledged done/error is felt at once).
+**Quiet mode** is firmware-local: an **indication LED on D8** blinks the alert
+pattern alongside the vibration motor. While muted, only the **motor** is gated —
+the LED keeps blinking, so a running alert loop's motor simply resumes on
+**un-mute** (an unacknowledged done/error is felt at once). A brief `VIBRATION
+ON/OFF` toast confirms the toggle.
 
 **UI modes.** The daemon owns the mode. **SCROLL** is the carousel (auto-surface
 the most-urgent tab + browse one card at a time via `S` frames). **LIST** shows a
