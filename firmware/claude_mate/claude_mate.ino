@@ -33,7 +33,8 @@
  *     VCC -> 5V, GND -> GND, SDA -> A4, SCL -> A3  (bit-banged; see softssd1306.h)
  *     I2C address 0x3C (common alternative: 0x3D)
  *   Buttons (INPUT_PULLUP, other leg to GND) -- layout MODE | SUBMIT | NEXT:
- *     SUBMIT button -> D2  (emits "B|1"; focus/proceed to the selected tab)
+ *     SUBMIT button -> D2  (short "B|1" = focus/proceed; long "B|5" = toggle quiet
+ *                          mode, which mutes all haptics on the device)
  *     NEXT   button -> D3  (emits "B|2"; next card / highlight down)
  *     MODE   button -> D4  (emits "B|3" on a short press, "B|4" on a long press;
  *                          short = prev card / highlight up, long = switch mode)
@@ -60,11 +61,13 @@
  *                  omitted/empty keeps the original two-line card.
  *     I                                              idle screen (no sessions)
  *     T|<total>|<sel>|<row>|<row>|...                LIST-mode frame (up to 4 rows);
- *                                                    row = <name>;<status>;<hl>
+ *                                                    row = <name>;<status>;<hl>;<ack>
  *                                                    status = WIP|WAIT|ERR|DONE|IDLE
  *                                                    total = tab count, sel = 0-based
  *                                                    highlighted index (scrollbar),
- *                                                    hl = 1 for the highlighted row.
+ *                                                    hl = 1 for the highlighted row,
+ *                                                    ack = 0 for an unacknowledged
+ *                                                    alert (draws a blinking dot).
  *     P                                              ping/keepalive (we reply H)
  *     V|<kind>                                       haptic control (motor only):
  *                                                    START one-shot start tick,
@@ -75,8 +78,9 @@
  *                                                    stop/silence the motor now
  *   Arduino -> Daemon:
  *     H                                              hello, sent once after boot
- *     B|<n>                                          n=1 SUBMIT, n=2 NEXT,
- *                                                    n=3 MODE short, n=4 MODE long
+ *     B|<n>                                          n=1 SUBMIT short, n=2 NEXT,
+ *                                                    n=3 MODE short, n=4 MODE long,
+ *                                                    n=5 SUBMIT long (quiet toggle)
  *
  * NOTE: opening the USB serial port resets the Nano (~1.5s). That is why we emit
  * H once in setup() so the daemon can (re)send the full current state.
@@ -156,10 +160,12 @@ static bool  gBlinkOn   = true;      // blink phase for the unacknowledged dot
 // The daemon owns the tab list + selection and sends a pre-windowed frame of up
 // to LIST_ROWS visible rows; we just draw it. Highlighted row is drawn inverted.
 #define LIST_ROWS 4                  // 128x32 fits 4 size-1 text rows (8px each)
-#define LIST_NAME_X 30               // x where the name column starts (after status)
+#define LIST_DOT_X  27               // x of the per-row unacknowledged blink dot
+#define LIST_NAME_X 33               // x where the name column starts (after status/dot)
 static char    listName[LIST_ROWS][19] = {{0}};  // per-row name (18 chars + NUL)
 static char    listStatus[LIST_ROWS][6] = {{0}}; // per-row status label (WIP/WAIT/...)
 static bool    listHl[LIST_ROWS]       = {false};// per-row highlighted?
+static bool    listUnacked[LIST_ROWS]  = {false};// per-row unacknowledged alert? (blink dot)
 static uint8_t listRows  = 0;        // visible rows in the frame (0..LIST_ROWS)
 static uint8_t listTotal = 0;        // total tabs (for the scrollbar)
 static uint8_t listSel   = 0;        // highlighted global index (for the scrollbar)
@@ -187,21 +193,26 @@ static unsigned long lastRxMs       = 0;     // millis() of the last serial byte
                                              // (loop watchdog: daemon liveness)
 
 // ---- Button debounce state ---------------------------------------------------
-// SUBMIT + NEXT are simple press-edge buttons (emit on press). MODE distinguishes
-// a short press (emit B|3 on release) from a long press (emit B|4 once at the
-// LONGPRESS_MS threshold, then swallow the release).
-static bool          submitStable = true;  // pull-up idle = HIGH (released)
-static bool          nextStable   = true;
-static unsigned long submitEdgeMs = 0;
+// NEXT is a simple press-edge button. SUBMIT and MODE each distinguish a SHORT
+// press (emit on release) from a LONG press (emit once at LONGPRESS_MS, then
+// swallow the release). SUBMIT long-press ALSO toggles quiet mode locally.
+struct BtnLong {
+  bool          stable;     // released?
+  int           lastRaw;
+  unsigned long edgeMs;     // debounce edge time
+  unsigned long pressMs;    // when the current press began
+  bool          longFired;  // long-press already emitted this hold?
+};
+static BtnLong submitBtn = {true, HIGH, 0, 0, false};
+static BtnLong modeBtn   = {true, HIGH, 0, 0, false};
+static bool          nextStable   = true;  // pull-up idle = HIGH (released)
+static int           nextLastRaw  = HIGH;
 static unsigned long nextEdgeMs   = 0;
-static int           submitLastRaw = HIGH;
-static int           nextLastRaw   = HIGH;
 
-static bool          modeStable   = true;  // released?
-static int           modeLastRaw  = HIGH;
-static unsigned long modeEdgeMs   = 0;     // debounce edge time
-static unsigned long modePressMs  = 0;     // when the current press began
-static bool          modeLongFired = false;// long-press already emitted this hold?
+// ---- Quiet mode (haptics muted) ----------------------------------------------
+static bool quietMode = false;              // SUBMIT long-press toggles this
+static char lastLoopKind[8] = {0};          // last DONE/ERROR loop the daemon set;
+                                            // replayed on un-mute, cleared by OFF.
 
 // -----------------------------------------------------------------------------
 // Helpers
@@ -327,6 +338,18 @@ static void pollVibro() {
 //   ERROR  API error/alert : 0.4s on / 0.2s off               ; LOOPS until ack
 //   OFF    (or STOP)       : end any pattern now (daemon sends on acknowledge/clear)
 static void buzzForKind(const char *k) {
+  // Remember the current continuous-loop kind (DONE/ERROR) so quiet mode can
+  // resume it on un-mute; OFF/one-shots clear it.
+  if (!strcmp(k, "DONE") || !strcmp(k, "ERROR")) {
+    uint8_t i = 0;
+    for (; k[i] && i < sizeof(lastLoopKind) - 1; i++) lastLoopKind[i] = k[i];
+    lastLoopKind[i] = 0;
+  } else if (!strcmp(k, "OFF") || !strcmp(k, "STOP")) {
+    lastLoopKind[0] = 0;
+  }
+  // Muted: swallow every buzz (OFF/STOP still stop the motor).
+  if (quietMode && strcmp(k, "OFF") && strcmp(k, "STOP")) return;
+
   if (!strcmp(k, "START")) {
     // 3 gentle pulses of 0.3s, ~0.18s apart. One-shot.
     const VibroStep s[] = {{300, 180}, {300, 180}, {300, 0}};
@@ -347,6 +370,19 @@ static void buzzForKind(const char *k) {
   } else if (!strcmp(k, "OFF") || !strcmp(k, "STOP")) {
     stopBuzz();
   }
+}
+
+// Toggle quiet mode (SUBMIT long-press). Muting silences immediately; un-muting
+// resumes any alert loop the daemon set while we were muted, so if a tab still
+// needs you (unacknowledged done/error) you feel it right away.
+static void toggleQuiet() {
+  quietMode = !quietMode;
+  if (quietMode) {
+    stopBuzz();                 // silence now
+  } else if (lastLoopKind[0]) {
+    buzzForKind(lastLoopKind);  // resume the pending alert ("buzz if unacked")
+  }
+  render();                     // refresh the muted indicator
 }
 
 // -----------------------------------------------------------------------------
@@ -473,6 +509,12 @@ static void drawList() {
     display.setTextSize(1);
     display.setCursor(1, y);
     display.print(listStatus[r]);                  // status label (WIP/WAIT/...)
+    // Unacknowledged alert: a filled dot that BLINKS (gBlinkOn), like the card's
+    // ack dot -- so a tab needing you stands out in the list at a glance.
+    if (listUnacked[r] && gBlinkOn) {
+      display.fillCircle(LIST_DOT_X, y + 3, 2,
+                         listHl[r] ? SSD1306_BLACK : SSD1306_WHITE);
+    }
     display.setCursor(LIST_NAME_X, y);             // aligned name column
     display.print(listName[r]);                    // clipped at the edge (no wrap)
   }
@@ -488,10 +530,22 @@ static void drawList() {
   display.display();
 }
 
+// Small "muted" badge drawn in the top-right corner whenever quiet mode is on, so
+// the mute state is visible at a glance on every screen. A bell outline with a
+// slash. Drawn LAST (over any content) as an overlay.
+static void drawQuietBadge() {
+  const int16_t bx = SCREEN_WIDTH - 8, by = 0;     // 8x8 top-right
+  // clear a small backing box so it stays legible over inverted rows / text
+  display.fillRect(bx, by, 8, 8, SSD1306_BLACK);
+  display.drawCircle(bx + 3, by + 3, 3, SSD1306_WHITE);   // bell-ish body
+  display.drawLine(bx, by + 7, bx + 7, by, SSD1306_WHITE); // the "muted" slash
+}
+
 static void render() {
   if      (showList) drawList();
   else if (showIdle) drawIdle();
   else               drawCard();
+  if (quietMode) { drawQuietBadge(); display.display(); }
 }
 
 // -----------------------------------------------------------------------------
@@ -543,21 +597,28 @@ static void handleLine(char *line) {
       listSel   = (uint8_t)atoi(fields[2]);
       listRows  = 0;
       for (uint8_t f = 3; f < n && listRows < LIST_ROWS; f++) {
-        // Each row is "name;status;hl". Split on ';' in place.
+        // Each row is "name;status;hl;ack". Split on ';' in place.
         char *row = fields[f];
         char *nm  = row;
         char *st  = "";
         bool  hl  = false;
+        bool  unacked = false;
         char *s1 = strchr(row, ';');
         if (s1) {
           *s1 = 0;
           st = s1 + 1;
           char *s2 = strchr(st, ';');
-          if (s2) { *s2 = 0; hl = (s2[1] == '1'); }
+          if (s2) {
+            *s2 = 0;
+            hl = (s2[1] == '1');
+            char *s3 = strchr(s2 + 1, ';');
+            if (s3) unacked = (s3[1] == '0');   // ack field: 0 = unacked -> blink
+          }
         }
         copyField(listName[listRows],   sizeof(listName[0]),   nm);
         copyField(listStatus[listRows], sizeof(listStatus[0]), st);
-        listHl[listRows] = hl;
+        listHl[listRows]      = hl;
+        listUnacked[listRows] = unacked;
         listRows++;
       }
       showList = true;
@@ -653,7 +714,7 @@ static void pumpSerial() {
 // Buttons
 // -----------------------------------------------------------------------------
 
-// Simple press-edge button (SUBMIT, NEXT): debounce, emit "B|<n>" on press.
+// Simple press-edge button (NEXT): debounce, emit "B|<n>" on press.
 static void pollPressButton(uint8_t pin, uint8_t n, bool &stable,
                             int &lastRaw, unsigned long &edgeMs) {
   int raw = digitalRead(pin);
@@ -673,37 +734,44 @@ static void pollPressButton(uint8_t pin, uint8_t n, bool &stable,
   }
 }
 
-// MODE button: emit "B|3" on a SHORT press (released before LONGPRESS_MS) or
-// "B|4" once when the hold crosses LONGPRESS_MS (the release is then swallowed).
-static void pollModeButton() {
-  int raw = digitalRead(PIN_BTN_MODE);
+// Short/long-press button (SUBMIT, MODE): emit "B|<shortN>" on a SHORT press
+// (released before LONGPRESS_MS) or "B|<longN>" once when the hold crosses
+// LONGPRESS_MS (the release is then swallowed). Returns true on the ONE tick the
+// long-press fires, so the caller can also act locally (SUBMIT toggles quiet).
+static bool pollLongButton(uint8_t pin, uint8_t shortN, uint8_t longN, BtnLong &b) {
+  bool longEdge = false;
+  int raw = digitalRead(pin);
   unsigned long now = millis();
-  if (raw != modeLastRaw) {
-    modeLastRaw = raw;
-    modeEdgeMs = now;
+  if (raw != b.lastRaw) {
+    b.lastRaw = raw;
+    b.edgeMs = now;
   }
-  if ((now - modeEdgeMs) >= DEBOUNCE_MS) {
+  if ((now - b.edgeMs) >= DEBOUNCE_MS) {
     bool pressedNow = (raw == LOW);
-    bool wasPressed = !modeStable;
+    bool wasPressed = !b.stable;
     if (pressedNow && !wasPressed) {      // press edge: start timing the hold
-      modePressMs = now;
-      modeLongFired = false;
+      b.pressMs = now;
+      b.longFired = false;
     } else if (!pressedNow && wasPressed) {
-      if (!modeLongFired) Serial.println(F("B|3"));   // short press on release
+      if (!b.longFired) { Serial.print(F("B|")); Serial.println(shortN); }  // short
     }
-    modeStable = !pressedNow;
+    b.stable = !pressedNow;
   }
   // Long-press fires while still held, once the threshold is crossed.
-  if (!modeStable && !modeLongFired && (now - modePressMs) >= LONGPRESS_MS) {
-    Serial.println(F("B|4"));
-    modeLongFired = true;
+  if (!b.stable && !b.longFired && (now - b.pressMs) >= LONGPRESS_MS) {
+    Serial.print(F("B|")); Serial.println(longN);
+    b.longFired = true;
+    longEdge = true;
   }
+  return longEdge;
 }
 
 static void pollButtons() {
-  pollPressButton(PIN_BTN_SUBMIT, 1, submitStable, submitLastRaw, submitEdgeMs);
-  pollPressButton(PIN_BTN_NEXT,   2, nextStable,   nextLastRaw,   nextEdgeMs);
-  pollModeButton();
+  // SUBMIT: short = B|1 (focus/proceed), long = B|5 (+ toggle quiet mode locally).
+  if (pollLongButton(PIN_BTN_SUBMIT, 1, 5, submitBtn)) toggleQuiet();
+  pollPressButton(PIN_BTN_NEXT, 2, nextStable, nextLastRaw, nextEdgeMs);
+  // MODE: short = B|3 (prev / list-up), long = B|4 (toggle SCROLL/LIST mode).
+  pollLongButton(PIN_BTN_MODE, 3, 4, modeBtn);
 }
 
 // -----------------------------------------------------------------------------
@@ -757,11 +825,17 @@ void loop() {
   pollButtons();
   pollVibro();                           // advance the haptic state machine
 
-  // Blink the unacknowledged-alert dot (~every 400ms). Only that card actually
-  // changes with the blink phase, so re-render only then.
+  // Blink the unacknowledged-alert dot (~every 400ms) -- on the card, or on any
+  // unacknowledged row in the LIST. Re-render only when a blinking dot is shown.
   bool nb = (millis() / 400) & 1;
   if (nb != gBlinkOn) {
     gBlinkOn = nb;
-    if (!showIdle && !showList && isAlertState(curState) && !curAck) render();
+    bool cardBlink = !showIdle && !showList && isAlertState(curState) && !curAck;
+    bool listBlink = false;
+    if (showList) {
+      for (uint8_t r = 0; r < listRows && r < LIST_ROWS; r++)
+        if (listUnacked[r]) { listBlink = true; break; }
+    }
+    if (cardBlink || listBlink) render();
   }
 }

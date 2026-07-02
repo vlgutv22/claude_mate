@@ -82,6 +82,7 @@ PORT_GLOBS = ("/dev/cu.usbserial*", "/dev/cu.usbmodem*")
 # Timings (seconds).
 CAROUSEL_PERIOD = 3.0        # rotate one card every ~3s
 NEXT_PAUSE = 10.0            # pause auto-rotation ~10s after a manual NEXT
+DOUBLE_CLICK_S = 0.35       # LIST SUBMIT: window to detect a double-click
 PING_PERIOD = 15.0          # keepalive ping interval
 RECONNECT_DELAY = 2.0       # wait between serial (re)connection attempts
 SESSION_DONE_TTL = 120.0    # drop a 'done' session after this long with no update
@@ -93,7 +94,7 @@ NAME_MAX = 20
 # LIST-mode (all-tabs) frame. The 128x32 OLED fits 4 size-1 rows; names are capped
 # tighter so the whole packed T| line stays under the firmware's 96-char LINE_MAX.
 LIST_ROWS = 4
-LIST_NAME_MAX = 12
+LIST_NAME_MAX = 11        # tighter: the row now also carries an ack flag
 # Short, readable status label shown in a left column per tab row in LIST mode
 # (the tab status is what matters most there). Kept <=4 chars so names still fit.
 STATE_LABEL = {"working": "WIP", "waiting": "WAIT", "error": "ERR",
@@ -483,6 +484,9 @@ class Display:
         self._mode = "scroll"
         self._list_sel_key: Optional[str] = None
         self._list_top = 0
+        # LIST detail sub-view: double-click SUBMIT opens the highlighted tab's
+        # full card; double-click again closes back to the list.
+        self._list_detail = False
 
     # ---- dial (stepper status wheel) ------------------------------------- #
 
@@ -687,27 +691,49 @@ class Display:
             self._mode = "list" if self._mode == "scroll" else "scroll"
             mode = self._mode
             cur = self._current_session
+            self._list_detail = False           # always start LIST at the overview
             if mode == "list":
                 self._list_sel_key = (cur.key if cur is not None
                                       else (sessions[0].key if sessions else None))
                 self._list_top = 0
         if mode == "list":
             log("mode -> LIST (all tabs)")
-            self.render_list()
+            self.render_list_view()
         else:
             log("mode -> SCROLL (carousel)")
             self.refresh_current()
 
     def list_nav(self, delta: int) -> None:
         """Move the LIST highlight by `delta` (wraps) to the neighbouring tab,
-        tracked by key so it stays put when the list re-sorts, then re-render."""
+        tracked by key so it stays put when the list re-sorts, then re-render.
+        In the detail sub-view this browses the full cards."""
         sessions = self._reg.ordered()
         total = len(sessions)
         if total > 0:
             with self._lock:
                 idx = (self._index_of_key(sessions, self._list_sel_key) + delta) % total
                 self._list_sel_key = sessions[idx].key
+        self.render_list_view()
+
+    def render_list_view(self) -> None:
+        """Render the LIST-mode display: the highlighted tab's full card when the
+        detail sub-view is open (double-click SUBMIT), else the scrolling list."""
+        with self._lock:
+            detail = self._list_detail
+        if detail:
+            sess = self.list_selected_session()
+            if sess is not None:
+                self.show_session(sess)
+                return
         self.render_list()
+
+    def toggle_list_detail(self) -> None:
+        """Double-click SUBMIT in LIST mode: open/close the highlighted tab's card."""
+        with self._lock:
+            self._list_detail = not self._list_detail
+            detail = self._list_detail
+        log(f"LIST detail {'opened' if detail else 'closed'}")
+        self.render_list_view()
 
     def list_selected_session(self) -> Optional[Session]:
         """The tab currently highlighted in LIST mode (SUBMIT focuses it),
@@ -754,7 +780,10 @@ class Display:
             name = (s.name or "?")[:LIST_NAME_MAX]
             name = name.replace("|", "/").replace(";", ",").replace("\n", " ").strip() or "?"
             label = STATE_LABEL.get(s.state, "IDLE")
-            parts.append(f"{name};{label};{'1' if gidx == sel else '0'}")
+            hl = "1" if gidx == sel else "0"
+            # ack: 0 = an unacknowledged alert (draws a blinking dot in the row).
+            ack = "0" if (s.state in ALERT_STATES and not s.acked) else "1"
+            parts.append(f"{name};{label};{hl};{ack}")
         self._link.write_line("|".join(parts))
 
     def resend_full_state(self) -> None:
@@ -770,7 +799,7 @@ class Display:
         log("handshake H -> resending full state")
         self.push_dial(force=True)
         if self.current_mode() == "list":
-            self.render_list()
+            self.render_list_view()
         else:
             self.refresh_current()
         with self._lock:
@@ -1010,6 +1039,10 @@ class ButtonReader(threading.Thread):
         self._stop = threading.Event()
         self.on_next = None  # callback set by the app (carousel pause)
         self.on_ack = None   # callback(sess): acknowledge a focused tab's alert
+        # LIST-mode SUBMIT double-click: a single click (focus) is deferred briefly
+        # so a second click within the window instead opens/closes the detail card.
+        self._submit_timer: Optional[threading.Timer] = None
+        self._submit_lock = threading.Lock()
 
     def run(self) -> None:
         while not self._stop.is_set():
@@ -1031,16 +1064,8 @@ class ButtonReader(threading.Thread):
             if len(parts) >= 2 and parts[1].isdigit():
                 n = int(parts[1])
                 mode = self._display.current_mode()
-                if n == 1:                       # SUBMIT: focus the selected tab
-                    if mode == "list":
-                        sess = self._display.list_selected_session()
-                    else:
-                        sess = self._display.current_session()
-                    log(f"SUBMIT button -> focus + acknowledge "
-                        f"{sess.name if sess else '-'}")
-                    focus_session(sess)
-                    if self.on_ack:
-                        self.on_ack(sess)        # focusing the window = acknowledged
+                if n == 1:                       # SUBMIT short: focus / (LIST) dbl-click
+                    self._submit_pressed(mode)
                 elif n == 2:                     # NEXT: highlight down / next card
                     if mode == "list":
                         log("NEXT button -> highlight next tab")
@@ -1062,11 +1087,45 @@ class ButtonReader(threading.Thread):
                 elif n == 4:                     # MODE long: toggle scroll <-> list
                     log("MODE long-press -> toggle mode")
                     self._display.toggle_mode()
+                elif n == 5:                     # SUBMIT long: quiet toggled (firmware)
+                    log("SUBMIT long-press -> quiet mode toggled (firmware-local)")
                 else:
                     log(f"unknown button index: {n}")
             return
         # Anything else: log at most as debug noise, ignore.
         log(f"ignoring serial line from Arduino: {line!r}")
+
+    # ---- SUBMIT single/double-click ------------------------------------- #
+
+    def _submit_pressed(self, mode: str) -> None:
+        """SUBMIT short-press. SCROLL: focus the current card now. LIST: a single
+        click focuses the highlighted tab (deferred ~DOUBLE_CLICK_S so a second
+        click within the window instead opens/closes its detail card)."""
+        if mode != "list":
+            self._focus(self._display.current_session())
+            return
+        with self._submit_lock:
+            if self._submit_timer is not None:       # second click -> double-click
+                self._submit_timer.cancel()
+                self._submit_timer = None
+                self._display.toggle_list_detail()
+                return
+            t = threading.Timer(DOUBLE_CLICK_S, self._submit_single_fire)
+            t.daemon = True
+            self._submit_timer = t
+            t.start()
+
+    def _submit_single_fire(self) -> None:
+        """The deferred LIST single-click fired (no double came): focus the tab."""
+        with self._submit_lock:
+            self._submit_timer = None
+        self._focus(self._display.list_selected_session())
+
+    def _focus(self, sess: Optional[Session]) -> None:
+        log(f"SUBMIT -> focus + acknowledge {sess.name if sess else '-'}")
+        focus_session(sess)
+        if self.on_ack:
+            self.on_ack(sess)                        # focusing the window = acknowledged
 
     def stop(self) -> None:
         self._stop.set()
@@ -1132,7 +1191,7 @@ class Carousel(threading.Thread):
         """Called on any registry change: refresh dial + display + haptics."""
         self._display.push_dial()
         if self._display.current_mode() == "list":
-            self._display.render_list()
+            self._display.render_list_view()
         else:
             self._display.refresh_current()
         self._display.update_haptics(self._reg.top_alert())
@@ -1157,7 +1216,7 @@ class Carousel(threading.Thread):
             # unacknowledged tab, unless the user is browsing (just pressed a nav).
             target = self._reg.top_alert()
             if self._display.current_mode() == "list":
-                self._display.render_list()
+                self._display.render_list_view()
             elif target is not None and not paused:
                 self._display.show_session(target)
             else:

@@ -30,7 +30,7 @@ input buffer and drops malformed/oversized lines).
 | `D\|<word>`                                           | Set the status word. `<word>` is one of `FREE`, `WIP`, `BLOCKED`, `WTF`. The Arduino draws the big word on the OLED. **Visual only** — the word never buzzes on its own; all haptics come via `V\|`. |
 | `S\|<idx>\|<total>\|<name>\|<state>\|<runtime>\|<limit>\|<ack>\|<model>\|<effort>` | Show one session card (the carousel step). See field table below. `ack`/`model`/`effort` are optional trailing fields — older daemons omit them and the firmware copes. |
 | `V\|<kind>`                                           | Haptic control (motor only; never touches the OLED). `<kind>` is `START`, `INPUT`, `DONE`, `ERROR`, or `OFF`. See **Haptics** below. |
-| `T\|<total>\|<sel>\|<row>\|<row>\|…`                  | **LIST-mode** frame (sent only in LIST mode). `<total>` = total tab count, `<sel>` = 0-based index of the highlighted tab (drives the scrollbar). Then up to **4** windowed rows, each `<name>;<status>;<hl>` where `status` is a short label shown in a left column (`WIP` working / `WAIT` waiting / `ERR` error / `DONE` done / `IDLE` idle) and `hl` is `1` for the highlighted row. Names are capped (`LIST_NAME_MAX`) so the whole line stays under the firmware's 96-char limit. |
+| `T\|<total>\|<sel>\|<row>\|<row>\|…`                  | **LIST-mode** frame (sent only in LIST mode). `<total>` = total tab count, `<sel>` = 0-based index of the highlighted tab (drives the scrollbar). Then up to **4** windowed rows, each `<name>;<status>;<hl>;<ack>` where `status` is a short label shown in a left column (`WIP` working / `WAIT` waiting / `ERR` error / `DONE` done / `IDLE` idle), `hl` is `1` for the highlighted row, and `ack` is `0` for an **unacknowledged alert** (the firmware draws a blinking dot in that row) else `1`. Names are capped (`LIST_NAME_MAX`) so the whole line stays under the firmware's 96-char limit. The daemon may instead send an `S` card for the highlighted tab when the LIST **detail** sub-view is open (double-click SUBMIT). |
 | `I`                                                   | Idle screen — no active sessions. The daemon also sends `D\|FREE` alongside it. |
 | `P`                                                   | Ping / keepalive. The Arduino MAY ignore it, or reply with `H`. |
 
@@ -91,21 +91,28 @@ unacknowledged, model `Opus 4.8`, effort `xhigh`.)
 ### 1b. Arduino → Daemon
 
 The three buttons are, left→right, **MODE | SUBMIT | NEXT**. Debounce is ~40 ms
-(snappy taps); the MODE button additionally distinguishes a short press from a
-long press (held ≥ ~500 ms).
+(snappy taps); **SUBMIT** and **MODE** each distinguish a short press from a long
+press (held ≥ ~500 ms).
 
 | Line       | Meaning |
 |------------|---------|
 | `H`        | Hello / handshake, sent **once** right after boot/reset (and as the reply to `P`). On receiving `H` the daemon **re-sends the full current state** (word + current display + re-arms haptics). |
-| `B\|1`     | **SUBMIT** pressed (D2) — focus/proceed to the selected tab (the current card in SCROLL mode, the highlighted row in LIST mode). |
+| `B\|1`     | **SUBMIT** short-press (D2) — focus/proceed to the selected tab. In LIST, a **double** short-press (two within ~0.35 s) instead opens/closes the highlighted tab's detail card; a single short-press focuses (the daemon defers it briefly to disambiguate). |
 | `B\|2`     | **NEXT** pressed (D3) — SCROLL: next card. LIST: move the highlight **down**. |
 | `B\|3`     | **MODE** short-press (D4) — SCROLL: previous card. LIST: move the highlight **up**. |
-| `B\|4`     | **MODE** long-press (D4, held ≥ ~500 ms) — **toggle** the UI mode (SCROLL ⇄ LIST). Fires once when the hold crosses the threshold; the release is then swallowed. |
+| `B\|4`     | **MODE** long-press (D4, held ≥ ~500 ms) — **toggle** the UI mode (SCROLL ⇄ LIST). |
+| `B\|5`     | **SUBMIT** long-press (D2, held ≥ ~500 ms) — **toggle quiet mode** (mutes all haptics). Handled **locally on the firmware**; this line is informational (the daemon logs it). |
+
+**Quiet mode** is firmware-local: while muted the Arduino swallows every `V|` buzz
+(except `V|OFF`), shows a small muted badge, and on **un-mute** replays any alert
+loop the daemon set while muted (so an unacknowledged done/error is felt at once).
 
 **UI modes.** The daemon owns the mode. **SCROLL** is the carousel (auto-surface
 the most-urgent tab + browse one card at a time via `S` frames). **LIST** shows a
 scrolling list of *all* tabs via `T` frames; NEXT / MODE-short move the highlight,
-SUBMIT focuses it. Haptics (`V|`) are unaffected by the mode.
+SUBMIT focuses it, and double-click SUBMIT opens a **detail** sub-view (the
+highlighted tab's full `S` card; double-click again returns to the list). Haptics
+(`V|`) are unaffected by the mode.
 
 **Reset note:** opening the USB serial port resets the Nano (~1.5 s). The `H`
 handshake plus the daemon re-sending state on `H` is exactly what makes the

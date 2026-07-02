@@ -127,18 +127,40 @@ with display_lock:
     idx_before_H = len(display)
 arduino_send("H"); time.sleep(1.5)
 
-print("\n-- phase 5b: LIST mode, key-stable highlight across a re-sort --")
-# 3 tabs live: sid-2 api(error), sid-3 infra(waiting), sid-1 webapp(working).
-# ordered() = [api, infra, webapp]. Enter LIST (seeds on the shown card = api),
-# NEXT to highlight infra (sid-3). Then RE-SORT the fleet (webapp -> error, so
-# ordered() becomes [api, webapp, infra]) and SUBMIT: the highlight is tracked by
-# KEY, so it must still focus infra (sid-3), NOT whatever slid into its old slot.
+print("\n-- phase 5b: LIST -- ack dot, double-click detail, key-stable focus, quiet --")
+# 3 tabs live: sid-2 api(error,unacked), sid-3 infra(waiting,unacked), sid-1 webapp(working).
 with display_lock:
     idx_before_list = len(display)
-arduino_send("B|4"); time.sleep(1.2)     # MODE long -> LIST mode (expect T| frame)
+arduino_send("B|4"); time.sleep(1.2)     # MODE long -> LIST mode (T| with per-row ack)
+
+def _row_acks(tline):                    # ack is the 4th ';' field of each row
+    return [f.split(";")[-1] for f in tline.split("|")[3:] if f.count(";") >= 3]
+with display_lock:
+    t_frames = [l for l in display[idx_before_list:] if l.startswith("T|")]
+saw_unacked_dot = any("0" in _row_acks(l) for l in t_frames)   # an unacked-alert row
+
 arduino_send("B|2"); time.sleep(0.8)     # NEXT -> highlight infra (sid-3)
 feed("error|sid-1|webapp"); time.sleep(1.5)   # re-sort: webapp jumps into slot 1
-arduino_send("B|1"); time.sleep(1.2)     # SUBMIT -> must still focus infra (sid-3)
+
+# Double-click SUBMIT -> open the highlighted tab's (infra) full card while in LIST.
+with display_lock:
+    idx_before_detail = len(display)
+arduino_send("B|1"); time.sleep(0.15); arduino_send("B|1"); time.sleep(1.2)
+with display_lock:
+    detail_opened = any(l.startswith("S|") and "|infra|" in l
+                        for l in display[idx_before_detail:])
+# Double-click again -> close detail -> the T| list resumes.
+with display_lock:
+    idx_before_close = len(display)
+arduino_send("B|1"); time.sleep(0.15); arduino_send("B|1"); time.sleep(1.2)
+with display_lock:
+    detail_closed = any(l.startswith("T|") for l in display[idx_before_close:])
+
+# Single-click SUBMIT -> deferred focus of the highlighted tab; key-tracked to
+# infra (sid-3) even though webapp slid into its old index slot.
+arduino_send("B|1"); time.sleep(1.2)
+arduino_send("B|5"); time.sleep(0.5)     # SUBMIT long -> quiet toggle (must not crash)
+
 with display_lock:
     saw_T = any(l.startswith("T|") for l in display[idx_before_list:])
     list_totals = [int(l.split("|")[1]) for l in display[idx_before_list:]
@@ -216,6 +238,12 @@ check("LIST frame lists all live tabs (total >= 3)",
       any(t >= 3 for t in list_totals))
 check("SUBMIT in LIST focuses the highlighted tab BY KEY, stable across a re-sort -> sid-3",
       any("session=sid-3" in l for l in focus_lines))  # sid-3 is focused only in the LIST phase
+check("LIST row carries an ack flag; an unacknowledged alert row = ;0 (blink dot)",
+      saw_unacked_dot)
+check("double-click SUBMIT in LIST opens the highlighted tab's detail card (infra)",
+      detail_opened)
+check("double-click SUBMIT again closes detail -> the T| list resumes",
+      detail_closed)
 check("MODE long-press again returns to SCROLL -> S| card resumes",
       saw_after(idx_after_scroll, lambda l: l.startswith("S|")))
 check("SCROLL: acknowledging a tab stays on it, no jump to the top tab "
