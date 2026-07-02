@@ -123,20 +123,14 @@
                                // (fits S card + name + model + effort fields)
 #define DEBOUNCE_MS    40UL    // ~40ms button debounce (snappy short taps)
 #define LONGPRESS_MS   500UL   // MODE held this long -> long-press (mode toggle)
+#define MUTE_HOLD_MS   2000UL  // SUBMIT held this long -> mute toggle. Deliberately
+                               // long so focusing a tab (a quick tap) never mutes.
 
 // ---- Haptic tuning -----------------------------------------------------------
-// PWM amplitude (0-255) per pattern, kept "graduated but soft": urgency reads as
-// rhythm + a little more push, never full-power buzz. Start/Done are the gentlest.
-// A coin/pager motor won't reliably START spinning at these gentle duties, so each
-// pulse is KICK-STARTED at full power for VIBRO_KICK_MS, then dropped to its duty
-// (the hold threshold is well below the start threshold, so it keeps spinning).
-// The sustain floors are a bit above the old values so the motor doesn't stall
-// once the kick ends.
+// The vibration motor runs FULL-ON during each pulse (a coin/pager motor won't run
+// at gentle PWM duties -- it just stutters near its startup threshold). Gentleness
+// comes from the SHORT, rhythmic pulses + gaps, not from a weak amplitude.
 #define VIBRO_MAX_STEPS   6       // longest pattern (DONE's 5-pulse heartbeat)
-#define VIBRO_KICK_MS     45      // full-power kick at the start of every pulse
-#define DUTY_SOFT        110      // START tick + DONE heartbeat (gentlest sustain)
-#define DUTY_INPUT       150      // needs-input double-tap (a touch firmer)
-#define DUTY_ALERT       200      // ERROR / warning loop (firmest; never full 255)
 // A looping pattern (DONE/ERROR) repeats until the daemon sends V|OFF. As a
 // failsafe, if the daemon goes silent (no serial at all) for this long we stop
 // on our own so a crashed daemon can't leave the motor buzzing. The daemon pings
@@ -198,11 +192,9 @@ struct VibroStep { uint16_t onMs; uint16_t offMs; };
 static VibroStep     vibroSteps[VIBRO_MAX_STEPS];
 static uint8_t       vibroStepCount = 0;     // pulses in the active pattern
 static uint8_t       vibroStepIdx   = 0;     // pulse currently playing
-static uint8_t       vibroDuty      = 0;     // PWM amplitude of this pattern
 static bool          vibroLoop      = false; // repeat the pattern until stopped?
 static bool          vibroActive    = false; // a pattern is playing
 static bool          vibroOn        = false; // motor energised right now?
-static bool          vibroKicked    = false; // this pulse past its full-power kick?
 static unsigned long vibroPhaseMs   = 0;     // millis() at the last phase change
 static unsigned long lastRxMs       = 0;     // millis() of the last serial byte
                                              // (loop watchdog: daemon liveness)
@@ -281,18 +273,18 @@ static uint8_t parseWord(const char *s) {
 // the LED is the only indication. Because the pattern keeps running in quiet mode
 // (for the LED), un-muting simply re-enables the motor mid-pattern -- no replay.
 
-// Energise the ON-phase: LED always; motor KICK-STARTED at full power (unless
-// muted) so a gentle-duty coin motor reliably starts spinning. pollVibro() drops
-// it to vibroDuty after VIBRO_KICK_MS.
+// Energise the ON-phase: LED + motor both full-on (motor muted in quiet mode). A
+// coin/pager motor is effectively binary -- it won't run at gentle PWM duties --
+// so it runs at full power for the whole pulse; "gentleness" comes from the short,
+// rhythmic pulses, not from a weak amplitude.
 static inline void alertOn() {
-  digitalWrite(PIN_LED, HIGH);
-  analogWrite(PIN_VIBRO, quietMode ? 0 : 255);   // full-power kick
-  vibroKicked = false;
+  digitalWrite(PIN_LED,   HIGH);
+  digitalWrite(PIN_VIBRO, quietMode ? LOW : HIGH);
 }
 // Both outputs off (gap between pulses / stopped).
 static inline void alertOff() {
-  digitalWrite(PIN_LED, LOW);
-  analogWrite(PIN_VIBRO, 0);
+  digitalWrite(PIN_LED,   LOW);
+  digitalWrite(PIN_VIBRO, LOW);
 }
 
 // Stop any alert immediately and leave both outputs off.
@@ -303,20 +295,17 @@ static void stopBuzz() {
   alertOff();
 }
 
-// Begin a haptic pattern: `count` pulses copied from `steps`, all at PWM
-// amplitude `duty` (0-255). If `loop` is true the sequence repeats until
-// stopBuzz() / a new pattern / the daemon-silence watchdog; otherwise it plays
-// once. Returns immediately; the pulses play out in pollVibro(). A new call
-// replaces any pattern in progress. PIN_VIBRO (D5) is PWM-capable, so duty sets
-// how hard the motor pushes (lower = gentler); analogWrite does not disturb millis().
-static void startPattern(const VibroStep *steps, uint8_t count,
-                         uint8_t duty, bool loop) {
+// Begin a haptic pattern: `count` pulses copied from `steps`. If `loop` is true
+// the sequence repeats until stopBuzz() / a new pattern / the daemon-silence
+// watchdog; otherwise it plays once. Returns immediately; the pulses play out in
+// pollVibro(). A new call replaces any pattern in progress. The motor runs full-on
+// per pulse (a coin motor won't run at gentle PWM), so there is no amplitude here.
+static void startPattern(const VibroStep *steps, uint8_t count, bool loop) {
   if (count == 0) { stopBuzz(); return; }
   if (count > VIBRO_MAX_STEPS) count = VIBRO_MAX_STEPS;
   for (uint8_t i = 0; i < count; i++) vibroSteps[i] = steps[i];
   vibroStepCount = count;
   vibroStepIdx   = 0;
-  vibroDuty      = duty;
   vibroLoop      = loop;
   vibroActive    = true;
   vibroOn        = true;                // start the first pulse now
@@ -339,16 +328,10 @@ static void pollVibro() {
 
   const VibroStep &step = vibroSteps[vibroStepIdx];
   if (vibroOn) {
-    unsigned long onFor = now - vibroPhaseMs;
-    if (onFor >= step.onMs) {
+    if ((now - vibroPhaseMs) >= step.onMs) {
       alertOff();                      // end of on-phase -> start this step's gap
       vibroOn = false;
       vibroPhaseMs = now;
-    } else if (!vibroKicked && onFor >= VIBRO_KICK_MS) {
-      // Kick done: drop the motor from full to its gentle sustain duty (LED stays
-      // on). Skip while muted -- the motor is already off.
-      vibroKicked = true;
-      if (!quietMode) analogWrite(PIN_VIBRO, vibroDuty);
     }
   } else {
     if ((now - vibroPhaseMs) >= step.offMs) {
@@ -365,36 +348,33 @@ static void pollVibro() {
   }
 }
 
-// Daemon-driven haptic patterns, gentlest -> firmest. The daemon decides WHEN to
-// buzz and how the "until acknowledged" alerts repeat; the firmware just plays
-// what it is told. Amplitude (PWM duty) stays well below full power so urgency
-// reads as rhythm + a little more push, never a jarring jolt.
+// Daemon-driven haptic patterns. The daemon decides WHEN to buzz and how the
+// "until acknowledged" alerts repeat; the firmware just plays what it is told. The
+// motor runs full-on per pulse -- gentleness comes from the short, rhythmic pulses
+// and the gaps, not from a weak amplitude (a coin motor won't run at low PWM).
 //
-//   START  job (re)started : 3 gentle 0.3s pulses               (one-shot)
+//   START  job (re)started : 3x0.3s pulses                       (one-shot)
 //   DONE   turn finished   : 5x0.2s heartbeat, gaps 0.2/0.4, then rest; LOOPS
-//   INPUT  needs your input: soft double-tap                    (daemon re-taps ~10s)
-//   ERROR  API error/alert : 0.4s on / 0.2s off               ; LOOPS until ack
+//   INPUT  needs your input: double-tap                          (daemon re-taps ~10s)
+//   ERROR  API error/alert : 0.4s on / 0.2s off                ; LOOPS until ack
 //   OFF    (or STOP)       : end any pattern now (daemon sends on acknowledge/clear)
 static void buzzForKind(const char *k) {
-  // Always start the pattern -- the engine gates only the MOTOR on quiet mode; the
-  // LED plays it either way, and a running loop's motor resumes on un-mute.
   if (!strcmp(k, "START")) {
-    // 3 gentle pulses of 0.3s, ~0.18s apart. One-shot.
     const VibroStep s[] = {{300, 180}, {300, 180}, {300, 0}};
-    startPattern(s, 3, DUTY_SOFT, false);
+    startPattern(s, 3, false);
   } else if (!strcmp(k, "DONE")) {
-    // 5 pulses of 0.2s with alternating 0.2/0.4 gaps (a soft heartbeat), then a
-    // 0.9s rest before it repeats. Loops until the daemon sends OFF (you focus).
+    // 5 pulses of 0.2s with alternating 0.2/0.4 gaps (a heartbeat), then a 0.9s
+    // rest before it repeats. Loops until the daemon sends OFF (you focus).
     const VibroStep s[] = {{200, 200}, {200, 400}, {200, 200}, {200, 400}, {200, 900}};
-    startPattern(s, 5, DUTY_SOFT, true);
+    startPattern(s, 5, true);
   } else if (!strcmp(k, "INPUT")) {
-    // Soft double-tap. One-shot; the daemon re-taps every ~10s until you focus.
+    // Double-tap. One-shot; the daemon re-taps every ~10s until you focus.
     const VibroStep s[] = {{90, 150}, {90, 0}};
-    startPattern(s, 2, DUTY_INPUT, false);
+    startPattern(s, 2, false);
   } else if (!strcmp(k, "ERROR")) {
     // 0.4s buzz, 0.2s pause, forever. Loops until the daemon sends OFF.
     const VibroStep s[] = {{400, 200}};
-    startPattern(s, 1, DUTY_ALERT, true);
+    startPattern(s, 1, true);
   } else if (!strcmp(k, "OFF") || !strcmp(k, "STOP")) {
     stopBuzz();
   }
@@ -405,10 +385,8 @@ static void buzzForKind(const char *k) {
 // un-muting resumes it mid-pattern (if a tab still needs you, you feel it at once).
 static void toggleQuiet() {
   quietMode = !quietMode;
-  // Apply the motor gate NOW (mid-pulse). On un-mute during a pulse, drive what the
-  // engine would: the full kick if still within it, else the sustain duty.
-  if (quietMode || !(vibroActive && vibroOn)) analogWrite(PIN_VIBRO, 0);
-  else analogWrite(PIN_VIBRO, vibroKicked ? vibroDuty : 255);
+  // Apply the motor gate NOW (mid-pulse), so it doesn't wait for the next phase.
+  digitalWrite(PIN_VIBRO, (!quietMode && vibroActive && vibroOn) ? HIGH : LOW);
   quietToastUntil = millis() + 1200;  // confirm the toggle with a brief toast
   render();
 }
@@ -771,7 +749,8 @@ static void pollPressButton(uint8_t pin, uint8_t n, bool &stable,
 // (released before LONGPRESS_MS) or "B|<longN>" once when the hold crosses
 // LONGPRESS_MS (the release is then swallowed). Returns true on the ONE tick the
 // long-press fires, so the caller can also act locally (SUBMIT toggles quiet).
-static bool pollLongButton(uint8_t pin, uint8_t shortN, uint8_t longN, BtnLong &b) {
+static bool pollLongButton(uint8_t pin, uint8_t shortN, uint8_t longN,
+                           unsigned long longMs, BtnLong &b) {
   bool longEdge = false;
   int raw = digitalRead(pin);
   unsigned long now = millis();
@@ -791,7 +770,7 @@ static bool pollLongButton(uint8_t pin, uint8_t shortN, uint8_t longN, BtnLong &
     b.stable = !pressedNow;
   }
   // Long-press fires while still held, once the threshold is crossed.
-  if (!b.stable && !b.longFired && (now - b.pressMs) >= LONGPRESS_MS) {
+  if (!b.stable && !b.longFired && (now - b.pressMs) >= longMs) {
     Serial.print(F("B|")); Serial.println(longN);
     b.longFired = true;
     longEdge = true;
@@ -800,11 +779,11 @@ static bool pollLongButton(uint8_t pin, uint8_t shortN, uint8_t longN, BtnLong &
 }
 
 static void pollButtons() {
-  // SUBMIT: short = B|1 (focus/proceed), long = B|5 (+ toggle quiet mode locally).
-  if (pollLongButton(PIN_BTN_SUBMIT, 1, 5, submitBtn)) toggleQuiet();
+  // SUBMIT: short = B|1 (focus/proceed), long HOLD (2s) = B|5 (+ toggle quiet mode).
+  if (pollLongButton(PIN_BTN_SUBMIT, 1, 5, MUTE_HOLD_MS, submitBtn)) toggleQuiet();
   pollPressButton(PIN_BTN_NEXT, 2, nextStable, nextLastRaw, nextEdgeMs);
-  // MODE: short = B|3 (prev / list-up), long = B|4 (toggle SCROLL/LIST mode).
-  pollLongButton(PIN_BTN_MODE, 3, 4, modeBtn);
+  // MODE: short = B|3 (prev / list-up), long (0.5s) = B|4 (toggle SCROLL/LIST mode).
+  pollLongButton(PIN_BTN_MODE, 3, 4, LONGPRESS_MS, modeBtn);
 }
 
 // -----------------------------------------------------------------------------
