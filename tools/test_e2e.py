@@ -224,6 +224,46 @@ focus_lines_after_b5 = ([l.strip() for l in open(focuslog)]
                         if os.path.exists(focuslog) else [])
 b5_no_focus = (focus_lines_after_b5 == focus_lines_before_b5)
 
+print("\n-- phase 10: LIST nav terminal-follow preview (focus new / collapse old) --")
+# Still in LIST (webapp2 working, gamma idle; highlight on gamma from phase 9).
+# Attach fake wrapper ctrl sockets to both (keepalive feeds, states unchanged),
+# then move the highlight to webapp2: after the ~0.45s settle debounce the
+# daemon must send 'focus' to webapp2's wrapper and 'collapse' to gamma's.
+ctrl_cmds = {"webapp2": [], "gamma": []}
+ctrl_lock = threading.Lock()
+
+def _fake_ctrl(name):
+    path = os.path.join(binhome, f"ctrl-{name}.sock")
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(path)
+    srv.listen(4)
+    def loop():
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                break
+            with conn:
+                try:
+                    data = conn.recv(64).decode(errors="ignore").strip()
+                except OSError:
+                    data = ""
+            if data:
+                with ctrl_lock:
+                    ctrl_cmds[name].append(data)
+    threading.Thread(target=loop, daemon=True).start()
+    return path
+
+ctrl_w = _fake_ctrl("webapp2")
+ctrl_g = _fake_ctrl("gamma")
+feed(f"working|sidW|webapp2|{ctrl_w}")
+feed(f"idle|sidG|gamma|{ctrl_g}")
+time.sleep(1.2)
+arduino_send("B|2"); time.sleep(1.5)          # highlight -> webapp2, settle > 0.45s
+with ctrl_lock:
+    preview_focus = "focus" in ctrl_cmds["webapp2"]
+    preview_collapse = "collapse" in ctrl_cmds["gamma"]
+
 proc.terminate()
 try:
     proc.wait(timeout=5)
@@ -291,6 +331,10 @@ check("SUBMIT long (B|5) silences the LED loop (V|OFF after ack)",
       b5_led_off)
 check("SUBMIT long (B|5) does NOT focus (no new deep-link/open calls)",
       b5_no_focus)
+check("LIST nav preview: newly highlighted tab's wrapper gets 'focus' (expand)",
+      preview_focus)
+check("LIST nav preview: previously expanded tab's wrapper gets 'collapse'",
+      preview_collapse)
 
 ok = all(checks)
 print("\n  focus.log:", [l.strip() for l in focus_lines] or "(empty)")

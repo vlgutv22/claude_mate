@@ -14,9 +14,11 @@ Run `claude` THROUGH this wrapper (alias claude=claude-mate-wrap). It:
   3. Reports state changes to the Claude Mate daemon over its Unix socket, and
      auto-registers on start / removes on exit (the display mirrors your open
      wrapped terminals).
-  4. Listens on a per-session control socket; when the daemon's FOCUS button is
-     pressed it raises THIS terminal window — auto-picking the method from
-     $TERM_PROGRAM (iTerm2 / Terminal.app / VS Code / tmux / generic).
+  4. Listens on a per-session control socket for window commands, auto-picking
+     the method from $TERM_PROGRAM (iTerm2 / Terminal.app / VS Code / tmux /
+     generic): 'focus' raises (and un-minimizes) THIS terminal window — sent on
+     the FOCUS button and when the device's LIST highlight lands on this tab;
+     'collapse' miniaturizes it — sent when the LIST highlight moves away.
 
 State model (matches the daemon): working | waiting | error | idle
   working  TUI is generating, OR a background dynamic-workflow is still running.
@@ -248,7 +250,8 @@ def focus_self():
 
     tp = TERM_PROGRAM.lower()
     if tp == "iterm.app":
-        # Match the session by its TTY (exact), fall back to title.
+        # Match the session by its TTY (exact), fall back to title. Restore the
+        # window first in case the LIST-nav preview miniaturized it.
         _osa(f'''
             tell application "iTerm2"
               activate
@@ -257,6 +260,7 @@ def focus_self():
                   repeat with s in sessions of t
                     try
                       if (tty of s) is "{MY_TTY}" or (name of s contains "{TITLE}") then
+                        set miniaturized of w to false
                         select w
                         tell t to select
                         select s
@@ -269,8 +273,10 @@ def focus_self():
             end tell''')
     elif tp == "apple_terminal":
         # Bring Terminal forward, then make THIS tab (matched by its TTY) the
-        # selected, front window. (macOS raises an app's windows as a group; we
-        # ensure ours ends up on top + focused.)
+        # selected, front window. Un-miniaturize first: the daemon's LIST-nav
+        # preview may have collapsed this window to the Dock, and selecting a
+        # tab of a miniaturized window would not restore it. (macOS raises an
+        # app's windows as a group; we ensure ours ends up on top + focused.)
         _osa(f'''
             tell application "Terminal"
               activate
@@ -278,6 +284,7 @@ def focus_self():
                 repeat with t in tabs of w
                   try
                     if (tty of t) is "{MY_TTY}" then
+                      set miniaturized of w to false
                       set selected of t to true
                       set frontmost of w to true
                       return
@@ -294,13 +301,17 @@ def focus_self():
     elif tp in ("warpterminal", "warp"):
         _osa('tell application "Warp" to activate')
     else:
-        # Generic: ask System Events to raise any window whose title matches.
+        # Generic: ask System Events to raise any window whose title matches
+        # (un-minimizing it first in case the LIST-nav preview collapsed it).
         _osa(f'''
             tell application "System Events"
               set procs to (every process whose background only is false)
               repeat with p in procs
                 repeat with w in (windows of p)
                   if name of w contains "{TITLE}" then
+                    try
+                      set value of attribute "AXMinimized" of w to false
+                    end try
                     set frontmost of p to true
                     perform action "AXRaise" of w
                   end if
@@ -308,8 +319,67 @@ def focus_self():
               end repeat
             end tell''')
 
+def collapse_self():
+    """Miniaturize THIS session's terminal window (the daemon's LIST-nav
+    preview collapses the previously-highlighted tab as the highlight moves).
+    Best effort, mirrors focus_self()'s per-$TERM_PROGRAM matching. No-ops
+    where a single pane can't be collapsed (tmux panes, VS Code integrated
+    terminals) -- collapsing the whole shared window would hide innocent
+    bystanders."""
+    if os.environ.get("TMUX"):
+        return                              # a tmux pane can't be miniaturized
+    tp = TERM_PROGRAM.lower()
+    if tp == "iterm.app":
+        _osa(f'''
+            tell application "iTerm2"
+              repeat with w in windows
+                repeat with t in tabs of w
+                  repeat with s in sessions of t
+                    try
+                      if (tty of s) is "{MY_TTY}" or (name of s contains "{TITLE}") then
+                        set miniaturized of w to true
+                        return
+                      end if
+                    end try
+                  end repeat
+                end repeat
+              end repeat
+            end tell''')
+    elif tp == "apple_terminal":
+        _osa(f'''
+            tell application "Terminal"
+              repeat with w in windows
+                repeat with t in tabs of w
+                  try
+                    if (tty of t) is "{MY_TTY}" then
+                      set miniaturized of w to true
+                      return
+                    end if
+                  end try
+                end repeat
+              end repeat
+            end tell''')
+    elif tp == "vscode":
+        pass                                # can't collapse one integrated pane
+    else:
+        # Generic: minimize any window whose title matches ours.
+        _osa(f'''
+            tell application "System Events"
+              set procs to (every process whose background only is false)
+              repeat with p in procs
+                repeat with w in (windows of p)
+                  if name of w contains "{TITLE}" then
+                    try
+                      set value of attribute "AXMinimized" of w to true
+                    end try
+                  end if
+                end repeat
+              end repeat
+            end tell''')
+
 def ctrl_listener():
-    """Per-session socket: the daemon connects and sends 'focus'."""
+    """Per-session socket: the daemon connects and sends 'focus' (raise +
+    un-minimize this terminal) or 'collapse' (miniaturize it)."""
     try:
         if os.path.exists(CTRL_SOCK):
             os.unlink(CTRL_SOCK)
@@ -331,6 +401,8 @@ def ctrl_listener():
                 data = ""
         if data.startswith("focus"):
             focus_self()
+        elif data.startswith("collapse"):
+            collapse_self()
 
 # --------------------------------------------------------------------------- #
 # Model + effort capture from the rendered screen
