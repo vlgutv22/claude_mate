@@ -18,7 +18,7 @@ in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
         └────────────────────────────────┘
               ((•)) vibration motor             ← buzzes per session, when IT needs you
           [ MODE ]   [ SUBMIT ]   [ NEXT ]     ← three buttons
-   MODE: short = prev / list-up · long = switch SCROLL↔LIST   SUBMIT: focus tab   NEXT: next / list-down
+   MODE: short = prev / list-up · long = switch SCROLL↔LIST   SUBMIT: short = focus tab · long = acknowledge   NEXT: next / list-down
 
    the dot:   ● blinking = unacknowledged (needs you)   ○ hollow = acknowledged (focused)
    the buzz:  START 3 soft ticks · INPUT gentle tap · DONE heartbeat-loop · ERROR alarm-loop  (loops/re-taps until you SUBMIT)
@@ -68,8 +68,11 @@ hooks are the zero-dependency feed. Use whichever fits each session.
 - **Two UI modes** — a long-press of **MODE** toggles between **SCROLL** (the
   one-card carousel above) and **LIST** (a scrolling list of *all* tabs, each with
   a status label — `WIP`/`WAIT`/`ERR`/`DONE`/`IDLE` — and its name). In LIST,
-  **NEXT** / **MODE-short** move the highlight and **SUBMIT** focuses the
-  highlighted tab. Buttons are snappy (~40 ms debounce; ~500 ms hold = long-press).
+  **NEXT** / **MODE-short** move the highlight, **SUBMIT** focuses the
+  highlighted tab (double-click opens/closes its **detail** card), and a
+  **long-press of SUBMIT acknowledges** the selected tab's alert without
+  focusing it. Buttons fire instantly (edge-accepted debounce; ~500 ms hold =
+  long-press).
 - **Per-session haptics** — the motor buzzes for *that session's own*
   transition, not just an aggregate change:
   - **START** — a job (re)started → three gentle 0.3 s ticks (one-shot).
@@ -142,7 +145,7 @@ hooks are the zero-dependency feed. Use whichever fits each session.
    │   • SSD1306 128x32 OLED — status card: ack    │
    │     dot · name · idx · model·effort · STATE   │
    │   • micro vibration motor (D5) plays V|<KIND>│
-   │   • SUBMIT/NEXT/MODE buttons → B|1..B|4       │
+   │   • SUBMIT/NEXT/MODE buttons → B|1..B|5       │
    └──────────────────────────────────────────────┘
                             │  H (hello on boot), B|<n> (buttons)
                             └──────────────► back to the daemon
@@ -185,7 +188,8 @@ rhythm, not raw force:
 
 `DONE` and `ERROR` **loop** in the firmware until the daemon sends `V|OFF`;
 `INPUT` re-taps on a timer. A turn ending (`working → idle`) becomes **done** and
-keeps looping until you focus the session — pressing **SUBMIT** acknowledges it
+keeps looping until you acknowledge the session — focusing it (**SUBMIT**
+short-press) or silencing it in place (**SUBMIT** long-press) acknowledges it
 (sending `V|OFF` to silence the motor: a done tab becomes idle; a waiting/error
 tab goes quiet but keeps its state until it changes). The OLED's ack dot mirrors
 this: blinking while unacknowledged, hollow once seen. If the daemon ever dies
@@ -216,7 +220,7 @@ Pinout summary (full details in [docs/WIRING.md](docs/WIRING.md)):
 |----------------------|-----------|----------------------------------------|
 | OLED SDA             | A4        | I2C                                    |
 | OLED SCL             | A5        | I2C                                    |
-| SUBMIT button        | D2        | `INPUT_PULLUP`, emits `B|1` (focus selected tab) |
+| SUBMIT button        | D2        | `INPUT_PULLUP`, emits `B|1` short (focus) / `B|5` long (acknowledge) |
 | NEXT button          | D3        | `INPUT_PULLUP`, emits `B|2` (next / highlight down) |
 | MODE button          | D4        | `INPUT_PULLUP`, emits `B|3` short / `B|4` long (prev / mode toggle) |
 | Vibration motor drive| D5        | PWM-capable; never drive the motor directly |

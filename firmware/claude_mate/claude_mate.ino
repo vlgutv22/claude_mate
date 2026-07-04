@@ -32,13 +32,15 @@
  *     VCC -> 5V, GND -> GND, SDA -> A4, SCL -> A3  (bit-banged; see softssd1306.h)
  *     I2C address 0x3C (common alternative: 0x3D)
  *   Buttons (INPUT_PULLUP, other leg to GND) -- layout MODE | SUBMIT | NEXT:
- *     SUBMIT button -> D2  (emits "B|1"; focus/proceed; double-click opens LIST detail)
+ *     SUBMIT button -> D2  (emits "B|1" on a short press: focus/proceed;
+ *                          double-click opens LIST detail. "B|5" on a long
+ *                          press: acknowledge the alert without focusing)
  *     NEXT   button -> D3  (emits "B|2"; next card / highlight down)
  *     MODE   button -> D4  (emits "B|3" on a short press, "B|4" on a long press;
  *                          short = prev card / highlight up, long = switch mode)
  *   Indication LED (the sole alert output; the vibration motor was removed):
  *     LED          -> D8   (OUTPUT; LED + ~220-1k series resistor to GND). Blinks
- *                          the alert pattern; QUIET mode turns it off (SUBMIT 2s).
+ *                          the alert pattern.
  *
  *
  * SERIAL PROTOCOL (115200 8N1, ASCII lines terminated by '\n', fields split '|')
@@ -71,8 +73,9 @@
  *                                                    stop/darken the LED now
  *   Arduino -> Daemon:
  *     H                                              hello, sent once after boot
- *     B|<n>                                          n=1 SUBMIT, n=2 NEXT,
- *                                                    n=3 MODE short, n=4 MODE long
+ *     B|<n>                                          n=1 SUBMIT short, n=2 NEXT,
+ *                                                    n=3 MODE short, n=4 MODE long,
+ *                                                    n=5 SUBMIT long (acknowledge)
  *
  * NOTE: opening the USB serial port resets the Nano (~1.5s). That is why we emit
  * H once in setup() so the daemon can (re)send the full current state.
@@ -108,7 +111,7 @@
 #define LINE_MAX       96      // cap input line length to bound RAM use
                                // (fits S card + name + model + effort fields)
 #define DEBOUNCE_MS    40UL    // ~40ms button debounce (snappy short taps)
-#define LONGPRESS_MS   500UL   // MODE held this long -> long-press (mode toggle)
+#define LONGPRESS_MS   500UL   // MODE/SUBMIT held this long -> long-press
 
 // ---- Alert-indicator tuning --------------------------------------------------
 // The alert output is now just the LED on D8 (digital on/off) -- no vibration
@@ -147,6 +150,15 @@ static bool  showIdle   = true;      // true => idle screen, no card
 static bool  showList   = false;     // true => LIST-mode frame (overrides card)
 static bool  gBlinkOn   = true;      // blink phase for the unacknowledged dot
 
+// ---- Render coalescing ---------------------------------------------------
+// Serial handlers only MARK the display dirty (requestRender, in Helpers); the
+// actual redraw happens in loop(), once the incoming burst has drained (the
+// daemon sends D|/S|/T|/V| back-to-back). One redraw per burst instead of one
+// per line, and never mid-burst -- so the RX buffer can't overflow behind a
+// redraw.
+static bool          needRender = false;
+static unsigned long dirtyMs    = 0;      // when the display first went dirty
+
 // ---- LIST-mode model (T| frame) ----------------------------------------------
 // The daemon owns the tab list + selection and sends a pre-windowed frame of up
 // to LIST_ROWS visible rows; we just draw it. Highlighted row is drawn inverted.
@@ -183,27 +195,36 @@ static unsigned long lastRxMs       = 0;     // millis() of the last serial byte
                                              // (loop watchdog: daemon liveness)
 
 // ---- Button debounce state ---------------------------------------------------
-// SUBMIT + NEXT are simple press-edge buttons (emit on press). MODE distinguishes
-// a SHORT press (emit B|3 on release) from a LONG press (emit B|4 once at
-// LONGPRESS_MS, then swallow the release).
-struct BtnLong {
-  bool          stable;     // released?
-  int           lastRaw;
-  unsigned long edgeMs;     // debounce edge time
+// Immediate-fire debounce: an edge is ACCEPTED (and its event emitted) the very
+// tick it is seen, provided the last accepted edge is >= DEBOUNCE_MS old. Bounce
+// after an accepted edge is ignored for the window; press latency is ~0 ms
+// (the old scheme waited out the full window before emitting, and could miss a
+// quick tap entirely).
+//   NEXT emits on the press edge. SUBMIT and MODE distinguish a SHORT press
+// (emit on release) from a LONG press (emit once at LONGPRESS_MS, then swallow
+// the release).
+struct Btn {
+  uint8_t       pin;
+  bool          pressed;    // debounced logical state (true = held down)
+  unsigned long changeMs;   // when the last edge was accepted
   unsigned long pressMs;    // when the current press began
   bool          longFired;  // long-press already emitted this hold?
 };
-static BtnLong modeBtn   = {true, HIGH, 0, 0, false};
-static bool          submitStable = true;  // pull-up idle = HIGH (released)
-static int           submitLastRaw = HIGH;
-static unsigned long submitEdgeMs = 0;
-static bool          nextStable   = true;
-static int           nextLastRaw  = HIGH;
-static unsigned long nextEdgeMs   = 0;
+static Btn submitBtn = {PIN_BTN_SUBMIT, false, 0, 0, false};
+static Btn nextBtn   = {PIN_BTN_NEXT,   false, 0, 0, false};
+static Btn modeBtn   = {PIN_BTN_MODE,   false, 0, 0, false};
 
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
+
+// Mark the display dirty; loop() coalesces and performs the actual redraw.
+static void requestRender() {
+  if (!needRender) {
+    needRender = true;
+    dirtyMs = millis();
+  }
+}
 
 // Map a state string to the State enum. Defaults to idle on unknown input.
 static uint8_t parseState(const char *s) {
@@ -527,7 +548,7 @@ static void handleLine(char *line) {
       showIdle = true;
       showList = false;
       curState = ST_IDLE;
-      render();
+      requestRender();
       break;
 
     case 'T': {  // T|total|sel|<name;st;hl;ack>|...  -- LIST-mode frame
@@ -575,7 +596,7 @@ static void handleLine(char *line) {
       }
       showList = true;
       showIdle = false;
-      render();
+      requestRender();
       break;
     }
 
@@ -585,7 +606,7 @@ static void handleLine(char *line) {
       uint8_t w = parseWord(bar + 1);
       if (w == 255) break;               // ignore unknown word
       curWord = w;                       // dial/word only; haptics come via V|
-      render();                          // refresh the OLED word now
+      requestRender();
       break;
     }
 
@@ -629,7 +650,7 @@ static void handleLine(char *line) {
       copyField(curEffort, sizeof(curEffort), (n > 9) ? fields[9] : "");
       showIdle = false;
       showList = false;                  // a card frame leaves LIST mode
-      render();
+      requestRender();
       break;
     }
 
@@ -666,64 +687,45 @@ static void pumpSerial() {
 // Buttons
 // -----------------------------------------------------------------------------
 
-// Simple press-edge button (NEXT): debounce, emit "B|<n>" on press.
-static void pollPressButton(uint8_t pin, uint8_t n, bool &stable,
-                            int &lastRaw, unsigned long &edgeMs) {
-  int raw = digitalRead(pin);
-  unsigned long now = millis();
-  if (raw != lastRaw) {
-    lastRaw = raw;
-    edgeMs = now;                        // start debounce window
-  }
-  if ((now - edgeMs) >= DEBOUNCE_MS) {
-    bool pressedNow = (raw == LOW);      // pull-up: LOW = pressed
-    bool wasPressed = !stable;
-    if (pressedNow && !wasPressed) {      // edge into pressed -> emit
-      Serial.print(F("B|"));
-      Serial.println(n);
-    }
-    stable = !pressedNow;                 // stable=true means released
-  }
+static void emitBtn(uint8_t n) {
+  Serial.print(F("B|"));
+  Serial.println(n);
 }
 
-// Short/long-press button (MODE): emit "B|<shortN>" on a SHORT press (released
-// before longMs) or "B|<longN>" once when the hold crosses longMs (the release is
-// then swallowed). Returns true on the ONE tick the long-press fires.
-static bool pollLongButton(uint8_t pin, uint8_t shortN, uint8_t longN,
-                           unsigned long longMs, BtnLong &b) {
-  bool longEdge = false;
-  int raw = digitalRead(pin);
+// One button, immediate-fire debounce. longN == 0: a plain button that emits
+// shortN on the PRESS edge (instant). longN != 0: shortN is emitted on RELEASE
+// (a short press), longN once when the hold crosses LONGPRESS_MS (the release
+// is then swallowed).
+static void pollBtn(Btn &b, uint8_t shortN, uint8_t longN) {
+  bool raw = (digitalRead(b.pin) == LOW);   // pull-up: LOW = pressed
   unsigned long now = millis();
-  if (raw != b.lastRaw) {
-    b.lastRaw = raw;
-    b.edgeMs = now;
-  }
-  if ((now - b.edgeMs) >= DEBOUNCE_MS) {
-    bool pressedNow = (raw == LOW);
-    bool wasPressed = !b.stable;
-    if (pressedNow && !wasPressed) {      // press edge: start timing the hold
-      b.pressMs = now;
+  if (raw != b.pressed && (now - b.changeMs) >= DEBOUNCE_MS) {
+    b.pressed  = raw;                       // accept the edge NOW
+    b.changeMs = now;
+    if (raw) {                              // press edge
+      b.pressMs   = now;
       b.longFired = false;
-    } else if (!pressedNow && wasPressed) {
-      if (!b.longFired) { Serial.print(F("B|")); Serial.println(shortN); }  // short
+      if (longN == 0) emitBtn(shortN);      // plain button: fire on press
+    } else {                                // release edge
+      if (longN != 0 && !b.longFired) emitBtn(shortN);   // short press
     }
-    b.stable = !pressedNow;
   }
   // Long-press fires while still held, once the threshold is crossed.
-  if (!b.stable && !b.longFired && (now - b.pressMs) >= longMs) {
-    Serial.print(F("B|")); Serial.println(longN);
+  if (longN != 0 && b.pressed && !b.longFired &&
+      (now - b.pressMs) >= LONGPRESS_MS) {
+    emitBtn(longN);
     b.longFired = true;
-    longEdge = true;
   }
-  return longEdge;
 }
 
 static void pollButtons() {
-  // SUBMIT: B|1 (focus/proceed; a double-click opens LIST detail, daemon-side).
-  pollPressButton(PIN_BTN_SUBMIT, 1, submitStable, submitLastRaw, submitEdgeMs);
-  pollPressButton(PIN_BTN_NEXT,   2, nextStable,   nextLastRaw,   nextEdgeMs);
-  // MODE: short = B|3 (prev / list-up), long (0.5s) = B|4 (toggle SCROLL/LIST mode).
-  pollLongButton(PIN_BTN_MODE, 3, 4, LONGPRESS_MS, modeBtn);
+  // SUBMIT: short = B|1 (focus; LIST double-click = detail, daemon-side),
+  //         long (0.5s) = B|5 (acknowledge the alert without focusing).
+  pollBtn(submitBtn, 1, 5);
+  // NEXT: B|2 on press (next card / highlight down).
+  pollBtn(nextBtn, 2, 0);
+  // MODE: short = B|3 (prev / list-up), long (0.5s) = B|4 (toggle SCROLL/LIST).
+  pollBtn(modeBtn, 3, 4);
 }
 
 // -----------------------------------------------------------------------------
@@ -756,10 +758,9 @@ void setup() {
     }
   }
 
-  display.clearDisplay();
-  display.display();
-  // Clip overflowing text at the screen edge instead of wrapping it onto the
-  // next row (which would corrupt the multi-line card layout).
+  // begin() already blanked and synced the panel. Clip overflowing text at the
+  // screen edge instead of wrapping it onto the next row (which would corrupt
+  // the multi-line card layout).
   display.setTextWrap(false);
 
   // Default to FREE and the idle screen until the daemon talks to us.
@@ -776,6 +777,7 @@ void loop() {
   pumpSerial();
   pollButtons();
   pollVibro();                           // advance the haptic state machine
+  display.pumpFlush();                   // ship ~32B (~2.3ms) of any armed frame
 
   // Blink the unacknowledged-alert dot (~every 400ms) -- on the card, or on any
   // unacknowledged row in the LIST. Re-render only when a blinking dot is shown.
@@ -788,6 +790,21 @@ void loop() {
       for (uint8_t r = 0; r < listRows && r < LIST_ROWS; r++)
         if (listUnacked[r]) { listBlink = true; break; }
     }
-    if (cardBlink || listBlink) render();
+    if (cardBlink || listBlink) requestRender();
+  }
+
+  // Perform a pending redraw once the serial burst has drained (>=8ms of RX
+  // silence), or after 60ms regardless so a continuous stream can't starve the
+  // display. Drawing must wait for the previous frame's chunked transfer to
+  // finish (flushBusy) -- rendering mutates the framebuffer mid-send otherwise.
+  // render() itself only draws + ARMS the transfer (~1ms); the bytes go out via
+  // pumpFlush() above, so buttons/serial stay live throughout.
+  if (needRender && !display.flushBusy()) {
+    unsigned long now = millis();
+    bool rxQuiet = (Serial.available() == 0) && (now - lastRxMs) >= 8;
+    if (rxQuiet || (now - dirtyMs) >= 60) {
+      needRender = false;
+      render();
+    }
   }
 }

@@ -11,14 +11,17 @@ The "brain" of the Claude Mate USB hardware companion. It:
      Nano. It auto-detects the port (/dev/cu.usbserial* then /dev/cu.usbmodem*),
      opens it once, keeps it open, and auto-reconnects if it disappears.
   3. Reads button events from the Arduino on a background thread (buttons
-     MODE | SUBMIT | NEXT; MODE distinguishes a short vs long press):
+     MODE | SUBMIT | NEXT; MODE and SUBMIT distinguish a short vs long press):
         H        -> handshake; the daemon resends the full current state.
-        B|1      -> SUBMIT: focus the selected tab (current card in SCROLL,
-                    highlighted row in LIST).
+        B|1      -> SUBMIT short: focus the selected tab (current card in
+                    SCROLL, highlighted row in LIST; LIST double-click opens/
+                    closes the detail card instead).
         B|2      -> NEXT: SCROLL next card / LIST highlight down.
         B|3      -> MODE short: SCROLL previous card / LIST highlight up.
         B|4      -> MODE long (>=500ms): toggle UI mode (SCROLL <-> LIST, an
                     all-tabs picker list).
+        B|5      -> SUBMIT long (>=500ms): acknowledge the selected tab's
+                    alert (silence the LED) WITHOUT focusing its window.
   4. Drives a carousel that rotates through sessions (~3s/step, urgent-first)
      and sends one S card per step.
   5. Computes the overall status word (FREE/WIP/BLOCKED/WTF) and pushes it with
@@ -1016,6 +1019,13 @@ class ButtonReader(threading.Thread):
         self._submit_timer: Optional[threading.Timer] = None
         self._submit_gen = 0
         self._submit_lock = threading.Lock()
+        # FOCUS runs on side threads (it can block for seconds on sockets /
+        # subprocesses). `_focus_serial` serializes them so two quick SUBMITs
+        # can't raise windows in finish-order instead of press-order, and
+        # `_focus_gen` lets a newer press supersede one still waiting its turn.
+        self._focus_serial = threading.Lock()
+        self._focus_gen_lock = threading.Lock()
+        self._focus_gen = 0
 
     def run(self) -> None:
         while not self._stop.is_set():
@@ -1060,8 +1070,14 @@ class ButtonReader(threading.Thread):
                 elif n == 4:                     # MODE long: toggle scroll <-> list
                     log("MODE long-press -> toggle mode")
                     self._display.toggle_mode()
-                elif n == 5:                     # SUBMIT long: quiet toggled (firmware)
-                    log("SUBMIT long-press -> quiet mode toggled (firmware-local)")
+                elif n == 5:                     # SUBMIT long: acknowledge, no focus
+                    sess = (self._display.list_selected_session()
+                            if mode == "list"
+                            else self._display.current_session())
+                    log("SUBMIT long-press -> acknowledge "
+                        f"{sess.name if sess else '-'} (no focus)")
+                    if self.on_ack:
+                        self.on_ack(sess)        # silences the LED loop + re-renders
                 else:
                     log(f"unknown button index: {n}")
             return
@@ -1102,9 +1118,25 @@ class ButtonReader(threading.Thread):
 
     def _focus(self, sess: Optional[Session]) -> None:
         log(f"SUBMIT -> focus + acknowledge {sess.name if sess else '-'}")
-        focus_session(sess)
+        # Acknowledge FIRST so the LED/display react instantly, then do the
+        # (slow: sockets/subprocesses, seconds of timeout) window-raising on a
+        # side thread -- the reader thread must keep consuming button events.
+        # Focus threads are SERIALIZED (press order == raise order) and a press
+        # that is still queued when a newer one arrives is dropped (last wins).
         if self.on_ack:
             self.on_ack(sess)                        # focusing the window = acknowledged
+        with self._focus_gen_lock:
+            self._focus_gen += 1
+            gen = self._focus_gen
+
+        def run() -> None:
+            with self._focus_serial:                 # one focus at a time
+                with self._focus_gen_lock:
+                    if gen != self._focus_gen:       # superseded while queued
+                        return
+                focus_session(sess)
+
+        threading.Thread(target=run, name="focus", daemon=True).start()
 
     def stop(self) -> None:
         self._stop.set()

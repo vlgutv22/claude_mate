@@ -105,13 +105,13 @@ press (held ≥ ~500 ms).
 | `B\|2`     | **NEXT** pressed (D3) — SCROLL: next card. LIST: move the highlight **down**. |
 | `B\|3`     | **MODE** short-press (D4) — SCROLL: previous card. LIST: move the highlight **up**. |
 | `B\|4`     | **MODE** long-press (D4, held ≥ ~500 ms) — **toggle** the UI mode (SCROLL ⇄ LIST). |
-| `B\|5`     | **SUBMIT** long-press (D2, held ≥ ~500 ms) — **toggle quiet mode** (mutes all haptics). Handled **locally on the firmware**; this line is informational (the daemon logs it). |
+| `B\|5`     | **SUBMIT** long-press (D2, held ≥ ~500 ms) — **acknowledge** the selected tab's alert (SCROLL: the current card; LIST: the highlighted row / open detail card) **without focusing** its window. The daemon marks the tab acknowledged, which stops the LED loop (`V\|OFF`) and the blinking dot. |
 
-**Quiet mode** is firmware-local: an **indication LED on D8** blinks the alert
-pattern alongside the vibration motor. While muted, only the **motor** is gated —
-the LED keeps blinking, so a running alert loop's motor simply resumes on
-**un-mute** (an unacknowledged done/error is felt at once). A brief `VIBRATION
-ON/OFF` toast confirms the toggle.
+**Debounce & latency.** Edges are accepted **immediately** (the event is emitted
+the same tick) provided the previous accepted edge is ≥ ~40 ms old — bounce
+inside the window is ignored, but a press costs ~0 ms of latency. NEXT emits on
+the **press** edge; SUBMIT and MODE emit their short event on **release**
+(required to tell a short press from a long one).
 
 **UI modes.** The daemon owns the mode. **SCROLL** is the carousel (auto-surface
 the most-urgent tab + browse one card at a time via `S` frames). **LIST** shows a

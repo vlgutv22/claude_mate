@@ -159,7 +159,9 @@ with display_lock:
 # Single-click SUBMIT -> deferred focus of the highlighted tab; key-tracked to
 # infra (sid-3) even though webapp slid into its old index slot.
 arduino_send("B|1"); time.sleep(1.2)
-arduino_send("B|5"); time.sleep(0.5)     # SUBMIT long -> quiet toggle (must not crash)
+# SUBMIT long -> ack the highlighted tab (already acked by the focus above; a
+# redundant ack must be a harmless no-op).
+arduino_send("B|5"); time.sleep(0.5)
 
 with display_lock:
     saw_T = any(l.startswith("T|") for l in display[idx_before_list:])
@@ -201,6 +203,26 @@ with display_lock:
 feed("end|sidB|beta"); time.sleep(1.5)        # end the detailed tab
 with display_lock:
     detail_autoclosed = any(l.startswith("T|") for l in display[idx_before_end:])
+
+print("\n-- phase 9: SUBMIT long (B|5) acknowledges WITHOUT focusing --")
+# Still in LIST mode (webapp2 working; the highlight re-anchored onto it when
+# beta ended -- key-stable). A fresh 'done' tab sorts to row 0; move the
+# highlight onto it, then B|5 must ack it (done -> idle, V|OFF) WITHOUT
+# opening/focusing anything.
+feed("done|sidG|gamma"); time.sleep(2.2)
+arduino_send("B|3"); time.sleep(0.8)          # highlight up -> gamma (row 0)
+focus_lines_before_b5 = ([l.strip() for l in open(focuslog)]
+                         if os.path.exists(focuslog) else [])
+with display_lock:
+    idx_before_b5 = len(display)
+arduino_send("B|5"); time.sleep(1.8)
+with display_lock:
+    b5_acked = any(l.startswith("T|") and "gamma;IDLE" in l
+                   for l in display[idx_before_b5:])
+    b5_led_off = any(l == "V|OFF" for l in display[idx_before_b5:])
+focus_lines_after_b5 = ([l.strip() for l in open(focuslog)]
+                        if os.path.exists(focuslog) else [])
+b5_no_focus = (focus_lines_after_b5 == focus_lines_before_b5)
 
 proc.terminate()
 try:
@@ -263,6 +285,12 @@ check("MODE long-press again returns to SCROLL -> S| card resumes",
 check("SCROLL: acknowledging a tab stays on it, no jump to the top tab "
       f"(first card after ack = beta, got {first_card_after_ack!r})",
       "|beta|" in first_card_after_ack)
+check("SUBMIT long (B|5) acknowledges the highlighted tab (done -> IDLE row)",
+      b5_acked)
+check("SUBMIT long (B|5) silences the LED loop (V|OFF after ack)",
+      b5_led_off)
+check("SUBMIT long (B|5) does NOT focus (no new deep-link/open calls)",
+      b5_no_focus)
 
 ok = all(checks)
 print("\n  focus.log:", [l.strip() for l in focus_lines] or "(empty)")
