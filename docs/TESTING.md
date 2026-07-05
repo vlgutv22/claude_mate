@@ -119,16 +119,17 @@ Flash the **real firmware**. Open the Arduino IDE **Serial Monitor** at
    (`F|<flags>|<sel>|<r0>|<r1>|<r2>|<r3>`):
 
    ```
-   F|1|4|api-server|WAIT  0:42|Opus 4.8  xhigh|1/3 BWD
+   F|1|4|api-server|WAIT  0:42|Opus 4.8  xhigh|1/3 B W D
    ```
 
    → the OLED shows the frame as four size-1 rows: the name `api-server` on r0
    **flashing** (`flags` bit0 = 1), the state + time on r1, the model + effort
-   on r2, and the position + packed fleet letters on r3 with the letter at
-   column `4` (the `B`) in a **filled square** (a lit block, letter knocked
-   out). Add bit1 to `flags` (send `3` instead of `1`) and a ► FOLLOW marker
-   appears by the state row; send `flags` `0` and the flashing stops. Send a
-   letter lowercase (e.g. `1/3 bWD`) and it blinks (an unacked alert).
+   on r2, and the position + space-separated fleet letters on r3 with the
+   letter at column `4` (the `B`) in a **wide centred filled rectangle** (a lit
+   block, letter knocked out). Add bit1 to `flags` (send `3` instead of `1`)
+   and a ► FOLLOW marker appears by the state row; send `flags` `0` and the
+   flashing stops. Send a letter lowercase (e.g. `1/3 b W D`) and it blinks
+   (an unacked alert).
 
    Blink the LED with `V|<kind>` and watch each pattern:
 
