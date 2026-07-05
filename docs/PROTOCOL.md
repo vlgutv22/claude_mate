@@ -25,21 +25,30 @@ selection, truncation and layout live in the daemon.
 |api-server           |   r0: session name — flashes (inverts ~2.5 Hz) while
 |WAIT  0:42           |   r1: state tag + time-in-state    its alert is unacked
 |Opus 4.8  xhigh      |   r2: model + effort
-|2/6 E|B|W|D|I        |   r3: queue position + one status LETTER per session
-+---------------------+
+|2/6 E|B|W|D|I        |   r3: queue position + one status LETTER per session;
++---------------------+       the active tab's letter is boxed (the switch)
 ```
 
-There are **no UI modes**. The three buttons mean the same thing at all times:
+The **active tab** (the session shown above) has its fleet letter **boxed** in
+r3. The box is the on-screen FOLLOW switch: an **outline** when FOLLOW mode is
+off, **filled** when on.
 
-| Button (left→right) | Short press | Held |
+The three buttons mean the same thing at all times:
+
+| Button (left→right) | Short press | Held / double |
 |---|---|---|
 | **PREV** | selection one step **up** the queue | auto-repeats (400 ms, then 5/s) |
-| **GO**   | **RAISE** the terminal of the session **shown on the glass** (acknowledging its alert) | at 500 ms: acknowledge **without** raising (release then ignored) |
+| **GO**   | single: **RAISE** the terminal of the session **shown on the glass** (acknowledging its alert) | **double-click** (≤ 300 ms apart): toggle **FOLLOW** mode. Held ≥ 500 ms: acknowledge **without** raising. |
 | **NEXT** | selection one step **down** the queue | auto-repeats (400 ms, then 5/s) |
 
-**Window contract:** navigation NEVER touches macOS windows. The only window
-operation in the entire system is GO, and it only **raises/activates** — the
-daemon never collapses, resizes, or miniaturizes anything.
+**FOLLOW mode** (toggled by double-clicking GO): while on, PREV/NEXT
+additionally **raise** the selected session's terminal, ~250 ms after the
+selection settles (so holding to scroll never raises the windows it passes
+over). Raise ONLY — never ack (ack stays on GO long-press), never collapse.
+
+**Window contract:** navigation touches macOS windows ONLY in FOLLOW mode, and
+then only to **raise/activate** the selected terminal — the daemon never
+collapses, resizes, or miniaturizes anything.
 
 **WYSIWYG:** GO/ACK act on **exactly the session whose frame is on the glass** —
 never a freshly recomputed queue head. So a press can only ever raise the
@@ -67,7 +76,7 @@ input buffer at 96 bytes and drops malformed/oversized lines).
 
 | Line | Meaning |
 |------|---------|
-| `F\|<flash>\|<r0>\|<r1>\|<r2>\|<r3>` | **The whole screen**, pre-rendered as four size-1 rows. See field table below. At least 6 fields; `r3` is the **last** field and may itself contain `\|`. |
+| `F\|<flags>\|<sel>\|<r0>\|<r1>\|<r2>\|<r3>` | **The whole screen**, pre-rendered as four size-1 rows. See field table below. At least 7 fields; `r3` is the **last** field and may itself contain `\|`. |
 | `V\|<kind>` | LED alert control (indication LED only; never touches the OLED). `<kind>` is `START`, `INPUT`, `DONE`, `ERROR`, or `OFF`. See **LED** below. |
 | `P` | Ping / keepalive, sent every ~15 s. The Arduino replies with `K` (NOT `H` — `H` means "I rebooted" and triggers a full resend + LED re-arm, which would restart the blink phase every ping). |
 
@@ -75,17 +84,18 @@ input buffer at 96 bytes and drops malformed/oversized lines).
 
 | Field   | Description |
 |---------|-------------|
-| `flash` | `1`: the firmware inverts **row 0** (the name) at ~2.5 Hz (an unacknowledged alert is on screen). `0`: steady. |
+| `flags` | Bitfield. **bit0**: invert **row 0** (the name) at ~2.5 Hz (an unacknowledged alert is on screen). **bit1**: FOLLOW mode is on (fill the active-tab switch box instead of outlining it). |
+| `sel`   | The character column **within `r3`** of the active tab's fleet letter to box (`-1` = none). Filled box = FOLLOW on, outline = off. |
 | `r0` (name) | Session name. The daemon truncates to the row width and, when two long sibling names collide, disambiguates with a middle squeeze (first 9 + `~` + last 10, e.g. `webapp-ba~ervice-one`). |
 | `r1` (state) | `TAG  time` — the 4-char state tag (`ERR`/`WAIT`/`DONE`/`WORK`/`IDLE`) and the time in that state (mm:ss, or h:mm past an hour). |
 | `r2` (meta) | Best-fit `model  effort` (empty for hook-driven sessions with no scraped metadata). |
-| `r3` (fleet) | `pos/total ` + one status **letter** per session in queue order, `\|`-separated: `E` error, `B` waiting (blocked), `W` working, `D` done, `I` idle. When the strip does not fit, it is cut with a trailing `+`. Because `r3` is the last field, the firmware stops tokenizing at the 5th `\|` and takes the rest verbatim — which is what lets the strip use `\|` as its on-screen divider. |
+| `r3` (fleet) | `pos/total ` + one status **letter** per session in queue order, `\|`-separated: `E` error, `B` waiting (blocked), `W` working, `D` done, `I` idle. When the strip does not fit, it is cut with a trailing `+`. Because `r3` is the last field, the firmware stops tokenizing at the 6th `\|` and takes the rest verbatim — which is what lets the strip use `\|` as its on-screen divider. |
 
 The daemon sends an `F` line whenever the rendered bytes change: immediately on
 any state change or button, and ~1/s while a displayed time ticks. Identical
 frames are not re-sent (except on handshake).
 
-With no sessions the daemon sends `F|0|MATE|no sessions||`.
+With no sessions the daemon sends `F|0|-1|MATE|no sessions||`.
 
 #### LED — `V|<kind>`
 
@@ -137,7 +147,7 @@ press (emit once at 500 ms; the release is then swallowed).
 | `K`   | Keepalive ack — the reply to `P`. The daemon ignores it. |
 | `B\|P` | **PREV** pressed (D4) — selection one step up the queue. Repeats while held. |
 | `B\|N` | **NEXT** pressed (D3) — selection one step down the queue. Repeats while held. |
-| `B\|G` | **GO** short press (D2) — raise the terminal of the session **shown on the glass** (raise only), acknowledging its alert. |
+| `B\|G` | **GO** short press (D2). The firmware just emits `B\|G` on each short press; the **daemon** disambiguates a single press (after ~300 ms) from a double-click. A single press raises the terminal of the session **shown on the glass** (raise only), acknowledging its alert. A **double-click** (two `B\|G` within ~300 ms) toggles **FOLLOW** mode. |
 | `B\|K` | **GO** long press (D2, held ≥ ~500 ms) — acknowledge the shown session's alert WITHOUT raising anything. No-op when nothing is unacknowledged. |
 
 **Reset note:** opening the USB serial port resets the Nano (~1.5 s). The `H`
@@ -270,3 +280,5 @@ silenced).
   **calm** session it stays on that session.
 * After 10 s without a press the selection returns to the live queue head.
 * PREV/NEXT wrap around the queue ends.
+* **FOLLOW** (double-click GO) makes PREV/NEXT also raise the selected terminal
+  after the selection settles (~250 ms); double-click again to turn it off.

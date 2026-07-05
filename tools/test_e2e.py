@@ -112,15 +112,26 @@ def saw_before(idx, pred):
     with display_lock:
         return any(pred(l) for l in display[:idx])
 
+# F|<flags>|<sel>|<r0>|<r1>|<r2>|<r3>
+def frame_flags(f):
+    p = f.split("|")
+    return int(p[1]) if len(p) >= 7 and p[1].lstrip("-").isdigit() else 0
+def frame_flash(f):  return bool(frame_flags(f) & 1)
+def frame_follow(f): return bool(frame_flags(f) & 2)
+def frame_sel(f):
+    p = f.split("|")
+    return int(p[2]) if len(p) >= 7 and p[2].lstrip("-").isdigit() else -99
 def frame_subject(f):
-    """Name field (r0) of an F|flash|r0|r1|r2|r3 line ('' if malformed)."""
-    parts = f.split("|")
-    return parts[2] if len(parts) >= 6 else ""
-
+    """Name field (r0) of an F| line ('' if malformed)."""
+    p = f.split("|")
+    return p[3] if len(p) >= 7 else ""
+def frame_r1(f):
+    p = f.split("|")
+    return p[4] if len(p) >= 7 else ""
 def frame_fleet(f):
-    """Fleet field (r3, last) of an F| line, kept intact incl. its '|' dividers."""
-    parts = f.split("|", 5)
-    return parts[5] if len(parts) >= 6 else ""
+    """Fleet field (r3, last), kept intact incl. its '|' dividers."""
+    p = f.split("|", 6)
+    return p[6] if len(p) >= 7 else ""
 
 def mark():
     with display_lock:
@@ -300,6 +311,51 @@ with display_lock:
 stayed_on_calm = (bool(frames_after_go11)
                   and frame_subject(frames_after_go11[-1]) == "webapp2")
 
+print("\n-- phase 12: double-click GO toggles FOLLOW; nav auto-raises in FOLLOW --")
+# Fresh clean slate of 3 working sessions, all with ctrl sockets so any raise is
+# observable. End the accumulated sessions first.
+for s in ("sid-1|webapp", "sid-2|api", "sid-3|infra", "sidW|webapp2",
+          "sidA|webapp-backend-service-one", "sidB|webapp-backend-service-two"):
+    feed("end|" + s)
+time.sleep(1.0)
+fa, fb, fc = fake_ctrl("folA"), fake_ctrl("folB"), fake_ctrl("folC")
+feed(f"working|sidFA|folA|{fa}")
+feed(f"working|sidFB|folB|{fb}")
+feed(f"working|sidFC|folC|{fc}")
+time.sleep(1.2)
+# Baseline: FOLLOW is off (no frame has the follow bit).
+idx_f = mark()
+with display_lock:
+    follow_off_at_start = not any(frame_follow(l) for l in display[idx_f:]
+                                  if l.startswith("F|"))
+# Double-click GO (two presses inside DOUBLE_CLICK_S) -> FOLLOW ON.
+with ctrl_lock:
+    ops_before_dbl = len(ctrl_ops)
+arduino_send("B|G"); time.sleep(0.10); arduino_send("B|G"); time.sleep(1.0)
+with display_lock:
+    follow_on_frame = any(frame_follow(l) for l in display[idx_f:] if l.startswith("F|"))
+with ctrl_lock:
+    dbl_raised = ctrl_ops[ops_before_dbl:]        # toggle-on raises the shown one
+# In FOLLOW, a nav must auto-raise the newly-shown terminal after the settle.
+with ctrl_lock:
+    ops_before_fnav = len(ctrl_ops)
+arduino_send("B|N"); time.sleep(0.8)              # > FOLLOW_SETTLE_S
+with ctrl_lock:
+    follow_nav_ops = ctrl_ops[ops_before_fnav:]
+follow_nav_raised = any(c == "focus" for (c, t) in follow_nav_ops)
+# Double-click again -> FOLLOW OFF; a nav must then raise NOTHING.
+idx_off = mark()
+arduino_send("B|G"); time.sleep(0.10); arduino_send("B|G"); time.sleep(1.0)
+with display_lock:
+    off_frames = [l for l in display[idx_off:] if l.startswith("F|")]
+follow_off_frame = bool(off_frames) and not frame_follow(off_frames[-1])
+with ctrl_lock:
+    ops_before_offnav = len(ctrl_ops)
+arduino_send("B|N"); time.sleep(0.8)
+with ctrl_lock:
+    off_nav_ops = ctrl_ops[ops_before_offnav:]
+follow_off_no_raise = (len(off_nav_ops) == 0)
+
 proc.terminate()
 try:
     proc.wait(timeout=5)
@@ -315,24 +371,30 @@ def check(name, ok):
     print(f"  [{'PASS' if ok else 'FAIL'}] {name}")
 
 def wellformed(f):
-    return len(f.split("|")) >= 6          # F|flash|r0|r1|r2|r3 (r3 may add more)
+    return len(f.split("|")) >= 7          # F|flags|sel|r0|r1|r2|r3 (r3 may add more)
 
 # ---- the single-frame protocol ------------------------------------------------
-check("empty boot shows the no-sessions frame (F|0|MATE|no sessions||)",
-      saw(lambda l: l.startswith("F|0|MATE|no sessions")))
-check("every F| frame is well-formed (>=6 fields)",
+check("empty boot shows the no-sessions frame (MATE / no sessions)",
+      saw(lambda l: l.startswith("F|") and frame_subject(l) == "MATE"))
+check("every F| frame is well-formed (>=7 fields)",
       all(wellformed(l) for l in display if l.startswith("F|")))
 check("working session frame: webapp name (r0) + WORK tag (r1), not flashing",
-      saw(lambda l: l.startswith("F|0|webapp|WORK")))
+      saw(lambda l: frame_subject(l) == "webapp" and frame_r1(l).startswith("WORK")
+          and not frame_flash(l)))
 check("model/effort rendered on its own row (Opus... xhigh)",
       saw(lambda l: l.startswith("F|") and "xhigh" in l and "Opus" in l))
-check("waiting session auto-surfaces and flashes (F|1|infra|WAIT...)",
-      saw_after(idx_wait, lambda l: l.startswith("F|1|infra|WAIT")))
-check("error outranks waiting: api auto-surfaces flashing (F|1|api|ERR...)",
-      saw_after(idx_err, lambda l: l.startswith("F|1|api|ERR")))
+check("waiting session auto-surfaces and flashes (infra/WAIT, flash bit set)",
+      saw_after(idx_wait, lambda l: frame_subject(l) == "infra"
+                and frame_r1(l).startswith("WAIT") and frame_flash(l)))
+check("error outranks waiting: api auto-surfaces flashing (api/ERR)",
+      saw_after(idx_err, lambda l: frame_subject(l) == "api"
+                and frame_r1(l).startswith("ERR") and frame_flash(l)))
 check("fleet row: '|'-separated status letters (E/B/W/D/I)",
       saw(lambda l: l.startswith("F|") and "|" in frame_fleet(l)
           and any(c in frame_fleet(l) for c in "EBWDI")))
+check("active-tab box: sel points at a fleet LETTER in r3",
+      saw(lambda l: l.startswith("F|") and 0 <= frame_sel(l) < len(frame_fleet(l))
+          and frame_fleet(l)[frame_sel(l)].isalpha()))
 
 # ---- LED (V|<KIND>) ------------------------------------------------------------
 check("V|OFF clears the loop at startup (before the first alert)",
@@ -353,7 +415,7 @@ check("NEXT/PREV walk the queue (api -> infra -> webapp -> infra)",
       has_run(nav_subjects, ["infra", "webapp", "infra"]))
 infra_navs = [f for f in nav_frames if frame_subject(f) == "infra"]
 check("browsing acks nothing (infra still flashing when REVISITED)",
-      bool(infra_navs) and infra_navs[-1].startswith("F|1|"))
+      bool(infra_navs) and frame_flash(infra_navs[-1]))
 
 # ---- GO / ACK triage sweep -----------------------------------------------------
 check("GO focuses the shown session (deep link session=sid-3 for infra)",
@@ -387,6 +449,20 @@ check("navigation sends ZERO window ops to wrapper ctrl sockets "
       nav_moved_nothing)
 check("the daemon NEVER sends 'collapse' (raise-only, always; non-vacuous)",
       bool(all_ops) and all(c == "focus" for (c, t) in all_ops))
+
+# ---- FOLLOW mode (double-click GO) ---------------------------------------------
+check("FOLLOW starts OFF (no follow bit before the double-click)",
+      follow_off_at_start)
+check("double-click GO turns FOLLOW ON (follow bit set in frames)",
+      follow_on_frame)
+check("turning FOLLOW on raises the shown terminal immediately",
+      any(c == "focus" for (c, t) in dbl_raised))
+check("in FOLLOW, PREV/NEXT auto-raise the selected terminal (raise only)",
+      follow_nav_raised)
+check("double-click GO again turns FOLLOW OFF",
+      follow_off_frame)
+check("with FOLLOW off, navigation raises NOTHING",
+      follow_off_no_raise)
 
 ok = all(checks)
 print("\n  focus.log:", focus_lines or "(empty)")

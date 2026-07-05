@@ -95,6 +95,13 @@ PORT_GLOBS = ("/dev/cu.usbserial*", "/dev/cu.usbmodem*")
 HOME_AFTER_S = 10.0          # no press for this long -> selection returns to
                              # the queue head; until then the screen NEVER
                              # changes subject on its own
+DOUBLE_CLICK_S = 0.30        # two GO short-presses within this window = a
+                             # double-click (toggles FOLLOW mode). A single GO
+                             # is deferred this long to disambiguate.
+FOLLOW_SETTLE_S = 0.25       # in FOLLOW mode, PREV/NEXT raise the selected
+                             # terminal only after the selection settles this
+                             # long -- so holding to scroll doesn't raise every
+                             # window it passes over (raise ONLY, never collapse)
 REALERT_SUPPRESS_S = 5.0     # a session re-entering the SAME alert class this
                              # soon after being acknowledged stays acknowledged
                              # (absorbs detection flaps re-firing the LED)
@@ -528,6 +535,10 @@ class Screen:
         # the raised terminal always matches the name the user is looking at.
         self._last_frame = ""
         self._shown_key: Optional[str] = None
+        # FOLLOW mode: when on, PREV/NEXT auto-raise the selected terminal. The
+        # active tab's fleet letter is boxed either way; the box is FILLED while
+        # following (the on-screen "switch"), an outline when not.
+        self._follow = False
         # LED loop tracker: what continuous loop the firmware is playing
         # ("ERROR"/"INPUT"/"DONE"/None); V| is (re)sent only when it changes.
         self._loop_kind: Optional[str] = _LOOP_UNSET
@@ -587,6 +598,30 @@ class Screen:
             self._last_press = time.time()
         self.refresh()
 
+    def toggle_follow(self) -> bool:
+        """Double-click GO: flip FOLLOW mode. Returns the new state."""
+        with self._lock:
+            self._follow = not self._follow
+            state = self._follow
+        self.refresh()          # redraw so the switch box fills/empties
+        return state
+
+    def is_follow(self) -> bool:
+        with self._lock:
+            return self._follow
+
+    def current_shown(self) -> Optional[Session]:
+        """The session whose frame is on the glass right now (for FOLLOW's
+        auto-raise), or None."""
+        with self._lock:
+            key = self._shown_key
+            if key is None:
+                return None
+            for s in self._reg.queue():
+                if s.key == key:
+                    return s
+            return None
+
     def resolve_press_target(self) -> Optional[Session]:
         """The session a GO/ACK press applies to: EXACTLY the one whose frame is
         on the glass (WYSIWYG). Never a freshly recomputed head -- so a press
@@ -607,17 +642,19 @@ class Screen:
 
     def _compose(self, queue: List[Session],
                  subject: Optional[Session]) -> Tuple[str, Optional[str], bool]:
-        """Build the F| line for the current state as four size-1 rows:
-            r0  session name (flashes while its alert is unacknowledged)
-            r1  state tag + time-in-state
-            r2  model + effort
-            r3  position + fleet strip (one '|'-separated status letter/session)
-        Returns (line, subject_key, flash). The fleet field is LAST and may
-        contain literal '|' (the firmware stops tokenizing at the 5th bar and
-        takes the rest verbatim), which is what lets the strip use '|' as its
-        visual divider."""
+        """Build the F| line for the current state:
+            F|<flags>|<sel>|<r0>|<r1>|<r2>|<r3>
+        with four size-1 rows (r0 name / r1 state+time / r2 model+effort /
+        r3 position + '|'-separated fleet letters). `flags` is a bitfield
+        (bit0 = flash the name, bit1 = FOLLOW mode -> fill the switch box);
+        `sel` is the character column WITHIN r3 of the active tab's fleet
+        letter to box (-1 = none). Returns (line, subject_key, flash). r3 is
+        LAST and may contain literal '|' (the firmware stops tokenizing at the
+        6th bar and takes the rest verbatim), which is what lets the strip use
+        '|' as its visual divider."""
+        follow = self._follow
         if subject is None:
-            return ("F|0|MATE|no sessions||", None, False)
+            return (f"F|{2 if follow else 0}|-1|MATE|no sessions||", None, False)
 
         names = _display_names(queue)
         r0 = names.get(subject.key, "?")[:ROW_CHARS]
@@ -639,9 +676,16 @@ class Screen:
         if len(strip) > room:
             strip = strip[:max(0, room - 1)] + "+"
         r3 = head + strip
+        # Column of the active tab's letter within r3 (letters sit at even
+        # strip offsets: 0,2,4,...; '|' dividers at the odds). -1 if the letter
+        # fell past a truncation.
+        sel = len(head) + 2 * (pos - 1)
+        if sel >= len(r3) or not r3[sel].isalpha():
+            sel = -1
 
         flash = subject.unacked_alert()
-        line = f"F|{1 if flash else 0}|{r0}|{r1}|{r2}|{r3}"
+        flags = (1 if flash else 0) | (2 if follow else 0)
+        line = f"F|{flags}|{sel}|{r0}|{r1}|{r2}|{r3}"
         return (line, subject.key, flash)
 
     def refresh(self, force: bool = False) -> None:
@@ -992,6 +1036,17 @@ class ButtonReader(threading.Thread):
         self._focus_serial = threading.Lock()
         self._focus_gen_lock = threading.Lock()
         self._focus_gen = 0
+        # GO double-click: a single GO is deferred DOUBLE_CLICK_S to see if a
+        # second GO follows (which toggles FOLLOW mode instead).
+        self._go_lock = threading.Lock()
+        self._go_timer: Optional[threading.Timer] = None
+        self._go_gen = 0
+        # FOLLOW-mode auto-raise: PREV/NEXT (re)arm this settle timer; when the
+        # selection stops moving for FOLLOW_SETTLE_S the shown terminal is
+        # raised (raise ONLY). Rapid scrolling never raises intermediate ones.
+        self._follow_lock = threading.Lock()
+        self._follow_timer: Optional[threading.Timer] = None
+        self._follow_gen = 0
 
     def run(self) -> None:
         while not self._stop_evt.is_set():
@@ -1013,11 +1068,11 @@ class ButtonReader(threading.Thread):
         if line.startswith("B|") and len(line) >= 3:
             ev = line[2]
             if ev == "P":                        # PREV: selection up the queue
-                self._screen.nav(-1)
+                self._nav(-1)
             elif ev == "N":                      # NEXT: selection down the queue
-                self._screen.nav(+1)
-            elif ev == "G":                      # GO short: acknowledge + raise
-                self._go()
+                self._nav(+1)
+            elif ev == "G":                      # GO short: focus / (dbl) follow
+                self._go_pressed()
             elif ev == "K":                      # GO long: acknowledge only
                 self._ack_only()
             else:
@@ -1025,18 +1080,96 @@ class ButtonReader(threading.Thread):
             return
         log(f"ignoring serial line from Arduino: {line!r}")
 
-    def _go(self) -> None:
-        """GO: raise the terminal of EXACTLY the session shown on the glass
-        (WYSIWYG). The ack happens first so the LED/display react instantly,
-        then the window is raised on a side thread -- the reader thread must
-        keep consuming button events. Focus threads are SERIALIZED (press order
-        == raise order) and a press still queued when a newer one arrives is
-        dropped (last wins).
+    # ---- navigation (+ FOLLOW-mode auto-raise) --------------------------- #
 
-        Screen behaviour: if the shown session was an ALERT (something to
-        triage), snap home so the next alert surfaces (n alerts = n presses).
-        If it was a CALM session (the user just wanted its terminal), STAY on
-        it -- do not jump to an alert elsewhere."""
+    def _nav(self, delta: int) -> None:
+        self._screen.nav(delta)
+        if self._screen.is_follow():
+            self._arm_follow_focus()
+
+    def _arm_follow_focus(self) -> None:
+        with self._follow_lock:
+            self._follow_gen += 1
+            gen = self._follow_gen
+            if self._follow_timer is not None:
+                self._follow_timer.cancel()
+            t = threading.Timer(FOLLOW_SETTLE_S, self._follow_fire, args=(gen,))
+            t.daemon = True
+            self._follow_timer = t
+            t.start()
+
+    def _follow_fire(self, gen: int) -> None:
+        """The selection settled in FOLLOW mode: raise the shown terminal
+        (raise ONLY, no acknowledge -- ack stays on GO long-press)."""
+        with self._follow_lock:
+            if gen != self._follow_gen:          # superseded by a newer nav
+                return
+            self._follow_timer = None
+        if not self._screen.is_follow():
+            return
+        sess = self._screen.current_shown()
+        if sess is None:
+            return
+        log(f"follow -> raise {sess.name}")
+        self._raise(sess)
+
+    # ---- GO: single (focus+ack) vs double-click (toggle FOLLOW) ---------- #
+
+    def _go_pressed(self) -> None:
+        """GO short-press. A single press (after DOUBLE_CLICK_S with no second
+        press) focuses+acks the shown session; a second press within the window
+        instead toggles FOLLOW mode."""
+        with self._go_lock:
+            if self._go_timer is not None:       # second press -> double-click
+                self._go_gen += 1
+                self._go_timer.cancel()
+                self._go_timer = None
+                on = self._screen.toggle_follow()
+                log(f"double-click GO -> FOLLOW {'ON' if on else 'OFF'}")
+                if on:                           # turning it on raises now
+                    sess = self._screen.current_shown()
+                    if sess is not None:
+                        self._raise(sess)
+                return
+            self._go_gen += 1
+            gen = self._go_gen
+            t = threading.Timer(DOUBLE_CLICK_S, self._go_single_fire, args=(gen,))
+            t.daemon = True
+            self._go_timer = t
+            t.start()
+
+    def _go_single_fire(self, gen: int) -> None:
+        with self._go_lock:
+            if gen != self._go_gen:              # a second press superseded it
+                return
+            self._go_timer = None
+        self._go()
+
+    def _raise(self, sess: Optional[Session]) -> None:
+        """Raise a session's window on a serialized side thread (raise ONLY).
+        Press order == raise order; a press still queued when a newer one
+        arrives is dropped (last wins)."""
+        if sess is None:
+            return
+        with self._focus_gen_lock:
+            self._focus_gen += 1
+            gen = self._focus_gen
+
+        def run() -> None:
+            with self._focus_serial:             # one raise at a time
+                with self._focus_gen_lock:
+                    if gen != self._focus_gen:   # superseded while queued
+                        return
+                focus_session(sess)
+
+        threading.Thread(target=run, name="focus", daemon=True).start()
+
+    def _go(self) -> None:
+        """A confirmed single GO: raise the terminal of EXACTLY the session
+        shown on the glass (WYSIWYG) and acknowledge it. If the shown session
+        was an ALERT (something to triage), snap home so the next alert
+        surfaces (n alerts = n presses); if it was a CALM session (the user
+        just wanted its terminal), STAY on it."""
         sess = self._screen.resolve_press_target()
         log(f"GO -> focus {sess.name if sess else '-'}")
         if sess is None:
@@ -1048,18 +1181,7 @@ class ButtonReader(threading.Thread):
             self._screen.snap_home()             # advance to the next alert
         else:
             self._screen.stay_on(sess)           # keep the focused terminal shown
-        with self._focus_gen_lock:
-            self._focus_gen += 1
-            gen = self._focus_gen
-
-        def run() -> None:
-            with self._focus_serial:             # one focus at a time
-                with self._focus_gen_lock:
-                    if gen != self._focus_gen:   # superseded while queued
-                        return
-                focus_session(sess)
-
-        threading.Thread(target=run, name="focus", daemon=True).start()
+        self._raise(sess)
 
     def _ack_only(self) -> None:
         """GO long-press: acknowledge the shown session's alert WITHOUT touching
@@ -1300,7 +1422,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         # Best-effort: silence the LED and leave an honest frame on the way out.
         try:
             link.write_line("V|OFF")
-            link.write_line("F|0|MATE|daemon stopped||")
+            link.write_line("F|0|-1|MATE|daemon stopped||")
         except Exception:
             pass
         link.close()

@@ -18,7 +18,9 @@
  *     |WAIT  0:42           |   r1: state tag + time-in-state
  *     |Opus 4.8  xhigh      |   r2: model + effort
  *     |2/6 W|B|E|D|I        |   r3: queue position + one status LETTER per
- *     +---------------------+       session, '|'-separated (E/B/W/D/I)
+ *     +---------------------+       session, '|'-separated (E/B/W/D/I). The
+ *                                   active tab's letter is boxed (a switch:
+ *                                   filled = FOLLOW mode on, outline = off).
  *
  * The firmware is a dumb renderer: it holds exactly one frame (3 text rows +
  * a flash flag) and draws it. All ordering, selection, truncation, and text
@@ -57,15 +59,18 @@
  *
  * SERIAL PROTOCOL (115200 8N1, ASCII lines terminated by '\n', fields split '|')
  *   Daemon -> Arduino:
- *     F|<flash>|<r0>|<r1>|<r2>|<r3>      the whole screen, pre-rendered as four
- *                                        size-1 rows (each up to 21 chars).
- *         flash = 1: invert row 0 (the name) at ~2.5 Hz (unacked alert)
+ *     F|<flags>|<sel>|<r0>|<r1>|<r2>|<r3>  the whole screen, pre-rendered as
+ *                                        four size-1 rows (each up to 21 chars).
+ *         flags = bitfield: bit0 = flash row 0 (the name) at ~2.5 Hz (unacked
+ *                 alert); bit1 = FOLLOW mode (fill the active-tab switch box)
+ *         sel   = column in r3 of the active tab's fleet letter to box
+ *                 (-1 = none). Filled box = FOLLOW on, outline = off.
  *         r0    = session name
  *         r1    = state tag + time-in-state
  *         r2    = model + effort
  *         r3    = queue position + '|'-separated status letters. r3 is the LAST
  *                 field and MAY contain literal '|' (the tokenizer stops at the
- *                 5th bar and takes the rest verbatim) -- that is what lets the
+ *                 6th bar and takes the rest verbatim) -- that is what lets the
  *                 fleet strip use '|' as its on-screen divider.
  *     V|<kind>                           LED alert control (light only):
  *                                        START one-shot start blink; INPUT /
@@ -78,7 +83,11 @@
  *                                        the daemon answers with a full resend
  *     K                                  keepalive ack (reply to P)
  *     B|P  B|N                           PREV / NEXT pressed (or auto-repeat)
- *     B|G                                GO short press (focus + acknowledge)
+ *     B|G                                GO short press. Single = focus the
+ *                                        shown session; DOUBLE (two within
+ *                                        ~0.3s, disambiguated daemon-side) =
+ *                                        toggle FOLLOW mode (PREV/NEXT then
+ *                                        auto-raise the selected terminal).
  *     B|K                                GO long press (acknowledge only)
  *
  * NOTE: opening the USB serial port resets the Nano (~1.5s). That is why we emit
@@ -144,6 +153,9 @@ static bool  lineOverflow = false;   // drop the rest of an over-long line
 // Four size-1 rows, drawn top-to-bottom. row[0] (the name) inverts while flash.
 static char  frameRow[4][ROW_CHARS + 1] = {{0}};
 static bool  frameFlash = false;     // invert row 0 (the name) at ~2.5 Hz
+static bool  frameFollow = false;    // FOLLOW mode: fill the active-tab switch box
+static int8_t frameSel  = -1;        // active tab's fleet-letter column in row 3
+                                     // (box it); -1 = none
 static bool  haveFrame  = false;     // false until the first F| arrives
 static bool  linkLost   = false;     // daemon silent > LINK_WATCHDOG_MS
 static bool  gBlinkOn   = true;      // shared blink phase for the flash band
@@ -346,6 +358,18 @@ static void drawFrame() {
     display.fillRect(0, 0, SCREEN_WIDTH, ROW_H, SSD1306_INVERSE);
   }
 
+  // Active-tab switch: box the selected fleet letter on row 3 (y=24). The box
+  // is FILLED (inverted letter) while FOLLOW mode is on -- the on-screen
+  // switch -- and an outline otherwise.
+  if (frameSel >= 0) {
+    int16_t bx = (int16_t)frameSel * 6;          // 6px per size-1 char
+    if (frameFollow) {
+      display.fillRect(bx, 24, 6, ROW_H, SSD1306_INVERSE);      // switch ON
+    } else {
+      display.drawRect(bx - 1, 23, 8, ROW_H + 1, SSD1306_WHITE); // switch OFF
+    }
+  }
+
   display.display();
 }
 
@@ -397,24 +421,27 @@ static void handleLine(char *line) {
                                          // which would restart the pattern
                                          // phase every 15 s.
 
-    case 'F': {  // F|<flash>|<r0>|<r1>|<r2>|<r3> -- the whole screen
-      // Split off exactly the first 5 '|'; fields[5] (=r3) then holds the rest
+    case 'F': {  // F|<flags>|<sel>|<r0>|<r1>|<r2>|<r3> -- the whole screen
+      // Split off exactly the first 6 '|'; fields[6] (=r3) then holds the rest
       // of the line VERBATIM, including any literal '|' (the fleet divider).
-      char *fields[6];
+      char *fields[7];
       uint8_t n = 0;
       char *p = line;
       fields[n++] = p;                   // fields[0] = "F"
-      while (n < 6) {
+      while (n < 7) {
         char *bar = strchr(p, '|');
         if (!bar) break;
         *bar = 0;
         p = bar + 1;
         fields[n++] = p;
       }
-      if (n < 6) break;                  // malformed: ignore
-      frameFlash = (fields[1][0] == '1');
+      if (n < 7) break;                  // malformed: ignore
+      uint8_t flags = (uint8_t)atoi(fields[1]);
+      frameFlash  = flags & 1;
+      frameFollow = flags & 2;
+      frameSel    = (int8_t)atoi(fields[2]);   // -1 = no active-tab box
       for (uint8_t r = 0; r < 4; r++)
-        copyField(frameRow[r], sizeof(frameRow[r]), fields[2 + r]);
+        copyField(frameRow[r], sizeof(frameRow[r]), fields[3 + r]);
       haveFrame = true;
       requestRender();
       break;

@@ -66,6 +66,9 @@ const Demo DEMOS[] = {
   {"notes",        "IDLE  05:30", "",                 "5/5 E|B|D|W|I", false},
 };
 const uint8_t DEMO_COUNT = sizeof(DEMOS) / sizeof(DEMOS[0]);
+// Active-tab switch box: r3 is "N/5 E|B|D|W|I" -> letters start at col 4, each
+// tab 2 cols apart, so demo i's own letter sits at col 4 + i*2. Alternate the
+// fill (FOLLOW on/off) each cycle so both box styles are visible on hardware.
 
 uint8_t demoIdx = 0;
 unsigned long lastStepMs = 0;
@@ -139,6 +142,11 @@ static void drawDemo(uint8_t i) {
   if (d.flash && blinkOn) {
     display.fillRect(0, 0, SCREEN_WIDTH, 8, SSD1306_INVERSE);   // flash the name row
   }
+  // Active-tab switch box on this demo's own fleet letter (col 4 + i*2), fill
+  // alternating so both the FOLLOW-on (filled) and off (outline) looks show.
+  int16_t bx = (int16_t)(4 + i * 2) * 6;
+  if (i & 1) display.fillRect(bx, 24, 6, 8, SSD1306_INVERSE);
+  else       display.drawRect(bx - 1, 23, 8, 9, SSD1306_WHITE);
   display.display();
 }
 
