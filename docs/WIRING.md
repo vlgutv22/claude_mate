@@ -12,9 +12,10 @@ the **indication LED on D8** is the alert output, driven by the daemon via
 
 ## The display + indication LED
 
-The OLED is the **sole visual status**: one pre-rendered frame — a size-2
-session name band (flashing while its alert is unacknowledged), an info row,
-and a fleet strip. The daemon composes it and sends it; the Arduino renders it.
+The OLED is the **sole visual status**: one pre-rendered frame of four size-1
+rows — session name (flashing while its alert is unacknowledged), state + time,
+model + effort, and a position + fleet-letter strip. The daemon composes it and
+sends it; the Arduino renders it.
 
 The **indication LED on D8** is the alert output. Alerts are driven by the
 daemon via `V|<kind>` for the worst unacknowledged alert class. Because the

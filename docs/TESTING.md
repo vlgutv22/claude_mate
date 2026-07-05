@@ -33,14 +33,16 @@ pip install pyserial                  # one-time, for the e2e test
 python3 tools/test_e2e.py             # fake Arduino over a PTY + a fake PTY-wrapper
                                       # ctrl socket: drives real hook lines through
                                       # the socket, presses fake buttons (B|P/N/G/K),
-                                      # and asserts 26 checks — the F|flash|name|
-                                      # info|fleet frame protocol, the V|<KIND> LED
-                                      # lines (incl. handshake re-arm), the PREV/NEXT
-                                      # queue walk, the GO/ACK triage sweep (GO
-                                      # focuses + snaps home; B|K acks without
-                                      # focusing; last ack -> V|OFF), sibling-name
-                                      # disambiguation, the press-grace wrong-target
-                                      # guard, and the window-op invariants
+                                      # and asserts ~30 checks — the
+                                      # F|flash|r0|r1|r2|r3 frame protocol (four
+                                      # size-1 rows + the '|'-separated letter fleet
+                                      # strip), the V|<KIND> LED lines (incl.
+                                      # handshake re-arm), the PREV/NEXT queue walk,
+                                      # the GO/ACK triage sweep (GO focuses exactly
+                                      # the shown session — WYSIWYG — then snaps to
+                                      # the next alert; B|K acks without focusing;
+                                      # last ack -> V|OFF), sibling-name
+                                      # disambiguation, and the window-op invariants
                                       # (navigation sends ZERO window ops; GO sends
                                       # exactly one 'focus'; 'collapse' is never
                                       # sent). Nothing is launched on your Mac:
@@ -79,11 +81,12 @@ Pass criterion: a `cu.*` device appears (and disappears when you unplug).
 Confirm the **hardware** works independently of the protocol. Flash the selftest
 sketch (`firmware/selftest/selftest.ino`) and watch the board. On boot it now:
 
-- **Cycles a demo frame** through `ERR → WAIT → DONE → WORK → IDLE` on the OLED
+- **Cycles a 4-row demo frame** (name / state+time / model+effort /
+  position+fleet letters) through `ERR → WAIT → DONE → WORK → IDLE` on the OLED
   every ~3 s in the real interface layout, printing each one over serial, and
   **plays the matching LED pattern on D8** on each change (ERROR strobe, INPUT
   blink, DONE cascade, START one-shot, dark on IDLE) → display + LED OK.
-- The **OLED** lights up and shows the frame (alert names flashing) → software
+- The **OLED** lights up and shows the frame (the alert name row flashing) → software
   I2C (SDA A4 / SCL A3) + display OK (if blank, try address **0x3D**; if it's
   a 1.3" panel, you may need the **SH1106** driver — see [WIRING.md](WIRING.md)).
 - Pressing **GO (D2)**, **NEXT (D3)**, and **PREV (D4)** is printed over serial
@@ -93,7 +96,8 @@ sketch (`firmware/selftest/selftest.ino`) and watch the board. On boot it now:
 This validates OLED + indication LED + buttons with **no Mac software**.
 
 Pass criterion: the OLED cycles the demo frames in the real interface layout
-(size-2 name band + info row + fleet strip, alert names flashing), the D8 LED
+(four size-1 rows — name / state+time / model+effort / position+fleet letters,
+the alert name row flashing), the D8 LED
 plays the matching pattern on each change (ERROR strobe / INPUT blink / DONE
 cascade / START one-shot / dark on IDLE), and all three buttons print their
 press lines (GO D2 / NEXT D3 / PREV D4).
@@ -114,12 +118,13 @@ Flash the **real firmware**. Open the Arduino IDE **Serial Monitor** at
 2. Now **send** lines by hand and watch the display. Send a full frame:
 
    ```
-   F|1|api-server|ERR  00:42 Opus xhigh|1/3 !?>
+   F|1|api-server|WAIT  0:42|Opus 4.8  xhigh|1/3 B|W|D
    ```
 
-   → the OLED shows the frame: size-2 name `api-server` with the band
-   **flashing** (flash flag `1`), the info row, and the fleet strip. Send the
-   same frame with a leading `F|0|…` and the flashing stops.
+   → the OLED shows the frame as four size-1 rows: the name `api-server` on r0
+   **flashing** (flash flag `1`), the state + time on r1, the model + effort on
+   r2, and the position + fleet letter strip on r3. Send the same frame with a
+   leading `F|0|…` and the flashing stops.
 
    Blink the LED with `V|<kind>` and watch each pattern:
 
@@ -142,7 +147,7 @@ Flash the **real firmware**. Open the Arduino IDE **Serial Monitor** at
    P
    ```
 
-   → the board replies `H`.
+   → the board replies `K` (the keepalive ack; `H` is sent only on boot/reset).
 
 4. Press the physical buttons and confirm the Serial Monitor prints:
 
@@ -156,7 +161,7 @@ Flash the **real firmware**. Open the Arduino IDE **Serial Monitor** at
    Also confirm the panel does a quick ~80 ms invert blip on every press.
 
 Pass criterion: `H` on boot, `F|` frames render (flash flag flashes the name
-band), the LED patterns (`V|`, incl. the looping kinds stopped by `V|OFF`)
+row), the LED patterns (`V|`, incl. the looping kinds stopped by `V|OFF`)
 play from typed lines, LINK LOST appears after ~30 s of silence, buttons emit
 `B|G`/`B|K`/`B|N`/`B|P` with auto-repeat on held PREV/NEXT.
 
@@ -176,7 +181,7 @@ python3 $REPO/daemon/claude_mate_daemon.py --mock
 `waiting` session, so all four words appear). Watch the real hardware:
 
 - The **screen** rests on the queue head — the most urgent session (an unacked
-  `error` first, then `waiting`, then `done`); its name band **flashes** while
+  `error` first, then `waiting`, then `done`); its name row **flashes** while
   the alert is unacknowledged. As the mock states cycle, the subject follows
   the worst unacked alert.
 - The **LED** plays the pattern of the worst unacked class (`V|ERROR` strobe >
@@ -184,9 +189,9 @@ python3 $REPO/daemon/claude_mate_daemon.py --mock
   `V|START` blink fires when a session starts working with nothing else pending.
 - Press **NEXT** / **PREV** → the selection steps down/up the queue (wraps);
   the screen then stays where you put it for ~10 s after your last press.
-- Press **GO** → the daemon acknowledges the shown session and attempts to
-  raise its window (in mock, watch the daemon log for the focus call); the
-  selection snaps home to the next alert.
+- Press **GO** → the daemon acknowledges the session **shown on the glass**
+  (WYSIWYG) and attempts to raise its window (in mock, watch the daemon log for
+  the focus call); the selection then snaps to the next alert.
 - **Hold GO** (~0.5 s) → acknowledges WITHOUT any window op; the flashing and
   the LED loop stop, and the next alert surfaces.
 
@@ -215,7 +220,7 @@ the socket format `<state>|<session_id>|<name>` (here:
 `working|abc123|demo`). Try each state — `working`, `waiting`, `done`, `error` —
 and watch the frame and the LED update accordingly:
 
-- `error` → `ERR` frame, name band flashing + a looping `V|ERROR` strobe
+- `error` → `ERR` frame, name row flashing + a looping `V|ERROR` strobe
   (until you GO / hold GO / it clears).
 - `waiting` → `WAIT` frame, flashing + a looping `V|INPUT` blink.
 - `done` → `DONE` frame, flashing + a looping `V|DONE` cascade.
@@ -244,7 +249,7 @@ and the hooks merged (see [INSTALL.md](INSTALL.md)):
    instead of `Stop` on API errors — they never both fire.)
 5. Open multiple sessions and confirm the queue orders them unacked-alerts
    first (`error` → `waiting` → `done`, oldest first), then the rest by class;
-   the fleet strip on the bottom row shows one glyph per session.
+   the fleet strip on the bottom row shows one letter per session.
 6. Press **GO** on a shown session → its terminal window is **raised** (wrapper
    sessions) or VS Code focuses via the deep link / workspace fallback (see
    the focus Limitations in [ARCHITECTURE.md](ARCHITECTURE.md)). Confirm

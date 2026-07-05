@@ -12,17 +12,17 @@ in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
 
 ```
         ┌───────────────────────┐
-        │ api-server            │   ← size-2 session name (flashes while its alert
-        │                       │      is unacknowledged)
-        │ WAIT  0:42 Opus xhigh │   ← state · time-in-state · model/effort
-        │ 2/6 !?*>>.            │   ← queue position · whole-fleet glyph strip
+        │ api-server            │   ← r0: session name (flashes while its alert
+        │ WAIT  0:42            │   ← r1: state · time-in-state    is unacknowledged)
+        │ Opus 4.8  xhigh       │   ← r2: model · effort
+        │ 2/6 E|B|W|D|I         │   ← r3: queue position · whole-fleet letter strip
         └───────────────────────┘
               (•) indication LED               ← blinks per alert class, until you ack
           [ PREV ]   [ GO ]   [ NEXT ]         ← three buttons — same meaning, always
    PREV/NEXT: step the triage queue (hold = auto-repeat)   GO: short = ack + raise its window · long = ack only
 
-   the flash: name band inverting = unacknowledged (needs you) · steady = seen
-   the strip: ! error · ? waiting · * done · > working · . idle — one glyph per session, queue order
+   the flash: name row inverting = unacknowledged (needs you) · steady = seen
+   the strip: E error · B waiting · W working · D done · I idle — one letter per session, queue order
    the LED:   START 1 s blink · INPUT even blink · DONE 4-blink cascade · ERROR fast strobe  (loops until you GO/ack)
 ```
 
@@ -35,7 +35,7 @@ in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
 
 The daemon keeps ONE urgency-sorted **triage queue** of every Claude Code
 session and renders ONE screen: the session that most needs you, over a
-whole-fleet glyph strip. The LED blinks a status-distinct pattern for the worst
+whole-fleet letter strip. The LED blinks a status-distinct pattern for the worst
 *unacknowledged* alert — so a single tab finishing, blocking, or erroring is
 *seen* even while the rest of your fleet keeps working. It keeps blinking until
 you deal with it. There are **no UI modes**: the three buttons — **PREV · GO ·
@@ -79,17 +79,17 @@ hooks are the zero-dependency feed. Use whichever fits each session.
   **without** touching any window. Buttons fire instantly (edge-accepted
   ~40 ms debounce), and every accepted press inverts the whole panel for
   ~80 ms — instant "the device heard you" feedback.
-- ***n* alerts, *n* presses** — after every GO/ACK the selection snaps home to
-  the (new) queue head, so a stack of pending alerts is handled with exactly
-  one press each, zero navigation. After ~10 s without a press the screen
-  snaps home on its own.
+- ***n* alerts, *n* presses** — after acknowledging an alert the selection
+  snaps to the next alert, so a stack of pending alerts is handled with exactly
+  one press each, zero navigation. Focusing a **calm** session (nothing to
+  triage) keeps it on the glass instead of jumping away. After ~10 s without a
+  press the screen returns to the queue head on its own.
 - **Navigation never touches windows** — the ONLY window operation in the
   whole system is GO, and it only **raises/activates**; the daemon never
   collapses, resizes, or miniaturizes anything.
-- **Press-grace guard** — if the screen auto-swapped subjects a split second
-  (< 0.5 s) before your GO landed while you were reading an unacknowledged
-  alert, the press applies to the alert you were reading — never to a window
-  you did not choose.
+- **GO is WYSIWYG** — GO/ACK act on exactly the session whose name is on the
+  glass, never a freshly recomputed queue head. So a press can only ever raise
+  the terminal you are actually looking at.
 - **Status-distinct LED alerts** — the indication LED blinks the pattern of the
   *worst unacknowledged* alert across the whole fleet:
   - **START** — a job (re)started → one long 1 s blink (one-shot).
@@ -107,13 +107,13 @@ hooks are the zero-dependency feed. Use whichever fits each session.
   **done** and *stays* done (name flashing, LED looping) until you acknowledge
   it; later idle keepalives don't silently clear it. GO (or a long-press ACK)
   acknowledges it.
-- **Flashing name band** — while the shown session's alert is unacknowledged,
-  the big size-2 name inverts at ~2.5 Hz; once acknowledged it goes steady. At
+- **Flashing name row** — while the shown session's alert is unacknowledged,
+  the top name row inverts at ~2.5 Hz; once acknowledged it goes steady. At
   a glance you know whether you've seen it.
 - **Whole-fleet strip** — the bottom row shows your queue position
-  (`pos/total`) plus one glyph per session in queue order: `!` error ·
-  `?` waiting · `*` done · `>` working · `.` idle.
-- **Live time-in-state** — the info row counts up how long the session has
+  (`pos/total`) plus one status letter per session in queue order,
+  `|`-separated: `E` error · `B` waiting · `W` working · `D` done · `I` idle.
+- **Live time-in-state** — the state row counts up how long the session has
   been in its current state: for a `working` tab that IS the live turn
   runtime; for an alert it is how long it has been waiting on *you*.
 - **One-button FOCUS** — GO raises the session's window: first the **PTY
@@ -154,7 +154,7 @@ hooks are the zero-dependency feed. Use whichever fits each session.
    │   Python daemon (Mac)                        │
    │   • ONE triage queue + "done-until-acked"    │   (unacked error > waiting > done first,
    │   • ONE pre-rendered screen                  │    then everything else by class)
-   │       F|<flash>|<name>|<info>|<fleet>        │
+   │       F|<flash>|<r0>|<r1>|<r2>|<r3>          │
    │   • LED policy  V|<START/INPUT/DONE/ERR/OFF> │   worst unacked class, loops until ack
    │   • GO: raise the session's window — RAISE   │
    │     ONLY (wrapper ctrl-sock → VS Code link)  │
@@ -190,8 +190,8 @@ Two control flows worth calling out:
 > The **triage queue** (unacknowledged **error > waiting > done** first, then
 > everything else by class) is the daemon's whole priority model: it decides
 > what the screen shows, what one GO press acts on, and what the LED blinks
-> about. The OLED's *big text* is the selected session's **name**; its state
-> (`ERR`/`WAIT`/`DONE`/`WORK`/`IDLE`) leads the info row.
+> about. The OLED's top row is the selected session's **name**; its state
+> (`ERR`/`WAIT`/`DONE`/`WORK`/`IDLE`) leads the second row.
 
 ---
 
@@ -219,7 +219,7 @@ but keeps its state until it changes. An alert can also die by
 answered in the terminal) or by **TTL pruning**; nothing else removes one. A
 session re-entering the same alert class within ~5 s of being acknowledged
 stays acknowledged, so a bouncing detector can't re-fire the LED you just
-silenced. The flashing name band mirrors the ack state: inverting while
+silenced. The flashing name row mirrors the ack state: inverting while
 unacknowledged, steady once seen. If the daemon ever dies mid-alert, the
 firmware stops the loop on its own after ~30 s of serial silence and shows the
 **LINK LOST** screen.
@@ -385,8 +385,8 @@ claude_mate/
   it) but does **not** offer a "retry" action. Reliably resubmitting a turn from outside the
   GUI is not feasible, so GO — taking you to the session — is the intended
   response.
-- **Model/effort strings are best-effort.** The info row's model/effort text
-  (e.g. `Opus 4.8 xhigh`) is scraped from the live TUI by the PTY wrapper and
+- **Model/effort strings are best-effort.** The model/effort row (e.g.
+  `Opus 4.8  xhigh`) is scraped from the live TUI by the PTY wrapper and
   stays empty for hook-only sessions or until scraped. Claude Mate never
   fabricates it; treat this as an extension point.
 - **FOCUS targets the wrapper's terminal first, then VS Code.** A wrapped session
@@ -412,17 +412,18 @@ three buttons**:
 - **UI modes are gone.** No SCROLL/LIST toggle, no carousel, no detail card, no
   mode long-press. The daemon keeps ONE urgency-sorted triage queue
   (unacknowledged error > waiting > done first, then everything else by class)
-  and pre-renders ONE screen — size-2 name band + info row + fleet strip; the
-  firmware is a dumb one-frame renderer.
+  and pre-renders ONE screen — four size-1 rows (name · state+time ·
+  model+effort · position+fleet strip); the firmware is a dumb one-frame
+  renderer.
 - **Buttons are PREV / GO / NEXT everywhere.** GO short = acknowledge + raise
-  the window; GO long = acknowledge only; PREV/NEXT auto-repeat while held. The
-  selection snaps home to the queue head after every GO/ACK and after ~10 s
-  idle, and a press-grace guard (< 0.5 s) keeps a just-swapped screen from
-  stealing your press.
+  the window; GO long = acknowledge only; PREV/NEXT auto-repeat while held.
+  GO/ACK act on exactly the session shown (WYSIWYG); acknowledging an alert
+  snaps to the next alert, while focusing a calm session keeps it on screen.
+  After ~10 s idle the selection returns to the queue head.
 - **Navigation never touches windows.** The terminal-follow preview
   (collapse/expand on navigation) is gone; GO **raises only** and the daemon
   never sends `collapse`.
-- **Serial protocol simplified.** Down: `F|<flash>|<name>|<info>|<fleet>` +
+- **Serial protocol simplified.** Down: `F|<flash>|<r0>|<r1>|<r2>|<r3>` +
   `V|<kind>` + `P`. Up: `H` + `B|P` / `B|N` / `B|G` / `B|K`. The old
   `D|` / `S|` / `T|` / `I` lines and `B|1`..`B|5` are gone.
 - **Firmware additions:** a boot splash, a **LINK LOST** screen after ~30 s of

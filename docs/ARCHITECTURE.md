@@ -4,8 +4,9 @@ Claude Mate is a USB hardware companion for Claude Code. It is an Arduino Nano
 driving a small I2C OLED, three buttons, and an **indication LED**. The daemon
 keeps ONE urgency-sorted **triage queue** of sessions and the OLED shows ONE
 screen — the *selected* session (normally the queue head, i.e. the thing that
-needs the human most): a size-2 session name over an info row (state +
-time-in-state + model/effort) and a whole-fleet glyph strip. The LED blinks a
+needs the human most): four size-1 rows — the session name, the state +
+time-in-state, the model + effort, and a whole-fleet letter strip (with the
+queue position). The LED blinks a
 status-distinct pattern (driven by the daemon) for the worst unacknowledged
 alert, looping until you acknowledge it. It shows the live status of one or
 more Claude Code sessions running in the VS Code native extension (and/or the
@@ -37,7 +38,7 @@ Python daemon  (daemon/claude_mate_daemon.py)
         |   - sorts ONE triage queue: unacknowledged alerts first
         |     (error > waiting > done, oldest first), then everything
         |     else by class (error > waiting > done > working > idle)
-        |   - pre-renders ONE screen:  F|<flash>|<name>|<info>|<fleet>
+        |   - pre-renders ONE screen:  F|<flash>|<r0>|<r1>|<r2>|<r3>
         |   - drives the LED:  V|<kind> for the worst unacked alert class
         v
 USB serial  (115200 8N1, ASCII lines, '|' delimited, '\n' terminated)
@@ -46,9 +47,10 @@ USB serial  (115200 8N1, ASCII lines, '|' delimited, '\n' terminated)
 Arduino Nano (ATmega328P)
         |
         +--> OLED SSD1306 128x32 (software I2C, addr 0x3C)  draws the one frame it
-        |                                            was last sent: size-2 name
-        |                                            band (flashing ~2.5 Hz while
-        |                                            unacked) + info row + fleet strip
+        |                                            was last sent: four size-1
+        |                                            rows — name (flashing ~2.5 Hz
+        |                                            while unacked), state+time,
+        |                                            model+effort, fleet strip
         +--> indication LED (D8)                    plays V|<kind>: START one-shot;
                                                      INPUT/DONE/ERROR loop until V|OFF
 
@@ -189,33 +191,36 @@ LINK LOST screen** if the daemon goes fully silent for ~30 s. See
 ## Screen behaviour
 
 The screen is **daemon-driven**: the Arduino only ever shows the single frame
-it was last told to show via an `F|<flash>|<name>|<info>|<fleet>` line.
+it was last told to show via an `F|<flash>|<r0>|<r1>|<r2>|<r3>` line.
 
-- **What a frame shows:** the selected session's name (≤ 10 chars, size-2,
-  inverting ~2.5 Hz while its alert is unacknowledged), an info row (≤ 21
-  chars: 4-char state tag `ERR `/`WAIT`/`DONE`/`WORK`/`IDLE`, time in that
-  state, best-fit model/effort), and a fleet row (≤ 21 chars: `pos/total` +
-  one glyph per session in queue order — `!` error, `?` waiting, `*` done,
-  `>` working, `.` idle; cut with a trailing `+` when it doesn't fit).
+- **What a frame shows:** four size-1 rows (≤ 21 chars each) — **r0** the
+  selected session's name (full width, ~21 chars, inverting ~2.5 Hz while its
+  alert is unacknowledged); **r1** the state (4-char tag
+  `ERR `/`WAIT`/`DONE`/`WORK`/`IDLE` + time in that state); **r2** the best-fit
+  model + effort on its own row; **r3** the fleet strip (`pos/total` + one
+  status letter per session in queue order, `|`-separated — `E` error,
+  `B` waiting, `W` working, `D` done, `I` idle; cut with a trailing `+` when it
+  doesn't fit).
 - **Screen ownership:** the display changes subject on its own ONLY when the
-  user is idle (no press for **10 s**). After a GO/ACK the selection snaps home
-  to the (new) queue head, so *n* pending alerts are handled with exactly *n*
-  presses.
+  user is idle (no press for **10 s**). Acknowledging an **alert** with GO/ACK
+  snaps to the next alert, so *n* pending alerts are handled with exactly *n*
+  presses; focusing a **calm** session (nothing to triage) keeps it on the
+  glass instead of jumping away.
 - **Navigation:** **PREV** / **NEXT** step the selection up/down the queue,
   wrap around the ends, and auto-repeat while held (400 ms to start, then
   5/s). Selection is tracked by session **key**, so queue re-sorts never move
   the subject out from under the cursor (only the `pos/total` number changes).
-- **Press-grace guard:** if the screen swapped subjects *on its own* less than
-  **0.5 s** before a GO/ACK arrived while the user was reading an
-  unacknowledged alert, the press applies to the alert that was being read —
-  never to a window the user did not choose.
+- **WYSIWYG:** GO/ACK act on exactly the session whose frame is on the glass —
+  never a freshly recomputed queue head. So a press can only ever raise the
+  terminal whose name the user is actually looking at.
 - The daemon sends an `F` line whenever the rendered bytes change: immediately
   on any state change or button, and ~1/s while a displayed time ticks.
   Identical frames are not re-sent (except on handshake). With **zero
-  sessions** it sends `F|0|MATE|no sessions|`.
+  sessions** it sends `F|0|MATE|no sessions||`.
 
-Long sibling names that collide at 10 chars are disambiguated with a middle
-squeeze (`proj~a-one`). The exact line format is in [PROTOCOL.md](PROTOCOL.md).
+Long sibling names that collide at the row width are disambiguated with a
+middle squeeze (first 9 + `~` + last 10, e.g. `webapp-ba~ervice-one`). The
+exact line format is in [PROTOCOL.md](PROTOCOL.md).
 
 ---
 
@@ -289,7 +294,7 @@ These are deliberate, documented boundaries — not bugs:
   attempt it. The hardware surfaces an `error` state as a flashing `ERR` frame
   (with the looping `V|ERROR` strobe) so a human can act, but the only button
   action toward a session is **GO** (raise its window).
-- **Model/effort strings are best-effort.** The info row's model/effort text is
+- **Model/effort strings are best-effort.** The model/effort row is
   scraped from the live TUI by the PTY wrapper and stays empty for hook-only
   sessions or until scraped. The daemon **never fabricates** it; it fits
   whatever it reliably knows into the 21-char row.
