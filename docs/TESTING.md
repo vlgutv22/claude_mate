@@ -30,12 +30,21 @@ Two self-contained tests exercise the Mac side before you touch any hardware:
 ```sh
 pip install pyserial                  # one-time, for the e2e test
 
-python3 tools/test_e2e.py             # fake Arduino over a PTY: drives real
-                                      # hook events through the socket and asserts
-                                      # the status word (D|FREE / D|WIP /
-                                      # D|BLOCKED / D|WTF), carousel cards, and the
-                                      # FOCUS deep-link (nothing is launched; the
-                                      # vibration motor lives only on the Arduino)
+python3 tools/test_e2e.py             # fake Arduino over a PTY + a fake PTY-wrapper
+                                      # ctrl socket: drives real hook lines through
+                                      # the socket, presses fake buttons (B|P/N/G/K),
+                                      # and asserts 26 checks — the F|flash|name|
+                                      # info|fleet frame protocol, the V|<KIND> LED
+                                      # lines (incl. handshake re-arm), the PREV/NEXT
+                                      # queue walk, the GO/ACK triage sweep (GO
+                                      # focuses + snaps home; B|K acks without
+                                      # focusing; last ack -> V|OFF), sibling-name
+                                      # disambiguation, the press-grace wrong-target
+                                      # guard, and the window-op invariants
+                                      # (navigation sends ZERO window ops; GO sends
+                                      # exactly one 'focus'; 'collapse' is never
+                                      # sent). Nothing is launched on your Mac:
+                                      # open/code/osascript are stubbed.
 
 python3 tools/test_settings_merge.py  # proves the installer's settings.json merge
                                       # preserves your existing config and is idempotent
@@ -70,21 +79,24 @@ Pass criterion: a `cu.*` device appears (and disappears when you unplug).
 Confirm the **hardware** works independently of the protocol. Flash the selftest
 sketch (`firmware/selftest/selftest.ino`) and watch the board. On boot it now:
 
-- **Cycles the word** through `FREE → WIP → BLOCKED → WTF` on the OLED every ~2 s,
-  printing each one over serial, and **buzzes the vibration motor** on each change
-  (WTF = 3 pulses, BLOCKED = 2, FREE = 1 short tick, WIP = silent) → display +
-  motor driver OK.
-- The **OLED** lights up and shows text + the current word → I2C + display OK
-  (if blank, try address **0x3D**; if it's a 1.3" panel, you may need the
-  **SH1106** driver — see [WIRING.md](WIRING.md)).
-- Pressing **SUBMIT (D2)**, **NEXT (D3)**, and **MODE (D4)** is printed over serial
-  → buttons OK. (The standalone selftest uses simple press events; the long-press
-  / LIST-mode behavior lives in the real firmware, Level 2.)
+- **Cycles a demo frame** through `ERR → WAIT → DONE → WORK → IDLE` on the OLED
+  every ~3 s in the real interface layout, printing each one over serial, and
+  **plays the matching LED pattern on D8** on each change (ERROR strobe, INPUT
+  blink, DONE cascade, START one-shot, dark on IDLE) → display + LED OK.
+- The **OLED** lights up and shows the frame (alert names flashing) → software
+  I2C (SDA A4 / SCL A3) + display OK (if blank, try address **0x3D**; if it's
+  a 1.3" panel, you may need the **SH1106** driver — see [WIRING.md](WIRING.md)).
+- Pressing **GO (D2)**, **NEXT (D3)**, and **PREV (D4)** is printed over serial
+  → buttons OK. (The standalone selftest uses simple press events; the
+  long-press / auto-repeat behavior lives in the real firmware, Level 2.)
 
-This validates OLED + vibration motor + buttons with **no Mac software**.
+This validates OLED + indication LED + buttons with **no Mac software**.
 
-Pass criterion: the OLED cycles all four words, the motor buzzes the right pulse
-count on each change, the screen shows text + word, and all three buttons respond.
+Pass criterion: the OLED cycles the demo frames in the real interface layout
+(size-2 name band + info row + fleet strip, alert names flashing), the D8 LED
+plays the matching pattern on each change (ERROR strobe / INPUT blink / DONE
+cascade / START one-shot / dark on IDLE), and all three buttons print their
+press lines (GO D2 / NEXT D3 / PREV D4).
 
 ---
 
@@ -99,63 +111,54 @@ Flash the **real firmware**. Open the Arduino IDE **Serial Monitor** at
    H
    ```
 
-2. Now **send** lines by hand and watch the display. Set the word:
+2. Now **send** lines by hand and watch the display. Send a full frame:
 
    ```
-   D|WTF
+   F|1|api-server|ERR  00:42 Opus xhigh|1/3 !?>
    ```
 
-   → the OLED shows the big word **WTF**. Try `D|BLOCKED`, `D|FREE`, `D|WIP` —
-   each just redraws the word. **The word is visual only and never buzzes** in
-   the real firmware; haptics come from `V|` (next step).
+   → the OLED shows the frame: size-2 name `api-server` with the band
+   **flashing** (flash flag `1`), the info row, and the fleet strip. Send the
+   same frame with a leading `F|0|…` and the flashing stops.
 
-   Buzz the motor with `V|<kind>` and feel each pattern:
+   Blink the LED with `V|<kind>` and watch each pattern:
 
    ```
-   V|START     3 gentle 0.3s ticks, then stops (one-shot)
-   V|INPUT     a soft double-tap, then stops (one-shot)
-   V|DONE      a 5-pulse heartbeat that LOOPS — send V|OFF to stop it
-   V|ERROR     a 0.4s-on/0.2s-off alarm that LOOPS — send V|OFF to stop it
+   V|START     one long 1 s blink, then dark (one-shot)
+   V|INPUT     aggressive even blink (~2.8 Hz) that LOOPS — V|OFF stops it
+   V|ERROR     fast strobe (~7 Hz) that LOOPS — V|OFF stops it
+   V|DONE      4-blink cascade + pause that LOOPS — V|OFF stops it
    V|OFF       stops any looping/playing pattern immediately
    ```
 
-   Confirm `V|DONE` / `V|ERROR` keep repeating until you send `V|OFF`, and that
-   with no serial at all a loop self-stops after ~30 s (the daemon-silence
-   watchdog).
+   Confirm the loops keep repeating until you send `V|OFF`, and that with no
+   serial at all a loop self-stops after ~30 s **and the display switches to
+   the LINK LOST screen** (the daemon-silence watchdog); any typed line brings
+   the frame back.
 
-3. Send a full session card:
-
-   ```
-   S|1|1|demo|error|03:21|71%
-   ```
-
-   → the OLED shows the card: name `demo`, state `error`, runtime `03:21`,
-   limit `71%`, position `1/1`.
-
-4. Send a **LIST-mode** frame (all-tabs list) and the idle screen + a ping:
+3. Send a ping:
 
    ```
-   T|3|1|webapp;WIP;0|api;ERR;1|infra;WAIT;0
-   I
    P
    ```
 
-   → `T|…` shows a 3-row list (a status label — `WIP`/`ERR`/`WAIT` — then the name)
-   with the middle row (`api`, `ERR`) highlighted (inverted) and a scrollbar; `I`
-   returns to the idle screen; `P` may be ignored or answered with `H`.
+   → the board replies `H`.
 
-5. Press the physical buttons and confirm the Serial Monitor prints:
+4. Press the physical buttons and confirm the Serial Monitor prints:
 
    ```
-   B|1     ← SUBMIT (D2)
-   B|2     ← NEXT (D3)
-   B|3     ← MODE (D4), short press
-   B|4     ← MODE (D4), held ≥ ~0.5 s (long press)
+   B|G     ← GO (D2), short press
+   B|K     ← GO (D2), held ≥ ~0.5 s (long press)
+   B|N     ← NEXT (D3); repeats ~5/s while held
+   B|P     ← PREV (D4); repeats ~5/s while held
    ```
 
-Pass criterion: `H` on boot, cards + `T|` lists render, the word (`D|`) updates
-and the haptics (`V|`, incl. the looping `V|DONE`/`V|ERROR` stopped by `V|OFF`)
-play from typed lines, buttons emit `B|1`/`B|2`/`B|3` and MODE long-press emits `B|4`.
+   Also confirm the panel does a quick ~80 ms invert blip on every press.
+
+Pass criterion: `H` on boot, `F|` frames render (flash flag flashes the name
+band), the LED patterns (`V|`, incl. the looping kinds stopped by `V|OFF`)
+play from typed lines, LINK LOST appears after ~30 s of silence, buttons emit
+`B|G`/`B|K`/`B|N`/`B|P` with auto-repeat on held PREV/NEXT.
 
 > When done, **close the Serial Monitor** so the daemon can use the port.
 
@@ -172,25 +175,26 @@ python3 $REPO/daemon/claude_mate_daemon.py --mock
 `--mock` injects a few fake sessions that cycle through states (including a
 `waiting` session, so all four words appear). Watch the real hardware:
 
-- The **carousel** rotates through cards roughly every 3 seconds.
-- The **status word** follows the logic: **WTF** when any session is `error`,
-  **BLOCKED** else if any is `waiting`, **WIP** else if any is `working`, **FREE**
-  otherwise. It should visit all four words as the mock states cycle.
-- The **motor** buzzes per session as tabs transition (a `V|START` tick, a
-  looping `V|DONE`/`V|ERROR` alarm, a re-tapped `V|INPUT`), independent of the word.
-- Press **NEXT** → the carousel advances immediately and pauses ~10 s.
-- Press **MODE** (short) → the carousel steps back one card and pauses ~10 s.
-- **Long-press MODE** (~0.5 s) → switches to **LIST** mode (all tabs, each with a
-  status label: WIP/WAIT/ERR/DONE/IDLE); NEXT / MODE-short move the highlight;
-  long-press again returns to SCROLL.
-- Press **SUBMIT** → the daemon attempts to focus the selected session (in mock,
-  watch the daemon log for the focus call).
+- The **screen** rests on the queue head — the most urgent session (an unacked
+  `error` first, then `waiting`, then `done`); its name band **flashes** while
+  the alert is unacknowledged. As the mock states cycle, the subject follows
+  the worst unacked alert.
+- The **LED** plays the pattern of the worst unacked class (`V|ERROR` strobe >
+  `V|INPUT` blink > `V|DONE` cascade), looping until acknowledged; a calm
+  `V|START` blink fires when a session starts working with nothing else pending.
+- Press **NEXT** / **PREV** → the selection steps down/up the queue (wraps);
+  the screen then stays where you put it for ~10 s after your last press.
+- Press **GO** → the daemon acknowledges the shown session and attempts to
+  raise its window (in mock, watch the daemon log for the focus call); the
+  selection snaps home to the next alert.
+- **Hold GO** (~0.5 s) → acknowledges WITHOUT any window op; the flashing and
+  the LED loop stop, and the next alert surfaces.
 
 Also confirm robustness: **unplug** the Nano mid-run — the daemon should not
 crash — then **replug**; it should reconnect and (via the `H` handshake) restore
-the display.
+the frame AND re-arm any active LED loop.
 
-Pass criterion: live carousel + correct status word + haptic + buttons handled +
+Pass criterion: queue-ordered display + correct LED class + buttons handled +
 survives an unplug/replug.
 
 ---
@@ -209,15 +213,16 @@ $REPO/tools/feed.sh working abc123 demo        # in another
 `tools/feed.sh` writes one newline-terminated line to `/tmp/claude-mate.sock` in
 the socket format `<state>|<session_id>|<name>` (here:
 `working|abc123|demo`). Try each state — `working`, `waiting`, `done`, `error` —
-and watch the card and the status word update accordingly:
+and watch the frame and the LED update accordingly:
 
-- `error` → **WTF** + a looping `V|ERROR` alarm (until you FOCUS / it clears).
-- `waiting` (and nothing errored) → **BLOCKED** + a gentle `V|INPUT` tap (re-tapped ~10 s).
-- `working` (and nothing waiting/errored) → **WIP** + a one-shot `V|START` tick.
-- `done` / nothing pending → **FREE** + a looping `V|DONE` heartbeat (until FOCUS).
+- `error` → `ERR` frame, name band flashing + a looping `V|ERROR` strobe
+  (until you GO / hold GO / it clears).
+- `waiting` → `WAIT` frame, flashing + a looping `V|INPUT` blink.
+- `done` → `DONE` frame, flashing + a looping `V|DONE` cascade.
+- `working` (nothing else pending) → `WORK` frame, steady + one-shot `V|START`.
 
-Pass criterion: feeding socket lines drives the card and the status word + haptic
-per [PROTOCOL.md](PROTOCOL.md).
+Pass criterion: feeding socket lines drives the frame + LED per
+[PROTOCOL.md](PROTOCOL.md).
 
 ---
 
@@ -227,29 +232,28 @@ Finally, exercise the whole pipeline with Claude Code. With the daemon running
 and the hooks merged (see [INSTALL.md](INSTALL.md)):
 
 1. Open a Claude Code session (VS Code extension or CLI) and **submit a prompt**
-   (`UserPromptSubmit`) → word changes to **WIP**, a card appears as `working`,
-   and a one-shot `V|START` tick fires (if nothing else needs you).
-2. Trigger a **Notification** (e.g. a permission prompt) → word changes to
-   **BLOCKED**, card shows `waiting`, and a gentle `V|INPUT` tap fires (re-tapped
-   ~10 s until you FOCUS).
-3. Let a turn **complete** (`Stop`) → card shows `done`; word returns to
-   **FREE** if nothing else needs you, and a `V|DONE` heartbeat **loops** until
-   you FOCUS the tab.
-4. Cause an **API error** (`StopFailure`) → card shows `error`, word to **WTF**,
-   and a `V|ERROR` alarm **loops** until you FOCUS. (`StopFailure` fires instead
-   of `Stop` on API errors — they never both fire.)
-5. Open multiple sessions and confirm the carousel orders them most-urgent-first
-   (`error` → `waiting` → `working` → `done` → `idle`) and the OLED shows the
-   highest-priority word (WTF > BLOCKED > WIP > FREE).
-6. Press **SUBMIT** on a card → VS Code focuses that session via the deep link, or
-   raises the workspace window as a fallback (see the focus Limitations in
-   [ARCHITECTURE.md](ARCHITECTURE.md)). Use **NEXT** / **MODE-short** to step
-   cards, or long-press **MODE** for the all-tabs LIST.
-7. End a session (`SessionEnd`) → it drops to `idle` / disappears; with zero
-   sessions the display shows the idle screen and the word returns to **FREE**.
+   (`UserPromptSubmit`) → a `WORK` frame appears and a one-shot `V|START`
+   blink fires (if nothing else needs you).
+2. Trigger a **Notification** (e.g. a permission prompt) → the session
+   auto-surfaces as a flashing `WAIT` frame and the `V|INPUT` blink **loops**
+   until you GO / hold GO / answer in the terminal.
+3. Let a turn **complete** (`Stop`) → a flashing `DONE` frame and a `V|DONE`
+   cascade that **loops** until acknowledged.
+4. Cause an **API error** (`StopFailure`) → a flashing `ERR` frame and a
+   `V|ERROR` strobe that **loops** until acknowledged. (`StopFailure` fires
+   instead of `Stop` on API errors — they never both fire.)
+5. Open multiple sessions and confirm the queue orders them unacked-alerts
+   first (`error` → `waiting` → `done`, oldest first), then the rest by class;
+   the fleet strip on the bottom row shows one glyph per session.
+6. Press **GO** on a shown session → its terminal window is **raised** (wrapper
+   sessions) or VS Code focuses via the deep link / workspace fallback (see
+   the focus Limitations in [ARCHITECTURE.md](ARCHITECTURE.md)). Confirm
+   navigation with **NEXT**/**PREV** moves NO windows — ever.
+7. End a session → it disappears; with zero sessions the display shows
+   `MATE / no sessions`.
 
-Pass criterion: real hook events move the cards and the status word correctly and
-FOCUS brings up the right session.
+Pass criterion: real hook events drive the frames and LED correctly, GO raises
+the right session, and navigation never touches a window.
 
 ---
 
@@ -261,9 +265,8 @@ FOCUS brings up the right session.
 | No device in `ls /dev/cu.*` | Bad cable, missing CH340 driver, or no power. |
 | OLED blank | Wrong I2C address (try 0x3D) or SH1106 1.3" panel needs the SH1106 driver. |
 | Display blanks ~1.5 s when daemon reconnects | Expected — USB open resets the Nano; the `H` handshake restores state. |
-| Word never reaches BLOCKED on a question | Check the `Notification` hook is wired and the daemon is running. |
-| Motor never buzzes | Haptics come from `V|<kind>` (not the word). Confirm a session actually transitioned (start/wait/done/error). Test the motor directly by typing `V|ERROR` in the Serial Monitor (Level 2). Check the D5 driver wiring (module IN / NPN base via 1k / ULN2003 IN1), common ground, and the flyback diode (see [WIRING.md](WIRING.md)). |
-| Motor buzzes forever | Send `V|OFF` (FOCUS does this). A loop also self-stops ~30 s after the daemon goes silent. |
-| Motor buzzes weakly or not at all | D5 can't drive the motor directly — it needs the transistor/module/ULN2003 channel; verify the motor is on the 5 V rail, not a GPIO. |
-| Buttons do nothing in the daemon | Confirm Level 2 first (`B|1`/`B|2`/`B|3`, and `B|4` on a MODE long-press, over serial), then check the daemon's button thread/logs. |
-| MODE long-press never toggles LIST | Hold ≥ ~0.5 s; a quick tap emits `B|3` (prev/highlight-up), only a held press emits `B|4`. |
+| No WAIT frame on a question | Check the `Notification` hook is wired and the daemon is running. |
+| LED never blinks | Alerts come from `V|<kind>`. Confirm a session actually transitioned (start/wait/done/error). Test the LED directly by typing `V|ERROR` in the Serial Monitor (Level 2). Check the D8 wiring (LED + series resistor to GND, see [WIRING.md](WIRING.md)). |
+| LED blinks forever | It loops until acknowledged: GO (raise) or hold GO (ack only) sends `V|OFF`. A loop also self-stops ~30 s after the daemon goes silent (and LINK LOST appears). |
+| Buttons do nothing in the daemon | Confirm Level 2 first (`B|G`/`B|N`/`B|P` over serial, `B|K` on a held GO), then check the daemon's button thread/logs. |
+| Screen shows LINK LOST | The daemon has been silent ~30 s: check `launchctl list \| grep claudemate` and `~/Library/Logs/claude-mate.err.log`. Any daemon line clears the overlay. |

@@ -6,35 +6,38 @@ Claude Mate daemon
 The "brain" of the Claude Mate USB hardware companion. It:
 
   1. Listens on a Unix-domain socket (CLAUDE_MATE_SOCK) for status lines emitted
-     by Claude Code hooks: "<state>|<session_id>|<name>".
+     by Claude Code hooks / the PTY wrapper: "<state>|<session_id>|<name>[|...]".
   2. Manages a single, continuously-open USB serial connection to the Arduino
      Nano. It auto-detects the port (/dev/cu.usbserial* then /dev/cu.usbmodem*),
      opens it once, keeps it open, and auto-reconnects if it disappears.
-  3. Reads button events from the Arduino on a background thread (buttons
-     MODE | SUBMIT | NEXT; MODE and SUBMIT distinguish a short vs long press):
-        H        -> handshake; the daemon resends the full current state.
-        B|1      -> SUBMIT short: focus the selected tab (current card in
-                    SCROLL, highlighted row in LIST; LIST double-click opens/
-                    closes the detail card instead). The previously expanded
-                    terminal is collapsed, like a nav settle would do.
-        B|2      -> NEXT: SCROLL next card / LIST highlight down.
-        B|3      -> MODE short: SCROLL previous card / LIST highlight up.
-                    In SCROLL (view-tab) mode, navigation also drives the
-                    TERMINAL-FOLLOW preview: once the shown card settles
-                    (~0.45s) that tab's terminal window is raised ('focus'
-                    to its wrapper ctrl socket) and the previously expanded
-                    one is miniaturized ('collapse'). Wrapper sessions only.
-                    LIST navigation is just a picker: it moves no windows.
-        B|4      -> MODE long (>=500ms): toggle UI mode (SCROLL <-> LIST, an
-                    all-tabs picker list).
-        B|5      -> SUBMIT long (>=500ms): acknowledge the selected tab's
-                    alert (silence the LED) WITHOUT focusing its window.
-  4. Drives a carousel that rotates through sessions (~3s/step, urgent-first)
-     and sends one S card per step.
-  5. Computes the overall status word (FREE/WIP/BLOCKED/WTF) and pushes it with
-     "D|<WORD>", which tells the Arduino to rotate its stepper-driven status
-     wheel to that word by the shortest path.
-  6. Focuses a VS Code session via a deep link, with a window-raise fallback.
+  3. Keeps ONE urgency-sorted triage queue of sessions
+     (error > waiting > done > working > idle; unacknowledged before
+     acknowledged inside a class; oldest event first) and renders ONE screen --
+     the selected session (normally the queue head, i.e. the thing that needs
+     the human most) as a pre-composed text frame:
+
+         F|<flash>|<name10>|<info21>|<fleet21>
+
+     The firmware is a dumb renderer; ALL layout/ordering/selection lives here.
+  4. Reads button events from the Arduino on a background thread. The buttons
+     mean the same thing at all times (no modes):
+        H     -> handshake; the daemon resends the full current state.
+        B|P   -> PREV: selection one step up the queue (auto-repeats on hold).
+        B|N   -> NEXT: selection one step down the queue (auto-repeats on hold).
+        B|G   -> GO (short press): acknowledge the selected session's alert and
+                 RAISE its terminal window. Raise/activate ONLY -- the daemon
+                 never collapses, resizes, or miniaturizes any window.
+        B|K   -> GO (long press): acknowledge WITHOUT touching any window.
+     After a GO/ACK the selection snaps home to the (new) queue head, so N
+     pending alerts are handled with exactly N presses, zero navigation.
+  5. Drives the indication LED via V|<KIND>: the pattern for the WORST
+     unacknowledged alert class, looping until acknowledged (V|OFF).
+
+Screen ownership rule: the display changes subject on its own ONLY when the
+user is idle (no button press for HOME_AFTER_S). A press-grace guard protects
+the boundary: if the screen auto-swapped subjects moments before a GO/ACK
+landed while the user was reading an alert, the press applies to the alert
+that was being read -- never to a window the user did not choose.
 
 Only third-party dependency: pyserial.
 
@@ -53,6 +56,7 @@ from __future__ import annotations
 import argparse
 import glob
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -60,7 +64,7 @@ import threading
 import time
 import urllib.parse
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 try:
     import serial  # pyserial
@@ -75,11 +79,7 @@ except ImportError:  # pragma: no cover - friendly error if dependency missing
 # Configuration / constants
 # --------------------------------------------------------------------------- #
 
-# Primary FOCUS deep link. Per VERIFIED FACTS, the documented URI handler is:
-#   vscode://anthropic.claude-code/open?session={session_id}&prompt={prompt}
-# NOTE: there is no *documented* URI to refocus an *already open* session panel;
-# this opens/focuses the Claude chat for the given session. It is isolated here
-# as a one-line constant so it is trivial to fix later if the handler changes.
+# Primary FOCUS deep link (hook-driven VS Code sessions). See focus_session().
 FOCUS_URI_TEMPLATE = "vscode://anthropic.claude-code/open?session={session_id}"
 
 # Default config (overridable via environment).
@@ -90,24 +90,24 @@ DEFAULT_BAUD = 115200
 PORT_GLOBS = ("/dev/cu.usbserial*", "/dev/cu.usbmodem*")
 
 # Timings (seconds).
-CAROUSEL_PERIOD = 3.0        # rotate one card every ~3s
-NEXT_PAUSE = 10.0            # pause auto-rotation ~10s after a manual NEXT
-DOUBLE_CLICK_S = 0.35       # LIST SUBMIT: window to detect a double-click
-NAV_PREVIEW_S = 0.45        # SCROLL nav: the shown card must settle this long
-                            # before the terminal-follow preview (expand new/
-                            # collapse old) fires -- flipping through tabs must
-                            # not thrash macOS window animations
+HOME_AFTER_S = 10.0          # no press for this long -> selection returns to
+                             # the queue head; until then the screen NEVER
+                             # changes subject on its own
+PRESS_GRACE_S = 0.5          # a GO/ACK landing within this window after an
+                             # AUTONOMOUS subject swap (while the user was
+                             # reading an unacked alert) applies to the
+                             # PREVIOUS subject -- the wrong-terminal guard
+REALERT_SUPPRESS_S = 5.0     # a session re-entering the SAME alert class this
+                             # soon after being acknowledged stays acknowledged
+                             # (absorbs detection flaps re-firing the LED)
 WRAPPER_LIVE_TIMEOUT_S = 1.0  # a live wrapper acks receipt ('go') within ms; a
                               # wedged one (stopped process: the kernel accepts
                               # the connect into the backlog and buffers the
-                              # send) costs only this per window op, not the
+                              # send) costs only this per focus, not the
                               # full completion deadline
-WRAPPER_ACK_TIMEOUT_S = 12.0  # overall deadline for the completion ack ('ok').
-                              # MUST exceed the wrapper's worst-case op (~10s:
-                              # tmux select-window 3s + select-pane 3s + the 4s
-                              # osascript), else a legitimately slow op outlives
-                              # the wait and the next window op overlaps it --
-                              # the exact out-of-order race the ack prevents.
+WRAPPER_ACK_TIMEOUT_S = 12.0  # overall deadline for the completion ack ('ok');
+                              # must exceed the wrapper's worst-case focus op
+                              # (~10s: tmux select-window/pane + osascript).
                               # Pre-ack wrappers close the socket at once (EOF),
                               # so the wait degrades to fire-and-forget.
 PING_PERIOD = 15.0          # keepalive ping interval
@@ -115,39 +115,34 @@ RECONNECT_DELAY = 2.0       # wait between serial (re)connection attempts
 SESSION_DONE_TTL = 120.0    # drop a 'done' session after this long with no update
 SESSION_IDLE_TTL = 600.0    # drop any stale session after this long
 
-# Card name length cap (the OLED is narrow).
-NAME_MAX = 20
+# Screen text geometry (must match the firmware's fixed 3-row layout).
+NAME_CHARS = 10             # size-2 top band
+ROW_CHARS = 21              # size-1 info/fleet rows
 
-# LIST-mode (all-tabs) frame. The 128x32 OLED fits 4 size-1 rows; names are capped
-# tighter so the whole packed T| line stays under the firmware's 96-char LINE_MAX.
-LIST_ROWS = 4
-LIST_NAME_MAX = 11        # tighter: the row now also carries an ack flag
-# Short, readable status label shown in a left column per tab row in LIST mode
-# (the tab status is what matters most there). Kept <=4 chars so names still fit.
-STATE_LABEL = {"working": "WIP", "waiting": "WAIT", "error": "ERR",
-               "done": "DONE", "idle": "IDLE"}
+# 4-char state tag shown at the start of the info row.
+STATE_TAG = {"working": "WORK", "waiting": "WAIT", "error": "ERR",
+             "done": "DONE", "idle": "IDLE"}
 
-# Navigation / auto-show priority, most urgent first: a tab in error, then one
-# waiting for input, then a finished (done) tab needing acknowledgment, then
-# still-working, then idle. NEXT / MODE-short walk this order; the screen auto-shows the
-# most urgent unacknowledged tab.
+# One glyph per session in the fleet strip (queue order).
+STATE_GLYPH = {"error": "!", "waiting": "?", "done": "*",
+               "working": ">", "idle": "."}
+
+# Triage priority, most urgent first. The queue sorts by
+# (class rank, acknowledged?, event time): a fresh error outranks everything,
+# unacknowledged before acknowledged inside a class, oldest first (FIFO triage).
 STATE_ORDER = {"error": 0, "waiting": 1, "done": 2, "working": 3, "idle": 4}
 
 VALID_STATES = set(STATE_ORDER.keys())
 
-# Alert states nag the human until acknowledged (FOCUS) or the state changes.
+# Alert states nag the human until acknowledged (GO/ACK) or the state changes.
 ALERT_STATES = {"error", "waiting", "done"}
 
-# Haptic kind emitted on a fresh transition INTO each state (used for logging and
-# to route the immediate one-shot buzz). Job-start uses a one-shot "START" tick.
+# One-shot LED kind on a fresh transition INTO each alert state.
 ALERT_KIND = {"error": "ERROR", "waiting": "INPUT", "done": "DONE"}
 
-# Every "until acknowledged" alert plays as a CONTINUOUS firmware loop, each with
-# its own distinct rhythm (the output is now a LED, so urgency has to read at a
-# glance): waiting (INPUT, aggressive even blink), a finished turn (DONE, cascade
-# burst), and a hard error (ERROR, frantic strobe). The firmware repeats the
-# pattern until we send V|OFF (on FOCUS/clear); the daemon only (re)sends the kind
-# when the desired loop changes, so the serial link is never spammed.
+# Every "until acknowledged" alert plays as a CONTINUOUS firmware LED loop with
+# its own distinct rhythm. The firmware repeats the pattern until V|OFF (sent
+# when the last unacknowledged member of the class is acknowledged/cleared).
 LOOP_KIND = {"error": "ERROR", "waiting": "INPUT", "done": "DONE"}
 
 # Sentinel for "we have not told the firmware a loop state yet", so the first
@@ -177,37 +172,24 @@ class Session:
     cwd: str = ""                  # working directory, if known
     last_update_ts: float = field(default_factory=time.time)
     state_since: float = field(default_factory=time.time)  # when current state began
-    started_ts: Optional[float] = None  # when current 'working' turn began
-    last_runtime: float = 0.0      # last completed turn duration (seconds)
-    limit: str = "-"               # best-effort rate/usage string; "-" if unknown
     model: str = ""                # model in use, e.g. "Opus 4.8" (PTY wrapper)
     effort: str = ""               # effort level, e.g. "xhigh" (PTY wrapper)
     focus_ctrl: str = ""           # PTY-wrapper control socket for FOCUS (if any)
     acked: bool = True             # alert (done/waiting/error) seen by the human?
+    last_ack_state: str = ""       # alert class most recently acknowledged...
+    last_ack_ts: float = 0.0       # ...and when (re-alert flap suppression)
 
-    def runtime_seconds(self) -> float:
-        """Timer value to show on the card, in seconds.
+    def display_seconds(self) -> float:
+        """The time shown on the info row: time in the current state.
 
-        Live (keeps counting up on each refresh) for every state except
-        'done', so an idle/blocked/errored tab shows how long it has been
-        sitting there instead of freezing on the last turn's duration:
-
-            working -> elapsed of the current turn (since it began)
-            done    -> the last completed turn's duration (a frozen result)
-            idle    -> time spent idle so far
-            waiting -> time spent blocked on the human so far
-            error   -> time spent in the error state so far
+        For 'working' that IS the live turn runtime; for an alert state it is
+        the triage-critical number -- how long this has been waiting on the
+        human; for 'idle' how long it has been sitting there.
         """
-        now = time.time()
-        if self.state == "working" and self.started_ts is not None:
-            return max(0.0, now - self.started_ts)
-        if self.state == "done":
-            # The completed turn's duration; if we never tracked the turn (e.g.
-            # a hook reported 'done' with no preceding 'working'), fall back to
-            # time-in-state so the card isn't stuck at 00:00.
-            return self.last_runtime if self.last_runtime > 0 \
-                else max(0.0, now - self.state_since)
-        return max(0.0, now - self.state_since)
+        return max(0.0, time.time() - self.state_since)
+
+    def unacked_alert(self) -> bool:
+        return self.state in ALERT_STATES and not self.acked
 
 
 class Registry:
@@ -222,15 +204,12 @@ class Registry:
                effort: str = "") -> Optional[str]:
         """Apply a status update from a hook, the PTY wrapper, or the mock injector.
 
-        Returns the one-shot haptic KIND to buzz NOW for this session's own
-        transition (START/DONE/INPUT/ERROR), or None for a keepalive / silent
-        change. Per-session, so a single tab finishing or blocking is felt even
-        when other tabs keep the fleet busy. Repeated nagging while a tab stays
-        in an alert state is handled separately by the Carousel scheduler.
+        Returns the one-shot LED KIND for this session's own transition
+        (START/DONE/INPUT/ERROR), or None for a keepalive / silent change.
 
         Models "finished but not yet acknowledged": a turn ending (working ->
-        idle) becomes 'done' and STAYS 'done' (alerting) until the user focuses
-        the tab; later idle keepalives must not clear it.
+        idle) becomes 'done' and STAYS 'done' (alerting) until the user
+        acknowledges it; later idle keepalives must not clear it.
         """
         if state not in VALID_STATES:
             log(f"ignoring update with invalid state: {state!r}")
@@ -266,29 +245,29 @@ class Registry:
                 elif prev_state == "done" and not sess.acked:
                     eff = "done"                 # keepalive while unacknowledged
 
-            # Runtime bookkeeping keyed on the working turn.
-            if eff == "working":
-                if prev_state != "working" or sess.started_ts is None:
-                    sess.started_ts = now
-            else:
-                if prev_state == "working" and sess.started_ts is not None:
-                    sess.last_runtime = max(0.0, now - sess.started_ts)
-                sess.started_ts = None
-
             changed = (eff != prev_state)
             if changed:
                 sess.state_since = now           # live "time in state" anchor
             sess.state = eff
 
-            # Acknowledgment + one-shot haptic kind on a real transition.
+            # Acknowledgment + one-shot LED kind on a real transition.
             haptic: Optional[str] = None
             if changed:
                 if eff in ALERT_STATES:          # done/waiting/error: fresh alert
-                    sess.acked = False           # nag until focused
-                    haptic = ALERT_KIND[eff]
+                    # Flap suppression: re-entering the SAME alert class right
+                    # after the human acknowledged it stays acknowledged, so a
+                    # bouncing detector can't re-fire the LED he just silenced.
+                    if (sess.last_ack_state == eff
+                            and (now - sess.last_ack_ts) < REALERT_SUPPRESS_S):
+                        sess.acked = True
+                    else:
+                        sess.acked = False       # nag until acknowledged
+                        haptic = ALERT_KIND[eff]
                 elif eff == "working":
                     sess.acked = True
-                    haptic = "START"             # job (re)started: gentle tick
+                    sess.last_ack_state = ""     # real forward progress: a
+                    sess.last_ack_ts = 0.0       # future alert is NEW, not a flap
+                    haptic = "START"             # job (re)started: calm tick
                 else:                            # idle
                     sess.acked = True
             return haptic
@@ -298,30 +277,28 @@ class Registry:
             self._sessions.pop(key, None)
 
     def acknowledge(self, sess: Optional["Session"]) -> None:
-        """FOCUS pressed: mark this tab's alert as seen. A finished (done) tab
-        becomes idle; a waiting/error tab is silenced but keeps its state (it
-        still shows, just stops nagging) until it changes on its own."""
+        """GO/ACK pressed: mark this session's alert as seen. A finished (done)
+        session becomes idle; a waiting/error session is silenced but keeps its
+        state (it still shows, just stops nagging) until it changes on its own."""
         if sess is None:
             return
         with self._lock:
+            if sess.state in ALERT_STATES:
+                sess.last_ack_state = sess.state
+                sess.last_ack_ts = time.time()
             sess.acked = True
             if sess.state == "done":
                 sess.state = "idle"
                 sess.state_since = time.time()
 
     def top_alert(self) -> Optional["Session"]:
-        """The most urgent unacknowledged tab needing the human (error >
-        waiting > done), or None. Drives auto-show + the repeat-buzz cadence."""
-        with self._lock:
-            items = [s for s in self._sessions.values()
-                     if s.state in ALERT_STATES and not s.acked]
-        if not items:
-            return None
-        items.sort(key=lambda s: (STATE_ORDER.get(s.state, 99), s.name.lower()))
-        return items[0]
+        """The most urgent unacknowledged session needing the human (error >
+        waiting > done), or None. Drives the LED loop class."""
+        items = [s for s in self.queue() if s.unacked_alert()]
+        return items[0] if items else None
 
     def prune(self) -> None:
-        """Drop stale/finished sessions so the carousel stays tidy."""
+        """Drop stale/finished sessions so the queue stays tidy."""
         now = time.time()
         with self._lock:
             dead: List[str] = []
@@ -338,39 +315,23 @@ class Registry:
             if dead:
                 log(f"pruned {len(dead)} stale session(s)")
 
-    def ordered(self) -> List[Session]:
-        """Return sessions sorted urgent-first, then by name for stability."""
+    def queue(self) -> List[Session]:
+        """The triage queue: every UNacknowledged alert first (by urgency
+        class, oldest first -- these are what still need the human), then
+        everything else by class. This keeps the invariant that after each
+        GO/ACK the queue head IS the next thing the LED is blinking about;
+        an already-acknowledged error never hides a fresh waiting alert."""
         with self._lock:
             items = list(self._sessions.values())
-        items.sort(key=lambda s: (STATE_ORDER.get(s.state, 99), s.name.lower()))
+        items.sort(key=lambda s: (0 if s.unacked_alert() else 1,
+                                  STATE_ORDER.get(s.state, 99),
+                                  s.state_since,
+                                  s.name.lower()))
         return items
 
     def count(self) -> int:
         with self._lock:
             return len(self._sessions)
-
-    def status_word(self) -> str:
-        """Compute the overall status word for the wheel per the CONTRACT.
-
-        Mapping (single source of truth), priority WTF > BLOCKED > WIP > FREE:
-            WTF     <- at least one session in error
-            BLOCKED <- at least one session waiting (Claude needs your input)
-            WIP     <- at least one session working
-            FREE    <- everything idle/done, or no sessions (also HOME position)
-        """
-        with self._lock:
-            states = [s.state for s in self._sessions.values()]
-        # WTF if anything errored (highest priority).
-        if any(st == "error" for st in states):
-            return "WTF"
-        # BLOCKED if anything is waiting for the human.
-        if any(st == "waiting" for st in states):
-            return "BLOCKED"
-        # WIP if anything is actively working.
-        if any(st == "working" for st in states):
-            return "WIP"
-        # FREE otherwise (done/idle/empty).
-        return "FREE"
 
 
 # --------------------------------------------------------------------------- #
@@ -450,8 +411,11 @@ class SerialLink:
             if not self.is_open():
                 return False
             try:
+                # No flush(): tcdrain has no timeout bound, and a wedged port
+                # would stall every caller holding the Screen lock. write() is
+                # bounded by write_timeout and these lines are tiny; the kernel
+                # drains them at line rate.
                 self._ser.write(data)
-                self._ser.flush()
                 return True
             except (serial.SerialException, OSError) as exc:
                 log(f"serial write failed ({line!r}): {exc}")
@@ -460,8 +424,6 @@ class SerialLink:
 
     def read_line(self) -> Optional[str]:
         """Read one line (blocking up to the read timeout). None on no-data/err."""
-        # Note: we hold the lock only to grab the handle; readline itself can
-        # block for the timeout, but writes use short bursts so contention is low.
         ser = self._ser
         if ser is None or not ser.is_open:
             return None
@@ -480,84 +442,285 @@ class SerialLink:
 
 
 # --------------------------------------------------------------------------- #
-# Display controller: builds protocol lines and tracks the current card.
+# Screen: composes the single frame and owns selection + LED state.
 # --------------------------------------------------------------------------- #
 
 
-class Display:
-    """Translates registry state into serial protocol lines."""
+def _fmt_time(seconds: float) -> str:
+    """Format seconds as mm:ss, or h:mm for >= 1 hour. Always <= 5 chars."""
+    seconds = int(max(0, seconds))
+    if seconds >= 3600:
+        h = seconds // 3600
+        m = (seconds % 3600) // 60
+        return f"{h}:{m:02d}"
+    m = seconds // 60
+    s = seconds % 60
+    return f"{m:02d}:{s:02d}"
+
+
+def _sanitize(text: str) -> str:
+    """Strip protocol-corrupting characters from a display string: the field
+    separator and ALL C0 control chars + DEL (an embedded NUL or newline would
+    otherwise wedge the firmware tokenizer on every frame for that subject).
+    Non-ASCII is left to write_line's ascii/replace ('?'), which is 1-for-1 so
+    field counts and length budgets hold."""
+    text = (text or "").replace("|", "/")
+    return "".join(ch if (ch >= " " and ch != "\x7f") else " " for ch in text)
+
+
+def _fit_meta(model: str, effort: str, width: int) -> str:
+    """Best-fit 'model effort' into `width` chars, degrading gracefully:
+    full model+effort -> first-word model+effort -> effort -> model, truncated."""
+    model = _sanitize(model).strip()
+    effort = _sanitize(effort).strip()
+    cands: List[str] = []
+    if model and effort:
+        cands = [f"{model} {effort}", f"{model.split()[0]} {effort}", effort]
+    elif model:
+        cands = [model, model.split()[0]]
+    elif effort:
+        cands = [effort]
+    for c in cands:
+        if len(c) <= width:
+            return c
+    return cands[-1][:width] if cands else ""
+
+
+def _display_names(sessions: List[Session]) -> Dict[str, str]:
+    """Map session key -> display name truncated to NAME_CHARS, disambiguating
+    collisions (sibling dirs with a long common prefix) with a middle squeeze:
+    first 4 chars + '~' + last 5 chars."""
+    out: Dict[str, str] = {}
+    plain: Dict[str, List[Session]] = {}
+    for s in sessions:
+        nm = _sanitize(s.name).strip() or "?"
+        t = nm[:NAME_CHARS]
+        plain.setdefault(t, []).append(s)
+        out[s.key] = t
+    for t, group in plain.items():
+        if len(group) < 2:
+            continue
+        # Only a real collision if the FULL names differ (identical basenames
+        # cannot be disambiguated by truncation at all).
+        fulls = {g.name for g in group}
+        if len(fulls) < 2:
+            continue
+        for g in group:
+            nm = _sanitize(g.name).strip()
+            if len(nm) > NAME_CHARS:
+                out[g.key] = nm[:4] + "~" + nm[-5:]
+    return out
+
+
+class Screen:
+    """Owns everything the device shows: the selection, the pre-rendered frame,
+    the press-grace bookkeeping, and the LED loop tracker."""
 
     def __init__(self, link: SerialLink, registry: Registry) -> None:
         self._link = link
         self._reg = registry
         self._lock = threading.Lock()
-        self._last_word: Optional[str] = None
-        self._current_index = 0          # carousel position within ordered list
-        self._current_session: Optional[Session] = None  # last shown card's session
-        # Haptic state. `_loop_kind` = what continuous loop the firmware is playing
-        # ("ERROR"/"INPUT"/"DONE"/None), so we only (re)send V| when it changes.
-        # Starts at a sentinel so the first resolve emits V|OFF and clears any stale
-        # loop.
+        # Selection: a session KEY, or None meaning "the queue head". Tracked
+        # by key so re-sorts never move the subject out from under the cursor.
+        self._sel_key: Optional[str] = None
+        self._last_press = 0.0
+        # Last frame actually sent (dedup) + its subject (press-grace guard).
+        self._last_frame = ""
+        self._shown_key: Optional[str] = None
+        self._shown_flash = False
+        # Press-grace: the previous subject and how/when it was swapped away.
+        self._prev_key: Optional[str] = None
+        self._prev_flash = False
+        self._swap_ts = 0.0
+        self._swap_autonomous = False
+        # LED loop tracker: what continuous loop the firmware is playing
+        # ("ERROR"/"INPUT"/"DONE"/None); V| is (re)sent only when it changes.
         self._loop_kind: Optional[str] = _LOOP_UNSET
-        # UI mode: "scroll" = the carousel (auto-surface + browse one card at a
-        # time), "list" = a scrolling list of ALL tabs to pick from. MODE long-press
-        # toggles it. The highlight is tracked by session KEY (not a positional
-        # index) so it follows the same tab when ordered() re-sorts on a state
-        # change / add / prune; `_list_top` windows it onto the 4-row screen.
-        self._mode = "scroll"
-        self._list_sel_key: Optional[str] = None
-        self._list_top = 0
-        # LIST detail sub-view: double-click SUBMIT opens the highlighted tab's
-        # full card; double-click again closes back to the list.
-        self._list_detail = False
-        # Terminal-follow preview (SCROLL / view-tab mode): the session key
-        # whose terminal window we consider "expanded" on the laptop -- the
-        # last one the preview raised or the user explicitly focused (SUBMIT).
-        # Persistent across mode toggles, so the first nav step after a focus
-        # collapses the right window. Swapped by nav_preview_swap().
-        self._preview_key: Optional[str] = None
+        # Thread-local user-action flag: set by button handlers around their
+        # whole call chain so refresh() can classify subject swaps correctly.
+        self._tls = threading.local()
 
-    # ---- dial (stepper status wheel) ------------------------------------- #
+    # ---- selection -------------------------------------------------------- #
 
-    def push_dial(self, force: bool = False) -> None:
-        """Send "D|<WORD>" so the Arduino rotates the wheel; only on change."""
-        word = self._reg.status_word()
+    def _interacting(self, now: float) -> bool:
+        return (now - self._last_press) < HOME_AFTER_S
+
+    def _subject(self, queue: List[Session]) -> Optional[Session]:
+        """The session the screen shows: the selected key if it still exists,
+        else the queue head."""
+        if not queue:
+            return None
+        key = self._sel_key
+        if key is not None:
+            for s in queue:
+                if s.key == key:
+                    return s
+        return queue[0]
+
+    def user_action(self):
+        """Context manager marking the CURRENT THREAD's Screen calls as
+        user-driven (a button handler). refresh() classifies a subject swap it
+        performs inside this scope as user-driven; every other swap is
+        autonomous and arms the press-grace guard. Thread-local so concurrent
+        Ticker/socket refreshes are never misclassified."""
+        screen = self
+
+        class _Scope:
+            def __enter__(self):
+                screen._tls.user_action = True
+
+            def __exit__(self, *exc):
+                screen._tls.user_action = False
+
+        return _Scope()
+
+    def nav(self, delta: int) -> None:
+        """PREV/NEXT: move the selection by `delta` in queue order (wraps)."""
+        now = time.time()
+        with self.user_action():
+            with self._lock:
+                queue = self._reg.queue()
+                self._last_press = now
+                if not queue:
+                    return
+                cur = self._subject(queue)
+                idx = 0
+                for i, s in enumerate(queue):
+                    if cur is not None and s.key == cur.key:
+                        idx = i
+                        break
+                nxt = queue[(idx + delta) % len(queue)]
+                self._sel_key = nxt.key
+            self.refresh()
+
+    def snap_home(self) -> None:
+        """After GO/ACK: surface the (new) queue head and PIN it, so the screen
+        does not change subject on its own inside the interaction window even
+        if a worse alert arrives (the LED still updates immediately)."""
+        with self.user_action():
+            with self._lock:
+                queue = self._reg.queue()
+                self._sel_key = queue[0].key if queue else None
+            self.refresh()
+
+    def resolve_press_target(self) -> Optional[Session]:
+        """The session a GO/ACK press applies to. Normally the shown subject;
+        if the screen swapped subjects ON ITS OWN within PRESS_GRACE_S while
+        the user was reading an unacked alert, the press applies to the alert
+        that was being read (the wrong-terminal guard). The guard is CONSUMED
+        by the press that used it, so a quick second press acts on what is
+        shown. Also counts this press for the interaction window."""
+        now = time.time()
         with self._lock:
-            changed = (word != self._last_word)
-            self._last_word = word
-        if changed or force:
-            self._link.write_line(f"D|{word}")
+            queue = self._reg.queue()
+            self._last_press = now
+            target = self._subject(queue)
+            if (self._swap_autonomous
+                    and (now - self._swap_ts) < PRESS_GRACE_S
+                    and self._prev_flash
+                    and self._prev_key is not None):
+                for s in queue:
+                    # Redirect only to a session that STILL needs the human --
+                    # never to one whose alert has meanwhile resolved.
+                    if s.key == self._prev_key and s.unacked_alert():
+                        log(f"press-grace: applying press to {s.name} "
+                            "(shown subject swapped moments before the press)")
+                        target = s
+                        break
+                self._swap_autonomous = False   # consume: one redirect per swap
+                self._prev_key = None
+            return target
 
-    def update_haptics(self, top: Optional[Session]) -> None:
-        """Single source of truth for the indicator LED, given the most-urgent
-        unacknowledged alert (or None):
+    # ---- frame composition -------------------------------------------------- #
+
+    def _compose(self, queue: List[Session],
+                 subject: Optional[Session]) -> Tuple[str, Optional[str], bool]:
+        """Build the F| line for the current state. Returns (line, subject_key,
+        flash)."""
+        if subject is None:
+            return ("F|0|MATE|no sessions|", None, False)
+
+        names = _display_names(queue)
+        name = names.get(subject.key, "?")
+
+        tag = STATE_TAG.get(subject.state, "IDLE")
+        t = _fmt_time(subject.display_seconds())
+        meta_w = ROW_CHARS - 4 - 1 - 5 - 1          # tag(4) sp time(5) sp
+        meta = _fit_meta(subject.model, subject.effort, meta_w)
+        info = f"{tag:<4} {t:>5} {meta:>{meta_w}}"[:ROW_CHARS].rstrip()
+
+        pos = 1
+        for i, s in enumerate(queue):
+            if s.key == subject.key:
+                pos = i + 1
+                break
+        head = f"{pos}/{len(queue)} "
+        room = ROW_CHARS - len(head)
+        strip = "".join(STATE_GLYPH.get(s.state, ".") for s in queue)
+        if len(strip) > room:
+            strip = strip[:max(0, room - 1)] + "+"
+        fleet = (head + strip)[:ROW_CHARS]
+
+        flash = subject.unacked_alert()
+        line = f"F|{1 if flash else 0}|{name}|{info}|{fleet}"
+        return (line, subject.key, flash)
+
+    def refresh(self, force: bool = False) -> None:
+        """Re-compose the frame and send it if the bytes changed (or `force`).
+        Tracks subject swaps for the press-grace guard.
+
+        The queue snapshot is taken INSIDE the Screen lock so snapshot-time and
+        commit-time are ordered -- a preempted caller can never commit a stale
+        frame over a newer one (Screen -> Registry lock nesting is safe: the
+        registry never takes the Screen lock)."""
+        now = time.time()
+        with self._lock:
+            queue = self._reg.queue()
+            if not self._interacting(now):
+                # Idle: the subject is the live queue head.
+                self._sel_key = None
+            subject = self._subject(queue)
+            if self._interacting(now) and subject is not None:
+                # Interacting: PIN whatever is rendered, so the screen cannot
+                # change subject on its own inside the interaction window
+                # (covers a pinned session vanishing -> head fallback, and an
+                # idle screen whose first press should anchor the subject).
+                self._sel_key = subject.key
+            line, key, flash = self._compose(queue, subject)
+            if key != self._shown_key:
+                self._prev_key = self._shown_key
+                self._prev_flash = self._shown_flash
+                self._swap_ts = now
+                # A swap performed by a button handler (nav / snap-home / the
+                # ack-triggered re-render) is user-driven; anything from the
+                # ticker or socket threads moved on its own.
+                self._swap_autonomous = not getattr(self._tls, "user_action",
+                                                    False)
+            changed = (line != self._last_frame)
+            if changed or force:
+                if self._link.write_line(line):
+                    self._last_frame = line
+                    self._shown_key = key
+                    self._shown_flash = flash
+
+    # ---- LED ---------------------------------------------------------------- #
+
+    def sync_led(self) -> None:
+        """Single source of truth for the indicator LED. Reads the most-urgent
+        unacknowledged alert and drives the firmware loop:
 
           * error / waiting / done -> a CONTINUOUS loop (V|ERROR / V|INPUT /
-            V|DONE), each with its own rhythm; the firmware repeats it until we
-            send V|OFF. Emitted only when the desired loop changes.
+            V|DONE); the firmware repeats it until V|OFF.
           * nothing -> V|OFF, silence.
 
-        Idempotent: a V| line goes out only when the desired loop changes.
-        Called on every registry change and once per carousel tick (~1s), so a
-        loop clears promptly on FOCUS.
-        """
-        desired = LOOP_KIND.get(top.state) if top is not None else None
-        self._set_loop(desired)
-
-    def _set_loop(self, kind: Optional[str]) -> None:
-        """Drive the firmware's continuous-loop state. Sends V|<kind> to start a
-        loop or V|OFF to stop it, but only when the desired state changes.
-
-        The check, the write, and the tracker commit are all done under the lock,
-        and the commit is gated on a SUCCESSFUL write. That guarantees:
-          * concurrent callers (carousel tick vs. socket/FOCUS updates) can't
-            interleave so the wire order disagrees with the tracker, and
-          * a failed write (port momentarily closed) never marks the tracker as
-            "looping X" when the firmware never got it -- which would suppress the
-            resend and drop the alert. On failure the tracker is left stale so the
-            next tick retries.
-        """
+        The truth read, the dedup check, the write, and the tracker commit all
+        happen under ONE lock hold, so concurrent callers can never invert the
+        LED state with a stale snapshot. The commit is gated on a SUCCESSFUL
+        write -- a failed write (port momentarily closed) leaves the tracker
+        stale so the next tick retries."""
         with self._lock:
+            top = self._reg.top_alert()
+            kind = LOOP_KIND.get(top.state) if top is not None else None
             if kind == self._loop_kind:
                 return
             line = f"V|{kind}" if kind else "V|OFF"
@@ -565,319 +728,52 @@ class Display:
                 return                        # keep tracker stale -> retry next tick
             self._loop_kind = kind
             if kind:
-                log(f"haptic: loop {kind} until acknowledged")
+                log(f"LED: loop {kind} until acknowledged")
 
     def start_tick(self) -> None:
-        """One-shot START tick (a job (re)started). The caller fires this only
-        when nothing needs you, so it never interrupts an alert loop."""
+        """One-shot START blink (a job (re)started). The caller fires this only
+        when nothing needs the human, so it never interrupts an alert loop."""
         self._link.write_line("V|START")
 
-    def show_session(self, sess: Optional[Session]) -> None:
-        """Show a specific session's card (by key, tolerant of reordering)."""
-        if sess is None:
-            return
-        sessions = self._reg.ordered()
-        for i, s in enumerate(sessions):
-            if s.key == sess.key:
-                self.show_index(i, sessions)  # render from THIS snapshot
-                return
-
-    # ---- cards ----------------------------------------------------------- #
-
-    @staticmethod
-    def _fmt_runtime(seconds: float) -> str:
-        """Format seconds as mm:ss, or h:mm for >= 1 hour."""
-        seconds = int(max(0, seconds))
-        if seconds >= 3600:
-            h = seconds // 3600
-            m = (seconds % 3600) // 60
-            return f"{h}:{m:02d}"
-        m = seconds // 60
-        s = seconds % 60
-        return f"{m:02d}:{s:02d}"
-
-    def _send_card(self, sess: Session, idx: int, total: int) -> None:
-        name = (sess.name or "?")[:NAME_MAX]
-        # Sanitize: the | char and newlines would corrupt the protocol.
-        name = name.replace("|", "/").replace("\n", " ").strip() or "?"
-        runtime = self._fmt_runtime(sess.runtime_seconds())
-        limit = (sess.limit or "-").replace("|", "/")[:6] or "-"
-        # 8th field: acknowledged? (1/0). The firmware shows a blinking dot for
-        # an unacknowledged alert, a hollow dot once acknowledged (focused).
-        ack = "1" if sess.acked else "0"
-        # 9th/10th fields: model + effort (PTY-wrapper sessions only; empty for
-        # hook-driven ones). Capped so the line stays within the firmware's
-        # LINE_MAX. The firmware draws them as a small "model · effort" row.
-        model = (sess.model or "").replace("|", "/").replace("\n", " ")[:12]
-        effort = (sess.effort or "").replace("|", "/").replace("\n", " ")[:10]
-        line = (f"S|{idx}|{total}|{name}|{sess.state}|{runtime}|{limit}|{ack}"
-                f"|{model}|{effort}")
-        self._link.write_line(line)
-
-    def show_index(self, index: int, sessions: Optional[List[Session]] = None) -> None:
-        """Show the card at ordered position `index` (wraps). Idle if empty.
-
-        Pass `sessions` to render from a caller's snapshot (avoids a second
-        ordered() that could have reordered between lookup and render)."""
-        if sessions is None:
-            sessions = self._reg.ordered()
-        total = len(sessions)
-        if total == 0:
-            with self._lock:
-                self._current_index = 0
-                self._current_session = None
-            self._link.write_line("I")
-            self._link.write_line("D|FREE")
-            return
-        idx = index % total
-        sess = sessions[idx]
-        with self._lock:
-            self._current_index = idx
-            self._current_session = sess
-        self._send_card(sess, idx + 1, total)
-
-    def advance(self) -> None:
-        """Move to the next card (used by carousel and NEXT button)."""
-        with self._lock:
-            nxt = self._current_index + 1
-        self.show_index(nxt)
-
-    def retreat(self) -> None:
-        """Move to the previous card (MODE short-press). show_index wraps negatives."""
-        with self._lock:
-            prv = self._current_index - 1
-        self.show_index(prv)
-
-    def refresh_current(self) -> None:
-        """Re-render the current card, anchored to the current SESSION by key so
-        it stays on the same tab when ordered() re-sorts -- e.g. acknowledging a
-        'done' tab drops it to 'idle', sliding it down the list; a positional
-        index would then land on whatever shifted up (the top/'first' tab).
-        Falls back to the index only if that session is gone (pruned)."""
-        with self._lock:
-            sess = self._current_session
-            idx = self._current_index
-        sessions = self._reg.ordered()
-        if sess is not None:
-            for i, s in enumerate(sessions):
-                if s.key == sess.key:
-                    self.show_index(i, sessions)
-                    return
-        self.show_index(idx, sessions)
-
-    # ---- UI mode (scroll carousel <-> all-tabs list) --------------------- #
-
-    def current_mode(self) -> str:
-        with self._lock:
-            return self._mode
-
-    @staticmethod
-    def _index_of_key(sessions: List[Session], key: Optional[str]) -> int:
-        """Position of `key` in `sessions`, or 0 if absent (e.g. it was pruned)."""
-        if key is not None:
-            for i, s in enumerate(sessions):
-                if s.key == key:
-                    return i
-        return 0
-
-    def toggle_mode(self) -> None:
-        """MODE long-press: flip between the scroll carousel and the all-tabs
-        list. Entering LIST seeds the highlight on the card you were viewing."""
-        sessions = self._reg.ordered()
-        with self._lock:
-            self._mode = "list" if self._mode == "scroll" else "scroll"
-            mode = self._mode
-            cur = self._current_session
-            self._list_detail = False           # always start LIST at the overview
-            if mode == "list":
-                self._list_sel_key = (cur.key if cur is not None
-                                      else (sessions[0].key if sessions else None))
-                self._list_top = 0
-        if mode == "list":
-            log("mode -> LIST (all tabs)")
-            self.render_list_view()
-        else:
-            log("mode -> SCROLL (carousel)")
-            self.refresh_current()
-
-    def list_nav(self, delta: int) -> None:
-        """Move the LIST highlight by `delta` (wraps) to the neighbouring tab,
-        tracked by key so it stays put when the list re-sorts, then re-render.
-        In the detail sub-view this browses the full cards."""
-        sessions = self._reg.ordered()
-        total = len(sessions)
-        if total > 0:
-            with self._lock:
-                idx = (self._index_of_key(sessions, self._list_sel_key) + delta) % total
-                self._list_sel_key = sessions[idx].key
-        self.render_list_view()
-
-    def render_list_view(self) -> None:
-        """Render the LIST-mode display: the highlighted tab's full card when the
-        detail sub-view is open (double-click SUBMIT), else the scrolling list.
-        If the detailed tab has ended/been pruned, auto-close detail back to the
-        list (don't silently show a different tab's card)."""
-        with self._lock:
-            detail = self._list_detail
-            key = self._list_sel_key
-        if detail:
-            sessions = self._reg.ordered()
-            sess = next((s for s in sessions if s.key == key), None)  # STRICT: no fallback
-            if sess is not None:
-                self.show_session(sess)
-                return
-            with self._lock:
-                self._list_detail = False        # selected tab gone -> close detail
-        self.render_list()
-
-    def toggle_list_detail(self) -> None:
-        """Double-click SUBMIT in LIST mode: open/close the highlighted tab's card."""
-        with self._lock:
-            self._list_detail = not self._list_detail
-            detail = self._list_detail
-        log(f"LIST detail {'opened' if detail else 'closed'}")
-        self.render_list_view()
-
-    def nav_preview_swap(self) -> "tuple[Optional[Session], Optional[Session]]":
-        """The SCROLL card settled (debounced): return the wrapper sessions
-        whose terminals should (collapse, expand) so the laptop follows the
-        device -- the shown tab's terminal comes up, the previously expanded
-        one is miniaturized -- and commit the new expanded key.
-
-        (None, None) when not in SCROLL mode (LIST is a picker; it moves no
-        windows) or the card hasn't effectively changed. Either side is None
-        when that session is gone or has no wrapper control socket
-        (hook-driven tabs have no window we can drive)."""
-        with self._lock:
-            if self._mode != "scroll":
-                return (None, None)
-            cur = self._current_session
-            key = cur.key if cur is not None else None
-            prev_key = self._preview_key
-            if key is None or key == prev_key:
-                return (None, None)
-            self._preview_key = key
-        sessions = self._reg.ordered()
-        prev = (next((s for s in sessions if s.key == prev_key), None)
-                if prev_key else None)
-        expand = cur if cur.focus_ctrl else None
-        collapse = prev if (prev is not None and prev.focus_ctrl) else None
-        return (collapse, expand)
-
-    def note_preview_focus(self, sess: Optional[Session]) -> Optional[Session]:
-        """A tab is being explicitly focused (SUBMIT, any mode): commit it as
-        the terminal now up and return the PREVIOUSLY expanded wrapper session
-        (if any) so the caller collapses it. An explicit focus owes the same
-        collapse a nav settle would have done -- without it, a SUBMIT inside
-        the nav-settle window made the pending preview a no-op (the key was
-        already committed) and the old terminal stayed expanded forever."""
-        if sess is None:
-            return None
-        with self._lock:
-            prev_key = self._preview_key
-            if prev_key == sess.key:
-                return None
-            self._preview_key = sess.key
-        if not prev_key:
-            return None
-        prev = next((s for s in self._reg.ordered() if s.key == prev_key), None)
-        return prev if (prev is not None and prev.focus_ctrl) else None
-
-    def list_selected_session(self) -> Optional[Session]:
-        """The tab currently highlighted in LIST mode (SUBMIT focuses it),
-        resolved by key so SUBMIT always acts on the tab you actually highlighted.
-        Falls back to the first tab if the selection was pruned."""
-        sessions = self._reg.ordered()
-        if not sessions:
-            return None
-        with self._lock:
-            key = self._list_sel_key
-        if key is not None:
-            for s in sessions:
-                if s.key == key:
-                    return s
-        return sessions[0]
-
-    def render_list(self) -> None:
-        """Send a LIST-mode frame: `T|<total>|<sel>|<row>|...` with up to
-        LIST_ROWS windowed rows (`name;glyph;hl`). Empty -> idle screen. The
-        highlight follows the selected key across re-sorts."""
-        sessions = self._reg.ordered()
-        total = len(sessions)
-        if total == 0:
-            with self._lock:
-                self._current_session = None
-                self._list_sel_key = None
-                self._list_top = 0
-            self._link.write_line("I")
-            self._link.write_line("D|FREE")
-            return
-        with self._lock:
-            sel = self._index_of_key(sessions, self._list_sel_key)
-            self._list_sel_key = sessions[sel].key   # re-anchor (handles pruned key)
-            top = self._list_top
-            if sel < top:
-                top = sel
-            elif sel >= top + LIST_ROWS:
-                top = sel - LIST_ROWS + 1
-            top = max(0, min(top, total - LIST_ROWS)) if total > LIST_ROWS else 0
-            self._list_top = top
-        parts = [f"T|{total}|{sel}"]
-        for i, s in enumerate(sessions[top:top + LIST_ROWS]):
-            gidx = top + i
-            name = (s.name or "?")[:LIST_NAME_MAX]
-            name = name.replace("|", "/").replace(";", ",").replace("\n", " ").strip() or "?"
-            label = STATE_LABEL.get(s.state, "IDLE")
-            hl = "1" if gidx == sel else "0"
-            # ack: 0 = an unacknowledged alert (draws a blinking dot in the row).
-            ack = "0" if (s.state in ALERT_STATES and not s.acked) else "1"
-            parts.append(f"{name};{label};{hl};{ack}")
-        self._link.write_line("|".join(parts))
+    # ---- lifecycle ------------------------------------------------------------ #
 
     def resend_full_state(self) -> None:
-        """On handshake (H) / reconnect: push dial (force) + current card AND
-        re-arm the motor from scratch.
+        """On handshake (H) / reconnect: push the current frame AND re-arm the
+        LED from scratch.
 
         A handshake means the Nano just (re)booted (opening the port resets it,
-        and a replug does too) motor-off, having lost any loop it was playing. If
+        and a replug does too) LED-off, having lost any loop it was playing. If
         we kept our loop tracker, `_set_loop` would see the desired loop already
-        "sent" and never re-emit it -- so an unacknowledged done/error alert would
-        go permanently silent after a routine replug. So we forget the tracker and
-        re-drive the motor from the current alert state."""
+        "sent" and never re-emit it -- so an unacknowledged alert would go
+        permanently silent after a routine replug. So we forget the tracker and
+        re-drive the LED from the current alert state."""
         log("handshake H -> resending full state")
-        self.push_dial(force=True)
-        if self.current_mode() == "list":
-            self.render_list_view()
-        else:
-            self.refresh_current()
         with self._lock:
             self._loop_kind = _LOOP_UNSET      # firmware was reset -> forget it
-        self.update_haptics(self._reg.top_alert())
+        self.refresh(force=True)
+        self.sync_led()
 
-    def current_session(self) -> Optional[Session]:
-        with self._lock:
-            return self._current_session
+    def notify_change(self) -> None:
+        """Called on any registry change: refresh frame + LED."""
+        self.refresh()
+        self.sync_led()
 
 
 # --------------------------------------------------------------------------- #
-# FOCUS action
+# FOCUS action (raise/activate ONLY -- never collapse/resize/minimize)
 # --------------------------------------------------------------------------- #
 
 
 def wrapper_ctrl_send(ctrl: str, cmd: str) -> bool:
-    """Send one command line ('focus' / 'collapse') to a PTY wrapper's
-    per-session control socket and WAIT for its ack. The wrapper replies in
-    two stages -- 'go' the moment it accepts the command (liveness), 'ok'
-    only after its window op (osascript) has COMPLETED -- so a caller holding
-    the window-op serialization lock gets true cross-session ordering:
-    without the completion ack, consecutive osascripts run concurrently and
-    finish out of order, leaving a STALE terminal expanded on top (device
-    card != laptop window). The first read waits only WRAPPER_LIVE_TIMEOUT_S,
-    so a wedged wrapper (stopped process whose socket the kernel still
-    accepts) costs ~1s, while a live-but-slow op gets the full
-    WRAPPER_ACK_TIMEOUT_S deadline. Pre-ack wrappers close the socket
-    immediately (recv -> EOF), degrading to the old fire-and-forget.
-    Returns success."""
+    """Send one command line ('focus') to a PTY wrapper's per-session control
+    socket and WAIT for its ack. The wrapper replies in two stages -- 'go' the
+    moment it accepts the command (liveness), 'ok' only after its window op
+    (osascript) has COMPLETED -- so consecutive focuses apply in press order.
+    The first read waits only WRAPPER_LIVE_TIMEOUT_S, so a wedged wrapper
+    (stopped process whose socket the kernel still accepts) costs ~1s, while a
+    live-but-slow op gets the full WRAPPER_ACK_TIMEOUT_S deadline. Pre-ack
+    wrappers close the socket immediately (recv -> EOF), degrading to
+    fire-and-forget. Returns success."""
     if not ctrl or not os.path.exists(ctrl):
         return False
     try:
@@ -906,14 +802,14 @@ def wrapper_ctrl_send(ctrl: str, cmd: str) -> bool:
 
 def focus_session(sess: Optional[Session]) -> None:
     """
-    Focus the VS Code session of the given card.
+    Raise the terminal/editor window of the given session. RAISE ONLY.
 
-    Primary: open the documented deep link via macOS `open`.
-    Fallback: raise the VS Code window for the workspace folder (open -a / code),
-    used when the session id is unknown/stale or the primary fails.
+    Best: ask the PTY wrapper to raise its own terminal window (un-minimizes +
+    activates). Then: the documented VS Code deep link. Fallback: raise the
+    VS Code window for the workspace folder.
     """
     if sess is None:
-        log("FOCUS pressed but no current session")
+        log("GO pressed but no session to focus")
         return
 
     log(f"FOCUS -> {sess.name} (sid={sess.sid or '?'}, cwd={sess.cwd or '?'})")
@@ -1008,8 +904,8 @@ class SocketServer(threading.Thread):
         self._sock_path = sock_path
         self._reg = registry
         self._on_update = on_update
-        self._on_haptic = on_haptic   # called with a buzz word on session events
-        self._stop = threading.Event()
+        self._on_haptic = on_haptic   # called with a LED kind on session events
+        self._stop_evt = threading.Event()  # NOT `_stop`: Thread.join() calls its own _stop()
         self._srv: Optional[socket.socket] = None
 
     def run(self) -> None:
@@ -1032,7 +928,7 @@ class SocketServer(threading.Thread):
         self._srv = srv
         log(f"socket listening on {self._sock_path}")
 
-        while not self._stop.is_set():
+        while not self._stop_evt.is_set():
             try:
                 conn, _ = srv.accept()
             except socket.timeout:
@@ -1054,7 +950,7 @@ class SocketServer(threading.Thread):
         conn.settimeout(1.0)
         buf = b""
         try:
-            while not self._stop.is_set():
+            while not self._stop_evt.is_set():
                 try:
                     chunk = conn.recv(4096)
                 except socket.timeout:
@@ -1104,49 +1000,33 @@ class SocketServer(threading.Thread):
                                   model=model, effort=effort)
         self._on_update()
         if haptic and self._on_haptic:
-            log(f"haptic: {haptic} transition for {name or sid} ({state})")
+            log(f"LED: {haptic} transition for {name or sid} ({state})")
             self._on_haptic(haptic)
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_evt.set()
 
 
 class ButtonReader(threading.Thread):
-    """Reads serial input and dispatches H / B|<n> events."""
+    """Reads serial input and dispatches H / B|<x> events."""
 
-    def __init__(self, link: SerialLink, display: Display) -> None:
+    def __init__(self, link: SerialLink, screen: Screen) -> None:
         super().__init__(name="button-reader", daemon=True)
         self._link = link
-        self._display = display
-        self._stop = threading.Event()
-        self.on_next = None  # callback set by the app (carousel pause)
-        self.on_ack = None   # callback(sess): acknowledge a focused tab's alert
-        # LIST-mode SUBMIT double-click: a single click (focus) is deferred briefly
-        # so a second click within the window instead opens/closes the detail card.
-        # `_submit_gen` invalidates a pending deferred single-click so the boundary
-        # race (Timer.cancel can't stop a timer already firing) can't double-fire.
-        self._submit_timer: Optional[threading.Timer] = None
-        self._submit_gen = 0
-        self._submit_lock = threading.Lock()
+        self._screen = screen
+        self._stop_evt = threading.Event()  # NOT `_stop`: Thread.join() calls its own _stop()
+        self.on_ack = None   # callback(sess): acknowledge a session's alert
         # FOCUS runs on side threads (it can block for seconds on sockets /
-        # subprocesses). `_focus_serial` serializes them so two quick SUBMITs
+        # subprocesses). `_focus_serial` serializes them so two quick GOs
         # can't raise windows in finish-order instead of press-order, and
-        # `_focus_gen` lets a newer press supersede one still waiting its turn.
-        # The SCROLL-nav preview takes the SAME lock, so previews and explicit
-        # focuses form one strictly-ordered stream of window ops.
+        # `_focus_gen` lets a newer press supersede one still waiting its turn
+        # (last wins).
         self._focus_serial = threading.Lock()
         self._focus_gen_lock = threading.Lock()
         self._focus_gen = 0
-        # SCROLL-nav terminal-follow preview: each nav step (re)arms this
-        # timer; when the shown card settles for NAV_PREVIEW_S the preview
-        # fires -- expand that tab's terminal, collapse the previous one.
-        # Gen-token guarded like the SUBMIT double-click timer.
-        self._nav_timer: Optional[threading.Timer] = None
-        self._nav_gen = 0
-        self._nav_lock = threading.Lock()
 
     def run(self) -> None:
-        while not self._stop.is_set():
+        while not self._stop_evt.is_set():
             if not self._link.is_open():
                 time.sleep(0.2)
                 continue
@@ -1158,183 +1038,84 @@ class ButtonReader(threading.Thread):
     def _dispatch(self, line: str) -> None:
         # Tolerate garbled / partial lines: only act on exact, known shapes.
         if line == "H":
-            self._display.resend_full_state()
+            self._screen.resend_full_state()
             return
-        if line.startswith("B|"):
-            parts = line.split("|")
-            if len(parts) >= 2 and parts[1].isdigit():
-                n = int(parts[1])
-                mode = self._display.current_mode()
-                if n == 1:                       # SUBMIT short: focus / (LIST) dbl-click
-                    self._submit_pressed(mode)
-                elif n == 2:                     # NEXT: highlight down / next card
-                    if mode == "list":
-                        log("NEXT button -> highlight next tab")
-                        self._display.list_nav(+1)
-                    else:
-                        log("NEXT button -> advancing carousel")
-                        if self.on_next:
-                            self.on_next()       # pause auto-show FIRST, then move
-                        self._display.advance()
-                        self._schedule_nav_preview()
-                elif n == 3:                     # MODE short: highlight up / prev card
-                    if mode == "list":
-                        log("MODE short -> highlight previous tab")
-                        self._display.list_nav(-1)
-                    else:
-                        log("MODE short -> previous card")
-                        if self.on_next:
-                            self.on_next()       # pause auto-show FIRST, then move
-                        self._display.retreat()
-                        self._schedule_nav_preview()
-                elif n == 4:                     # MODE long: toggle scroll <-> list
-                    log("MODE long-press -> toggle mode")
-                    self._display.toggle_mode()
-                elif n == 5:                     # SUBMIT long: acknowledge, no focus
-                    sess = (self._display.list_selected_session()
-                            if mode == "list"
-                            else self._display.current_session())
-                    log("SUBMIT long-press -> acknowledge "
-                        f"{sess.name if sess else '-'} (no focus)")
-                    if self.on_ack:
-                        self.on_ack(sess)        # silences the LED loop + re-renders
-                else:
-                    log(f"unknown button index: {n}")
+        if line == "K":                          # keepalive ack to our P: no-op
             return
-        # Anything else: log at most as debug noise, ignore.
+        if line.startswith("B|") and len(line) >= 3:
+            ev = line[2]
+            if ev == "P":                        # PREV: selection up the queue
+                self._screen.nav(-1)
+            elif ev == "N":                      # NEXT: selection down the queue
+                self._screen.nav(+1)
+            elif ev == "G":                      # GO short: acknowledge + raise
+                self._go()
+            elif ev == "K":                      # GO long: acknowledge only
+                self._ack_only()
+            else:
+                log(f"unknown button event: {line!r}")
+            return
         log(f"ignoring serial line from Arduino: {line!r}")
 
-    # ---- SCROLL-nav terminal-follow preview ------------------------------ #
-
-    def _schedule_nav_preview(self) -> None:
-        """(Re)arm the debounced preview: fires once the shown SCROLL card has
-        stayed put for NAV_PREVIEW_S. Rapid flipping just keeps re-arming, so
-        intermediate tabs never thrash macOS window animations."""
-        with self._nav_lock:
-            self._nav_gen += 1
-            gen = self._nav_gen
-            if self._nav_timer is not None:
-                self._nav_timer.cancel()
-            t = threading.Timer(NAV_PREVIEW_S, self._nav_preview_fire, args=(gen,))
-            t.daemon = True
-            self._nav_timer = t
-            t.start()
-
-    def _nav_preview_fire(self, gen: int) -> None:
-        """Card settled: expand its terminal, collapse the previously expanded
-        one (wrapper sessions only). Runs on the timer thread, but the window
-        work is SERIALIZED with SUBMIT focuses on `_focus_serial`, and each
-        ctrl send WAITS for the wrapper's ack -- so macOS applies the window
-        ops in exactly this order and the terminal left on top always matches
-        the card on the device (concurrent osascripts used to finish out of
-        order and leave a stale tab expanded). A swap still queued when a
-        newer nav lands is dropped (last wins)."""
-        with self._nav_lock:
-            if gen != self._nav_gen:             # superseded by a newer nav
+    def _go(self) -> None:
+        """GO: acknowledge the target FIRST (LED/display react instantly), then
+        raise its window on a side thread -- the reader thread must keep
+        consuming button events. Focus threads are SERIALIZED (press order ==
+        raise order) and a press still queued when a newer one arrives is
+        dropped (last wins). The whole synchronous chain (ack -> re-render ->
+        snap-home) runs inside the user-action scope so its subject swaps are
+        classified user-driven."""
+        with self._screen.user_action():
+            sess = self._screen.resolve_press_target()
+            log(f"GO -> focus + acknowledge {sess.name if sess else '-'}")
+            if sess is None:
                 return
-            self._nav_timer = None
-        with self._focus_serial:                 # one window op at a time
-            with self._nav_lock:
-                if gen != self._nav_gen:         # superseded while queued
-                    return
-            collapse, expand = self._display.nav_preview_swap()
-            if collapse is None and expand is None:
-                return
-            # This swap is now the NEWEST window op. Retire any SUBMIT focus
-            # still queued behind us: lock wakeup order isn't FIFO, so without
-            # this an older press could run AFTER this swap and raise a stale
-            # terminal on top of the card the device actually shows. (A swap
-            # that did no work returns above and retires nothing -- it must
-            # not eat a legit focus, e.g. one pressed just before a mode
-            # toggle left this timer to fire as a no-op.)
-            with self._focus_gen_lock:
-                self._focus_gen += 1
-            if collapse is not None:
-                log(f"nav preview: collapse {collapse.name}")
-                wrapper_ctrl_send(collapse.focus_ctrl, "collapse")
-            if expand is not None:               # expand LAST so it ends on top
-                log(f"nav preview: expand {expand.name}")
-                wrapper_ctrl_send(expand.focus_ctrl, "focus")
-
-    # ---- SUBMIT single/double-click ------------------------------------- #
-
-    def _submit_pressed(self, mode: str) -> None:
-        """SUBMIT short-press. SCROLL: focus the current card now. LIST: a single
-        click focuses the highlighted tab (deferred ~DOUBLE_CLICK_S so a second
-        click within the window instead opens/closes its detail card)."""
-        if mode != "list":
-            self._focus(self._display.current_session())
-            return
-        with self._submit_lock:
-            if self._submit_timer is not None:       # second click -> double-click
-                self._submit_gen += 1                # invalidate the pending single
-                self._submit_timer.cancel()
-                self._submit_timer = None
-                self._display.toggle_list_detail()
-                return
-            self._submit_gen += 1
-            gen = self._submit_gen
-            t = threading.Timer(DOUBLE_CLICK_S, self._submit_single_fire, args=(gen,))
-            t.daemon = True
-            self._submit_timer = t
-            t.start()
-
-    def _submit_single_fire(self, gen: int) -> None:
-        """The deferred LIST single-click fired: focus the tab -- unless a second
-        click already superseded this generation (the cancel-vs-fire boundary race)."""
-        with self._submit_lock:
-            if gen != self._submit_gen:              # cancelled/superseded -> do nothing
-                return
-            self._submit_timer = None
-        self._focus(self._display.list_selected_session())
-
-    def _focus(self, sess: Optional[Session]) -> None:
-        log(f"SUBMIT -> focus + acknowledge {sess.name if sess else '-'}")
-        # Acknowledge FIRST so the LED/display react instantly, then do the
-        # (slow: sockets/subprocesses, seconds of timeout) window-raising on a
-        # side thread -- the reader thread must keep consuming button events.
-        # Focus threads are SERIALIZED (press order == raise order) and a press
-        # that is still queued when a newer one arrives is dropped (last wins).
-        if self.on_ack:
-            self.on_ack(sess)                        # focusing the window = acknowledged
-        # Commit this terminal as the one up and take over the collapse the
-        # nav preview would otherwise have owed the previously expanded tab
-        # (a SUBMIT inside the settle window turns the pending preview into a
-        # no-op, so the collapse must ride with the focus).
-        prev = self._display.note_preview_focus(sess)
+            if self.on_ack:
+                self.on_ack(sess)                # raising the window = acknowledged
+            self._screen.snap_home()             # surface the next alert
         with self._focus_gen_lock:
             self._focus_gen += 1
             gen = self._focus_gen
 
         def run() -> None:
-            with self._focus_serial:                 # one focus at a time
+            with self._focus_serial:             # one focus at a time
                 with self._focus_gen_lock:
-                    if gen != self._focus_gen:       # superseded while queued
+                    if gen != self._focus_gen:   # superseded while queued
                         return
-                if prev is not None:
-                    log(f"focus: collapse {prev.name}")
-                    wrapper_ctrl_send(prev.focus_ctrl, "collapse")
                 focus_session(sess)
 
         threading.Thread(target=run, name="focus", daemon=True).start()
 
+    def _ack_only(self) -> None:
+        """GO long-press: acknowledge the target's alert WITHOUT touching any
+        window. A no-op when the target has nothing to acknowledge."""
+        with self._screen.user_action():
+            sess = self._screen.resolve_press_target()
+            if sess is None or not sess.unacked_alert():
+                log("ACK (long press): nothing to acknowledge")
+                return
+            log(f"ACK (long press) -> {sess.name} (no focus)")
+            if self.on_ack:
+                self.on_ack(sess)                # silences the LED + re-renders
+            self._screen.snap_home()             # surface the next alert
+
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_evt.set()
 
 
 class SerialMaintainer(threading.Thread):
     """Keeps the serial port open; reconnects when it drops; sends pings."""
 
-    def __init__(self, link: SerialLink, display: Display) -> None:
+    def __init__(self, link: SerialLink, screen: Screen) -> None:
         super().__init__(name="serial-maintainer", daemon=True)
         self._link = link
-        self._display = display
-        self._stop = threading.Event()
+        self._screen = screen
+        self._stop_evt = threading.Event()  # NOT `_stop`: Thread.join() calls its own _stop()
         self._last_ping = 0.0
 
     def run(self) -> None:
         was_open = False
-        while not self._stop.is_set():
+        while not self._stop_evt.is_set():
             if not self._link.is_open():
                 if was_open:
                     log("serial disconnected; will reconnect")
@@ -1344,84 +1125,46 @@ class SerialMaintainer(threading.Thread):
                     # Give the Nano time to reset; it will send H which triggers
                     # a full resend. We also push state proactively as a safety net.
                     time.sleep(2.0)
-                    self._display.resend_full_state()
+                    self._screen.resend_full_state()
                 else:
-                    self._stop.wait(RECONNECT_DELAY)
+                    self._stop_evt.wait(RECONNECT_DELAY)
                     continue
             # Periodic keepalive ping.
             now = time.time()
             if now - self._last_ping >= PING_PERIOD:
                 self._link.write_line("P")
                 self._last_ping = now
-            self._stop.wait(1.0)
+            self._stop_evt.wait(1.0)
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_evt.set()
 
 
-class Carousel(threading.Thread):
-    """Keeps the live card/dial fresh, auto-surfaces the most urgent tab, and
-    paces the repeat-buzz nags for unacknowledged alerts."""
+class Ticker(threading.Thread):
+    """1 Hz housekeeping: prunes stale sessions, keeps the displayed times
+    ticking (the frame is re-sent only when its bytes actually change), snaps
+    the selection home after the interaction window, and keeps the LED honest."""
 
-    def __init__(self, display: Display, registry: Registry) -> None:
-        super().__init__(name="carousel", daemon=True)
-        self._display = display
+    def __init__(self, screen: Screen, registry: Registry) -> None:
+        super().__init__(name="ticker", daemon=True)
+        self._screen = screen
         self._reg = registry
-        self._stop = threading.Event()
-        self._lock = threading.Lock()
-        self._paused_until = 0.0
+        self._stop_evt = threading.Event()  # NOT `_stop`: Thread.join() calls its own _stop()
         self._last_prune = 0.0
-
-    def pause(self) -> None:
-        """Pause auto-show for NEXT_PAUSE seconds (after a manual NEXT / MODE-short) so
-        the user can browse without the screen snapping back immediately."""
-        with self._lock:
-            self._paused_until = time.time() + NEXT_PAUSE
-
-    def notify_change(self) -> None:
-        """Called on any registry change: refresh dial + display + haptics."""
-        self._display.push_dial()
-        if self._display.current_mode() == "list":
-            self._display.render_list_view()
-        else:
-            self._display.refresh_current()
-        self._display.update_haptics(self._reg.top_alert())
 
     def run(self) -> None:
         # Prime the display.
-        self._display.show_index(0)
-        self._display.push_dial(force=True)
-        while not self._stop.is_set():
+        self._screen.refresh(force=True)
+        while not self._stop_evt.is_set():
             now = time.time()
-
-            # Periodic pruning of stale sessions.
             if now - self._last_prune >= 5.0:
                 self._reg.prune()
                 self._last_prune = now
-
-            with self._lock:
-                paused = now < self._paused_until
-
-            # LIST mode: keep the all-tabs list fresh (state glyphs update live);
-            # no auto-surfacing. SCROLL mode: auto-surface the most urgent
-            # unacknowledged tab, unless the user is browsing (just pressed a nav).
-            target = self._reg.top_alert()
-            if self._display.current_mode() == "list":
-                self._display.render_list_view()
-            elif target is not None and not paused:
-                self._display.show_session(target)
-            else:
-                self._display.refresh_current()
-            self._display.push_dial()
-
-            # Drive the motor from the loudest alert: continuous loops for
-            # done/error, paced taps for waiting, silence otherwise.
-            self._display.update_haptics(target)
-
-            self._stop.wait(1.0)
+            self._screen.notify_change()
+            self._stop_evt.wait(1.0)
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_evt.set()
 
 
 # --------------------------------------------------------------------------- #
@@ -1436,7 +1179,7 @@ class MockInjector(threading.Thread):
         super().__init__(name="mock-injector", daemon=True)
         self._reg = registry
         self._on_update = on_update
-        self._stop = threading.Event()
+        self._stop_evt = threading.Event()  # NOT `_stop`: Thread.join() calls its own _stop()
 
     def run(self) -> None:
         # Three to four fake sessions in different working dirs.
@@ -1446,43 +1189,36 @@ class MockInjector(threading.Thread):
             ("sid-ccc", "infra", "/Users/demo/infra"),
             ("sid-ddd", "notes", "/Users/demo/notes"),
         ]
-        # Cycle covers every state so the wheel visits all four words over time:
-        #   working -> WIP, waiting -> BLOCKED, error -> WTF, done/idle -> FREE.
         cycle = ["working", "waiting", "error", "done", "idle"]
         log("MOCK mode: injecting fake sessions")
-        # Seed initial states. These four exercise all four words at once
-        # (WTF via 'error' > BLOCKED via 'waiting' > WIP via 'working' > FREE),
-        # and the 'waiting' seed guarantees BLOCKED is reachable.
+        # Seed initial states covering every queue class at once.
         seeds = ["working", "waiting", "error", "done"]
         for (sid, name, cwd), st in zip(fakes, seeds):
             self._reg.update(st, sid, name, cwd)
-            # Set a fake limit on one of them to exercise the field.
         demo_meta = {
             "webapp": ("Opus 4.8", "xhigh"),
             "api":    ("Sonnet 4.6", "high"),
             "infra":  ("Haiku 4.5", "medium"),
             "notes":  ("Opus 4.8", "max"),
         }
-        with self._reg._lock:  # set demo limit / model / effort strings directly
+        with self._reg._lock:  # set demo model / effort strings directly
             for s in self._reg._sessions.values():
-                if s.name == "webapp":
-                    s.limit = "71%"
                 if s.name in demo_meta:
                     s.model, s.effort = demo_meta[s.name]
         self._on_update()
 
         step = 0
-        while not self._stop.is_set():
-            # Advance one session's state every ~4s so the light/carousel move.
+        while not self._stop_evt.is_set():
+            # Advance one session's state every ~4s so the screen/LED move.
             sid, name, cwd = fakes[step % len(fakes)]
             new_state = cycle[(step // len(fakes)) % len(cycle)]
             self._reg.update(new_state, sid, name, cwd)
             self._on_update()
             step += 1
-            self._stop.wait(4.0)
+            self._stop_evt.wait(4.0)
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_evt.set()
 
 
 # --------------------------------------------------------------------------- #
@@ -1493,7 +1229,7 @@ class MockInjector(threading.Thread):
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Claude Mate daemon: bridges Claude Code hooks to the "
-                    "Arduino status-wheel/OLED companion over USB serial.",
+                    "Arduino triage-queue companion over USB serial.",
     )
     parser.add_argument(
         "--mock",
@@ -1526,43 +1262,34 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     registry = Registry()
     link = SerialLink(args.port, args.baud)
-    display = Display(link, registry)
-
-    # The carousel owns "on change" behavior; the socket server and mock
-    # injector call this whenever the registry mutates.
-    carousel = Carousel(display, registry)
+    screen = Screen(link, registry)
 
     def on_update() -> None:
-        carousel.notify_change()
+        screen.notify_change()
 
     def on_ack(sess) -> None:
         registry.acknowledge(sess)
-        # Stay on the tab you just acknowledged: in SCROLL you always ack the
-        # CURRENT card, and refresh_current is now key-stable, so it keeps the
-        # view on that tab even though acknowledging a 'done' tab drops it to
-        # 'idle' and re-sorts it down the list (it used to jump to the top tab).
-        carousel.notify_change()
+        screen.notify_change()
 
     def on_haptic(kind: str) -> None:
         """Immediate one-shots on a fresh transition. on_update() ran first, so
         the error/waiting/done continuous loops are already handled by
-        update_haptics(); the only extra signal is the calm one-shot START tick,
-        fired only when nothing louder needs you."""
-        top = registry.top_alert()
-        if kind == "START" and top is None:  # began work, nothing else needs you
-            display.start_tick()
+        update_led(); the only extra signal is the calm one-shot START blink,
+        fired only when nothing louder needs the human."""
+        if kind == "START" and registry.top_alert() is None:
+            screen.start_tick()
 
     socket_server = SocketServer(args.sock, registry, on_update, on_haptic)
-    button_reader = ButtonReader(link, display)
-    button_reader.on_next = carousel.pause
+    button_reader = ButtonReader(link, screen)
     button_reader.on_ack = on_ack
-    maintainer = SerialMaintainer(link, display)
+    maintainer = SerialMaintainer(link, screen)
+    ticker = Ticker(screen, registry)
 
     threads: List[threading.Thread] = [
         socket_server,
         maintainer,
         button_reader,
-        carousel,
+        ticker,
     ]
 
     mock = None
@@ -1577,6 +1304,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     for t in threads:
         t.start()
 
+    # launchd stops us with SIGTERM: turn it into a clean SystemExit so the
+    # finally below runs and the device is left in an honest state.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
     log("running. Ctrl-C to stop.")
     try:
         while True:
@@ -1588,16 +1319,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             stop = getattr(t, "stop", None)
             if callable(stop):
                 stop()
-        # Best-effort: silence the motor and blank the display on the way out.
+        # Join the workers BEFORE the goodbye writes so a still-running ticker
+        # can't clobber them (all loops wake within ~1 s).
+        for t in threads:
+            t.join(timeout=1.5)
+        # Best-effort: silence the LED and leave an honest frame on the way out.
         try:
             link.write_line("V|OFF")
-            link.write_line("I")
-            link.write_line("D|FREE")
+            link.write_line("F|0|MATE|daemon stopped|")
         except Exception:
             pass
         link.close()
-        # Give daemon threads a brief moment to wind down.
-        time.sleep(0.3)
     return 0
 
 

@@ -1,13 +1,16 @@
 # Claude Mate — Architecture
 
 Claude Mate is a USB hardware companion for Claude Code. It is an Arduino Nano
-driving a small I2C OLED, three buttons, and a **micro vibration motor**. The
-OLED shows one of four big status words (FREE / WIP / BLOCKED / WTF) over a
-session-detail line, and the motor buzzes a per-session haptic alert (driven by
-the daemon) when a session needs you. It shows the live status of one or more Claude Code sessions running in
-the VS Code native extension (and/or the terminal CLI) on a Mac, and lets you
-press a button to **focus** the VS Code window of a session that needs your
-attention.
+driving a small I2C OLED, three buttons, and an **indication LED**. The daemon
+keeps ONE urgency-sorted **triage queue** of sessions and the OLED shows ONE
+screen — the *selected* session (normally the queue head, i.e. the thing that
+needs the human most): a size-2 session name over an info row (state +
+time-in-state + model/effort) and a whole-fleet glyph strip. The LED blinks a
+status-distinct pattern (driven by the daemon) for the worst unacknowledged
+alert, looping until you acknowledge it. It shows the live status of one or
+more Claude Code sessions running in the VS Code native extension (and/or the
+terminal CLI) on a Mac, and lets you press a button to **raise** the window of
+a session that needs your attention.
 
 Retry / resubmit is intentionally **out of scope** (see [Limitations](#limitations)).
 **Focus is the must-have action.**
@@ -31,40 +34,44 @@ Unix domain socket  /tmp/claude-mate.sock
         v
 Python daemon  (daemon/claude_mate_daemon.py)
         |   - keeps session-state model keyed by session_id
-        |   - recomputes the status word (FREE/WIP/BLOCKED/WTF) on every change
-        |   - drives the carousel (~1 card / 3 s)
+        |   - sorts ONE triage queue: unacknowledged alerts first
+        |     (error > waiting > done, oldest first), then everything
+        |     else by class (error > waiting > done > working > idle)
+        |   - pre-renders ONE screen:  F|<flash>|<name>|<info>|<fleet>
+        |   - drives the LED:  V|<kind> for the worst unacked alert class
         v
 USB serial  (115200 8N1, ASCII lines, '|' delimited, '\n' terminated)
         |
         v
 Arduino Nano (ATmega328P)
         |
-        +--> OLED SSD1306 128x32 (I2C, addr 0x3C)   shows the current session card
-        |                                            + the current word (FREE/WIP/
-        |                                            BLOCKED/WTF) as the big status
-        +--> micro vibration motor (D5)             per-session haptic via V|<kind>:
-        |                                            START/INPUT one-shot, DONE/ERROR loop
+        +--> OLED SSD1306 128x32 (software I2C, addr 0x3C)  draws the one frame it
+        |                                            was last sent: size-2 name
+        |                                            band (flashing ~2.5 Hz while
+        |                                            unacked) + info row + fleet strip
+        +--> indication LED (D8)                    plays V|<kind>: START one-shot;
+                                                     INPUT/DONE/ERROR loop until V|OFF
 
-Buttons back (return path) -- layout MODE | SUBMIT | NEXT:
-        Button press (SUBMIT=D2, NEXT=D3, MODE=D4)
-        |   serial line: B|1 SUBMIT · B|2 NEXT · B|3 MODE-short · B|4 MODE-long
+Buttons back (return path) -- layout PREV | GO | NEXT:
+        Button press (PREV=D4, GO=D2, NEXT=D3)
+        |   serial line: B|P PREV · B|N NEXT · B|G GO-short · B|K GO-long
         v
         Arduino  -->  serial  -->  daemon
         |
-        +-- B|2 NEXT   : SCROLL -> next card (pause auto-show ~10 s) ; LIST -> highlight down
-        +-- B|3 MODE(short): SCROLL -> previous card (pause ~10 s)   ; LIST -> highlight up
-        +-- B|4 MODE(long) : toggle UI mode (SCROLL <-> LIST)
-        +-- B|1 SUBMIT : focus the VS Code session of the selected tab
-                          (current card in SCROLL, highlighted row in LIST)
-                          primary  : macOS deep link  (open <FOCUS_URI_TEMPLATE>)
-                          fallback : raise VS Code window for the workspace cwd
+        +-- B|P PREV   : selection one step up the queue   (auto-repeats while held)
+        +-- B|N NEXT   : selection one step down the queue (auto-repeats while held)
+        +-- B|G GO     : acknowledge + RAISE the selected session's window
+        |                 best    : PTY wrapper ctrl socket ('focus' — raise only)
+        |                 primary : macOS deep link  (open <FOCUS_URI_TEMPLATE>)
+        |                 fallback: raise VS Code window for the workspace cwd
+        +-- B|K GO-long: acknowledge WITHOUT raising anything
 ```
 
 A handshake byte closes the loop after every reset. Opening the USB serial port
 resets the Nano (~1.5 s), so on boot the Arduino emits `H`; the daemon answers
-`H` by **re-sending the full current state** (word + current card), and the OLED
-redraws it. This keeps the display correct across reconnects without any
-persistent storage on the device.
+`H` by **re-sending the full current state** (the current frame + re-arming the
+LED loop), and the OLED redraws it. This keeps the display correct across
+reconnects without any persistent storage on the device.
 
 ---
 
@@ -84,137 +91,153 @@ persistent storage on the device.
  |          |                 |              |              |  |
  |          | runs            |              v              |  |
  |          v                 |  +-----------------------+  |  |
- |  +----------------+   sock  |  |  session-state model  |  |  |
+ |  +----------------+   sock  |  | session registry      |  |  |
  |  | claude-status. +-------->|  |  (dict keyed by sid)  |  |  |
- |  |     sh (hook)  |  line   |  |  + status-word calc   |  |  |
+ |  |     sh (hook)  |  line   |  |  + the triage queue   |  |  |
  |  +----------------+         |  +-----------+-----------+  |  |
  |                             |              |              |  |
  |                             |   +----------+----------+   |  |
  |                             |   |                     |   |  |
  |                             |   v                     v   |  |
  |                             | +-----------+   +-----------+|  |
- |                             | | carousel  |   | serial    ||  |
- |                             | | thread    |   | I/O +     ||  |
- |                             | | (~3 s)    |   | button    ||  |
- |                             | +-----+-----+   | reader    ||  |
- |                             |       |         | thread    ||  |
- |                             |       +----+----+-----------+|  |
- |                             +------------|------^----------+  |
- |                                          |      |             |
- +------------------------------------------|------|-------------+
-                                            | USB  | B|1 / B|2 / B|3 / B|4
-                          D|.. S|.. T|.. I/P | CDC  | H
-                                            v      |
+ |                             | | screen    |   | serial    ||  |
+ |                             | | composer  |   | maintainer||  |
+ |                             | | + 1 Hz    |   | + button  ||  |
+ |                             | | ticker    |   | reader    ||  |
+ |                             | +-----+-----+   +-----+-----+|  |
+ |                             +-------|---------------^------+  |
+ |                                     |               |         |
+ +-------------------------------------|---------------|---------+
+                                       | USB           | B|P / B|N / B|G / B|K
+                             F|.. V|.. P | CDC          | H
+                                       v               |
                               +-----------------------------------+
                               |        Arduino Nano (328P)        |
                               |                                   |
                               |  +--------+    +----------------+ |
-                              |  | OLED   |    | vibration motor| |
-                              |  | 0x3C   |    | D5, V|<kind>:  | |
-                              |  | I2C    |    | START/INPUT 1shot| |
-                              |  | FREE/  |    | DONE/ERROR loop| |
-                              |  | WIP/.. |    | OFF = stop     | |
+                              |  | OLED   |    | indication LED | |
+                              |  | 0x3C   |    | D8, V|<kind>:  | |
+                              |  | one F| |    | START one-shot | |
+                              |  | frame  |    | INPUT/DONE/ERR | |
+                              |  |        |    | loop until OFF | |
                               |  +--------+    +----------------+ |
-                              |  [MODE D4] [SUBMIT D2] [NEXT D3]  |
+                              |   [PREV D4]  [GO D2]  [NEXT D3]   |
                               +-----------------------------------+
 ```
 
 The daemon is the brain. The Arduino is a thin display + input device: it holds
-no session model, makes no policy decisions, and simply renders whatever the
-daemon last sent and reports button presses.
+no session model, makes no policy decisions, and simply renders the one frame
+the daemon last sent and reports button presses. The only screens it draws on
+its own are the boot **splash** (`MATE / starting...`) and the **LINK LOST**
+screen (`NO LINK / waiting for daemon`) after ~30 s of daemon silence; on every
+accepted press it also inverts the whole panel for ~80 ms as instant feedback.
 
 ---
 
-## Status-word logic
+## Triage-queue logic
 
-The status word reflects the **overall system state**, not a single session. The
-daemon recomputes a **word** on every state change and sends `D|<word>` to the
-Arduino whenever the word changes; the Arduino draws it on the OLED (visual only).
-Haptics are separate — driven per session via `V|<kind>` (see the OLED word +
-vibration haptic section above).
+There are **no UI modes** and no aggregate status word. The single source of
+truth for ordering is the **triage queue**, recomputed on every change:
 
 ```
-WTF      if ANY session is in {error}
-         -> something blew up: StopFailure / API 5xx / overloaded / timeout
-BLOCKED  else if ANY session == waiting
-         -> Claude needs your input (a permission/question)
-WIP      else if ANY session == working
-         -> busy, but nothing needs you right now
-FREE     otherwise
-         -> all idle/done, or no sessions
+every UNACKNOWLEDGED alert first  (error > waiting > done, oldest first)
+then everything else by class     (error > waiting > done > working > idle)
 ```
 
-Priority order is strict: **WTF > BLOCKED > WIP > FREE**. A single `error`
-session forces WTF even if others are merely `working`. Only when there is nothing
-to act on and nothing in progress does the word return to FREE.
+This keeps the invariant that after each GO/ACK the queue head IS the next
+thing the LED is blinking about — an already-acknowledged error never hides a
+fresh waiting alert.
 
-### OLED word + vibration haptic
+An alert is born on the transition into `error`/`waiting`/`done` and dies in
+exactly four ways — nothing else removes one, so none can be lost silently:
 
-The OLED is the **sole visual status**: it renders the big word
-(FREE / WIP / BLOCKED / WTF) over the session-detail line. There is no wheel, no
-dial, no homing, and no endstop.
+1. **`B|G` GO** — acknowledged + the window raised.
+2. **`B|K` ACK** — acknowledged, no window op.
+3. **Auto-resolve** — the session leaves the alert class on its own (the user
+   answered in the terminal → `working`; a new turn started).
+4. **TTL prune** — `done` sessions drop after 120 s without updates; anything
+   drops after 600 s.
 
-The **micro vibration motor on D5** is a haptic alert driven **entirely by the
-daemon, per session**, via `V|<kind>` lines — *not* by the word. The word (`D|`)
-is visual only. The daemon decides when a specific tab started, is waiting,
-finished, or errored, and sends the matching kind; the firmware just plays it at
-a **graduated-but-soft** PWM amplitude (urgency reads as rhythm, not force):
+Acknowledging a `done` session turns it `idle`. **Flap suppression:** a session
+re-entering the SAME alert class within 5 s of being acknowledged stays
+acknowledged, so a bouncing detector cannot re-fire the LED the user just
+silenced.
+
+### The indication LED
+
+The OLED is the **sole visual status**; the **indication LED on D8** is the
+alert output, driven **entirely by the daemon** via `V|<kind>` lines — the
+firmware just plays the pattern. The pattern is always the class of the
+**worst unacknowledged alert** across all sessions (`ERROR` > `INPUT` >
+`DONE`), so the LED loops exactly while something needs the human:
 
 ```
-START   3 gentle 0.3s ticks                          one-shot
-INPUT   soft double-tap                               re-tapped ~every 10s
-DONE    5×0.2s heartbeat (gaps 0.2/0.4s), then rest   LOOPS until V|OFF
-ERROR   0.4s on / 0.2s off alarm                      LOOPS until V|OFF
-OFF     stop the motor                                (sent on FOCUS / clear)
+START   one long 1 s blink, then dark                 one-shot
+INPUT   aggressive even blink (~2.8 Hz)               LOOPS until V|OFF
+ERROR   super-aggressive fast strobe (~7 Hz)          LOOPS until V|OFF
+DONE    cascade — 4 quick blinks, then a pause        LOOPS until V|OFF
+OFF     LED off now                                   (sent when nothing is unacked)
 ```
 
-`DONE` and `ERROR` loop in the firmware until the daemon sends `V|OFF` (on FOCUS
-or when the alert clears); a firmware watchdog also stops any loop if the daemon
-goes silent for ~30 s. See [PROTOCOL.md](PROTOCOL.md) for the exact contract.
-
-The motor pulls more current than a GPIO can source, so D5 drives it through a
-small switch: a 3-pin vibro module, an NPN transistor (1 kΩ base resistor +
-1N4148 flyback diode), or a spare ULN2003 channel. It is powered from the USB
-5 V rail with common grounds — see [WIRING.md](WIRING.md).
+The daemon (re)sends a loop kind only when the desired loop *changes*, so the
+link is not spammed. As a failsafe the firmware stops any loop **and shows the
+LINK LOST screen** if the daemon goes fully silent for ~30 s. See
+[PROTOCOL.md](PROTOCOL.md) for the exact contract.
 
 ---
 
-## Carousel behaviour
+## Screen behaviour
 
-The carousel is **daemon-driven**, not Arduino-driven. The Arduino only ever
-shows the single card it was last told to show via an `S|...` line.
+The screen is **daemon-driven**: the Arduino only ever shows the single frame
+it was last told to show via an `F|<flash>|<name>|<info>|<fleet>` line.
 
-- The daemon auto-rotates through the known sessions, sending one `S` line per
-  step roughly **every 3 seconds**.
-- **Ordering — most urgent first:** `error` → `waiting` → `working` → `done` →
-  `idle`. This matches the status-word priority (WTF → BLOCKED → WIP → FREE) so
-  the most actionable session surfaces first.
-- Pressing **NEXT** (`B|2`) advances to the next card immediately **and pauses
-  auto-rotation for ~10 seconds**, giving you time to read a specific card
-  before the rotation resumes.
-- Pressing **MODE** short (`B|3`) steps to the previous card and likewise pauses
-  auto-rotation for ~10 seconds. A **long** press (`B|4`) instead toggles into
-  **LIST mode** — a scrolling list of *all* tabs (`T` frames), where NEXT /
-  MODE-short move the highlight and SUBMIT focuses it; long-press again returns
-  to the scroll carousel.
-- Pressing **SUBMIT** (`B|1`) acts on the **selected** tab (the currently
-  displayed card in SCROLL, the highlighted row in LIST) — it calls `focus()`
-  for that session.
-- If there are **zero sessions**, the daemon sends `I` (idle screen) together
-  with `D|FREE` instead of any `S`/`T` frame.
+- **What a frame shows:** the selected session's name (≤ 10 chars, size-2,
+  inverting ~2.5 Hz while its alert is unacknowledged), an info row (≤ 21
+  chars: 4-char state tag `ERR `/`WAIT`/`DONE`/`WORK`/`IDLE`, time in that
+  state, best-fit model/effort), and a fleet row (≤ 21 chars: `pos/total` +
+  one glyph per session in queue order — `!` error, `?` waiting, `*` done,
+  `>` working, `.` idle; cut with a trailing `+` when it doesn't fit).
+- **Screen ownership:** the display changes subject on its own ONLY when the
+  user is idle (no press for **10 s**). After a GO/ACK the selection snaps home
+  to the (new) queue head, so *n* pending alerts are handled with exactly *n*
+  presses.
+- **Navigation:** **PREV** / **NEXT** step the selection up/down the queue,
+  wrap around the ends, and auto-repeat while held (400 ms to start, then
+  5/s). Selection is tracked by session **key**, so queue re-sorts never move
+  the subject out from under the cursor (only the `pos/total` number changes).
+- **Press-grace guard:** if the screen swapped subjects *on its own* less than
+  **0.5 s** before a GO/ACK arrived while the user was reading an
+  unacknowledged alert, the press applies to the alert that was being read —
+  never to a window the user did not choose.
+- The daemon sends an `F` line whenever the rendered bytes change: immediately
+  on any state change or button, and ~1/s while a displayed time ticks.
+  Identical frames are not re-sent (except on handshake). With **zero
+  sessions** it sends `F|0|MATE|no sessions|`.
 
-Each card carries: 1-based index, total count, truncated name (≤10 chars),
-state, runtime (`mm:ss` or `h:mm`), and a best-effort limit string (`"-"` when
-unknown). The exact line format is in [PROTOCOL.md](PROTOCOL.md).
+Long sibling names that collide at 10 chars are disambiguated with a middle
+squeeze (`proj~a-one`). The exact line format is in [PROTOCOL.md](PROTOCOL.md).
 
 ---
 
 ## Focus mechanism
 
-Focus is the single must-have action. When you press the **SUBMIT** button on a
-card, the daemon tries to bring you to that exact Claude Code session:
+Focus is the single must-have action, and it is the **only window operation in
+the entire system**: navigation NEVER touches macOS windows, and focus only
+**raises/activates** — the daemon never collapses, resizes, or miniaturizes
+anything (the wrapper's `collapse` verb still exists for compatibility, but the
+daemon never sends it). When you press **GO** on a session, the daemon tries to
+bring you to it:
 
-1. **Primary — VS Code deep link.** The daemon runs the macOS `open` command
+1. **Best — the PTY wrapper's own terminal.** For wrapped sessions the daemon
+   connects to the session's per-session control socket and sends the single
+   verb `focus`; the wrapper raises + un-minimizes + activates *its own*
+   terminal window. The wrapper replies in two stages — `go` on receipt
+   (liveness), `ok` after the window op completed — and the daemon serializes
+   focus work on a side thread, so consecutive GO presses raise windows in
+   press order (a press still queued when a newer one arrives is dropped —
+   last wins).
+
+2. **Primary — VS Code deep link.** The daemon runs the macOS `open` command
    against a URI built from a configurable `FOCUS_URI_TEMPLATE` constant,
    formatted with the session id. Per the VERIFIED FACTS, the documented URI
    handler is:
@@ -227,11 +250,14 @@ card, the daemon tries to bring you to that exact Claude Code session:
    behind a single constant means if the precise URI changes, it is a one-line
    fix.
 
-2. **Fallback — raise the workspace window (always implemented).** When the
+3. **Fallback — raise the workspace window (always implemented).** When the
    session id is unknown/stale, or the primary `open` returns nonzero, the daemon
    raises VS Code for the session's workspace folder:
    `open -a "Visual Studio Code" <cwd>` (or `code <cwd>` if the CLI is on PATH),
    optionally activating "Visual Studio Code" via AppleScript.
+
+A short GO also **acknowledges** the alert (raising the window = seen); a long
+GO (~0.5 s, `B|K`) acknowledges *without* any window op.
 
 ---
 
@@ -243,11 +269,14 @@ card, the daemon tries to bring you to that exact Claude Code session:
   and **auto-reconnects** if the device disappears and returns; it never crashes
   on a missing port.
 - Work is split across **threads with locks** (socket server, button reader,
-  carousel) — no busy-wait spinning.
+  serial maintainer, 1 Hz ticker) — no busy-wait spinning; focus runs on
+  serialized side threads so the button reader never blocks.
 - The **hook always exits 0** and never blocks Claude; if the daemon/socket is
   down it silently no-ops with a short timeout.
-- The **Arduino** tolerates partial/garbled lines, caps its input buffer, ignores
-  malformed lines, and debounces buttons (~200 ms).
+- The **Arduino** tolerates partial/garbled lines, caps its input buffer
+  (96 bytes), ignores malformed lines, and debounces buttons (~40 ms,
+  immediate-fire). If the daemon goes silent for ~30 s it stops any LED loop
+  and shows the **LINK LOST** screen instead of a frozen display.
 
 ---
 
@@ -257,15 +286,16 @@ These are deliberate, documented boundaries — not bugs:
 
 - **Retry / resubmit is not supported in the GUI.** Re-running a failed turn is
   not reliably possible from outside the VS Code GUI, so Claude Mate does not
-  attempt it. The hardware surfaces an `error` state and shows **WTF** (with the
-  looping `V|ERROR` alarm haptic) so a human can act, but the only button action
-  toward a session is **FOCUS**.
-- **Limits are best-effort.** The `limit` field is a short display string and
-  defaults to `"-"`. If the daemon cannot reliably obtain rate/usage limits, it
-  shows `"-"` and **never fabricates** numbers. Real limit reporting is an
-  extension point, not a guarantee.
-- **Focus depends on the deep link.** Primary focus uses the VS Code deep link
-  derived from the session id (VERIFIED FACTS:
+  attempt it. The hardware surfaces an `error` state as a flashing `ERR` frame
+  (with the looping `V|ERROR` strobe) so a human can act, but the only button
+  action toward a session is **GO** (raise its window).
+- **Model/effort strings are best-effort.** The info row's model/effort text is
+  scraped from the live TUI by the PTY wrapper and stays empty for hook-only
+  sessions or until scraped. The daemon **never fabricates** it; it fits
+  whatever it reliably knows into the 21-char row.
+- **Focus depends on the deep link (hook-only sessions).** A wrapped session
+  raises its own terminal via its control socket. Hook-only sessions use the
+  VS Code deep link derived from the session id (VERIFIED FACTS:
   `vscode://anthropic.claude-code/open?session=...`). Per those same facts,
   **no documented URI pattern exists to programmatically focus an existing
   session inside an already-running chat panel** — the handler opens/links a chat
@@ -275,4 +305,5 @@ These are deliberate, documented boundaries — not bugs:
   the precise chat in some cases.
 - **No persistence on the device.** The Arduino holds no state; every reset
   relies on the `H` handshake and the daemon re-sending state. If the daemon is
-  not running, the display is stale/blank.
+  not running, the firmware shows the **LINK LOST** screen after ~30 s rather
+  than stale data.

@@ -1,7 +1,7 @@
 # Claude Mate
 
 A tiny USB hardware companion that shows the **live status of your Claude Code
-sessions** on a small OLED, **buzzes a micro vibration motor** the moment one of
+sessions** on a small OLED, **blinks an indication LED** the moment one of
 them needs you — finishes, gets blocked, or errors — and lets you **jump
 straight to the session that needs you** with a single button press.
 
@@ -11,34 +11,40 @@ an ambient, always-on status pane for every Claude Code session you have open �
 in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
 
 ```
-        ┌────────────────────────────────┐
-        │ ● api-server              2/4   │   ← ack dot · session name · card index
-        │ Opus 4.8 · xhigh                │   ← model · effort (PTY-wrapper sessions)
-        │ WAIT  04:12                     │   ← big STATE word · live time-in-state
-        └────────────────────────────────┘
-              ((•)) vibration motor             ← buzzes per session, when IT needs you
-          [ MODE ]   [ SUBMIT ]   [ NEXT ]     ← three buttons
-   MODE: short = prev / list-up · long = switch SCROLL↔LIST   SUBMIT: short = focus tab · long = acknowledge   NEXT: next / list-down
+        ┌───────────────────────┐
+        │ api-server            │   ← size-2 session name (flashes while its alert
+        │                       │      is unacknowledged)
+        │ WAIT  0:42 Opus xhigh │   ← state · time-in-state · model/effort
+        │ 2/6 !?*>>.            │   ← queue position · whole-fleet glyph strip
+        └───────────────────────┘
+              (•) indication LED               ← blinks per alert class, until you ack
+          [ PREV ]   [ GO ]   [ NEXT ]         ← three buttons — same meaning, always
+   PREV/NEXT: step the triage queue (hold = auto-repeat)   GO: short = ack + raise its window · long = ack only
 
-   the dot:   ● blinking = unacknowledged (needs you)   ○ hollow = acknowledged (focused)
-   the buzz:  START 3 soft ticks · INPUT gentle tap · DONE heartbeat-loop · ERROR alarm-loop  (loops/re-taps until you SUBMIT)
+   the flash: name band inverting = unacknowledged (needs you) · steady = seen
+   the strip: ! error · ? waiting · * done · > working · . idle — one glyph per session, queue order
+   the LED:   START 1 s blink · INPUT even blink · DONE 4-blink cascade · ERROR fast strobe  (loops until you GO/ack)
 ```
 
 ---
 
 ## What it is
 
-**Claude Mate** is an Arduino Nano + 0.91" I2C OLED + 3 buttons + a **micro
-vibration motor**, paired with a lightweight Python daemon on your Mac.
+**Claude Mate** is an Arduino Nano + 0.91" I2C OLED + 3 buttons + an
+**indication LED**, paired with a lightweight Python daemon on your Mac.
 
-The daemon keeps a model of every Claude Code session, **auto-surfaces the one
-that most needs you**, drives the OLED card, and **buzzes the motor per session**
-— so a single tab finishing, blocking, or erroring is *felt* even while the rest
-of your fleet keeps working. It keeps nagging (gently) until you deal with it.
+The daemon keeps ONE urgency-sorted **triage queue** of every Claude Code
+session and renders ONE screen: the session that most needs you, over a
+whole-fleet glyph strip. The LED blinks a status-distinct pattern for the worst
+*unacknowledged* alert — so a single tab finishing, blocking, or erroring is
+*seen* even while the rest of your fleet keeps working. It keeps blinking until
+you deal with it. There are **no UI modes**: the three buttons — **PREV · GO ·
+NEXT** — mean the same thing at all times.
 
-The single must-have action is **FOCUS**: press a button and the window for the
+The single must-have action is **GO**: press it and the window for the
 displayed session is raised so you can deal with it — the integrated VS Code
 panel *or* the actual terminal that session is running in (matched by TTY).
+Raise **only**: nothing in the system ever collapses or resizes a window.
 Retrying or resubmitting a turn is intentionally **out of scope** (see
 [Limitations](#limitations)).
 
@@ -60,50 +66,64 @@ hooks are the zero-dependency feed. Use whichever fits each session.
 
 ## Features
 
-- **Auto-surface the urgent tab** — the daemon shows the single most urgent
-  session that needs you, ordered **error → waiting → done → working → idle**.
-  There is **no blind auto-carousel**; the screen holds the thing you should
-  look at. **NEXT** and **MODE (short)** step the same urgent-first order manually
-  and pause auto-surfacing for ~10 s so you can browse.
-- **Two UI modes** — a long-press of **MODE** toggles between **SCROLL** (the
-  one-card carousel above) and **LIST** (a scrolling list of *all* tabs, each with
-  a status label — `WIP`/`WAIT`/`ERR`/`DONE`/`IDLE` — and its name). In LIST,
-  **NEXT** / **MODE-short** move the highlight, **SUBMIT** focuses the
-  highlighted tab (double-click opens/closes its **detail** card), and a
-  **long-press of SUBMIT acknowledges** the selected tab's alert without
-  focusing it. Buttons fire instantly (edge-accepted debounce; ~500 ms hold =
-  long-press).
-- **Per-session haptics** — the motor buzzes for *that session's own*
-  transition, not just an aggregate change:
-  - **START** — a job (re)started → three gentle 0.3 s ticks (one-shot).
-  - **INPUT** — a session is waiting on you → a soft double-tap, re-tapped
-    gently every ~10 s until you focus it.
-  - **DONE** — a turn finished → a 5-pulse "heartbeat" (0.2 s pulses, gaps
-    alternating 0.2 / 0.4 s), **looping** until you focus it.
-  - **ERROR** — a turn ended on an API error → a 0.4 s-on / 0.2 s-off alarm,
-    **looping** until you focus it.
+- **One urgency-sorted triage queue** — every session, ordered so the thing
+  that needs you most is on top: **unacknowledged alerts first (error →
+  waiting → done, oldest first), then everything else by class (error →
+  waiting → done → working → idle)**. The screen normally shows the queue
+  head; **PREV** / **NEXT** step the same order manually (hold to auto-repeat,
+  wrapping at the ends), and while you're browsing (any press within ~10 s)
+  the screen never changes subject on its own.
+- **No UI modes** — the three buttons mean the same thing at all times:
+  **PREV · GO · NEXT**. A short **GO** acknowledges the shown alert **and
+  raises its window**; a **long-press of GO** (~0.5 s) acknowledges it
+  **without** touching any window. Buttons fire instantly (edge-accepted
+  ~40 ms debounce), and every accepted press inverts the whole panel for
+  ~80 ms — instant "the device heard you" feedback.
+- ***n* alerts, *n* presses** — after every GO/ACK the selection snaps home to
+  the (new) queue head, so a stack of pending alerts is handled with exactly
+  one press each, zero navigation. After ~10 s without a press the screen
+  snaps home on its own.
+- **Navigation never touches windows** — the ONLY window operation in the
+  whole system is GO, and it only **raises/activates**; the daemon never
+  collapses, resizes, or miniaturizes anything.
+- **Press-grace guard** — if the screen auto-swapped subjects a split second
+  (< 0.5 s) before your GO landed while you were reading an unacknowledged
+  alert, the press applies to the alert you were reading — never to a window
+  you did not choose.
+- **Status-distinct LED alerts** — the indication LED blinks the pattern of the
+  *worst unacknowledged* alert across the whole fleet:
+  - **START** — a job (re)started → one long 1 s blink (one-shot).
+  - **INPUT** — a session is waiting on you → an aggressive even blink
+    (~2.8 Hz), **looping** until you ack it.
+  - **DONE** — a turn finished → a cascade of 4 quick blinks, then a pause,
+    **looping** until you ack it.
+  - **ERROR** — a turn ended on an API error → a super-aggressive ~7 Hz
+    strobe, **looping** until you ack it.
 
-  Amplitude is PWM duty kept **graduated but soft** — Start/Done gentlest, the
-  error alarm firmest but never full power — so urgency reads as *rhythm and
-  repetition*, never a jarring jolt.
-- **Loop / re-tap until acknowledged** — the DONE and ERROR alerts **loop
-  continuously** in the firmware, and the waiting alert re-taps every ~10 s, until
-  you **FOCUS** the session (which sends `V|OFF` to silence the motor) or it
-  changes on its own. If the daemon dies mid-alert the firmware stops the loop on
-  its own after ~30 s of silence.
+  The loops run in the firmware until the daemon sends `V|OFF` (a GO/ACK, or
+  the state changes on its own). If the daemon dies mid-alert the firmware
+  stops the loop on its own after ~30 s of silence — and shows **LINK LOST**.
 - **"Finished but not seen" model** — when a turn ends, the session becomes
-  **done** and *stays* done (alerting, with a blinking dot) until you focus it;
-  later idle keepalives don't silently clear it. Focusing acknowledges it.
-- **Acknowledge dot on the card** — alert states (done / waiting / error) carry a
-  dot top-left: **filled + blinking = unacknowledged**, **hollow ring =
-  acknowledged**. At a glance you know whether you've seen it.
-- **Live time-in-state** — the card's timer counts up live for every state
-  except `done`: an idle/blocked/errored tab shows *how long it has been sitting
-  there*, while a finished tab shows the completed turn's frozen duration.
-- **One-button FOCUS** — raises the session's window: first the **PTY wrapper's
-  own terminal** (iTerm2 / Terminal.app / VS Code / Ghostty / Warp / tmux,
-  matched by TTY), else a **VS Code deep link**, else the VS Code window for the
-  workspace folder.
+  **done** and *stays* done (name flashing, LED looping) until you acknowledge
+  it; later idle keepalives don't silently clear it. GO (or a long-press ACK)
+  acknowledges it.
+- **Flashing name band** — while the shown session's alert is unacknowledged,
+  the big size-2 name inverts at ~2.5 Hz; once acknowledged it goes steady. At
+  a glance you know whether you've seen it.
+- **Whole-fleet strip** — the bottom row shows your queue position
+  (`pos/total`) plus one glyph per session in queue order: `!` error ·
+  `?` waiting · `*` done · `>` working · `.` idle.
+- **Live time-in-state** — the info row counts up how long the session has
+  been in its current state: for a `working` tab that IS the live turn
+  runtime; for an alert it is how long it has been waiting on *you*.
+- **One-button FOCUS** — GO raises the session's window: first the **PTY
+  wrapper's own terminal** (iTerm2 / Terminal.app / VS Code / Ghostty / Warp /
+  tmux, matched by TTY), else a **VS Code deep link**, else the VS Code window
+  for the workspace folder. Raise only, always.
+- **Honest link state** — with no daemon frame yet the firmware shows a boot
+  splash; after ~30 s of daemon silence it replaces the stale frame with a
+  **LINK LOST** screen (`NO LINK / waiting for daemon`) instead of freezing,
+  and recovers on the next parsed line.
 - **Hot-reloadable detection** — the wrapper's state patterns live in
   [`patterns.json`](patterns.json) and reload live (~0.25 s, no restart), so you
   can tune what counts as error/waiting/busy without touching code.
@@ -124,7 +144,7 @@ hooks are the zero-dependency feed. Use whichever fits each session.
    │                 "<state>|<sid>|<name>\n"
    │
    └─ (b) PTY wrapper ─ bin/claude-mate-wrap  (alias claude=claude-mate-wrap)
-                     "<state>|<sid>|<name>|<ctrl_sock>\n"   + screen-scrapes the live TUI
+                     "<state>|<sid>|<name>|<ctrl_sock>|<model>|<effort>\n"   + screen-scrapes the live TUI
                             │
                             ▼
               Unix domain socket  /tmp/claude-mate.sock
@@ -132,68 +152,77 @@ hooks are the zero-dependency feed. Use whichever fits each session.
                             ▼
    ┌──────────────────────────────────────────────┐
    │   Python daemon (Mac)                        │
-   │   • session model + "done-until-acknowledged"│
-   │   • status word     D|<FREE/WIP/BLOCKED/WTF> │   (overall health / priority)
-   │   • per-session buzz V|<START/INPUT/DONE/ERR>│   loops + V|OFF on focus
-   │   • auto-surface the most-urgent session     │
-   │   • FOCUS: wrapper ctrl-sock → VS Code link  │
+   │   • ONE triage queue + "done-until-acked"    │   (unacked error > waiting > done first,
+   │   • ONE pre-rendered screen                  │    then everything else by class)
+   │       F|<flash>|<name>|<info>|<fleet>        │
+   │   • LED policy  V|<START/INPUT/DONE/ERR/OFF> │   worst unacked class, loops until ack
+   │   • GO: raise the session's window — RAISE   │
+   │     ONLY (wrapper ctrl-sock → VS Code link)  │
    └──────────────────────────────────────────────┘
                             │  USB serial 115200 8N1, "|"-delimited ASCII
                             ▼
    ┌──────────────────────────────────────────────┐
    │   Arduino Nano (ATmega328P)                  │
-   │   • SSD1306 128x32 OLED — status card: ack    │
-   │     dot · name · idx · model·effort · STATE   │
-   │   • micro vibration motor (D5) plays V|<KIND>│
-   │   • SUBMIT/NEXT/MODE buttons → B|1..B|5       │
+   │   • SSD1306 128x32 OLED — draws the one      │
+   │     frame it was last sent (dumb renderer)   │
+   │   • indication LED (D8) plays V|<KIND>       │
+   │   • PREV/GO/NEXT buttons → B|P B|N B|G B|K   │
    └──────────────────────────────────────────────┘
-                            │  H (hello on boot), B|<n> (buttons)
+                            │  H (hello on boot), B|<x> (buttons)
                             └──────────────► back to the daemon
 ```
 
 Two control flows worth calling out:
 
 - **FOCUS round-trip.** Each wrapped session opens a per-session control socket
-  (`/tmp/claude-mate-ctrl-<id>.sock`) and tells the daemon about it. On a FOCUS
-  press the daemon connects to that socket and sends `focus`; the wrapper raises
-  *its own* terminal window using the right method for `$TERM_PROGRAM` (iTerm2
-  and Terminal.app match the exact tab by TTY). Hook-only sessions fall back to a
+  (`/tmp/claude-mate-ctrl-<id>.sock`) and tells the daemon about it. On a GO
+  press the daemon connects to that socket and sends the single verb `focus`;
+  the wrapper raises *its own* terminal window using the right method for
+  `$TERM_PROGRAM` (iTerm2 and Terminal.app match the exact tab by TTY), replying
+  `go` on receipt and `ok` when the window op completed — so consecutive GO
+  presses raise windows in press order. Hook-only sessions fall back to a
   VS Code deep link / window raise.
 - **Reset recovery.** Opening the USB serial port resets the Nano (~1.5 s). On
   boot the Arduino emits `H`; the daemon responds by re-sending the full current
-  state (status word + current card), so the display recovers cleanly after any
-  reconnect.
+  state (the current frame + re-arming the LED loop), so the display recovers
+  cleanly after any reconnect.
 
-> The aggregate **FREE / WIP / BLOCKED / WTF** word (priority **WTF > BLOCKED >
-> WIP > FREE**) is the daemon's overall health-and-priority model: it decides
-> which session is surfaced and how it buzzes. The OLED's *big text* is the
-> surfaced session's own **state** (WORKING / WAITING / ERROR / DONE / IDLE).
+> The **triage queue** (unacknowledged **error > waiting > done** first, then
+> everything else by class) is the daemon's whole priority model: it decides
+> what the screen shows, what one GO press acts on, and what the LED blinks
+> about. The OLED's *big text* is the selected session's **name**; its state
+> (`ERR`/`WAIT`/`DONE`/`WORK`/`IDLE`) leads the info row.
 
 ---
 
-## Haptics & the acknowledge model
+## LED alerts & the acknowledge model
 
-Haptics are driven **entirely by the daemon** via `V|<KIND>` lines — the
-firmware just plays the pattern; the status word (`D|`) is visual only and never
-buzzes on its own. The daemon decides, **per session**, when to buzz and how it
-repeats. Amplitude (PWM duty) is **graduated but soft** — urgency reads as
-rhythm, not raw force:
+The LED is driven **entirely by the daemon** via `V|<KIND>` lines — the
+firmware just plays the pattern on D8; the screen never blinks the LED on its
+own. The pattern is always the class of the **worst unacknowledged alert**
+across all sessions (`ERROR` > `INPUT` > `DONE`), so the LED loops exactly
+while something needs you:
 
-| Event (per session) | `V|` kind | Pattern | Repeat until focused |
-|---------------------|-----------|---------|----------------------|
-| Job (re)started     | `START`   | 3 gentle 0.3 s ticks | — (one-shot) |
-| Waiting on you      | `INPUT`   | soft double-tap | re-taps every **~10 s** |
-| Turn finished       | `DONE`    | 5×0.2 s heartbeat (gaps 0.2/0.4 s) | **loops** continuously |
-| Error / retry       | `ERROR`   | 0.4 s on / 0.2 s off alarm | **loops** continuously |
+| Event | `V|` kind | LED pattern | Repeat until acked |
+|-------|-----------|-------------|--------------------|
+| Job (re)started (nothing else pending) | `START` | one long 1 s blink, then dark | — (one-shot) |
+| Waiting on you      | `INPUT`   | aggressive even blink (~2.8 Hz) | **loops** continuously |
+| Turn finished       | `DONE`    | cascade — 4 quick blinks, then a pause | **loops** continuously |
+| Error / retry       | `ERROR`   | super-aggressive fast strobe (~7 Hz) | **loops** continuously |
 
-`DONE` and `ERROR` **loop** in the firmware until the daemon sends `V|OFF`;
-`INPUT` re-taps on a timer. A turn ending (`working → idle`) becomes **done** and
-keeps looping until you acknowledge the session — focusing it (**SUBMIT**
-short-press) or silencing it in place (**SUBMIT** long-press) acknowledges it
-(sending `V|OFF` to silence the motor: a done tab becomes idle; a waiting/error
-tab goes quiet but keeps its state until it changes). The OLED's ack dot mirrors
-this: blinking while unacknowledged, hollow once seen. If the daemon ever dies
-mid-alert, the firmware stops the loop on its own after ~30 s of serial silence.
+The loops run in the firmware until the daemon sends `V|OFF`. A turn ending
+becomes **done** and keeps looping until you acknowledge the session — raising
+it (**GO** short-press) or silencing it in place (**GO** long-press, no window
+op) acknowledges it: a done tab becomes idle; a waiting/error tab goes quiet
+but keeps its state until it changes. An alert can also die by
+**auto-resolving** (the session leaves the alert class on its own — you
+answered in the terminal) or by **TTL pruning**; nothing else removes one. A
+session re-entering the same alert class within ~5 s of being acknowledged
+stays acknowledged, so a bouncing detector can't re-fire the LED you just
+silenced. The flashing name band mirrors the ack state: inverting while
+unacknowledged, steady once seen. If the daemon ever dies mid-alert, the
+firmware stops the loop on its own after ~30 s of serial silence and shows the
+**LINK LOST** screen.
 
 ---
 
@@ -203,32 +232,28 @@ mid-alert, the firmware stops the loop on its own after ~30 s of serial silence.
 |-----|-----------------------------------------|----------------------------------------|
 | 1   | Arduino Nano (ATmega328P)               | Any USB-serial Nano clone works        |
 | 1   | SSD1306 0.91" 128×32 OLED, I2C           | Address `0x3C` (some boards `0x3D`); 0.96" 128×64 also works |
-| 3   | Momentary push buttons                  | MODE, SUBMIT, NEXT                     |
-| 1   | Micro vibration motor                   | coin/pager type; haptic alert on D5    |
-| 1   | NPN transistor + ~1 kΩ + 1N4148 diode   | D5 driver — **or** a 3-pin vibro module / a spare ULN2003 channel instead |
+| 3   | Momentary push buttons                  | PREV, GO, NEXT                         |
+| 1   | LED + ~220 Ω–1 kΩ resistor              | indication LED on D8 (the sole alert output) |
 | —   | Jumper wires, breadboard / perfboard    |                                        |
 | 1   | USB cable (to the Mac)                   | Data-capable, not charge-only          |
 
-> The vibration motor is tiny (tens of mA) so the **USB 5 V rail powers it
-> fine** — no brown-out concern. Don't drive it straight off D5: use a vibro
-> module, an NPN transistor (1 kΩ base + 1N4148 flyback), or a ULN2003 channel,
-> and keep all grounds common. See [docs/WIRING.md](docs/WIRING.md).
+> The indication LED is the **sole alert output**: wire it on **D8 through a
+> ~220 Ω–1 kΩ series resistor** to GND so the pin isn't over-driven, and keep
+> all grounds common. See [docs/WIRING.md](docs/WIRING.md).
 
 Pinout summary (full details in [docs/WIRING.md](docs/WIRING.md)):
 
 | Signal               | Pin       | Notes                                  |
 |----------------------|-----------|----------------------------------------|
-| OLED SDA             | A4        | I2C                                    |
-| OLED SCL             | A5        | I2C                                    |
-| SUBMIT button        | D2        | `INPUT_PULLUP`, emits `B|1` short (focus) / `B|5` long (acknowledge) |
-| NEXT button          | D3        | `INPUT_PULLUP`, emits `B|2` (next / highlight down) |
-| MODE button          | D4        | `INPUT_PULLUP`, emits `B|3` short / `B|4` long (prev / mode toggle) |
-| Vibration motor drive| D5        | PWM-capable; never drive the motor directly |
+| OLED SDA             | A4        | I2C data                               |
+| OLED SCL             | A3        | **software (bit-banged) I2C** — hardware SCL A5 was damaged; see `firmware/claude_mate/softssd1306.h` |
+| GO button            | D2        | `INPUT_PULLUP`, emits `B|G` short (ack + raise) / `B|K` long (ack only) |
+| NEXT button          | D3        | `INPUT_PULLUP`, emits `B|N` (selection down; auto-repeats while held) |
+| PREV button          | D4        | `INPUT_PULLUP`, emits `B|P` (selection up; auto-repeats while held) |
+| Indication LED       | D8        | LED + series resistor to GND; plays the `V|<kind>` alert pattern |
 
-The three buttons use `INPUT_PULLUP` (other leg to GND; pressed = LOW). D5 drives
-the vibration motor through a module / NPN+1k+1N4148 / ULN2003 channel. D5 is
-PWM-capable, which is how the firmware keeps the patterns gentle (amplitude well
-below full power).
+The three buttons use `INPUT_PULLUP` (other leg to GND; pressed = LOW), laid
+out left→right as **PREV | GO | NEXT**.
 
 ---
 
@@ -293,7 +318,7 @@ conversation above don't false-trigger. The footer phrases are limited to
 `to select` / `to navigate` (a real question picker), and a footer-only `waiting`
 must **persist a couple of seconds** before it reports — so a config dialog you
 open and dismiss (the `/effort` or `/model` slider, whose footer is
-`… · Esc to cancel`) no longer buzzes the instant you open it.
+`… · Esc to cancel`) no longer alerts the instant you open it.
 
 ---
 
@@ -307,21 +332,23 @@ id is provided). Each session is in one of these states:
 | `working` | `UserPromptSubmit` / wrapper "busy"   | A turn is in progress (or a background workflow is still running) |
 | `waiting` | `Notification` / wrapper prompt+picker | Needs permission, a question, or a menu choice |
 | `error`   | `StopFailure` / wrapper API-error      | Turn ended on an API error (5xx / overloaded / timeout / usage limit) |
-| `done`    | `Stop` (then held until acknowledged)  | Turn completed OK — keeps alerting until focused |
+| `done`    | `Stop` (then held until acknowledged)  | Turn completed OK — keeps alerting until you GO/ack |
 | `idle`    | Inactivity (TTL) / acknowledged done   | No active turn                            |
 
-The daemon recomputes the overall **status word** on every change (priority
-**WTF > BLOCKED > WIP > FREE**) and sends `D|<word>`:
+The daemon re-sorts the **triage queue** on every change:
 
-- **WTF** if any session is in `error`.
-- **BLOCKED** else if any session is `waiting`.
-- **WIP** else if any session is `working`.
-- **FREE** otherwise (all idle/done, or no sessions).
+```
+every UNACKNOWLEDGED alert first  (error > waiting > done, oldest first)
+then everything else by class     (error > waiting > done > working > idle)
+```
 
-That word is the **priority model**: it decides which session gets auto-surfaced
-and which buzz fires. Auto-surface and navigation order, most urgent first:
-`error → waiting → done → working → idle`. The OLED shows that surfaced session's
-card; with zero sessions it shows the `IDLE` screen.
+That queue is the **priority model**: its head is what the screen shows (unless
+you're browsing), what one GO press acts on, and what the LED blinks about —
+the LED pattern is always the class of the worst *unacknowledged* alert
+(`ERROR` > `INPUT` > `DONE`), dropping to `V|OFF` when nothing needs you. The
+invariant: after each GO/ACK the queue head IS the next thing the LED is
+blinking about, so an already-acknowledged error never hides a fresh waiting
+alert. With zero sessions the OLED shows `MATE / no sessions`.
 
 ---
 
@@ -337,7 +364,7 @@ claude_mate/
 ├── daemon/
 │   └── claude_mate_daemon.py      # Python daemon (pyserial only)
 ├── firmware/
-│   ├── claude_mate/               # Arduino sketch (OLED card + vibration motor)
+│   ├── claude_mate/               # Arduino sketch (one-frame OLED renderer + LED)
 │   └── selftest/                  # hardware self-test sketch
 ├── hooks/
 │   ├── claude-status.sh           # installed to ~/.claude/hooks/
@@ -354,24 +381,56 @@ claude_mate/
 ## Limitations
 
 - **Retry/resubmit is out of scope.** When a turn ends on an error, Claude Mate
-  shows it (`error` card + the looping 0.4/0.2 s alarm buzz until you focus it)
-  but does **not** offer a "retry" action. Reliably resubmitting a turn from outside the
-  GUI is not feasible, so FOCUS — taking you to the session — is the intended
+  shows it (a flashing `ERR` frame + the looping ~7 Hz LED strobe until you ack
+  it) but does **not** offer a "retry" action. Reliably resubmitting a turn from outside the
+  GUI is not feasible, so GO — taking you to the session — is the intended
   response.
-- **Limits are best-effort.** The usage/rate-limit field is shown as a short
-  string (e.g. `71%`) when it can be obtained, and as `-` when it cannot. Claude
-  Mate never fabricates limit numbers; treat this as an extension point.
+- **Model/effort strings are best-effort.** The info row's model/effort text
+  (e.g. `Opus 4.8 xhigh`) is scraped from the live TUI by the PTY wrapper and
+  stays empty for hook-only sessions or until scraped. Claude Mate never
+  fabricates it; treat this as an extension point.
 - **FOCUS targets the wrapper's terminal first, then VS Code.** A wrapped session
-  raises its own terminal window (matched by TTY) reliably. Hook-only sessions
-  fall back to a VS Code deep link, then to raising the VS Code window for the
-  workspace folder — the exact deep-link URI lives behind a single config
-  constant so it is trivial to update.
+  raises its own terminal window (matched by TTY) reliably — and raise is the
+  *only* window operation; nothing is ever collapsed or resized. Hook-only
+  sessions fall back to a VS Code deep link, then to raising the VS Code window
+  for the workspace folder — the exact deep-link URI lives behind a single
+  config constant so it is trivial to update.
 - **Detection is screen-scrape-based (wrapper).** State is inferred from the
   rendered TUI using `patterns.json`. It is scoped to the live status region to
   avoid false positives, but unusual terminal themes/locales may need a pattern
   tweak — which you can do live, no restart.
 - **macOS-focused.** The daemon and wrapper target a Mac (serial device naming,
   `open`, AppleScript focus). Other platforms would need port/focus adjustments.
+
+---
+
+## What changed (2026-07-05)
+
+The device interface was rewritten from scratch — **one screen, one queue,
+three buttons**:
+
+- **UI modes are gone.** No SCROLL/LIST toggle, no carousel, no detail card, no
+  mode long-press. The daemon keeps ONE urgency-sorted triage queue
+  (unacknowledged error > waiting > done first, then everything else by class)
+  and pre-renders ONE screen — size-2 name band + info row + fleet strip; the
+  firmware is a dumb one-frame renderer.
+- **Buttons are PREV / GO / NEXT everywhere.** GO short = acknowledge + raise
+  the window; GO long = acknowledge only; PREV/NEXT auto-repeat while held. The
+  selection snaps home to the queue head after every GO/ACK and after ~10 s
+  idle, and a press-grace guard (< 0.5 s) keeps a just-swapped screen from
+  stealing your press.
+- **Navigation never touches windows.** The terminal-follow preview
+  (collapse/expand on navigation) is gone; GO **raises only** and the daemon
+  never sends `collapse`.
+- **Serial protocol simplified.** Down: `F|<flash>|<name>|<info>|<fleet>` +
+  `V|<kind>` + `P`. Up: `H` + `B|P` / `B|N` / `B|G` / `B|K`. The old
+  `D|` / `S|` / `T|` / `I` lines and `B|1`..`B|5` are gone.
+- **Firmware additions:** a boot splash, a **LINK LOST** screen after ~30 s of
+  daemon silence, and an ~80 ms whole-panel invert blip on every accepted
+  press. LED semantics are unchanged (START one-shot; INPUT / ERROR / DONE loop
+  until acknowledged; OFF).
+- The hook, the PTY wrapper, the socket protocol, and the wiring are unchanged
+  (button *roles* renamed: D4 MODE → PREV, D2 SUBMIT → GO).
 
 ---
 

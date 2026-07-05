@@ -7,10 +7,13 @@ End-to-end test of the Claude Mate daemon with NO hardware.
   - a stub `open`/`code`/`osascript` on PATH captures the FOCUS deep-link, so the
     must-have focus action is verified WITHOUT launching anything on this Mac
   - real hook lines are fed through the Unix socket, exactly like claude-status.sh
+  - a fake PTY-wrapper control socket records every window op the daemon sends,
+    so the "navigation NEVER touches windows / focus is raise-only" invariants
+    are asserted, not assumed
 
-Drives a scenario and asserts the status wheel (D|<WORD>), carousel cards, and
-focus URI. The stepper itself lives only on the Arduino; the daemon just emits
-"D|FREE|WIP|BLOCKED|WTF" lines, so this passes with no hardware.
+Drives a scenario and asserts the F| frames (the single pre-rendered screen),
+the V| LED lines, the triage-queue ordering, the press-grace wrong-target
+guard, and the focus URI.
 
 Run:   python3 tools/test_e2e.py      (needs pyserial: pip install pyserial)
 """
@@ -105,142 +108,33 @@ def saw_after(idx, pred):
     with display_lock:
         return any(pred(l) for l in display[idx:])
 
-time.sleep(2.5)
+def saw_before(idx, pred):
+    with display_lock:
+        return any(pred(l) for l in display[:idx])
 
-print("\n-- phase 1: one working session (expect WIP) --")
-feed("working|sid-1|webapp"); time.sleep(2.0)
+def wait_for(idx, pred, timeout=2.0):
+    """Poll until a line matching pred appears at/after idx. Returns success."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if saw_after(idx, pred):
+            return True
+        time.sleep(0.02)
+    return False
 
-print("\n-- phase 2: FOCUS button, single session (deterministic) --")
-arduino_send("B|1"); time.sleep(1.5)
+def frame_subject(f):
+    """Name field of an F|flash|name|info|fleet line ('' if malformed)."""
+    parts = f.split("|")
+    return parts[2] if len(parts) >= 5 else ""
 
-print("\n-- phase 3: a session starts waiting for input (expect BLOCKED) --")
-feed("waiting|sid-3|infra"); time.sleep(3.5)
+def mark():
+    with display_lock:
+        return len(display)
 
-print("\n-- phase 4: an API error arrives (expect WTF) --")
-feed("error|sid-2|api"); time.sleep(3.5)
-
-print("\n-- phase 5: handshake H -> full resend (must RE-ARM the motor loop) --")
-# Snapshot the frame count so we can prove the handshake re-emits the looping
-# alert haptic (a Nano reset/replug reboots motor-off; the daemon must re-arm it,
-# else an unacknowledged error/done alert goes silent forever).
-with display_lock:
-    idx_before_H = len(display)
-arduino_send("H"); time.sleep(1.5)
-
-print("\n-- phase 5b: LIST -- ack dot, double-click detail, key-stable focus, quiet --")
-# 3 tabs live: sid-2 api(error,unacked), sid-3 infra(waiting,unacked), sid-1 webapp(working).
-with display_lock:
-    idx_before_list = len(display)
-arduino_send("B|4"); time.sleep(1.2)     # MODE long -> LIST mode (T| with per-row ack)
-
-def _row_acks(tline):                    # ack is the 4th ';' field of each row
-    return [f.split(";")[-1] for f in tline.split("|")[3:] if f.count(";") >= 3]
-with display_lock:
-    t_frames = [l for l in display[idx_before_list:] if l.startswith("T|")]
-saw_unacked_dot = any("0" in _row_acks(l) for l in t_frames)   # an unacked-alert row
-
-arduino_send("B|2"); time.sleep(0.8)     # NEXT -> highlight infra (sid-3)
-feed("error|sid-1|webapp"); time.sleep(1.5)   # re-sort: webapp jumps into slot 1
-
-# Double-click SUBMIT -> open the highlighted tab's (infra) full card while in LIST.
-with display_lock:
-    idx_before_detail = len(display)
-arduino_send("B|1"); time.sleep(0.15); arduino_send("B|1"); time.sleep(1.2)
-with display_lock:
-    detail_opened = any(l.startswith("S|") and "|infra|" in l
-                        for l in display[idx_before_detail:])
-# Double-click again -> close detail -> the T| list resumes.
-with display_lock:
-    idx_before_close = len(display)
-arduino_send("B|1"); time.sleep(0.15); arduino_send("B|1"); time.sleep(1.2)
-with display_lock:
-    detail_closed = any(l.startswith("T|") for l in display[idx_before_close:])
-
-# Single-click SUBMIT -> deferred focus of the highlighted tab; key-tracked to
-# infra (sid-3) even though webapp slid into its old index slot.
-arduino_send("B|1"); time.sleep(1.2)
-# SUBMIT long -> ack the highlighted tab (already acked by the focus above; a
-# redundant ack must be a harmless no-op).
-arduino_send("B|5"); time.sleep(0.5)
-
-with display_lock:
-    saw_T = any(l.startswith("T|") for l in display[idx_before_list:])
-    list_totals = [int(l.split("|")[1]) for l in display[idx_before_list:]
-                   if l.startswith("T|") and len(l.split("|")) > 1 and l.split("|")[1].isdigit()]
-arduino_send("B|4"); time.sleep(1.2)     # MODE long -> back to SCROLL (S| resumes)
-with display_lock:
-    idx_after_scroll = len(display)
-feed("working|sid-1|webapp"); time.sleep(1.5)  # nudge a refresh in scroll mode
-
-print("\n-- phase 6: everything finishes (expect FREE) --")
-feed("done|sid-2|api"); feed("done|sid-3|infra")
-feed("done|sid-1|webapp"); time.sleep(3.0)
-
-print("\n-- phase 7: SCROLL ack stays on the acknowledged tab (no jump) --")
-# Clean slate, then webapp2(working) + beta(done). beta is the top alert so it
-# auto-surfaces as the current card. Acknowledging (SUBMIT) turns it done->idle,
-# which re-sorts it BELOW webapp2 -- the view must STAY on beta, not jump to the
-# top tab. (Last phase: on_ack's auto-surface pause can't affect earlier phases.)
-for s in ("sid-1|webapp", "sid-2|api", "sid-3|infra"):
-    feed("end|" + s)
-time.sleep(1.0)
-feed("working|sidW|webapp2"); feed("done|sidB|beta"); time.sleep(2.2)
-with display_lock:
-    idx_before_ack = len(display)
-arduino_send("B|1"); time.sleep(1.5)          # SUBMIT: ack beta -> must stay on beta
-with display_lock:
-    cards_after_ack = [l for l in display[idx_before_ack:] if l.startswith("S|")]
-first_card_after_ack = cards_after_ack[0] if cards_after_ack else ""
-
-print("\n-- phase 8: LIST detail auto-closes when the detailed tab ends --")
-# beta is the current card; enter LIST (seeds on beta), double-click to open its
-# detail, then END beta: detail must auto-close back to the list (not stick on a
-# stale card).
-arduino_send("B|4"); time.sleep(1.2)          # SCROLL -> LIST (seeds highlight on beta)
-arduino_send("B|1"); time.sleep(0.15); arduino_send("B|1"); time.sleep(1.0)  # dbl-click -> detail
-with display_lock:
-    idx_before_end = len(display)
-feed("end|sidB|beta"); time.sleep(1.5)        # end the detailed tab
-with display_lock:
-    detail_autoclosed = any(l.startswith("T|") for l in display[idx_before_end:])
-
-print("\n-- phase 9: SUBMIT long (B|5) acknowledges WITHOUT focusing --")
-# Still in LIST mode (webapp2 working; the highlight re-anchored onto it when
-# beta ended -- key-stable). A fresh 'done' tab sorts to row 0; move the
-# highlight onto it, then B|5 must ack it (done -> idle, V|OFF) WITHOUT
-# opening/focusing anything.
-feed("done|sidG|gamma"); time.sleep(2.2)
-arduino_send("B|3"); time.sleep(0.8)          # highlight up -> gamma (row 0)
-focus_lines_before_b5 = ([l.strip() for l in open(focuslog)]
-                         if os.path.exists(focuslog) else [])
-with display_lock:
-    idx_before_b5 = len(display)
-arduino_send("B|5"); time.sleep(1.8)
-with display_lock:
-    b5_acked = any(l.startswith("T|") and "gamma;IDLE" in l
-                   for l in display[idx_before_b5:])
-    b5_led_off = any(l == "V|OFF" for l in display[idx_before_b5:])
-focus_lines_after_b5 = ([l.strip() for l in open(focuslog)]
-                        if os.path.exists(focuslog) else [])
-b5_no_focus = (focus_lines_after_b5 == focus_lines_before_b5)
-
-print("\n-- phase 10: terminal-follow preview: none in LIST, ordered in SCROLL --")
-# Still in LIST (webapp2 working, gamma idle; highlight on gamma from phase 9).
-# Attach fake wrapper ctrl sockets: webapp2 speaks the full go/ok protocol but
-# DELAYS its 'collapse' completion ack ~0.8s (a slow osascript); gamma acks
-# instantly; delta is a PRE-ACK wrapper (closes without any reply -> EOF).
-# LIST nav is a picker and must move NO windows. Back in SCROLL, each next/prev
-# (after the ~0.45s settle) must 'focus' the shown card's wrapper and 'collapse'
-# the previously expanded one, in strict alternation -- and the op AFTER
-# webapp2's delayed collapse must arrive >= the delay later (proving the daemon
-# actually WAITS for the completion ack instead of firing-and-forgetting),
-# while the op after delta's silent EOF must arrive promptly (pre-ack compat,
-# no deadline stall).
-ACK_DELAY = 0.8
-ctrl_seq = []                     # (session, cmd, arrival time) in arrival order
+# --- fake PTY-wrapper control socket: records every window op ------------------
+ctrl_ops = []                     # (cmd, arrival time) in arrival order
 ctrl_lock = threading.Lock()
 
-def _fake_ctrl(name, ack=True, delay_collapse=0.0):
+def fake_ctrl(name):
     path = os.path.join(binhome, f"ctrl-{name}.sock")
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(path)
@@ -255,13 +149,9 @@ def _fake_ctrl(name, ack=True, delay_collapse=0.0):
                 data = conn.recv(64).decode(errors="ignore").strip()
                 if data:
                     with ctrl_lock:
-                        ctrl_seq.append((name, data, time.monotonic()))
-                if ack:
-                    conn.sendall(b"go\n")              # liveness, like the wrapper
-                    if data == "collapse" and delay_collapse:
-                        time.sleep(delay_collapse)     # a slow window op
-                    conn.sendall(b"ok\n")              # completion ack
-                # ack=False: close with no reply -> a pre-ack wrapper (EOF)
+                        ctrl_ops.append((data, time.monotonic()))
+                conn.sendall(b"go\n")
+                conn.sendall(b"ok\n")
             except OSError:
                 pass
             finally:
@@ -272,55 +162,145 @@ def _fake_ctrl(name, ack=True, delay_collapse=0.0):
     threading.Thread(target=loop, daemon=True).start()
     return path
 
-ctrl_w = _fake_ctrl("webapp2", delay_collapse=ACK_DELAY)
-ctrl_g = _fake_ctrl("gamma")
-ctrl_d = _fake_ctrl("delta", ack=False)
+time.sleep(2.5)
+
+print("\n-- phase 1: empty boot -> MATE/no-sessions frame, LED cleared --")
+time.sleep(0.5)
+
+print("\n-- phase 2: one working session -> WORK frame + V|START --")
+feed("working|sid-1|webapp||Opus 4.8|xhigh"); time.sleep(1.5)
+
+print("\n-- phase 3: a session starts waiting -> auto-surfaces, flashes, V|INPUT --")
+idx_wait = mark()
+feed("waiting|sid-3|infra"); time.sleep(1.5)
+
+print("\n-- phase 4: an API error arrives -> outranks waiting, V|ERROR --")
+idx_err = mark()
+feed("error|sid-2|api"); time.sleep(1.5)
+
+print("\n-- phase 5: handshake H -> full resend (frame + re-armed LED loop) --")
+idx_H = mark()
+arduino_send("H"); time.sleep(1.5)
+
+print("\n-- phase 6: PREV/NEXT browse the queue; no window ops, no acks --")
+# Queue now: api(ERR,unacked) > infra(WAIT,unacked) > webapp(WORK).
+idx_nav = mark()
+arduino_send("B|N"); time.sleep(0.8)      # down: api -> infra
+arduino_send("B|N"); time.sleep(0.8)      # down: infra -> webapp
+arduino_send("B|P"); time.sleep(0.8)      # up:   webapp -> infra
+with display_lock:
+    nav_frames = [l for l in display[idx_nav:] if l.startswith("F|")]
+# The 1 Hz ticker interleaves time-update frames of the SAME subject between
+# the nav-driven frames; collapse consecutive repeats before checking the walk.
+nav_subjects = []
+for f in nav_frames:
+    s = frame_subject(f)
+    if not nav_subjects or nav_subjects[-1] != s:
+        nav_subjects.append(s)
+
+print("\n-- phase 7: GO acks + focuses the shown alert; next alert surfaces --")
+# Subject is infra (from nav). GO must focus infra (deep link sid-3), ack it,
+# and snap home -> api (still unacked ERR) becomes the subject.
+idx_go = mark()
+arduino_send("B|G"); time.sleep(1.5)
+with display_lock:
+    frames_after_go = [l for l in display[idx_go:] if l.startswith("F|")]
+go_snapped_to_api = any(frame_subject(f) == "api" for f in frames_after_go)
+
+print("\n-- phase 8: GO long (B|K) acks WITHOUT focusing; LED steps down --")
+# Subject is api (ERR, unacked). B|K must ack it (no focus), snap home; with
+# no unacked alerts left the LED must drop to V|OFF.
+focus_before_k = ([l.strip() for l in open(focuslog)]
+                  if os.path.exists(focuslog) else [])
+idx_k = mark()
+arduino_send("B|K"); time.sleep(1.5)
+focus_after_k = ([l.strip() for l in open(focuslog)]
+                 if os.path.exists(focuslog) else [])
+k_no_focus = (focus_after_k == focus_before_k)
+with display_lock:
+    k_led_off = any(l == "V|OFF" for l in display[idx_k:])
+
+print("\n-- phase 8b: a new alert must NOT steal the screen inside the "
+      "interaction window (subject pinned; LED updates immediately) --")
+# We pressed B|K moments ago, so the 10s interaction window is open and the
+# subject is pinned. A fresh waiting alert must move the LED (V|INPUT) but NOT
+# the shown subject.
+idx_pin = mark()
+feed("waiting|sidQ|quux"); time.sleep(2.0)
+with display_lock:
+    pin_frames = [l for l in display[idx_pin:] if l.startswith("F|")]
+    pin_led = any(l == "V|INPUT" for l in display[idx_pin:])
+pin_no_swap = all(frame_subject(f) != "quux" for f in pin_frames)
+feed("end|sidQ|quux"); time.sleep(0.8)
+
+print("\n-- phase 9: done alert + uniqueness truncation of long sibling names --")
+# The subject is still PINNED (phase 8's interaction window), so the done
+# alert won't surface until the window expires during phase 10's wait; the
+# uniqueness assertion is computed there, scanning frames from this mark on.
+idx_done = mark()
+feed("done|sidA|project-alpha-one")
+feed("working|sidB|project-alpha-two"); time.sleep(1.5)
+
+print("\n-- phase 10: press-grace: autonomous subject swap right before GO --")
+# Wait out the interaction window so the screen is free to move on its own,
+# then land a fresh, worse alert (error) which auto-surfaces over the unacked
+# 'done' alert being read -- and press GO immediately. The press must apply to
+# the PREVIOUS subject (project-alpha-one, sidA), not the just-arrived beta.
+print("   (waiting out the 10s interaction window...)")
+time.sleep(10.5)
+# The window expired mid-wait: the done alert auto-surfaced. Its frames carry
+# the disambiguated sibling name (phase 9's assertion).
+with display_lock:
+    done_frames = [l for l in display[idx_done:] if l.startswith("F|")]
+uniq_names = any("proj~a-one" in f for f in done_frames)
+# The screen must now rest on the done alert (queue head, project-alpha-one).
+idx_grace = mark()
+feed("error|sidE|beta")
+# Poll until the autonomous swap frame (flashing beta) is actually on the wire,
+# then press IMMEDIATELY -- the poll interval keeps the press inside the 0.5s
+# grace window, and a starved daemon fails loudly instead of passing vacuously.
+grace_swap_seen = wait_for(idx_grace, lambda l: l.startswith("F|1|beta"))
+arduino_send("B|G"); time.sleep(1.5)
+focus_lines = [l.strip() for l in open(focuslog)] if os.path.exists(focuslog) else []
+grace_focused_prev = any("session=sidA" in l for l in focus_lines)
+grace_not_beta = not any("session=sidE" in l for l in focus_lines)
+
+print("\n-- phase 11: navigation moves NO windows; GO sends ONLY 'focus' --")
+# Attach ctrl sockets to SEVERAL sessions the browse will dwell on, so a
+# reintroduced settle-timer preview (the old 0.45s terminal-follow) would be
+# caught red-handed in nav_window_ops.
+ctrl_w = fake_ctrl("webapp2")
+ctrl_a = fake_ctrl("webapp")
+ctrl_i = fake_ctrl("infra")
 feed(f"working|sidW|webapp2|{ctrl_w}")
-feed(f"idle|sidG|gamma|{ctrl_g}")
-feed(f"idle|sidD|delta|{ctrl_d}")
+feed(f"working|sid-1|webapp|{ctrl_a}")
+feed(f"waiting|sid-3|infra|{ctrl_i}")
 time.sleep(1.2)
-arduino_send("B|2"); time.sleep(1.5)          # LIST nav: highlight moves, NO windows
 with ctrl_lock:
-    list_nav_ops = list(ctrl_seq)
-arduino_send("B|4"); time.sleep(1.2)          # MODE long -> back to SCROLL
-for _ in range(4):                            # visit all 3 cards, wrap past the 1st
-    arduino_send("B|2"); time.sleep(1.9)      # settle 0.45s + delayed ack + margin
+    ops_before_nav = len(ctrl_ops)
+# Browse across the whole queue, dwelling longer than the old settle timer.
+for ev in ("B|N", "B|N", "B|N", "B|P", "B|P"):
+    arduino_send(ev); time.sleep(0.7)
+time.sleep(1.0)
 with ctrl_lock:
-    scroll_ops = [(n, c) for (n, c, t) in ctrl_seq[len(list_nav_ops):]]
-    scroll_times = [t for (n, c, t) in ctrl_seq[len(list_nav_ops):]]
-scroll_focus = [n for (n, c) in scroll_ops if c == "focus"]
-scroll_collapse = [n for (n, c) in scroll_ops if c == "collapse"]
-# Four navs over three tabs -> focuses on all three (the 4th wraps around), and
-# EXACTLY one collapse per move-off, of exactly the tab focused before it:
-# f(A) c(A) f(B) c(B) f(C) c(C) f(A). Anything extra (e.g. collapsing the tab
-# just shown) or missing (previous tab left expanded) must fail.
-preview_focus_all = (len(scroll_focus) == 4
-                     and set(scroll_focus) == {"webapp2", "gamma", "delta"}
-                     and all(scroll_focus[i] != scroll_focus[i + 1] for i in range(3)))
-preview_collapse_prev = scroll_collapse == scroll_focus[:3]
-# The exact expected stream, derived from the observed rotation:
-# f(A) c(A) f(B) c(B) f(C) c(C) f(A) -- nothing extra, nothing missing,
-# each collapse strictly between its tab's focus and the next tab's focus.
-expected_ops = []
-for i, n in enumerate(scroll_focus):
-    expected_ops.append((n, "focus"))
-    if i < 3:
-        expected_ops.append((scroll_focus[i], "collapse"))
-preview_ordered = preview_focus_all and preview_collapse_prev and scroll_ops == expected_ops
-# Ack-wait is real: the op following webapp2's delayed 'collapse' arrived at
-# least ~the delay later. Fire-and-forget would show a near-zero gap.
-ack_waited = False
-for i, (n, c) in enumerate(scroll_ops):
-    if (n, c) == ("webapp2", "collapse") and i + 1 < len(scroll_ops):
-        ack_waited = (scroll_times[i + 1] - scroll_times[i]) >= ACK_DELAY - 0.1
+    nav_window_ops = ctrl_ops[ops_before_nav:]
+# Now navigate TO webapp2 and GO: exactly one 'focus', never 'collapse'.
+# Find it by pressing NEXT up to queue-size times, checking the subject.
+focused_webapp2 = False
+for _ in range(8):
+    with display_lock:
+        cur = [l for l in display if l.startswith("F|")]
+    if cur and frame_subject(cur[-1]) == "webapp2":
+        focused_webapp2 = True
         break
-# Pre-ack compat: the op following delta's silent-EOF 'collapse' arrived
-# promptly (no WRAPPER_ACK_TIMEOUT_S stall).
-preack_prompt = False
-for i, (n, c) in enumerate(scroll_ops):
-    if (n, c) == ("delta", "collapse") and i + 1 < len(scroll_ops):
-        preack_prompt = (scroll_times[i + 1] - scroll_times[i]) < 2.0
-        break
+    arduino_send("B|N"); time.sleep(0.5)
+with ctrl_lock:
+    ops_before_go = len(ctrl_ops)   # the find-loop navs must have moved nothing
+arduino_send("B|G"); time.sleep(2.0)
+with ctrl_lock:
+    go_ops = ctrl_ops[ops_before_go:]
+    all_ops = list(ctrl_ops)
+nav_moved_nothing = (len(nav_window_ops) == 0 and ops_before_go == ops_before_nav)
 
 proc.terminate()
 try:
@@ -336,74 +316,83 @@ def check(name, ok):
     checks.append(ok)
     print(f"  [{'PASS' if ok else 'FAIL'}] {name}")
 
-check("idle frame at boot (I)", saw(lambda l: l == "I"))
-check("FREE at boot (D|FREE)", saw(lambda l: l == "D|FREE"))
-check("WIP while working (D|WIP)", saw(lambda l: l == "D|WIP"))
-check("BLOCKED on waiting session (D|BLOCKED)", saw(lambda l: l == "D|BLOCKED"))
-check("WTF on API error (D|WTF)", saw(lambda l: l == "D|WTF"))
-check("webapp working card", saw(lambda l: l.startswith("S|") and "|webapp|working|" in l))
-check("infra waiting card", saw(lambda l: l.startswith("S|") and "|infra|waiting|" in l))
-check("api error card", saw(lambda l: l.startswith("S|") and "|api|error|" in l))
-check("FOCUS opened a vscode deep link",
-      any("vscode://anthropic.claude-code/open?session=" in l for l in focus_lines))
-check("FOCUS targeted live session sid-1",
-      any("session=sid-1" in l for l in focus_lines))
+def wellformed(f):
+    return len(f.split("|")) >= 5
 
-# ---- haptics (V|<KIND>) ----------------------------------------------------
-# The fake-Arduino reader captures V| lines too. Assert the new haptic model:
-# a start tick, a needs-input tap, a looping error alert, a looping done alert,
-# and that the daemon clears the firmware loop to a known state (V|OFF).
-check("V|OFF clears the loop (startup / on error->done)",
-      saw(lambda l: l == "V|OFF"))
-check("V|START tick when a job starts with nothing else pending",
+# ---- the single-frame protocol ------------------------------------------------
+check("empty boot shows the no-sessions frame (F|0|MATE|no sessions|)",
+      saw(lambda l: l.startswith("F|0|MATE|no sessions")))
+check("every F| frame is well-formed (5 fields)",
+      all(wellformed(l) for l in display if l.startswith("F|")))
+check("working session frame: webapp + WORK tag, not flashing",
+      saw(lambda l: l.startswith("F|0|webapp|WORK") ))
+check("model/effort rendered on the info row (Opus... xhigh)",
+      saw(lambda l: l.startswith("F|") and "xhigh" in l and "Opus" in l))
+check("waiting session auto-surfaces and flashes (F|1|infra|WAIT...)",
+      saw_after(idx_wait, lambda l: l.startswith("F|1|infra|WAIT")))
+check("error outranks waiting: api auto-surfaces flashing (F|1|api|ERR...)",
+      saw_after(idx_err, lambda l: l.startswith("F|1|api|ERR")))
+check("fleet strip shows the queue shape (!?> for err/wait/work)",
+      saw(lambda l: l.startswith("F|") and "!?>" in l.split("|")[-1]))
+
+# ---- LED (V|<KIND>) ------------------------------------------------------------
+check("V|OFF clears the loop at startup (before the first alert)",
+      saw_before(idx_wait, lambda l: l == "V|OFF"))
+check("V|START blink when a job starts with nothing else pending",
       saw(lambda l: l == "V|START"))
-check("V|INPUT tap when a session starts waiting",
-      saw(lambda l: l == "V|INPUT"))
-check("V|ERROR loop when an API error arrives",
-      saw(lambda l: l == "V|ERROR"))
-check("V|DONE loop when a turn finishes (until acknowledged)",
-      saw(lambda l: l == "V|DONE"))
-check("handshake H re-arms the active loop haptic (V|ERROR/V|DONE re-sent after reset)",
-      saw_after(idx_before_H, lambda l: l in ("V|ERROR", "V|DONE")))
-check("MODE long-press (B|4) enters LIST mode -> T| frame sent", saw_T)
-check("LIST frame lists all live tabs (total >= 3)",
-      any(t >= 3 for t in list_totals))
-check("SUBMIT in LIST focuses the highlighted tab BY KEY, stable across a re-sort -> sid-3",
-      any("session=sid-3" in l for l in focus_lines))  # sid-3 is focused only in the LIST phase
-check("LIST row carries an ack flag; an unacknowledged alert row = ;0 (blink dot)",
-      saw_unacked_dot)
-check("double-click SUBMIT in LIST opens the highlighted tab's detail card (infra)",
-      detail_opened)
-check("double-click SUBMIT again closes detail -> the T| list resumes",
-      detail_closed)
-check("LIST detail auto-closes when the detailed tab ends (no stuck stale card)",
-      detail_autoclosed)
-check("MODE long-press again returns to SCROLL -> S| card resumes",
-      saw_after(idx_after_scroll, lambda l: l.startswith("S|")))
-check("SCROLL: acknowledging a tab stays on it, no jump to the top tab "
-      f"(first card after ack = beta, got {first_card_after_ack!r})",
-      "|beta|" in first_card_after_ack)
-check("SUBMIT long (B|5) acknowledges the highlighted tab (done -> IDLE row)",
-      b5_acked)
-check("SUBMIT long (B|5) silences the LED loop (V|OFF after ack)",
-      b5_led_off)
-check("SUBMIT long (B|5) does NOT focus (no new deep-link/open calls)",
-      b5_no_focus)
-check("LIST nav moves NO windows (picker only: no wrapper focus/collapse traffic)",
-      not list_nav_ops)
-check("SCROLL nav preview: every shown card's wrapper gets 'focus' on settle (all 3 tabs)",
-      preview_focus_all)
-check("SCROLL nav preview: exactly the previously expanded tab collapses on each move-off",
-      preview_collapse_prev)
-check("SCROLL nav preview: exact op stream f/c strictly alternates, collapse between focuses",
-      preview_ordered)
-check("daemon WAITS for the completion ack (delayed 'ok' delays the next window op)",
-      ack_waited)
-check("pre-ack wrapper (EOF, no ack) does not stall the window-op stream",
-      preack_prompt)
+check("V|INPUT loop when a session starts waiting", saw(lambda l: l == "V|INPUT"))
+check("V|ERROR loop when an API error arrives", saw(lambda l: l == "V|ERROR"))
+check("V|DONE loop when a turn finishes", saw(lambda l: l == "V|DONE"))
+check("handshake H re-sends the frame", saw_after(idx_H, lambda l: l.startswith("F|")))
+check("handshake H re-arms the active LED loop (V|ERROR re-sent after reset)",
+      saw_after(idx_H, lambda l: l == "V|ERROR"))
+
+# ---- navigation ----------------------------------------------------------------
+def has_run(seq, run):
+    return any(seq[i:i + len(run)] == run for i in range(len(seq)))
+check("NEXT/PREV walk the queue (api -> infra -> webapp -> infra)",
+      has_run(nav_subjects, ["infra", "webapp", "infra"]))
+infra_navs = [f for f in nav_frames if frame_subject(f) == "infra"]
+check("browsing acks nothing (infra still flashing when REVISITED)",
+      bool(infra_navs) and infra_navs[-1].startswith("F|1|"))
+
+# ---- GO / ACK triage sweep -----------------------------------------------------
+check("GO focuses the shown session (deep link session=sid-3 for infra)",
+      any("session=sid-3" in l for l in focus_lines))
+check("GO snaps home to the next unacked alert (api surfaces)",
+      go_snapped_to_api)
+check("GO long (B|K) acknowledges WITHOUT focusing (no new open calls)",
+      k_no_focus)
+check("last unacked alert acked -> LED off (V|OFF)", k_led_off)
+
+# ---- screen ownership (the 10s interaction window) -------------------------------
+check("a new alert inside the interaction window does NOT steal the screen",
+      pin_no_swap and bool(pin_frames))
+check("...but the LED updates immediately (V|INPUT while pinned)", pin_led)
+
+# ---- naming --------------------------------------------------------------------
+check("sibling long names disambiguated (proj~a-one)", uniq_names)
+
+# ---- press-grace wrong-target guard --------------------------------------------
+check("press-grace: the autonomous beta swap frame rendered BEFORE GO was sent",
+      grace_swap_seen)
+check("press-grace: GO right after an autonomous swap acts on the PREVIOUS "
+      "subject (focused sidA, the alert being read)", grace_focused_prev)
+check("press-grace: the just-arrived alert was NOT focused (no session=sidE)",
+      grace_not_beta)
+
+# ---- window-op invariants (the reason for the redesign) -------------------------
+check("navigation sends ZERO window ops to wrapper ctrl sockets "
+      "(browse + find loops, dwelling on ctrl-socket sessions)",
+      nav_moved_nothing)
+check("GO on a wrapper session sends exactly one 'focus'",
+      [c for (c, t) in go_ops] == ["focus"] if focused_webapp2 else False)
+check("the daemon NEVER sends 'collapse' (raise-only, always; non-vacuous)",
+      bool(all_ops) and all(c == "focus" for (c, t) in all_ops))
 
 ok = all(checks)
-print("\n  focus.log:", [l.strip() for l in focus_lines] or "(empty)")
+print("\n  focus.log:", focus_lines or "(empty)")
+print("  ctrl ops:", [(c) for (c, t) in all_ops] or "(none)")
 print("  display frames:", len(display))
 print("\n================", "ALL PASSED" if ok else "SOME FAILED", "================")
 sys.exit(0 if ok else 1)
