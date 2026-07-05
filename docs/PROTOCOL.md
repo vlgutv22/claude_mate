@@ -14,26 +14,25 @@ There are three interfaces:
 
 ## 0. The interface model (one screen, one queue, three buttons)
 
-The daemon keeps ONE urgency-sorted **triage queue** of sessions and renders
-ONE screen: the *selected* session — normally the **queue head**, i.e. the
-thing that needs the human most. The firmware is a dumb renderer: it holds
-exactly one pre-composed frame (four size-1 rows) and draws it. All ordering,
-selection, truncation and layout live in the daemon.
+The daemon keeps ONE **stable-ordered** list of sessions (alphabetical, so tabs
+never shuffle) and renders ONE screen: the *selected* session. The firmware is
+a dumb renderer: it holds exactly one pre-composed frame (four size-1 rows) and
+draws it. All ordering, selection, truncation and layout live in the daemon.
 
 ```
 +---------------------+
 |api-server           |   r0: session name — flashes (inverts ~2.5 Hz) while
 |WAIT  0:42           |   r1: state tag + time-in-state    its alert is unacked
 |Opus 4.8  xhigh      |   r2: model + effort
-|2/6 EBWDI            |   r3: queue position + one status LETTER per session;
-+---------------------+       the active tab's letter sits in a filled square
+|2/6 E B W D I        |   r3: queue position + one status LETTER per session;
++---------------------+       the active tab's letter sits in a filled rectangle
 ```
 
 The **active tab** (the session shown above) has its fleet letter drawn in a
-**wide filled square** in r3 — a lit block with the letter knocked out — so you
-can see at a glance which tab is on screen. Any tab with an **unacknowledged
-alert** has its letter **blinking** in the strip, so you can tell acked from
-unacked without hunting.
+**wide filled rectangle** in r3 — a lit block with the letter centred and
+knocked out — so you can see at a glance which tab is on screen. Any tab with
+an **unacknowledged alert** has its letter **blinking** in the strip, so you can
+tell acked from unacked without hunting.
 
 The three buttons mean the same thing at all times:
 
@@ -59,8 +58,9 @@ terminal whose name the user is actually looking at.
 
 **No auto-switch:** a GO/ACK **stays on the tab it acted on** — the device
 never jumps to another tab on a press. The screen only changes subject when you
-navigate, or after **10 s** of no presses, when it returns to the queue head
-(so the next alert surfaces on its own without yanking the view mid-press).
+navigate, or after **10 s** of no presses, when it auto-surfaces the most-urgent
+unacknowledged alert (at its stable position) — so the next alert surfaces on
+its own without yanking the view mid-press. The tab **order** never changes.
 
 ---
 
@@ -88,11 +88,11 @@ input buffer at 96 bytes and drops malformed/oversized lines).
 | Field   | Description |
 |---------|-------------|
 | `flags` | Bitfield. **bit0**: invert **row 0** (the name) at ~2.5 Hz (an unacknowledged alert is on screen). **bit1**: FOLLOW mode is on (draw a ► marker by the state row). |
-| `sel`   | The character column **within `r3`** of the active tab's fleet letter (`-1` = none). The firmware fills a **wide** block (~10 px) centred on that letter — a lit square with the letter knocked out. |
+| `sel`   | The character column **within `r3`** of the active tab's fleet letter (`-1` = none). The firmware fills a **wide** rectangle (~11 px) **centred** on that letter — a lit block with the letter knocked out. |
 | `r0` (name) | Session name. The daemon truncates to the row width and, when two long sibling names collide, disambiguates with a middle squeeze (first 9 + `~` + last 10, e.g. `webapp-ba~ervice-one`). |
 | `r1` (state) | `TAG  time` — the 4-char state tag (`ERR`/`WAIT`/`DONE`/`WORK`/`IDLE`) and the time in that state (mm:ss, or h:mm past an hour). |
 | `r2` (meta) | Best-fit `model  effort` (empty for hook-driven sessions with no scraped metadata). |
-| `r3` (fleet) | `pos/total ` + one status **letter** per session in queue order, **packed with no separator** (the active-tab square already marks which is which): `E` error, `B` waiting (blocked), `W` working, `D` done, `I` idle. An **unacknowledged alert's letter is sent LOWERCASE** — the firmware draws it uppercase but **blinks** it, so you can see which tabs still need acknowledging (they stop blinking as you ack them). When the strip does not fit, it is cut with a trailing `+`. `r3` is the last field (the firmware stops tokenizing at the 6th `\|` and takes the rest verbatim). |
+| `r3` (fleet) | `pos/total ` + one status **letter** per session in the stable (alphabetical) order, **space-separated**: `E` error, `B` waiting (blocked), `W` working, `D` done, `I` idle. An **unacknowledged alert's letter is sent LOWERCASE** — the firmware draws it uppercase but **blinks** it, so you can see which tabs still need acknowledging (they stop blinking as you ack them). When the strip does not fit, it is cut with a trailing `+`. `r3` is the last field (the firmware stops tokenizing at the 6th `\|` and takes the rest verbatim). |
 
 The daemon sends an `F` line whenever the rendered bytes change: immediately on
 any state change or button, and ~1/s while a displayed time ticks. Identical
@@ -244,16 +244,23 @@ The daemon keeps a dictionary of sessions, **keyed by `session_id`** (or by
 | `done`    | `Stop` fired — turn completed OK. Also `working` → `idle` becomes `done` (finished but not yet acknowledged) and STAYS `done` until acknowledged. |
 | `idle`    | Acknowledging a `done` session, or inactivity/TTL pruning. **No hook/socket message sets `idle` directly into the model.** |
 
-### The triage queue (single source of truth for ordering)
+### Tab order (stable) vs. urgency (separate)
+
+The display / navigation order is **stable — alphabetical by name** (then the
+session key as a deterministic tiebreak). Tabs keep their position as their
+states change; they never shuffle under the user.
+
+**Urgency** is computed separately and drives only two things, never the tab
+order:
 
 ```
-every UNACKNOWLEDGED alert first  (error > waiting > done, oldest first)
-then everything else by class     (error > waiting > done > working > idle)
+worst UNACKNOWLEDGED alert  (error > waiting > done, oldest first)
 ```
 
-This keeps the invariant that after each GO/ACK the queue head IS the next
-thing the LED is blinking about — an already-acknowledged error never hides a
-fresh waiting alert.
+* the **LED** loop class, and
+* the **idle auto-surface**: after 10 s of no presses the display shows this
+  most-urgent alert (at its stable position). If nothing is unacknowledged it
+  rests on the first tab.
 
 ### Ack lifecycle
 
@@ -274,14 +281,14 @@ silenced).
 
 ### Selection rules
 
-* Selection is tracked by session **key**, so queue re-sorts never move the
-  subject out from under the cursor (only the `pos/total` number changes).
+* Tab order is **stable (alphabetical)** — tabs never change position as their
+  states change. Selection is tracked by session **key**.
 * While the user is interacting (any press within 10 s) the screen never
   changes subject on its own.
 * GO/ACK act on the session **currently shown** (WYSIWYG) and **stay** on it —
   the device never auto-switches tabs on a press.
-* After 10 s without a press the selection returns to the live queue head (so
-  the next alert surfaces on its own).
-* PREV/NEXT wrap around the queue ends.
+* After 10 s without a press the display auto-surfaces the most-urgent
+  unacknowledged alert (at its stable position), else rests on the first tab.
+* PREV/NEXT wrap around the ends.
 * **FOLLOW** (double-click GO) makes PREV/NEXT also raise the selected terminal
   after the selection settles (~250 ms); double-click again to turn it off.

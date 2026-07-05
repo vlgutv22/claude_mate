@@ -17,12 +17,12 @@
  *     |api-server           |   r0: session name -- flashes (inverts ~2.5 Hz)
  *     |WAIT  0:42           |   r1: state tag + time-in-state
  *     |Opus 4.8  xhigh      |   r2: model + effort
- *     |2/6 WBEDI            |   r3: queue position + one status LETTER per
- *     +---------------------+       session, packed (E/B/W/D/I). An UNACKED
- *                                   alert's letter BLINKS (sent lowercase). The
- *                                   active tab's letter sits in a filled square
- *                                   (letter knocked out). A ">" triangle by the
- *                                   state row = FOLLOW mode on.
+ *     |2/6 W B E D I        |   r3: queue position + one status LETTER per
+ *     +---------------------+       session (E/B/W/D/I). An UNACKED alert's
+ *                                   letter BLINKS (sent lowercase). The active
+ *                                   tab's letter sits in a wide centred filled
+ *                                   rectangle (letter knocked out). A ">"
+ *                                   triangle by the state row = FOLLOW mode on.
  *
  * The firmware is a dumb renderer: it holds exactly one frame (3 text rows +
  * a flash flag) and draws it. All ordering, selection, truncation, and text
@@ -379,12 +379,17 @@ static void drawFrame() {
     }
   }
 
-  // Active-tab selection square: fill the selected letter's cell (letters are
-  // packed with no separator, so the box is one 6px cell -- inverting yields a
-  // solid lit (blue) block with the letter knocked out in black).
+  // Active-tab selection rectangle: a wide filled block CENTRED on the selected
+  // letter (the 5px glyph sits at bx..bx+4; an 11px block from bx-3 gives 3px
+  // margins each side). Letters are space-separated, so it never overlaps a
+  // neighbour. Inverting yields a lit (blue) rectangle with the letter knocked
+  // out in black.
   if (frameSel >= 0) {
-    int16_t bx = (int16_t)frameSel * 6;
-    display.fillRect(bx, 24, 6, ROW_H, SSD1306_INVERSE);
+    int16_t bx = (int16_t)frameSel * 6 - 3;
+    if (bx < 0) bx = 0;
+    int16_t bw = 11;
+    if (bx + bw > SCREEN_WIDTH) bw = SCREEN_WIDTH - bx;
+    display.fillRect(bx, 24, bw, ROW_H, SSD1306_INVERSE);
   }
   // FOLLOW mode: a small filled "play" triangle at the right of the state row
   // (r1 is always short, so it never collides).

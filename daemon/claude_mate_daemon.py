@@ -302,8 +302,12 @@ class Registry:
 
     def top_alert(self) -> Optional["Session"]:
         """The most urgent unacknowledged session needing the human (error >
-        waiting > done), or None. Drives the LED loop class."""
-        items = [s for s in self.queue() if s.unacked_alert()]
+        waiting > done, oldest first), or None. Drives the LED loop class and
+        the idle auto-surface. Sorted by URGENCY independently of the display
+        order (which is a stable alphabetical order, see queue())."""
+        with self._lock:
+            items = [s for s in self._sessions.values() if s.unacked_alert()]
+        items.sort(key=lambda s: (STATE_ORDER.get(s.state, 99), s.state_since))
         return items[0] if items else None
 
     def prune(self) -> None:
@@ -325,17 +329,13 @@ class Registry:
                 log(f"pruned {len(dead)} stale session(s)")
 
     def queue(self) -> List[Session]:
-        """The triage queue: every UNacknowledged alert first (by urgency
-        class, oldest first -- these are what still need the human), then
-        everything else by class. This keeps the invariant that after each
-        GO/ACK the queue head IS the next thing the LED is blinking about;
-        an already-acknowledged error never hides a fresh waiting alert."""
+        """The display/navigation order: STABLE, alphabetical by name (then key
+        as a deterministic tiebreak). Tabs keep their position as their states
+        change -- they never shuffle under the user. Urgency drives the LED and
+        the idle auto-surface separately (see top_alert()), not this order."""
         with self._lock:
             items = list(self._sessions.values())
-        items.sort(key=lambda s: (0 if s.unacked_alert() else 1,
-                                  STATE_ORDER.get(s.state, 99),
-                                  s.state_since,
-                                  s.name.lower()))
+        items.sort(key=lambda s: (s.name.lower(), s.key))
         return items
 
     def count(self) -> int:
@@ -666,21 +666,23 @@ class Screen:
                 break
         head = f"{pos}/{len(queue)} "
         room = ROW_CHARS - len(head)
-        # One letter per session, packed with NO separator (the active-tab
-        # square already marks which is which). An UNACKNOWLEDGED alert's letter
-        # is sent LOWERCASE so the firmware BLINKS it -- you can see at a glance
-        # which tabs still need acknowledging (they stop as you ack them).
+        # One letter per session, SPACE-separated (no '|' bars -- the active-tab
+        # square marks which is which; the space gives the highlight rectangle
+        # room to centre the letter). An UNACKNOWLEDGED alert's letter is sent
+        # LOWERCASE so the firmware BLINKS it -- you can see at a glance which
+        # tabs still need acknowledging (they stop as you ack them).
         letters = []
         for s in queue:
             ltr = STATE_LETTER.get(s.state, "I")
             letters.append(ltr.lower() if s.unacked_alert() else ltr)
-        strip = "".join(letters)
+        strip = " ".join(letters)
         if len(strip) > room:
             strip = strip[:max(0, room - 1)] + "+"
         r3 = head + strip
-        # Column of the active tab's letter within r3 (letters are now
-        # consecutive). -1 if it fell past a truncation.
-        sel = len(head) + (pos - 1)
+        # Column of the active tab's letter within r3 (letters sit at even
+        # strip offsets: 0,2,4,...; spaces at the odds). -1 if it fell past a
+        # truncation.
+        sel = len(head) + 2 * (pos - 1)
         if sel >= len(r3) or not r3[sel].isalpha():
             sel = -1
 
@@ -700,8 +702,12 @@ class Screen:
         with self._lock:
             queue = self._reg.queue()
             if not self._interacting(now):
-                # Idle: the subject is the live queue head.
-                self._sel_key = None
+                # Idle: auto-surface the most-urgent unacked alert (at its
+                # stable position); if nothing needs the human, rest on the
+                # first tab. The tab ORDER never changes -- only which one is
+                # shown.
+                top = self._reg.top_alert()
+                self._sel_key = top.key if top is not None else None
             subject = self._subject(queue)
             if self._interacting(now) and subject is not None:
                 # Interacting: PIN whatever is rendered, so the screen cannot

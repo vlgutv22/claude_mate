@@ -365,6 +365,28 @@ with ctrl_lock:
     off_nav_ops = ctrl_ops[ops_before_offnav:]
 follow_off_no_raise = (len(off_nav_ops) == 0)
 
+print("\n-- phase 13: tab ORDER is stable (alphabetical), never urgency-shuffled --")
+# Clean slate, then two sessions whose alphabetical order (apple < zebra) is the
+# OPPOSITE of their urgency once zebra errors. The strip must keep apple first.
+for s in ("sidFA|folA", "sidFB|folB", "sidFC|folC"):
+    feed("end|" + s)
+time.sleep(1.0)
+feed("working|sidAP|apple")
+feed("working|sidZE|zebra"); time.sleep(1.2)
+feed("error|sidZE|zebra"); time.sleep(1.5)          # zebra now most urgent
+with display_lock:
+    order_fleets = [frame_fleet(l) for l in display if l.startswith("F|")]
+# On a 2-session strip, apple(working=W) must come BEFORE zebra(error, unacked
+# -> lowercase e) -- alphabetical, NOT urgency (which would put e first).
+stable_order = False
+for fl in reversed(order_fleets):
+    parts = fl.split()
+    if parts and parts[0].endswith("/2"):
+        letters = [c for c in "".join(parts[1:]) if c.isalpha()]
+        if letters == ["W", "e"]:
+            stable_order = True
+            break
+
 proc.terminate()
 try:
     proc.wait(timeout=5)
@@ -398,7 +420,7 @@ check("waiting session auto-surfaces and flashes (infra/WAIT, flash bit set)",
 check("error outranks waiting: api auto-surfaces flashing (api/ERR)",
       saw_after(idx_err, lambda l: frame_subject(l) == "api"
                 and frame_r1(l).startswith("ERR") and frame_flash(l)))
-check("fleet row: packed status letters (E/B/W/D/I, no '|' separator)",
+check("fleet row: status letters (E/B/W/D/I), space-separated, no '|'",
       saw(lambda l: l.startswith("F|") and "|" not in frame_fleet(l)
           and any(c in frame_fleet(l).upper() for c in "EBWDI")))
 check("active-tab box: sel points at a fleet LETTER in r3",
@@ -475,6 +497,10 @@ check("double-click GO again turns FOLLOW OFF",
       follow_off_frame)
 check("with FOLLOW off, navigation raises NOTHING",
       follow_off_no_raise)
+
+# ---- stable tab order ----------------------------------------------------------
+check("tab order is stable/alphabetical -- an error does NOT shuffle it to front",
+      stable_order)
 
 ok = all(checks)
 print("\n  focus.log:", focus_lines or "(empty)")
