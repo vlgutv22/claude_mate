@@ -26,12 +26,12 @@ selection, truncation and layout live in the daemon.
 |WAIT  0:42           |   r1: state tag + time-in-state    its alert is unacked
 |Opus 4.8  xhigh      |   r2: model + effort
 |2/6 E|B|W|D|I        |   r3: queue position + one status LETTER per session;
-+---------------------+       the active tab's letter is boxed (the switch)
++---------------------+       the active tab's letter sits in a filled square
 ```
 
-The **active tab** (the session shown above) has its fleet letter **boxed** in
-r3. The box is the on-screen FOLLOW switch: an **outline** when FOLLOW mode is
-off, **filled** when on.
+The **active tab** (the session shown above) has its fleet letter drawn in a
+**filled square** in r3 — a lit block with the letter knocked out — so you can
+see at a glance which tab is on screen.
 
 The three buttons mean the same thing at all times:
 
@@ -41,10 +41,11 @@ The three buttons mean the same thing at all times:
 | **GO**   | single: **RAISE** the terminal of the session **shown on the glass** (acknowledging its alert) | **double-click** (≤ 300 ms apart): toggle **FOLLOW** mode. Held ≥ 500 ms: acknowledge **without** raising. |
 | **NEXT** | selection one step **down** the queue | auto-repeats (400 ms, then 5/s) |
 
-**FOLLOW mode** (toggled by double-clicking GO): while on, PREV/NEXT
-additionally **raise** the selected session's terminal, ~250 ms after the
-selection settles (so holding to scroll never raises the windows it passes
-over). Raise ONLY — never ack (ack stays on GO long-press), never collapse.
+**FOLLOW mode** (toggled by double-clicking GO; shown by a small ► marker by
+the state row): while on, PREV/NEXT additionally **raise** the selected
+session's terminal, ~250 ms after the selection settles (so holding to scroll
+never raises the windows it passes over). Raise ONLY — never ack (ack stays on
+GO long-press), never collapse.
 
 **Window contract:** navigation touches macOS windows ONLY in FOLLOW mode, and
 then only to **raise/activate** the selected terminal — the daemon never
@@ -54,10 +55,10 @@ collapses, resizes, or miniaturizes anything.
 never a freshly recomputed queue head. So a press can only ever raise the
 terminal whose name the user is actually looking at.
 
-**Screen ownership:** the display changes subject on its own ONLY when the user
-is idle (no press for **10 s**). Acknowledging an **alert** with GO/ACK snaps
-home to the next alert (so *n* alerts = *n* presses); focusing a **calm**
-session (nothing to triage) keeps it on the glass instead of jumping away.
+**No auto-switch:** a GO/ACK **stays on the tab it acted on** — the device
+never jumps to another tab on a press. The screen only changes subject when you
+navigate, or after **10 s** of no presses, when it returns to the queue head
+(so the next alert surfaces on its own without yanking the view mid-press).
 
 ---
 
@@ -84,8 +85,8 @@ input buffer at 96 bytes and drops malformed/oversized lines).
 
 | Field   | Description |
 |---------|-------------|
-| `flags` | Bitfield. **bit0**: invert **row 0** (the name) at ~2.5 Hz (an unacknowledged alert is on screen). **bit1**: FOLLOW mode is on (fill the active-tab switch box instead of outlining it). |
-| `sel`   | The character column **within `r3`** of the active tab's fleet letter to box (`-1` = none). Filled box = FOLLOW on, outline = off. |
+| `flags` | Bitfield. **bit0**: invert **row 0** (the name) at ~2.5 Hz (an unacknowledged alert is on screen). **bit1**: FOLLOW mode is on (draw a ► marker by the state row). |
+| `sel`   | The character column **within `r3`** of the active tab's fleet letter (`-1` = none). The firmware fills that letter's cell (a lit square with the letter knocked out). |
 | `r0` (name) | Session name. The daemon truncates to the row width and, when two long sibling names collide, disambiguates with a middle squeeze (first 9 + `~` + last 10, e.g. `webapp-ba~ervice-one`). |
 | `r1` (state) | `TAG  time` — the 4-char state tag (`ERR`/`WAIT`/`DONE`/`WORK`/`IDLE`) and the time in that state (mm:ss, or h:mm past an hour). |
 | `r2` (meta) | Best-fit `model  effort` (empty for hook-driven sessions with no scraped metadata). |
@@ -275,10 +276,10 @@ silenced).
   subject out from under the cursor (only the `pos/total` number changes).
 * While the user is interacting (any press within 10 s) the screen never
   changes subject on its own.
-* GO/ACK act on the session **currently shown** (WYSIWYG). After acknowledging
-  an **alert** the selection snaps home to the next alert; after focusing a
-  **calm** session it stays on that session.
-* After 10 s without a press the selection returns to the live queue head.
+* GO/ACK act on the session **currently shown** (WYSIWYG) and **stay** on it —
+  the device never auto-switches tabs on a press.
+* After 10 s without a press the selection returns to the live queue head (so
+  the next alert surfaces on its own).
 * PREV/NEXT wrap around the queue ends.
 * **FOLLOW** (double-click GO) makes PREV/NEXT also raise the selected terminal
   after the selection settles (~250 ms); double-click again to turn it off.

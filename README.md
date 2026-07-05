@@ -16,13 +16,15 @@ in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
         │ WAIT  0:42            │   ← r1: state · time-in-state    is unacknowledged)
         │ Opus 4.8  xhigh       │   ← r2: model · effort
         │ 2/6 E|B|W|D|I         │   ← r3: queue position · whole-fleet letter strip
-        └───────────────────────┘
+        └───────────────────────┘       (the active tab's letter sits in a filled square)
               (•) indication LED               ← blinks per alert class, until you ack
           [ PREV ]   [ GO ]   [ NEXT ]         ← three buttons — same meaning, always
-   PREV/NEXT: step the triage queue (hold = auto-repeat)   GO: short = ack + raise its window · long = ack only
+   PREV/NEXT: step the triage queue (hold = auto-repeat)   GO: short = ack + raise · double = FOLLOW · long = ack only
 
    the flash: name row inverting = unacknowledged (needs you) · steady = seen
    the strip: E error · B waiting · W working · D done · I idle — one letter per session, queue order
+   the box:   the active tab's letter is a filled square (letter knocked out) — shows which tab is on screen
+   FOLLOW:    double-click GO → a ► marker appears; PREV/NEXT then also raise the selected terminal (raise only)
    the LED:   START 1 s blink · INPUT even blink · DONE 4-blink cascade · ERROR fast strobe  (loops until you GO/ack)
 ```
 
@@ -79,11 +81,10 @@ hooks are the zero-dependency feed. Use whichever fits each session.
   **without** touching any window. Buttons fire instantly (edge-accepted
   ~40 ms debounce), and every accepted press inverts the whole panel for
   ~80 ms — instant "the device heard you" feedback.
-- ***n* alerts, *n* presses** — after acknowledging an alert the selection
-  snaps to the next alert, so a stack of pending alerts is handled with exactly
-  one press each, zero navigation. Focusing a **calm** session (nothing to
-  triage) keeps it on the glass instead of jumping away. After ~10 s without a
-  press the screen returns to the queue head on its own.
+- **No auto-switch** — a GO/ACK stays on the tab it acted on; the device never
+  jumps to another tab on a press. After ~10 s without a press the screen
+  returns to the queue head on its own, so the next alert surfaces without
+  yanking the view mid-press.
 - **Navigation never touches windows** — the ONLY window operation in the
   whole system is GO, and it only **raises/activates**; the daemon never
   collapses, resizes, or miniaturizes anything.
@@ -154,7 +155,7 @@ hooks are the zero-dependency feed. Use whichever fits each session.
    │   Python daemon (Mac)                        │
    │   • ONE triage queue + "done-until-acked"    │   (unacked error > waiting > done first,
    │   • ONE pre-rendered screen                  │    then everything else by class)
-   │       F|<flash>|<r0>|<r1>|<r2>|<r3>          │
+   │       F|<flags>|<sel>|<r0>|<r1>|<r2>|<r3>          │
    │   • LED policy  V|<START/INPUT/DONE/ERR/OFF> │   worst unacked class, loops until ack
    │   • GO: raise the session's window — RAISE   │
    │     ONLY (wrapper ctrl-sock → VS Code link)  │
@@ -247,7 +248,7 @@ Pinout summary (full details in [docs/WIRING.md](docs/WIRING.md)):
 |----------------------|-----------|----------------------------------------|
 | OLED SDA             | A4        | I2C data                               |
 | OLED SCL             | A3        | **software (bit-banged) I2C** — hardware SCL A5 was damaged; see `firmware/claude_mate/softssd1306.h` |
-| GO button            | D2        | `INPUT_PULLUP`, emits `B|G` short (ack + raise) / `B|K` long (ack only) |
+| GO button            | D2        | `INPUT_PULLUP`, emits `B|G` short (single = ack + raise; double-click = toggle FOLLOW) / `B|K` long (ack only) |
 | NEXT button          | D3        | `INPUT_PULLUP`, emits `B|N` (selection down; auto-repeats while held) |
 | PREV button          | D4        | `INPUT_PULLUP`, emits `B|P` (selection up; auto-repeats while held) |
 | Indication LED       | D8        | LED + series resistor to GND; plays the `V|<kind>` alert pattern |
@@ -416,14 +417,14 @@ three buttons**:
   model+effort · position+fleet strip); the firmware is a dumb one-frame
   renderer.
 - **Buttons are PREV / GO / NEXT everywhere.** GO short = acknowledge + raise
-  the window; GO long = acknowledge only; PREV/NEXT auto-repeat while held.
-  GO/ACK act on exactly the session shown (WYSIWYG); acknowledging an alert
-  snaps to the next alert, while focusing a calm session keeps it on screen.
-  After ~10 s idle the selection returns to the queue head.
-- **Navigation never touches windows.** The terminal-follow preview
-  (collapse/expand on navigation) is gone; GO **raises only** and the daemon
-  never sends `collapse`.
-- **Serial protocol simplified.** Down: `F|<flash>|<r0>|<r1>|<r2>|<r3>` +
+  the shown window (WYSIWYG); GO **double-click** = toggle FOLLOW mode; GO long
+  = acknowledge only; PREV/NEXT auto-repeat while held. A GO/ACK **stays on the
+  tab** it acted on (no auto-switch); after ~10 s idle the selection returns to
+  the queue head.
+- **Navigation never touches windows** (except in FOLLOW mode, which raises
+  only). The old terminal-follow preview (collapse/expand on every navigation)
+  is gone; the daemon never sends `collapse`.
+- **Serial protocol simplified.** Down: `F|<flags>|<sel>|<r0>|<r1>|<r2>|<r3>` +
   `V|<kind>` + `P`. Up: `H` + `B|P` / `B|N` / `B|G` / `B|K`. The old
   `D|` / `S|` / `T|` / `I` lines and `B|1`..`B|5` are gone.
 - **Firmware additions:** a boot splash, a **LINK LOST** screen after ~30 s of

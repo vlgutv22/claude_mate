@@ -38,7 +38,7 @@ Python daemon  (daemon/claude_mate_daemon.py)
         |   - sorts ONE triage queue: unacknowledged alerts first
         |     (error > waiting > done, oldest first), then everything
         |     else by class (error > waiting > done > working > idle)
-        |   - pre-renders ONE screen:  F|<flash>|<r0>|<r1>|<r2>|<r3>
+        |   - pre-renders ONE screen:  F|<flags>|<sel>|<r0>|<r1>|<r2>|<r3>
         |   - drives the LED:  V|<kind> for the worst unacked alert class
         v
 USB serial  (115200 8N1, ASCII lines, '|' delimited, '\n' terminated)
@@ -62,7 +62,8 @@ Buttons back (return path) -- layout PREV | GO | NEXT:
         |
         +-- B|P PREV   : selection one step up the queue   (auto-repeats while held)
         +-- B|N NEXT   : selection one step down the queue (auto-repeats while held)
-        +-- B|G GO     : acknowledge + RAISE the selected session's window
+        +-- B|G GO     : single = ack + RAISE the shown session's window (stay);
+        |                 double-click = toggle FOLLOW mode
         |                 best    : PTY wrapper ctrl socket ('focus' — raise only)
         |                 primary : macOS deep link  (open <FOCUS_URI_TEMPLATE>)
         |                 fallback: raise VS Code window for the workspace cwd
@@ -191,7 +192,7 @@ LINK LOST screen** if the daemon goes fully silent for ~30 s. See
 ## Screen behaviour
 
 The screen is **daemon-driven**: the Arduino only ever shows the single frame
-it was last told to show via an `F|<flash>|<r0>|<r1>|<r2>|<r3>` line.
+it was last told to show via an `F|<flags>|<sel>|<r0>|<r1>|<r2>|<r3>` line.
 
 - **What a frame shows:** four size-1 rows (≤ 21 chars each) — **r0** the
   selected session's name (full width, ~21 chars, inverting ~2.5 Hz while its
@@ -202,10 +203,14 @@ it was last told to show via an `F|<flash>|<r0>|<r1>|<r2>|<r3>` line.
   `B` waiting, `W` working, `D` done, `I` idle; cut with a trailing `+` when it
   doesn't fit).
 - **Screen ownership:** the display changes subject on its own ONLY when the
-  user is idle (no press for **10 s**). Acknowledging an **alert** with GO/ACK
-  snaps to the next alert, so *n* pending alerts are handled with exactly *n*
-  presses; focusing a **calm** session (nothing to triage) keeps it on the
-  glass instead of jumping away.
+  user is idle (no press for **10 s**), when it returns to the queue head. A
+  GO/ACK **stays on the tab** it acted on — the device never auto-switches tabs
+  on a press.
+- **Active-tab square / FOLLOW:** the shown session's fleet letter is drawn in
+  a filled square (a lit block, letter knocked out) so you can see which tab is
+  on screen. Double-clicking GO toggles **FOLLOW** mode (a ► marker by the
+  state row): PREV/NEXT then also raise the selected terminal, ~250 ms after
+  the selection settles (raise only — never ack or collapse).
 - **Navigation:** **PREV** / **NEXT** step the selection up/down the queue,
   wrap around the ends, and auto-repeat while held (400 ms to start, then
   5/s). Selection is tracked by session **key**, so queue re-sorts never move

@@ -31,8 +31,11 @@ The "brain" of the Claude Mate USB hardware companion. It:
                  raised.
         B|K   -> GO (long press): acknowledge the shown session's alert WITHOUT
                  touching any window.
-     After acknowledging an ALERT the selection snaps home to the next alert
-     (N alerts = N presses); focusing a CALM session keeps it on the glass.
+     A GO/ACK never auto-switches tabs -- it stays on the session it acted on.
+     (After 10 s idle the screen returns to the queue head on its own, so the
+     next alert surfaces without yanking the view mid-press.)
+     Double-clicking GO toggles FOLLOW mode: PREV/NEXT then also raise the
+     selected terminal (raise only, after the selection settles).
   5. Drives the indication LED via V|<KIND>: the pattern for the WORST
      unacknowledged alert class, looping until acknowledged (V|OFF).
 
@@ -576,15 +579,6 @@ class Screen:
                     break
             nxt = queue[(idx + delta) % len(queue)]
             self._sel_key = nxt.key
-        self.refresh()
-
-    def snap_home(self) -> None:
-        """After acknowledging an ALERT: surface the (new) queue head and PIN
-        it, so the next alert to triage is on the glass and the screen does not
-        drift on its own inside the interaction window."""
-        with self._lock:
-            queue = self._reg.queue()
-            self._sel_key = queue[0].key if queue else None
         self.refresh()
 
     def stay_on(self, sess: Optional[Session]) -> None:
@@ -1166,26 +1160,22 @@ class ButtonReader(threading.Thread):
 
     def _go(self) -> None:
         """A confirmed single GO: raise the terminal of EXACTLY the session
-        shown on the glass (WYSIWYG) and acknowledge it. If the shown session
-        was an ALERT (something to triage), snap home so the next alert
-        surfaces (n alerts = n presses); if it was a CALM session (the user
-        just wanted its terminal), STAY on it."""
+        shown on the glass (WYSIWYG), acknowledge it, and STAY on it -- the
+        device never auto-switches tabs on a press. (After 10 s idle the screen
+        returns to the queue head on its own.)"""
         sess = self._screen.resolve_press_target()
         log(f"GO -> focus {sess.name if sess else '-'}")
         if sess is None:
             return
-        was_alert = sess.unacked_alert()
         if self.on_ack:
             self.on_ack(sess)                    # raising the window = acknowledged
-        if was_alert:
-            self._screen.snap_home()             # advance to the next alert
-        else:
-            self._screen.stay_on(sess)           # keep the focused terminal shown
+        self._screen.stay_on(sess)               # stay on the acted tab
         self._raise(sess)
 
     def _ack_only(self) -> None:
         """GO long-press: acknowledge the shown session's alert WITHOUT touching
-        any window. A no-op when the shown session has nothing to acknowledge."""
+        any window, and STAY on it (no auto-switch). A no-op when the shown
+        session has nothing to acknowledge."""
         sess = self._screen.resolve_press_target()
         if sess is None or not sess.unacked_alert():
             log("ACK (long press): nothing to acknowledge")
@@ -1193,7 +1183,7 @@ class ButtonReader(threading.Thread):
         log(f"ACK (long press) -> {sess.name} (no focus)")
         if self.on_ack:
             self.on_ack(sess)                    # silences the LED + re-renders
-        self._screen.snap_home()                 # surface the next alert
+        self._screen.stay_on(sess)               # stay on the acked tab
 
     def stop(self) -> None:
         self._stop_evt.set()

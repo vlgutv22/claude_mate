@@ -142,11 +142,12 @@ static void drawDemo(uint8_t i) {
   if (d.flash && blinkOn) {
     display.fillRect(0, 0, SCREEN_WIDTH, 8, SSD1306_INVERSE);   // flash the name row
   }
-  // Active-tab switch box on this demo's own fleet letter (col 4 + i*2), fill
-  // alternating so both the FOLLOW-on (filled) and off (outline) looks show.
+  // Active-tab selection square on this demo's own fleet letter (col 4 + i*2):
+  // a filled cell (lit square, letter knocked out). Odd demos also show the
+  // FOLLOW-mode "play" triangle by the state row.
   int16_t bx = (int16_t)(4 + i * 2) * 6;
-  if (i & 1) display.fillRect(bx, 24, 6, 8, SSD1306_INVERSE);
-  else       display.drawRect(bx - 1, 23, 8, 9, SSD1306_WHITE);
+  display.fillRect(bx, 24, 6, 8, SSD1306_INVERSE);
+  if (i & 1) display.fillTriangle(119, 9, 119, 14, 125, 11, SSD1306_WHITE);
   display.display();
 }
 

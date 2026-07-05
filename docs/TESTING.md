@@ -115,16 +115,19 @@ Flash the **real firmware**. Open the Arduino IDE **Serial Monitor** at
    H
    ```
 
-2. Now **send** lines by hand and watch the display. Send a full frame:
+2. Now **send** lines by hand and watch the display. Send a full frame
+   (`F|<flags>|<sel>|<r0>|<r1>|<r2>|<r3>`):
 
    ```
-   F|1|api-server|WAIT  0:42|Opus 4.8  xhigh|1/3 B|W|D
+   F|1|4|api-server|WAIT  0:42|Opus 4.8  xhigh|1/3 B|W|D
    ```
 
    → the OLED shows the frame as four size-1 rows: the name `api-server` on r0
-   **flashing** (flash flag `1`), the state + time on r1, the model + effort on
-   r2, and the position + fleet letter strip on r3. Send the same frame with a
-   leading `F|0|…` and the flashing stops.
+   **flashing** (`flags` bit0 = 1), the state + time on r1, the model + effort
+   on r2, and the position + fleet letter strip on r3 with the letter at
+   column `4` (the first `B`) in a **filled square** (a lit block, letter
+   knocked out). Add bit1 to `flags` (send `3` instead of `1`) and a ► FOLLOW
+   marker appears by the state row; send `flags` `0` and the flashing stops.
 
    Blink the LED with `V|<kind>` and watch each pattern:
 
@@ -191,9 +194,12 @@ python3 $REPO/daemon/claude_mate_daemon.py --mock
   the screen then stays where you put it for ~10 s after your last press.
 - Press **GO** → the daemon acknowledges the session **shown on the glass**
   (WYSIWYG) and attempts to raise its window (in mock, watch the daemon log for
-  the focus call); the selection then snaps to the next alert.
+  the focus call); the display **stays on that tab** (no auto-switch).
 - **Hold GO** (~0.5 s) → acknowledges WITHOUT any window op; the flashing and
-  the LED loop stop, and the next alert surfaces.
+  the LED loop stop, and the display stays on the tab. (After ~10 s idle the
+  view returns to the queue head, surfacing the next alert.)
+- **Double-click GO** → toggles FOLLOW mode (a ► marker appears); PREV/NEXT
+  then also raise the selected terminal after it settles.
 
 Also confirm robustness: **unplug** the Nano mid-run — the daemon should not
 crash — then **replug**; it should reconnect and (via the `H` handshake) restore

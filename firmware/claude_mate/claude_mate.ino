@@ -19,8 +19,9 @@
  *     |Opus 4.8  xhigh      |   r2: model + effort
  *     |2/6 W|B|E|D|I        |   r3: queue position + one status LETTER per
  *     +---------------------+       session, '|'-separated (E/B/W/D/I). The
- *                                   active tab's letter is boxed (a switch:
- *                                   filled = FOLLOW mode on, outline = off).
+ *                                   active tab's letter sits in a filled
+ *                                   square (letter knocked out). A small ">"
+ *                                   triangle by the state row = FOLLOW mode on.
  *
  * The firmware is a dumb renderer: it holds exactly one frame (3 text rows +
  * a flash flag) and draws it. All ordering, selection, truncation, and text
@@ -63,8 +64,8 @@
  *                                        four size-1 rows (each up to 21 chars).
  *         flags = bitfield: bit0 = flash row 0 (the name) at ~2.5 Hz (unacked
  *                 alert); bit1 = FOLLOW mode (fill the active-tab switch box)
- *         sel   = column in r3 of the active tab's fleet letter to box
- *                 (-1 = none). Filled box = FOLLOW on, outline = off.
+ *         sel   = column in r3 of the active tab's fleet letter (-1 = none);
+ *                 that letter's cell is filled (lit square, letter knocked out)
  *         r0    = session name
  *         r1    = state tag + time-in-state
  *         r2    = model + effort
@@ -358,16 +359,17 @@ static void drawFrame() {
     display.fillRect(0, 0, SCREEN_WIDTH, ROW_H, SSD1306_INVERSE);
   }
 
-  // Active-tab switch: box the selected fleet letter on row 3 (y=24). The box
-  // is FILLED (inverted letter) while FOLLOW mode is on -- the on-screen
-  // switch -- and an outline otherwise.
+  // Active-tab selection square: fill the selected fleet letter's 6x8 cell.
+  // Inverting a lit-letter cell yields a solid lit (blue) square with the
+  // letter knocked out (black/off pixels) -- clear on a monochrome panel.
   if (frameSel >= 0) {
     int16_t bx = (int16_t)frameSel * 6;          // 6px per size-1 char
-    if (frameFollow) {
-      display.fillRect(bx, 24, 6, ROW_H, SSD1306_INVERSE);      // switch ON
-    } else {
-      display.drawRect(bx - 1, 23, 8, ROW_H + 1, SSD1306_WHITE); // switch OFF
-    }
+    display.fillRect(bx, 24, 6, ROW_H, SSD1306_INVERSE);
+  }
+  // FOLLOW mode: a small filled "play" triangle at the right of the state row
+  // (r1 is always short, so it never collides).
+  if (frameFollow) {
+    display.fillTriangle(119, 9, 119, 14, 125, 11, SSD1306_WHITE);
   }
 
   display.display();

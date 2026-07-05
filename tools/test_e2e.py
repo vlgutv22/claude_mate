@@ -205,18 +205,25 @@ for f in nav_frames:
     if not nav_subjects or nav_subjects[-1] != s:
         nav_subjects.append(s)
 
-print("\n-- phase 7: GO acks + focuses the shown alert; next alert surfaces --")
+print("\n-- phase 7: GO acks + focuses the shown alert, then STAYS on it --")
 # Subject is infra (from nav). GO must focus infra (deep link sid-3), ack it,
-# and snap home -> api (still unacked ERR) becomes the subject.
+# and STAY on infra (no auto-switch to another tab).
 idx_go = mark()
 arduino_send("B|G"); time.sleep(1.5)
 with display_lock:
     frames_after_go = [l for l in display[idx_go:] if l.startswith("F|")]
-go_snapped_to_api = any(frame_subject(f) == "api" for f in frames_after_go)
+go_stayed = bool(frames_after_go) and frame_subject(frames_after_go[-1]) == "infra"
 
-print("\n-- phase 8: GO long (B|K) acks WITHOUT focusing; LED steps down --")
-# Subject is api (ERR, unacked). B|K must ack it (no focus), snap home; with
-# no unacked alerts left the LED must drop to V|OFF.
+print("\n-- phase 8: GO long (B|K) acks the shown alert WITHOUT focusing; stays --")
+# infra is now acked. Navigate to the remaining unacked alert (api, ERR), then
+# B|K acks it (no focus) and stays on api; with no unacked alerts left the LED
+# drops to V|OFF.
+for _ in range(6):
+    with display_lock:
+        cur = [l for l in display if l.startswith("F|")]
+    if cur and frame_subject(cur[-1]) == "api":
+        break
+    arduino_send("B|N"); time.sleep(0.6)
 focus_before_k = ([l.strip() for l in open(focuslog)]
                   if os.path.exists(focuslog) else [])
 idx_k = mark()
@@ -225,7 +232,9 @@ focus_after_k = ([l.strip() for l in open(focuslog)]
                  if os.path.exists(focuslog) else [])
 k_no_focus = (focus_after_k == focus_before_k)
 with display_lock:
+    k_frames = [l for l in display[idx_k:] if l.startswith("F|")]
     k_led_off = any(l == "V|OFF" for l in display[idx_k:])
+k_stayed = bool(k_frames) and frame_subject(k_frames[-1]) == "api"
 
 print("\n-- phase 8b: a new alert must NOT steal the screen inside the "
       "interaction window (subject pinned; LED updates immediately) --")
@@ -420,10 +429,10 @@ check("browsing acks nothing (infra still flashing when REVISITED)",
 # ---- GO / ACK triage sweep -----------------------------------------------------
 check("GO focuses the shown session (deep link session=sid-3 for infra)",
       any("session=sid-3" in l for l in focus_lines))
-check("GO snaps home to the next unacked alert (api surfaces)",
-      go_snapped_to_api)
+check("GO STAYS on the acked tab, no auto-switch (still infra)", go_stayed)
 check("GO long (B|K) acknowledges WITHOUT focusing (no new open calls)",
       k_no_focus)
+check("GO long (B|K) STAYS on the acked tab (still api)", k_stayed)
 check("last unacked alert acked -> LED off (V|OFF)", k_led_off)
 
 # ---- screen ownership (the 10s interaction window) -------------------------------
