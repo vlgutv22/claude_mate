@@ -15,7 +15,7 @@ in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
         │ api-server            │   ← r0: session name (flashes while its alert
         │ WAIT  0:42            │   ← r1: state · time-in-state    is unacknowledged)
         │ Opus 4.8  xhigh       │   ← r2: model · effort
-        │ 2/6 E|B|W|D|I         │   ← r3: queue position · whole-fleet letter strip
+        │ 2/6 EBWDI             │   ← r3: queue position · whole-fleet letter strip
         └───────────────────────┘       (the active tab's letter sits in a filled square)
               (•) indication LED               ← blinks per alert class, until you ack
           [ PREV ]   [ GO ]   [ NEXT ]         ← three buttons — same meaning, always
@@ -113,8 +113,9 @@ hooks are the zero-dependency feed. Use whichever fits each session.
   the top name row inverts at ~2.5 Hz; once acknowledged it goes steady. At
   a glance you know whether you've seen it.
 - **Whole-fleet strip** — the bottom row shows your queue position
-  (`pos/total`) plus one status letter per session in queue order,
-  `|`-separated: `E` error · `B` waiting · `W` working · `D` done · `I` idle.
+  (`pos/total`) plus one status letter per session in queue order (packed,
+  no separator): `E` error · `B` waiting · `W` working · `D` done · `I` idle.
+  A letter **blinks** while that tab's alert is unacknowledged.
 - **Live time-in-state** — the state row counts up how long the session has
   been in its current state: for a `working` tab that IS the live turn
   runtime; for an alert it is how long it has been waiting on *you*.

@@ -199,11 +199,11 @@ it was last told to show via an `F|<flags>|<sel>|<r0>|<r1>|<r2>|<r3>` line.
   alert is unacknowledged); **r1** the state (4-char tag
   `ERR `/`WAIT`/`DONE`/`WORK`/`IDLE` + time in that state); **r2** the best-fit
   model + effort on its own row; **r3** the fleet strip (`pos/total` + one
-  status letter per session in queue order, `|`-separated — `E` error,
-  `B` waiting, `W` working, `D` done, `I` idle; cut with a trailing `+` when it
-  doesn't fit). An unacknowledged alert's letter is sent **lowercase** so the
-  firmware **blinks** it — the acked/unacked state of every tab is visible in
-  the strip.
+  status letter per session in queue order, packed with no separator — `E`
+  error, `B` waiting, `W` working, `D` done, `I` idle; cut with a trailing `+`
+  when it doesn't fit). An unacknowledged alert's letter is sent **lowercase**
+  so the firmware **blinks** it — the acked/unacked state of every tab is
+  visible in the strip.
 - **Screen ownership:** the display changes subject on its own ONLY when the
   user is idle (no press for **10 s**), when it returns to the queue head. A
   GO/ACK **stays on the tab** it acted on — the device never auto-switches tabs

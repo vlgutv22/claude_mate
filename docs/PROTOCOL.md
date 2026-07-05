@@ -25,7 +25,7 @@ selection, truncation and layout live in the daemon.
 |api-server           |   r0: session name — flashes (inverts ~2.5 Hz) while
 |WAIT  0:42           |   r1: state tag + time-in-state    its alert is unacked
 |Opus 4.8  xhigh      |   r2: model + effort
-|2/6 E|B|W|D|I        |   r3: queue position + one status LETTER per session;
+|2/6 EBWDI            |   r3: queue position + one status LETTER per session;
 +---------------------+       the active tab's letter sits in a filled square
 ```
 
@@ -92,7 +92,7 @@ input buffer at 96 bytes and drops malformed/oversized lines).
 | `r0` (name) | Session name. The daemon truncates to the row width and, when two long sibling names collide, disambiguates with a middle squeeze (first 9 + `~` + last 10, e.g. `webapp-ba~ervice-one`). |
 | `r1` (state) | `TAG  time` — the 4-char state tag (`ERR`/`WAIT`/`DONE`/`WORK`/`IDLE`) and the time in that state (mm:ss, or h:mm past an hour). |
 | `r2` (meta) | Best-fit `model  effort` (empty for hook-driven sessions with no scraped metadata). |
-| `r3` (fleet) | `pos/total ` + one status **letter** per session in queue order, `\|`-separated: `E` error, `B` waiting (blocked), `W` working, `D` done, `I` idle. An **unacknowledged alert's letter is sent LOWERCASE** — the firmware draws it uppercase but **blinks** it, so you can see which tabs still need acknowledging (they stop blinking as you ack them). When the strip does not fit, it is cut with a trailing `+`. Because `r3` is the last field, the firmware stops tokenizing at the 6th `\|` and takes the rest verbatim — which is what lets the strip use `\|` as its on-screen divider. |
+| `r3` (fleet) | `pos/total ` + one status **letter** per session in queue order, **packed with no separator** (the active-tab square already marks which is which): `E` error, `B` waiting (blocked), `W` working, `D` done, `I` idle. An **unacknowledged alert's letter is sent LOWERCASE** — the firmware draws it uppercase but **blinks** it, so you can see which tabs still need acknowledging (they stop blinking as you ack them). When the strip does not fit, it is cut with a trailing `+`. `r3` is the last field (the firmware stops tokenizing at the 6th `\|` and takes the rest verbatim). |
 
 The daemon sends an `F` line whenever the rendered bytes change: immediately on
 any state change or button, and ~1/s while a displayed time ticks. Identical

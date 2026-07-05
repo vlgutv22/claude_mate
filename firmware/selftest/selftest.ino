@@ -55,20 +55,19 @@ struct Demo {
   const char *r0;      // name row (<=21 chars)
   const char *r1;      // state tag + time
   const char *r2;      // model + effort
-  const char *r3;      // position + fleet status letters ('|'-separated)
+  const char *r3;      // position + packed fleet status letters
   bool flash;          // alert: flash the name row
 };
 const Demo DEMOS[] = {
-  {"api-server",   "ERR   00:42", "Opus 4.8  xhigh",  "1/5 E|B|D|W|I", true },
-  {"webapp",       "WAIT  01:07", "Sonnet 4.6  high", "2/5 E|B|D|W|I", true },
-  {"infra",        "DONE  00:15", "Haiku 4.5  med",   "3/5 E|B|D|W|I", true },
-  {"claude-mate",  "WORK  12:03", "Opus 4.8  xhigh",  "4/5 E|B|D|W|I", false},
-  {"notes",        "IDLE  05:30", "",                 "5/5 E|B|D|W|I", false},
+  {"api-server",   "ERR   00:42", "Opus 4.8  xhigh",  "1/5 EBDWI", true },
+  {"webapp",       "WAIT  01:07", "Sonnet 4.6  high", "2/5 EBDWI", true },
+  {"infra",        "DONE  00:15", "Haiku 4.5  med",   "3/5 EBDWI", true },
+  {"claude-mate",  "WORK  12:03", "Opus 4.8  xhigh",  "4/5 EBDWI", false},
+  {"notes",        "IDLE  05:30", "",                 "5/5 EBDWI", false},
 };
 const uint8_t DEMO_COUNT = sizeof(DEMOS) / sizeof(DEMOS[0]);
-// Active-tab switch box: r3 is "N/5 E|B|D|W|I" -> letters start at col 4, each
-// tab 2 cols apart, so demo i's own letter sits at col 4 + i*2. Alternate the
-// fill (FOLLOW on/off) each cycle so both box styles are visible on hardware.
+// Active-tab square: r3 is "N/5 EBDWI" -> letters start at col 4, packed, so
+// demo i's own letter sits at col 4 + i. Odd demos also show the FOLLOW ► mark.
 
 uint8_t demoIdx = 0;
 unsigned long lastStepMs = 0;
@@ -142,10 +141,10 @@ static void drawDemo(uint8_t i) {
   if (d.flash && blinkOn) {
     display.fillRect(0, 0, SCREEN_WIDTH, 8, SSD1306_INVERSE);   // flash the name row
   }
-  // Active-tab selection square on this demo's own fleet letter (col 4 + i*2):
+  // Active-tab selection square on this demo's own fleet letter (col 4 + i):
   // a filled cell (lit square, letter knocked out). Odd demos also show the
   // FOLLOW-mode "play" triangle by the state row.
-  int16_t bx = (int16_t)(4 + i * 2) * 6;
+  int16_t bx = (int16_t)(4 + i) * 6;
   display.fillRect(bx, 24, 6, 8, SSD1306_INVERSE);
   if (i & 1) display.fillTriangle(119, 9, 119, 14, 125, 11, SSD1306_WHITE);
   display.display();

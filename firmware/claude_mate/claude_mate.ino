@@ -17,12 +17,12 @@
  *     |api-server           |   r0: session name -- flashes (inverts ~2.5 Hz)
  *     |WAIT  0:42           |   r1: state tag + time-in-state
  *     |Opus 4.8  xhigh      |   r2: model + effort
- *     |2/6 W|B|E|D|I        |   r3: queue position + one status LETTER per
- *     +---------------------+       session, '|'-separated (E/B/W/D/I). An
- *                                   UNACKED alert's letter BLINKS (sent
- *                                   lowercase). The active tab's letter sits in
- *                                   a wide filled square (letter knocked out).
- *                                   A ">" triangle by the state row = FOLLOW on.
+ *     |2/6 WBEDI            |   r3: queue position + one status LETTER per
+ *     +---------------------+       session, packed (E/B/W/D/I). An UNACKED
+ *                                   alert's letter BLINKS (sent lowercase). The
+ *                                   active tab's letter sits in a filled square
+ *                                   (letter knocked out). A ">" triangle by the
+ *                                   state row = FOLLOW mode on.
  *
  * The firmware is a dumb renderer: it holds exactly one frame (3 text rows +
  * a flash flag) and draws it. All ordering, selection, truncation, and text
@@ -70,11 +70,10 @@
  *         r0    = session name
  *         r1    = state tag + time-in-state
  *         r2    = model + effort
- *         r3    = queue position + '|'-separated status letters (an unacked
- *                 alert's letter is LOWERCASE -> drawn uppercase but blinking).
- *                 r3 is the LAST field and MAY contain literal '|' (the
- *                 tokenizer stops at the 6th bar and takes the rest verbatim)
- *                 -- that is what lets the fleet strip use '|' as its divider.
+ *         r3    = queue position + packed status letters, no separator (an
+ *                 unacked alert's letter is LOWERCASE -> drawn uppercase but
+ *                 blinking). r3 is the LAST field (the tokenizer stops at the
+ *                 6th bar and takes the rest verbatim).
  *     V|<kind>                           LED alert control (light only):
  *                                        START one-shot start blink; INPUT /
  *                                        ERROR / DONE looping "until
@@ -380,15 +379,12 @@ static void drawFrame() {
     }
   }
 
-  // Active-tab selection square: a WIDE filled block centred on the selected
-  // fleet letter. Inverting yields a solid lit (blue) block with the letter
-  // knocked out (black/off pixels) -- clear on a monochrome panel.
+  // Active-tab selection square: fill the selected letter's cell (letters are
+  // packed with no separator, so the box is one 6px cell -- inverting yields a
+  // solid lit (blue) block with the letter knocked out in black).
   if (frameSel >= 0) {
-    int16_t bx = (int16_t)frameSel * 6 - 2;      // 2px margin each side (10px wide)
-    if (bx < 0) bx = 0;
-    int16_t bw = 10;
-    if (bx + bw > SCREEN_WIDTH) bw = SCREEN_WIDTH - bx;
-    display.fillRect(bx, 24, bw, ROW_H, SSD1306_INVERSE);
+    int16_t bx = (int16_t)frameSel * 6;
+    display.fillRect(bx, 24, 6, ROW_H, SSD1306_INVERSE);
   }
   // FOLLOW mode: a small filled "play" triangle at the right of the state row
   // (r1 is always short, so it never collides).

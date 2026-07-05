@@ -398,8 +398,8 @@ check("waiting session auto-surfaces and flashes (infra/WAIT, flash bit set)",
 check("error outranks waiting: api auto-surfaces flashing (api/ERR)",
       saw_after(idx_err, lambda l: frame_subject(l) == "api"
                 and frame_r1(l).startswith("ERR") and frame_flash(l)))
-check("fleet row: '|'-separated status letters (E/B/W/D/I)",
-      saw(lambda l: l.startswith("F|") and "|" in frame_fleet(l)
+check("fleet row: packed status letters (E/B/W/D/I, no '|' separator)",
+      saw(lambda l: l.startswith("F|") and "|" not in frame_fleet(l)
           and any(c in frame_fleet(l).upper() for c in "EBWDI")))
 check("active-tab box: sel points at a fleet LETTER in r3",
       saw(lambda l: l.startswith("F|") and 0 <= frame_sel(l) < len(frame_fleet(l))

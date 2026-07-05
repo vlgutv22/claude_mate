@@ -666,21 +666,21 @@ class Screen:
                 break
         head = f"{pos}/{len(queue)} "
         room = ROW_CHARS - len(head)
-        # One letter per session; an UNACKNOWLEDGED alert's letter is sent
-        # LOWERCASE so the firmware BLINKS it -- you can see at a glance which
-        # tabs still need acknowledging (they stop blinking as you ack them).
+        # One letter per session, packed with NO separator (the active-tab
+        # square already marks which is which). An UNACKNOWLEDGED alert's letter
+        # is sent LOWERCASE so the firmware BLINKS it -- you can see at a glance
+        # which tabs still need acknowledging (they stop as you ack them).
         letters = []
         for s in queue:
             ltr = STATE_LETTER.get(s.state, "I")
             letters.append(ltr.lower() if s.unacked_alert() else ltr)
-        strip = "|".join(letters)
+        strip = "".join(letters)
         if len(strip) > room:
             strip = strip[:max(0, room - 1)] + "+"
         r3 = head + strip
-        # Column of the active tab's letter within r3 (letters sit at even
-        # strip offsets: 0,2,4,...; '|' dividers at the odds). -1 if the letter
-        # fell past a truncation.
-        sel = len(head) + 2 * (pos - 1)
+        # Column of the active tab's letter within r3 (letters are now
+        # consecutive). -1 if it fell past a truncation.
+        sel = len(head) + (pos - 1)
         if sel >= len(r3) or not r3[sel].isalpha():
             sel = -1
 
