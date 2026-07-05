@@ -15,14 +15,16 @@ The "brain" of the Claude Mate USB hardware companion. It:
         H        -> handshake; the daemon resends the full current state.
         B|1      -> SUBMIT short: focus the selected tab (current card in
                     SCROLL, highlighted row in LIST; LIST double-click opens/
-                    closes the detail card instead).
+                    closes the detail card instead). The previously expanded
+                    terminal is collapsed, like a nav settle would do.
         B|2      -> NEXT: SCROLL next card / LIST highlight down.
         B|3      -> MODE short: SCROLL previous card / LIST highlight up.
-                    In LIST, navigation also drives the TERMINAL-FOLLOW
-                    preview: once the highlight settles (~0.45s) the
-                    highlighted tab's terminal window is raised ('focus' to
-                    its wrapper ctrl socket) and the previously expanded
+                    In SCROLL (view-tab) mode, navigation also drives the
+                    TERMINAL-FOLLOW preview: once the shown card settles
+                    (~0.45s) that tab's terminal window is raised ('focus'
+                    to its wrapper ctrl socket) and the previously expanded
                     one is miniaturized ('collapse'). Wrapper sessions only.
+                    LIST navigation is just a picker: it moves no windows.
         B|4      -> MODE long (>=500ms): toggle UI mode (SCROLL <-> LIST, an
                     all-tabs picker list).
         B|5      -> SUBMIT long (>=500ms): acknowledge the selected tab's
@@ -91,10 +93,23 @@ PORT_GLOBS = ("/dev/cu.usbserial*", "/dev/cu.usbmodem*")
 CAROUSEL_PERIOD = 3.0        # rotate one card every ~3s
 NEXT_PAUSE = 10.0            # pause auto-rotation ~10s after a manual NEXT
 DOUBLE_CLICK_S = 0.35       # LIST SUBMIT: window to detect a double-click
-NAV_PREVIEW_S = 0.45        # LIST nav: highlight must settle this long before
-                            # the terminal-follow preview (expand new/collapse
-                            # old) fires -- scrolling through tabs must not
-                            # thrash macOS window animations
+NAV_PREVIEW_S = 0.45        # SCROLL nav: the shown card must settle this long
+                            # before the terminal-follow preview (expand new/
+                            # collapse old) fires -- flipping through tabs must
+                            # not thrash macOS window animations
+WRAPPER_LIVE_TIMEOUT_S = 1.0  # a live wrapper acks receipt ('go') within ms; a
+                              # wedged one (stopped process: the kernel accepts
+                              # the connect into the backlog and buffers the
+                              # send) costs only this per window op, not the
+                              # full completion deadline
+WRAPPER_ACK_TIMEOUT_S = 12.0  # overall deadline for the completion ack ('ok').
+                              # MUST exceed the wrapper's worst-case op (~10s:
+                              # tmux select-window 3s + select-pane 3s + the 4s
+                              # osascript), else a legitimately slow op outlives
+                              # the wait and the next window op overlaps it --
+                              # the exact out-of-order race the ack prevents.
+                              # Pre-ack wrappers close the socket at once (EOF),
+                              # so the wait degrades to fire-and-forget.
 PING_PERIOD = 15.0          # keepalive ping interval
 RECONNECT_DELAY = 2.0       # wait between serial (re)connection attempts
 SESSION_DONE_TTL = 120.0    # drop a 'done' session after this long with no update
@@ -495,10 +510,11 @@ class Display:
         # LIST detail sub-view: double-click SUBMIT opens the highlighted tab's
         # full card; double-click again closes back to the list.
         self._list_detail = False
-        # Terminal-follow preview (LIST mode): the session key whose terminal
-        # window we consider "expanded" on screen. Seeded on entering LIST to
-        # the seeded highlight (the tab the user was just looking at), so the
-        # FIRST nav step collapses that window. Swapped by nav_preview_swap().
+        # Terminal-follow preview (SCROLL / view-tab mode): the session key
+        # whose terminal window we consider "expanded" on the laptop -- the
+        # last one the preview raised or the user explicitly focused (SUBMIT).
+        # Persistent across mode toggles, so the first nav step after a focus
+        # collapses the right window. Swapped by nav_preview_swap().
         self._preview_key: Optional[str] = None
 
     # ---- dial (stepper status wheel) ------------------------------------- #
@@ -677,11 +693,6 @@ class Display:
                 self._list_sel_key = (cur.key if cur is not None
                                       else (sessions[0].key if sessions else None))
                 self._list_top = 0
-                # Terminal-follow preview: the tab we enter on is (presumably)
-                # the terminal already up -- the first nav step collapses it.
-                self._preview_key = self._list_sel_key
-            else:
-                self._preview_key = None        # leaving LIST ends the preview
         if mode == "list":
             log("mode -> LIST (all tabs)")
             self.render_list_view()
@@ -728,38 +739,49 @@ class Display:
         self.render_list_view()
 
     def nav_preview_swap(self) -> "tuple[Optional[Session], Optional[Session]]":
-        """The LIST highlight settled (debounced): return the wrapper sessions
-        whose terminals should (collapse, expand) so the screen follows the
-        device -- the newly highlighted tab's terminal comes up, the previously
-        expanded one is miniaturized -- and commit the new expanded key.
+        """The SCROLL card settled (debounced): return the wrapper sessions
+        whose terminals should (collapse, expand) so the laptop follows the
+        device -- the shown tab's terminal comes up, the previously expanded
+        one is miniaturized -- and commit the new expanded key.
 
-        (None, None) when not in LIST mode or the highlight hasn't effectively
-        moved. Either side is None when that session is gone or has no wrapper
-        control socket (hook-driven tabs have no window we can drive)."""
-        sessions = self._reg.ordered()
+        (None, None) when not in SCROLL mode (LIST is a picker; it moves no
+        windows) or the card hasn't effectively changed. Either side is None
+        when that session is gone or has no wrapper control socket
+        (hook-driven tabs have no window we can drive)."""
         with self._lock:
-            if self._mode != "list":
+            if self._mode != "scroll":
                 return (None, None)
-            key = self._list_sel_key
+            cur = self._current_session
+            key = cur.key if cur is not None else None
             prev_key = self._preview_key
             if key is None or key == prev_key:
                 return (None, None)
             self._preview_key = key
-        cur = next((s for s in sessions if s.key == key), None)
+        sessions = self._reg.ordered()
         prev = (next((s for s in sessions if s.key == prev_key), None)
                 if prev_key else None)
-        expand = cur if (cur is not None and cur.focus_ctrl) else None
+        expand = cur if cur.focus_ctrl else None
         collapse = prev if (prev is not None and prev.focus_ctrl) else None
         return (collapse, expand)
 
-    def note_preview_focus(self, sess: Optional[Session]) -> None:
-        """A tab was explicitly focused (SUBMIT): its terminal is now up, so a
-        later LIST nav step should collapse THIS one. No-op outside LIST."""
+    def note_preview_focus(self, sess: Optional[Session]) -> Optional[Session]:
+        """A tab is being explicitly focused (SUBMIT, any mode): commit it as
+        the terminal now up and return the PREVIOUSLY expanded wrapper session
+        (if any) so the caller collapses it. An explicit focus owes the same
+        collapse a nav settle would have done -- without it, a SUBMIT inside
+        the nav-settle window made the pending preview a no-op (the key was
+        already committed) and the old terminal stayed expanded forever."""
         if sess is None:
-            return
+            return None
         with self._lock:
-            if self._mode == "list":
-                self._preview_key = sess.key
+            prev_key = self._preview_key
+            if prev_key == sess.key:
+                return None
+            self._preview_key = sess.key
+        if not prev_key:
+            return None
+        prev = next((s for s in self._reg.ordered() if s.key == prev_key), None)
+        return prev if (prev is not None and prev.focus_ctrl) else None
 
     def list_selected_session(self) -> Optional[Session]:
         """The tab currently highlighted in LIST mode (SUBMIT focuses it),
@@ -844,7 +866,18 @@ class Display:
 
 def wrapper_ctrl_send(ctrl: str, cmd: str) -> bool:
     """Send one command line ('focus' / 'collapse') to a PTY wrapper's
-    per-session control socket. Fire-and-forget; returns success."""
+    per-session control socket and WAIT for its ack. The wrapper replies in
+    two stages -- 'go' the moment it accepts the command (liveness), 'ok'
+    only after its window op (osascript) has COMPLETED -- so a caller holding
+    the window-op serialization lock gets true cross-session ordering:
+    without the completion ack, consecutive osascripts run concurrently and
+    finish out of order, leaving a STALE terminal expanded on top (device
+    card != laptop window). The first read waits only WRAPPER_LIVE_TIMEOUT_S,
+    so a wedged wrapper (stopped process whose socket the kernel still
+    accepts) costs ~1s, while a live-but-slow op gets the full
+    WRAPPER_ACK_TIMEOUT_S deadline. Pre-ack wrappers close the socket
+    immediately (recv -> EOF), degrading to the old fire-and-forget.
+    Returns success."""
     if not ctrl or not os.path.exists(ctrl):
         return False
     try:
@@ -852,6 +885,18 @@ def wrapper_ctrl_send(ctrl: str, cmd: str) -> bool:
         c.settimeout(2.0)
         c.connect(ctrl)
         c.sendall(cmd.encode("ascii") + b"\n")
+        try:
+            deadline = time.monotonic() + WRAPPER_ACK_TIMEOUT_S
+            c.settimeout(WRAPPER_LIVE_TIMEOUT_S)   # a live wrapper 'go's in ms
+            buf = b""
+            while b"ok" not in buf:
+                chunk = c.recv(16)
+                if not chunk:          # EOF: pre-ack wrapper (or already done)
+                    break
+                buf += chunk
+                c.settimeout(max(0.1, deadline - time.monotonic()))
+        except socket.timeout:
+            log(f"wrapper {cmd} ack timeout ({ctrl}); continuing")
         c.close()
         return True
     except OSError as exc:
@@ -1087,12 +1132,14 @@ class ButtonReader(threading.Thread):
         # subprocesses). `_focus_serial` serializes them so two quick SUBMITs
         # can't raise windows in finish-order instead of press-order, and
         # `_focus_gen` lets a newer press supersede one still waiting its turn.
+        # The SCROLL-nav preview takes the SAME lock, so previews and explicit
+        # focuses form one strictly-ordered stream of window ops.
         self._focus_serial = threading.Lock()
         self._focus_gen_lock = threading.Lock()
         self._focus_gen = 0
-        # LIST-nav terminal-follow preview: each nav step (re)arms this timer;
-        # when the highlight settles for NAV_PREVIEW_S the preview fires --
-        # expand the highlighted tab's terminal, collapse the previous one.
+        # SCROLL-nav terminal-follow preview: each nav step (re)arms this
+        # timer; when the shown card settles for NAV_PREVIEW_S the preview
+        # fires -- expand that tab's terminal, collapse the previous one.
         # Gen-token guarded like the SUBMIT double-click timer.
         self._nav_timer: Optional[threading.Timer] = None
         self._nav_gen = 0
@@ -1124,22 +1171,22 @@ class ButtonReader(threading.Thread):
                     if mode == "list":
                         log("NEXT button -> highlight next tab")
                         self._display.list_nav(+1)
-                        self._schedule_nav_preview()
                     else:
                         log("NEXT button -> advancing carousel")
                         if self.on_next:
                             self.on_next()       # pause auto-show FIRST, then move
                         self._display.advance()
+                        self._schedule_nav_preview()
                 elif n == 3:                     # MODE short: highlight up / prev card
                     if mode == "list":
                         log("MODE short -> highlight previous tab")
                         self._display.list_nav(-1)
-                        self._schedule_nav_preview()
                     else:
                         log("MODE short -> previous card")
                         if self.on_next:
                             self.on_next()       # pause auto-show FIRST, then move
                         self._display.retreat()
+                        self._schedule_nav_preview()
                 elif n == 4:                     # MODE long: toggle scroll <-> list
                     log("MODE long-press -> toggle mode")
                     self._display.toggle_mode()
@@ -1157,11 +1204,11 @@ class ButtonReader(threading.Thread):
         # Anything else: log at most as debug noise, ignore.
         log(f"ignoring serial line from Arduino: {line!r}")
 
-    # ---- LIST-nav terminal-follow preview -------------------------------- #
+    # ---- SCROLL-nav terminal-follow preview ------------------------------ #
 
     def _schedule_nav_preview(self) -> None:
-        """(Re)arm the debounced preview: fires once the LIST highlight has
-        stayed put for NAV_PREVIEW_S. Rapid scrolling just keeps re-arming, so
+        """(Re)arm the debounced preview: fires once the shown SCROLL card has
+        stayed put for NAV_PREVIEW_S. Rapid flipping just keeps re-arming, so
         intermediate tabs never thrash macOS window animations."""
         with self._nav_lock:
             self._nav_gen += 1
@@ -1174,21 +1221,40 @@ class ButtonReader(threading.Thread):
             t.start()
 
     def _nav_preview_fire(self, gen: int) -> None:
-        """Highlight settled: expand the highlighted tab's terminal, collapse
-        the previously expanded one (wrapper sessions only). Runs on the timer
-        thread; the wrapper does the (slow) AppleScript work in its process,
-        our socket sends are quick."""
+        """Card settled: expand its terminal, collapse the previously expanded
+        one (wrapper sessions only). Runs on the timer thread, but the window
+        work is SERIALIZED with SUBMIT focuses on `_focus_serial`, and each
+        ctrl send WAITS for the wrapper's ack -- so macOS applies the window
+        ops in exactly this order and the terminal left on top always matches
+        the card on the device (concurrent osascripts used to finish out of
+        order and leave a stale tab expanded). A swap still queued when a
+        newer nav lands is dropped (last wins)."""
         with self._nav_lock:
             if gen != self._nav_gen:             # superseded by a newer nav
                 return
             self._nav_timer = None
-        collapse, expand = self._display.nav_preview_swap()
-        if collapse is not None:
-            log(f"nav preview: collapse {collapse.name}")
-            wrapper_ctrl_send(collapse.focus_ctrl, "collapse")
-        if expand is not None:                   # expand LAST so it ends on top
-            log(f"nav preview: expand {expand.name}")
-            wrapper_ctrl_send(expand.focus_ctrl, "focus")
+        with self._focus_serial:                 # one window op at a time
+            with self._nav_lock:
+                if gen != self._nav_gen:         # superseded while queued
+                    return
+            collapse, expand = self._display.nav_preview_swap()
+            if collapse is None and expand is None:
+                return
+            # This swap is now the NEWEST window op. Retire any SUBMIT focus
+            # still queued behind us: lock wakeup order isn't FIFO, so without
+            # this an older press could run AFTER this swap and raise a stale
+            # terminal on top of the card the device actually shows. (A swap
+            # that did no work returns above and retires nothing -- it must
+            # not eat a legit focus, e.g. one pressed just before a mode
+            # toggle left this timer to fire as a no-op.)
+            with self._focus_gen_lock:
+                self._focus_gen += 1
+            if collapse is not None:
+                log(f"nav preview: collapse {collapse.name}")
+                wrapper_ctrl_send(collapse.focus_ctrl, "collapse")
+            if expand is not None:               # expand LAST so it ends on top
+                log(f"nav preview: expand {expand.name}")
+                wrapper_ctrl_send(expand.focus_ctrl, "focus")
 
     # ---- SUBMIT single/double-click ------------------------------------- #
 
@@ -1231,7 +1297,11 @@ class ButtonReader(threading.Thread):
         # that is still queued when a newer one arrives is dropped (last wins).
         if self.on_ack:
             self.on_ack(sess)                        # focusing the window = acknowledged
-        self._display.note_preview_focus(sess)       # this terminal is now the one up
+        # Commit this terminal as the one up and take over the collapse the
+        # nav preview would otherwise have owed the previously expanded tab
+        # (a SUBMIT inside the settle window turns the pending preview into a
+        # no-op, so the collapse must ride with the focus).
+        prev = self._display.note_preview_focus(sess)
         with self._focus_gen_lock:
             self._focus_gen += 1
             gen = self._focus_gen
@@ -1241,6 +1311,9 @@ class ButtonReader(threading.Thread):
                 with self._focus_gen_lock:
                     if gen != self._focus_gen:       # superseded while queued
                         return
+                if prev is not None:
+                    log(f"focus: collapse {prev.name}")
+                    wrapper_ctrl_send(prev.focus_ctrl, "collapse")
                 focus_session(sess)
 
         threading.Thread(target=run, name="focus", daemon=True).start()

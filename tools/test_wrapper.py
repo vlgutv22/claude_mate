@@ -75,6 +75,7 @@ proc = subprocess.Popen([sys.executable, WRAP], stdin=s, stdout=s,
 os.close(s)
 
 focus_sent = False
+ack = b""
 deadline = time.time() + 8
 while time.time() < deadline and proc.poll() is None:
     if not focus_sent:
@@ -83,8 +84,18 @@ while time.time() < deadline and proc.poll() is None:
             if len(parts) >= 4 and parts[3].startswith("/tmp/claude-mate-ctrl-") and os.path.exists(parts[3]):
                 try:
                     c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); c.connect(parts[3])
-                    c.sendall(b"focus\n"); c.close(); focus_sent = True
-                    print("  -> sent FOCUS to", parts[3])
+                    c.sendall(b"focus\n")
+                    # Two-stage ack: 'go' on receipt, 'ok' after the window op
+                    # (the daemon orders cross-session window ops by waiting).
+                    c.settimeout(5.0)
+                    try:
+                        while b"ok" not in ack:
+                            chunk = c.recv(16)
+                            if not chunk: break
+                            ack += chunk
+                    except socket.timeout: pass
+                    c.close(); focus_sent = True
+                    print("  -> sent FOCUS to", parts[3], "ack:", ack)
                 except OSError: pass
     time.sleep(0.1)
 try: proc.wait(timeout=5)
@@ -105,6 +116,8 @@ check("every report carried a ctrl socket",
       all(len(l.split("|")) >= 4 and l.split("|")[3].startswith("/tmp/claude-mate-ctrl-") for l in received))
 check("sent 'end' on exit", "end" in states)
 check("FOCUS reached wrapper (osascript ran)", osa_called)
+check("ctrl 'focus' acked in two stages (go on receipt, ok after the op)",
+      b"go" in ack and b"ok" in ack)
 print("\n  state sequence:", states)
 ok = all(checks)
 print("\n================", "ALL PASSED" if ok else "SOME FAILED", "================")

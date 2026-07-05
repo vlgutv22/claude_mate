@@ -224,15 +224,23 @@ focus_lines_after_b5 = ([l.strip() for l in open(focuslog)]
                         if os.path.exists(focuslog) else [])
 b5_no_focus = (focus_lines_after_b5 == focus_lines_before_b5)
 
-print("\n-- phase 10: LIST nav terminal-follow preview (focus new / collapse old) --")
+print("\n-- phase 10: terminal-follow preview: none in LIST, ordered in SCROLL --")
 # Still in LIST (webapp2 working, gamma idle; highlight on gamma from phase 9).
-# Attach fake wrapper ctrl sockets to both (keepalive feeds, states unchanged),
-# then move the highlight to webapp2: after the ~0.45s settle debounce the
-# daemon must send 'focus' to webapp2's wrapper and 'collapse' to gamma's.
-ctrl_cmds = {"webapp2": [], "gamma": []}
+# Attach fake wrapper ctrl sockets: webapp2 speaks the full go/ok protocol but
+# DELAYS its 'collapse' completion ack ~0.8s (a slow osascript); gamma acks
+# instantly; delta is a PRE-ACK wrapper (closes without any reply -> EOF).
+# LIST nav is a picker and must move NO windows. Back in SCROLL, each next/prev
+# (after the ~0.45s settle) must 'focus' the shown card's wrapper and 'collapse'
+# the previously expanded one, in strict alternation -- and the op AFTER
+# webapp2's delayed collapse must arrive >= the delay later (proving the daemon
+# actually WAITS for the completion ack instead of firing-and-forgetting),
+# while the op after delta's silent EOF must arrive promptly (pre-ack compat,
+# no deadline stall).
+ACK_DELAY = 0.8
+ctrl_seq = []                     # (session, cmd, arrival time) in arrival order
 ctrl_lock = threading.Lock()
 
-def _fake_ctrl(name):
+def _fake_ctrl(name, ack=True, delay_collapse=0.0):
     path = os.path.join(binhome, f"ctrl-{name}.sock")
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(path)
@@ -243,26 +251,76 @@ def _fake_ctrl(name):
                 conn, _ = srv.accept()
             except OSError:
                 break
-            with conn:
+            try:
+                data = conn.recv(64).decode(errors="ignore").strip()
+                if data:
+                    with ctrl_lock:
+                        ctrl_seq.append((name, data, time.monotonic()))
+                if ack:
+                    conn.sendall(b"go\n")              # liveness, like the wrapper
+                    if data == "collapse" and delay_collapse:
+                        time.sleep(delay_collapse)     # a slow window op
+                    conn.sendall(b"ok\n")              # completion ack
+                # ack=False: close with no reply -> a pre-ack wrapper (EOF)
+            except OSError:
+                pass
+            finally:
                 try:
-                    data = conn.recv(64).decode(errors="ignore").strip()
+                    conn.close()
                 except OSError:
-                    data = ""
-            if data:
-                with ctrl_lock:
-                    ctrl_cmds[name].append(data)
+                    pass
     threading.Thread(target=loop, daemon=True).start()
     return path
 
-ctrl_w = _fake_ctrl("webapp2")
+ctrl_w = _fake_ctrl("webapp2", delay_collapse=ACK_DELAY)
 ctrl_g = _fake_ctrl("gamma")
+ctrl_d = _fake_ctrl("delta", ack=False)
 feed(f"working|sidW|webapp2|{ctrl_w}")
 feed(f"idle|sidG|gamma|{ctrl_g}")
+feed(f"idle|sidD|delta|{ctrl_d}")
 time.sleep(1.2)
-arduino_send("B|2"); time.sleep(1.5)          # highlight -> webapp2, settle > 0.45s
+arduino_send("B|2"); time.sleep(1.5)          # LIST nav: highlight moves, NO windows
 with ctrl_lock:
-    preview_focus = "focus" in ctrl_cmds["webapp2"]
-    preview_collapse = "collapse" in ctrl_cmds["gamma"]
+    list_nav_ops = list(ctrl_seq)
+arduino_send("B|4"); time.sleep(1.2)          # MODE long -> back to SCROLL
+for _ in range(4):                            # visit all 3 cards, wrap past the 1st
+    arduino_send("B|2"); time.sleep(1.9)      # settle 0.45s + delayed ack + margin
+with ctrl_lock:
+    scroll_ops = [(n, c) for (n, c, t) in ctrl_seq[len(list_nav_ops):]]
+    scroll_times = [t for (n, c, t) in ctrl_seq[len(list_nav_ops):]]
+scroll_focus = [n for (n, c) in scroll_ops if c == "focus"]
+scroll_collapse = [n for (n, c) in scroll_ops if c == "collapse"]
+# Four navs over three tabs -> focuses on all three (the 4th wraps around), and
+# EXACTLY one collapse per move-off, of exactly the tab focused before it:
+# f(A) c(A) f(B) c(B) f(C) c(C) f(A). Anything extra (e.g. collapsing the tab
+# just shown) or missing (previous tab left expanded) must fail.
+preview_focus_all = (len(scroll_focus) == 4
+                     and set(scroll_focus) == {"webapp2", "gamma", "delta"}
+                     and all(scroll_focus[i] != scroll_focus[i + 1] for i in range(3)))
+preview_collapse_prev = scroll_collapse == scroll_focus[:3]
+# The exact expected stream, derived from the observed rotation:
+# f(A) c(A) f(B) c(B) f(C) c(C) f(A) -- nothing extra, nothing missing,
+# each collapse strictly between its tab's focus and the next tab's focus.
+expected_ops = []
+for i, n in enumerate(scroll_focus):
+    expected_ops.append((n, "focus"))
+    if i < 3:
+        expected_ops.append((scroll_focus[i], "collapse"))
+preview_ordered = preview_focus_all and preview_collapse_prev and scroll_ops == expected_ops
+# Ack-wait is real: the op following webapp2's delayed 'collapse' arrived at
+# least ~the delay later. Fire-and-forget would show a near-zero gap.
+ack_waited = False
+for i, (n, c) in enumerate(scroll_ops):
+    if (n, c) == ("webapp2", "collapse") and i + 1 < len(scroll_ops):
+        ack_waited = (scroll_times[i + 1] - scroll_times[i]) >= ACK_DELAY - 0.1
+        break
+# Pre-ack compat: the op following delta's silent-EOF 'collapse' arrived
+# promptly (no WRAPPER_ACK_TIMEOUT_S stall).
+preack_prompt = False
+for i, (n, c) in enumerate(scroll_ops):
+    if (n, c) == ("delta", "collapse") and i + 1 < len(scroll_ops):
+        preack_prompt = (scroll_times[i + 1] - scroll_times[i]) < 2.0
+        break
 
 proc.terminate()
 try:
@@ -331,10 +389,18 @@ check("SUBMIT long (B|5) silences the LED loop (V|OFF after ack)",
       b5_led_off)
 check("SUBMIT long (B|5) does NOT focus (no new deep-link/open calls)",
       b5_no_focus)
-check("LIST nav preview: newly highlighted tab's wrapper gets 'focus' (expand)",
-      preview_focus)
-check("LIST nav preview: previously expanded tab's wrapper gets 'collapse'",
-      preview_collapse)
+check("LIST nav moves NO windows (picker only: no wrapper focus/collapse traffic)",
+      not list_nav_ops)
+check("SCROLL nav preview: every shown card's wrapper gets 'focus' on settle (all 3 tabs)",
+      preview_focus_all)
+check("SCROLL nav preview: exactly the previously expanded tab collapses on each move-off",
+      preview_collapse_prev)
+check("SCROLL nav preview: exact op stream f/c strictly alternates, collapse between focuses",
+      preview_ordered)
+check("daemon WAITS for the completion ack (delayed 'ok' delays the next window op)",
+      ack_waited)
+check("pre-ack wrapper (EOF, no ack) does not stall the window-op stream",
+      preack_prompt)
 
 ok = all(checks)
 print("\n  focus.log:", [l.strip() for l in focus_lines] or "(empty)")

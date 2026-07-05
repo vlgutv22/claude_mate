@@ -17,8 +17,12 @@ Run `claude` THROUGH this wrapper (alias claude=claude-mate-wrap). It:
   4. Listens on a per-session control socket for window commands, auto-picking
      the method from $TERM_PROGRAM (iTerm2 / Terminal.app / VS Code / tmux /
      generic): 'focus' raises (and un-minimizes) THIS terminal window — sent on
-     the FOCUS button and when the device's LIST highlight lands on this tab;
-     'collapse' miniaturizes it — sent when the LIST highlight moves away.
+     the FOCUS button and when the device's SCROLL card lands on this tab;
+     'collapse' miniaturizes it — sent when the card moves on. Commands are
+     acked in two stages — 'go' on receipt (liveness), 'ok' only after the
+     window op completes — so the daemon can order window ops ACROSS sessions
+     (unordered osascripts finish out of order and leave a stale terminal on
+     top) without stalling long on a wedged wrapper.
 
 State model (matches the daemon): working | waiting | error | idle
   working  TUI is generating, OR a background dynamic-workflow is still running.
@@ -251,7 +255,7 @@ def focus_self():
     tp = TERM_PROGRAM.lower()
     if tp == "iterm.app":
         # Match the session by its TTY (exact), fall back to title. Restore the
-        # window first in case the LIST-nav preview miniaturized it.
+        # window first in case the nav preview miniaturized it.
         _osa(f'''
             tell application "iTerm2"
               activate
@@ -273,7 +277,7 @@ def focus_self():
             end tell''')
     elif tp == "apple_terminal":
         # Bring Terminal forward, then make THIS tab (matched by its TTY) the
-        # selected, front window. Un-miniaturize first: the daemon's LIST-nav
+        # selected, front window. Un-miniaturize first: the daemon's nav
         # preview may have collapsed this window to the Dock, and selecting a
         # tab of a miniaturized window would not restore it. (macOS raises an
         # app's windows as a group; we ensure ours ends up on top + focused.)
@@ -302,7 +306,7 @@ def focus_self():
         _osa('tell application "Warp" to activate')
     else:
         # Generic: ask System Events to raise any window whose title matches
-        # (un-minimizing it first in case the LIST-nav preview collapsed it).
+        # (un-minimizing it first in case the nav preview collapsed it).
         _osa(f'''
             tell application "System Events"
               set procs to (every process whose background only is false)
@@ -320,8 +324,8 @@ def focus_self():
             end tell''')
 
 def collapse_self():
-    """Miniaturize THIS session's terminal window (the daemon's LIST-nav
-    preview collapses the previously-highlighted tab as the highlight moves).
+    """Miniaturize THIS session's terminal window (the daemon's SCROLL-nav
+    preview collapses the previously-shown tab as the card moves on).
     Best effort, mirrors focus_self()'s per-$TERM_PROGRAM matching. No-ops
     where a single pane can't be collapsed (tmux panes, VS Code integrated
     terminals) -- collapsing the whole shared window would hide innocent
@@ -379,7 +383,14 @@ def collapse_self():
 
 def ctrl_listener():
     """Per-session socket: the daemon connects and sends 'focus' (raise +
-    un-minimize this terminal) or 'collapse' (miniaturize it)."""
+    un-minimize this terminal) or 'collapse' (miniaturize it). Two-stage
+    reply: 'go' immediately on receipt (proves this wrapper is alive, so the
+    daemon's short first wait doesn't burn its full op deadline on a wedged
+    process), then 'ok' only AFTER the window op completes. The daemon holds
+    one window-op lock across ALL sessions and waits for 'ok', so ops apply
+    in exactly the order the device drove them -- fire-and-forget osascripts
+    from different wrappers finish out of order, which left a stale terminal
+    expanded (device card != laptop window)."""
     try:
         if os.path.exists(CTRL_SOCK):
             os.unlink(CTRL_SOCK)
@@ -394,15 +405,30 @@ def ctrl_listener():
             conn, _ = srv.accept()
         except OSError:
             break
-        with conn:
+        try:
             try:
                 data = conn.recv(64).decode(errors="ignore").strip()
             except OSError:
                 data = ""
-        if data.startswith("focus"):
-            focus_self()
-        elif data.startswith("collapse"):
-            collapse_self()
+            known = data.startswith("focus") or data.startswith("collapse")
+            if known:
+                try:
+                    conn.sendall(b"go\n")   # liveness: accepted, now running --
+                except OSError:             # the daemon's short first wait ends
+                    pass                    # here instead of at its op deadline
+                if data.startswith("focus"):
+                    focus_self()
+                else:
+                    collapse_self()
+            try:
+                conn.sendall(b"ok\n")       # ack: op done, the next one may run
+            except OSError:
+                pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
 
 # --------------------------------------------------------------------------- #
 # Model + effort capture from the rendered screen
