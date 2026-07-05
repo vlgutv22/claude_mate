@@ -7,11 +7,11 @@
  *
  * What it does:
  *   - Cycles a demo frame through the session states ERR -> WAIT -> DONE ->
- *     WORK -> IDLE, ~every 3s, drawn in the REAL interface layout (size-2 name
- *     band + info row + fleet strip).
+ *     WORK -> IDLE, ~every 3s, drawn in the REAL interface layout (four size-1
+ *     rows: name / state+time / model+effort / position + fleet letters).
  *   - On each change, plays the matching LED pattern on D8 exactly like the
  *     main firmware (ERROR strobe / INPUT blink / DONE cascade / START blink),
- *     and flashes the name band for the alert states.
+ *     and flashes the name row for the alert states.
  *   - Prints a line over serial whenever a button is pressed:
  *       "GO button (D2) pressed" / "NEXT button (D3) pressed" /
  *       "PREV button (D4) pressed"
@@ -50,20 +50,21 @@
 
 SoftSSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT);
 
-// ---- Demo states (mirror the real interface) ----------------------------------
+// ---- Demo states (mirror the real interface: 4 size-1 rows) --------------------
 struct Demo {
-  const char *name;    // size-2 name band (<=10 chars)
-  const char *info;    // info row (<=21 chars)
-  bool flash;          // alert: flash the name band
+  const char *r0;      // name row (<=21 chars)
+  const char *r1;      // state tag + time
+  const char *r2;      // model + effort
+  const char *r3;      // position + fleet status letters ('|'-separated)
+  bool flash;          // alert: flash the name row
 };
 const Demo DEMOS[] = {
-  {"api-server", "ERR  00:42 Opus xhigh", true },
-  {"webapp",     "WAIT 01:07 Sonnet high", true },
-  {"infra",      "DONE 00:15 Haiku med",  true },
-  {"claude-mat", "WORK 12:03 Opus xhigh", false},
-  {"notes",      "IDLE 05:30",            false},
+  {"api-server",   "ERR   00:42", "Opus 4.8  xhigh",  "1/5 E|B|D|W|I", true },
+  {"webapp",       "WAIT  01:07", "Sonnet 4.6  high", "2/5 E|B|D|W|I", true },
+  {"infra",        "DONE  00:15", "Haiku 4.5  med",   "3/5 E|B|D|W|I", true },
+  {"claude-mate",  "WORK  12:03", "Opus 4.8  xhigh",  "4/5 E|B|D|W|I", false},
+  {"notes",        "IDLE  05:30", "",                 "5/5 E|B|D|W|I", false},
 };
-const char *FLEET = "1/5 !?*>.";
 const uint8_t DEMO_COUNT = sizeof(DEMOS) / sizeof(DEMOS[0]);
 
 uint8_t demoIdx = 0;
@@ -125,22 +126,19 @@ static void ledForDemo(uint8_t i) {
   }
 }
 
-// ---- Frame rendering (the real interface layout) -------------------------------
+// ---- Frame rendering (the real interface layout: 4 size-1 rows) ----------------
 static void drawDemo(uint8_t i) {
   const Demo &d = DEMOS[i];
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
-  display.setTextSize(2);
-  display.setCursor(0, 0);
-  display.print(d.name);
-  if (d.flash && blinkOn) {
-    display.fillRect(0, 0, SCREEN_WIDTH, 16, SSD1306_INVERSE);
-  }
   display.setTextSize(1);
-  display.setCursor(0, 16);
-  display.print(d.info);
-  display.setCursor(0, 24);
-  display.print(FLEET);
+  display.setCursor(0, 0);  display.print(d.r0);
+  display.setCursor(0, 8);  display.print(d.r1);
+  display.setCursor(0, 16); display.print(d.r2);
+  display.setCursor(0, 24); display.print(d.r3);
+  if (d.flash && blinkOn) {
+    display.fillRect(0, 0, SCREEN_WIDTH, 8, SSD1306_INVERSE);   // flash the name row
+  }
   display.display();
 }
 
@@ -186,7 +184,7 @@ void setup() {
   demoIdx = 0;
   ledForDemo(demoIdx);
   Serial.print(F("demo: "));
-  Serial.println(DEMOS[demoIdx].name);
+  Serial.println(DEMOS[demoIdx].r0);
   drawDemo(demoIdx);
   while (display.flushBusy()) display.pumpFlush();
 
@@ -203,7 +201,7 @@ void loop() {
     demoIdx = (demoIdx + 1) % DEMO_COUNT;
     ledForDemo(demoIdx);
     Serial.print(F("demo: "));
-    Serial.println(DEMOS[demoIdx].name);
+    Serial.println(DEMOS[demoIdx].r0);
     drawDemo(demoIdx);
   }
 

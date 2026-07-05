@@ -14,9 +14,9 @@ The "brain" of the Claude Mate USB hardware companion. It:
      (error > waiting > done > working > idle; unacknowledged before
      acknowledged inside a class; oldest event first) and renders ONE screen --
      the selected session (normally the queue head, i.e. the thing that needs
-     the human most) as a pre-composed text frame:
+     the human most) as a pre-composed 4-row (all size-1) text frame:
 
-         F|<flash>|<name10>|<info21>|<fleet21>
+         F|<flash>|<name>|<state+time>|<model+effort>|<pos + fleet letters>
 
      The firmware is a dumb renderer; ALL layout/ordering/selection lives here.
   4. Reads button events from the Arduino on a background thread. The buttons
@@ -24,20 +24,22 @@ The "brain" of the Claude Mate USB hardware companion. It:
         H     -> handshake; the daemon resends the full current state.
         B|P   -> PREV: selection one step up the queue (auto-repeats on hold).
         B|N   -> NEXT: selection one step down the queue (auto-repeats on hold).
-        B|G   -> GO (short press): acknowledge the selected session's alert and
-                 RAISE its terminal window. Raise/activate ONLY -- the daemon
-                 never collapses, resizes, or miniaturizes any window.
-        B|K   -> GO (long press): acknowledge WITHOUT touching any window.
-     After a GO/ACK the selection snaps home to the (new) queue head, so N
-     pending alerts are handled with exactly N presses, zero navigation.
+        B|G   -> GO (short press): RAISE the terminal of the session SHOWN on
+                 the glass (WYSIWYG -- always the name the user is looking at).
+                 Raise/activate ONLY; the daemon never collapses, resizes, or
+                 miniaturizes any window. An alert is acknowledged as it is
+                 raised.
+        B|K   -> GO (long press): acknowledge the shown session's alert WITHOUT
+                 touching any window.
+     After acknowledging an ALERT the selection snaps home to the next alert
+     (N alerts = N presses); focusing a CALM session keeps it on the glass.
   5. Drives the indication LED via V|<KIND>: the pattern for the WORST
      unacknowledged alert class, looping until acknowledged (V|OFF).
 
 Screen ownership rule: the display changes subject on its own ONLY when the
-user is idle (no button press for HOME_AFTER_S). A press-grace guard protects
-the boundary: if the screen auto-swapped subjects moments before a GO/ACK
-landed while the user was reading an alert, the press applies to the alert
-that was being read -- never to a window the user did not choose.
+user is idle (no button press for HOME_AFTER_S). A GO/ACK acts on EXACTLY the
+session whose frame is on the glass -- never a freshly recomputed head -- so a
+press can only ever raise the terminal the user is actually looking at.
 
 Only third-party dependency: pyserial.
 
@@ -93,10 +95,6 @@ PORT_GLOBS = ("/dev/cu.usbserial*", "/dev/cu.usbmodem*")
 HOME_AFTER_S = 10.0          # no press for this long -> selection returns to
                              # the queue head; until then the screen NEVER
                              # changes subject on its own
-PRESS_GRACE_S = 0.5          # a GO/ACK landing within this window after an
-                             # AUTONOMOUS subject swap (while the user was
-                             # reading an unacked alert) applies to the
-                             # PREVIOUS subject -- the wrong-terminal guard
 REALERT_SUPPRESS_S = 5.0     # a session re-entering the SAME alert class this
                              # soon after being acknowledged stays acknowledged
                              # (absorbs detection flaps re-firing the LED)
@@ -115,17 +113,18 @@ RECONNECT_DELAY = 2.0       # wait between serial (re)connection attempts
 SESSION_DONE_TTL = 120.0    # drop a 'done' session after this long with no update
 SESSION_IDLE_TTL = 600.0    # drop any stale session after this long
 
-# Screen text geometry (must match the firmware's fixed 3-row layout).
-NAME_CHARS = 10             # size-2 top band
-ROW_CHARS = 21              # size-1 info/fleet rows
+# Screen text geometry (must match the firmware's fixed 4-row layout, all
+# size-1: r0 name / r1 state+time / r2 model+effort / r3 position + fleet).
+ROW_CHARS = 21              # size-1 rows are 21 chars wide (128 / 6px)
 
-# 4-char state tag shown at the start of the info row.
+# 4-char state tag shown on the state row.
 STATE_TAG = {"working": "WORK", "waiting": "WAIT", "error": "ERR",
              "done": "DONE", "idle": "IDLE"}
 
-# One glyph per session in the fleet strip (queue order).
-STATE_GLYPH = {"error": "!", "waiting": "?", "done": "*",
-               "working": ">", "idle": "."}
+# One LETTER per session in the fleet strip (queue order), '|'-separated:
+#   I idle  E error  W working (WIP)  D done  B waiting (blocked, needs input)
+STATE_LETTER = {"error": "E", "waiting": "B", "working": "W",
+                "done": "D", "idle": "I"}
 
 # Triage priority, most urgent first. The queue sorts by
 # (class rank, acknowledged?, event time): a fresh error outranks everything,
@@ -487,14 +486,14 @@ def _fit_meta(model: str, effort: str, width: int) -> str:
 
 
 def _display_names(sessions: List[Session]) -> Dict[str, str]:
-    """Map session key -> display name truncated to NAME_CHARS, disambiguating
-    collisions (sibling dirs with a long common prefix) with a middle squeeze:
-    first 4 chars + '~' + last 5 chars."""
+    """Map session key -> display name truncated to ROW_CHARS (the full size-1
+    row now), disambiguating collisions (sibling dirs with a long common prefix)
+    with a middle squeeze: first 9 chars + '~' + last 10 chars."""
     out: Dict[str, str] = {}
     plain: Dict[str, List[Session]] = {}
     for s in sessions:
         nm = _sanitize(s.name).strip() or "?"
-        t = nm[:NAME_CHARS]
+        t = nm[:ROW_CHARS]
         plain.setdefault(t, []).append(s)
         out[s.key] = t
     for t, group in plain.items():
@@ -507,14 +506,14 @@ def _display_names(sessions: List[Session]) -> Dict[str, str]:
             continue
         for g in group:
             nm = _sanitize(g.name).strip()
-            if len(nm) > NAME_CHARS:
-                out[g.key] = nm[:4] + "~" + nm[-5:]
+            if len(nm) > ROW_CHARS:
+                out[g.key] = nm[:9] + "~" + nm[-10:]
     return out
 
 
 class Screen:
     """Owns everything the device shows: the selection, the pre-rendered frame,
-    the press-grace bookkeeping, and the LED loop tracker."""
+    and the LED loop tracker."""
 
     def __init__(self, link: SerialLink, registry: Registry) -> None:
         self._link = link
@@ -524,21 +523,14 @@ class Screen:
         # by key so re-sorts never move the subject out from under the cursor.
         self._sel_key: Optional[str] = None
         self._last_press = 0.0
-        # Last frame actually sent (dedup) + its subject (press-grace guard).
+        # Last frame actually sent (dedup) + the key of the subject CURRENTLY
+        # ON THE GLASS. A GO/ACK press acts on exactly this key (WYSIWYG), so
+        # the raised terminal always matches the name the user is looking at.
         self._last_frame = ""
         self._shown_key: Optional[str] = None
-        self._shown_flash = False
-        # Press-grace: the previous subject and how/when it was swapped away.
-        self._prev_key: Optional[str] = None
-        self._prev_flash = False
-        self._swap_ts = 0.0
-        self._swap_autonomous = False
         # LED loop tracker: what continuous loop the firmware is playing
         # ("ERROR"/"INPUT"/"DONE"/None); V| is (re)sent only when it changes.
         self._loop_kind: Optional[str] = _LOOP_UNSET
-        # Thread-local user-action flag: set by button handlers around their
-        # whole call chain so refresh() can classify subject swaps correctly.
-        self._tls = threading.local()
 
     # ---- selection -------------------------------------------------------- #
 
@@ -557,97 +549,84 @@ class Screen:
                     return s
         return queue[0]
 
-    def user_action(self):
-        """Context manager marking the CURRENT THREAD's Screen calls as
-        user-driven (a button handler). refresh() classifies a subject swap it
-        performs inside this scope as user-driven; every other swap is
-        autonomous and arms the press-grace guard. Thread-local so concurrent
-        Ticker/socket refreshes are never misclassified."""
-        screen = self
-
-        class _Scope:
-            def __enter__(self):
-                screen._tls.user_action = True
-
-            def __exit__(self, *exc):
-                screen._tls.user_action = False
-
-        return _Scope()
-
     def nav(self, delta: int) -> None:
         """PREV/NEXT: move the selection by `delta` in queue order (wraps)."""
-        now = time.time()
-        with self.user_action():
-            with self._lock:
-                queue = self._reg.queue()
-                self._last_press = now
-                if not queue:
-                    return
-                cur = self._subject(queue)
-                idx = 0
-                for i, s in enumerate(queue):
-                    if cur is not None and s.key == cur.key:
-                        idx = i
-                        break
-                nxt = queue[(idx + delta) % len(queue)]
-                self._sel_key = nxt.key
-            self.refresh()
-
-    def snap_home(self) -> None:
-        """After GO/ACK: surface the (new) queue head and PIN it, so the screen
-        does not change subject on its own inside the interaction window even
-        if a worse alert arrives (the LED still updates immediately)."""
-        with self.user_action():
-            with self._lock:
-                queue = self._reg.queue()
-                self._sel_key = queue[0].key if queue else None
-            self.refresh()
-
-    def resolve_press_target(self) -> Optional[Session]:
-        """The session a GO/ACK press applies to. Normally the shown subject;
-        if the screen swapped subjects ON ITS OWN within PRESS_GRACE_S while
-        the user was reading an unacked alert, the press applies to the alert
-        that was being read (the wrong-terminal guard). The guard is CONSUMED
-        by the press that used it, so a quick second press acts on what is
-        shown. Also counts this press for the interaction window."""
         now = time.time()
         with self._lock:
             queue = self._reg.queue()
             self._last_press = now
-            target = self._subject(queue)
-            if (self._swap_autonomous
-                    and (now - self._swap_ts) < PRESS_GRACE_S
-                    and self._prev_flash
-                    and self._prev_key is not None):
+            if not queue:
+                return
+            cur = self._subject(queue)
+            idx = 0
+            for i, s in enumerate(queue):
+                if cur is not None and s.key == cur.key:
+                    idx = i
+                    break
+            nxt = queue[(idx + delta) % len(queue)]
+            self._sel_key = nxt.key
+        self.refresh()
+
+    def snap_home(self) -> None:
+        """After acknowledging an ALERT: surface the (new) queue head and PIN
+        it, so the next alert to triage is on the glass and the screen does not
+        drift on its own inside the interaction window."""
+        with self._lock:
+            queue = self._reg.queue()
+            self._sel_key = queue[0].key if queue else None
+        self.refresh()
+
+    def stay_on(self, sess: Optional[Session]) -> None:
+        """After focusing a CALM session (nothing to triage): keep it on the
+        glass instead of jumping to some alert elsewhere -- the user asked to
+        see this terminal, so the device stays on it."""
+        if sess is None:
+            return
+        with self._lock:
+            self._sel_key = sess.key
+            self._last_press = time.time()
+        self.refresh()
+
+    def resolve_press_target(self) -> Optional[Session]:
+        """The session a GO/ACK press applies to: EXACTLY the one whose frame is
+        on the glass (WYSIWYG). Never a freshly recomputed head -- so a press
+        can only ever act on the name the user is actually looking at. Falls
+        back to the queue head only if the shown session has vanished. Also
+        counts this press for the interaction window."""
+        now = time.time()
+        with self._lock:
+            queue = self._reg.queue()
+            self._last_press = now
+            if self._shown_key is not None:
                 for s in queue:
-                    # Redirect only to a session that STILL needs the human --
-                    # never to one whose alert has meanwhile resolved.
-                    if s.key == self._prev_key and s.unacked_alert():
-                        log(f"press-grace: applying press to {s.name} "
-                            "(shown subject swapped moments before the press)")
-                        target = s
-                        break
-                self._swap_autonomous = False   # consume: one redirect per swap
-                self._prev_key = None
-            return target
+                    if s.key == self._shown_key:
+                        return s
+            return self._subject(queue)         # shown session gone -> head
 
     # ---- frame composition -------------------------------------------------- #
 
     def _compose(self, queue: List[Session],
                  subject: Optional[Session]) -> Tuple[str, Optional[str], bool]:
-        """Build the F| line for the current state. Returns (line, subject_key,
-        flash)."""
+        """Build the F| line for the current state as four size-1 rows:
+            r0  session name (flashes while its alert is unacknowledged)
+            r1  state tag + time-in-state
+            r2  model + effort
+            r3  position + fleet strip (one '|'-separated status letter/session)
+        Returns (line, subject_key, flash). The fleet field is LAST and may
+        contain literal '|' (the firmware stops tokenizing at the 5th bar and
+        takes the rest verbatim), which is what lets the strip use '|' as its
+        visual divider."""
         if subject is None:
-            return ("F|0|MATE|no sessions|", None, False)
+            return ("F|0|MATE|no sessions||", None, False)
 
         names = _display_names(queue)
-        name = names.get(subject.key, "?")
+        r0 = names.get(subject.key, "?")[:ROW_CHARS]
 
         tag = STATE_TAG.get(subject.state, "IDLE")
         t = _fmt_time(subject.display_seconds())
-        meta_w = ROW_CHARS - 4 - 1 - 5 - 1          # tag(4) sp time(5) sp
-        meta = _fit_meta(subject.model, subject.effort, meta_w)
-        info = f"{tag:<4} {t:>5} {meta:>{meta_w}}"[:ROW_CHARS].rstrip()
+        r1 = f"{tag:<4}  {t}"[:ROW_CHARS]
+
+        r2 = _fit_meta(subject.model, subject.effort, ROW_CHARS)
 
         pos = 1
         for i, s in enumerate(queue):
@@ -656,18 +635,17 @@ class Screen:
                 break
         head = f"{pos}/{len(queue)} "
         room = ROW_CHARS - len(head)
-        strip = "".join(STATE_GLYPH.get(s.state, ".") for s in queue)
+        strip = "|".join(STATE_LETTER.get(s.state, "I") for s in queue)
         if len(strip) > room:
             strip = strip[:max(0, room - 1)] + "+"
-        fleet = (head + strip)[:ROW_CHARS]
+        r3 = head + strip
 
         flash = subject.unacked_alert()
-        line = f"F|{1 if flash else 0}|{name}|{info}|{fleet}"
+        line = f"F|{1 if flash else 0}|{r0}|{r1}|{r2}|{r3}"
         return (line, subject.key, flash)
 
     def refresh(self, force: bool = False) -> None:
         """Re-compose the frame and send it if the bytes changed (or `force`).
-        Tracks subject swaps for the press-grace guard.
 
         The queue snapshot is taken INSIDE the Screen lock so snapshot-time and
         commit-time are ordered -- a preempted caller can never commit a stale
@@ -687,21 +665,11 @@ class Screen:
                 # idle screen whose first press should anchor the subject).
                 self._sel_key = subject.key
             line, key, flash = self._compose(queue, subject)
-            if key != self._shown_key:
-                self._prev_key = self._shown_key
-                self._prev_flash = self._shown_flash
-                self._swap_ts = now
-                # A swap performed by a button handler (nav / snap-home / the
-                # ack-triggered re-render) is user-driven; anything from the
-                # ticker or socket threads moved on its own.
-                self._swap_autonomous = not getattr(self._tls, "user_action",
-                                                    False)
             changed = (line != self._last_frame)
             if changed or force:
                 if self._link.write_line(line):
                     self._last_frame = line
                     self._shown_key = key
-                    self._shown_flash = flash
 
     # ---- LED ---------------------------------------------------------------- #
 
@@ -1058,21 +1026,28 @@ class ButtonReader(threading.Thread):
         log(f"ignoring serial line from Arduino: {line!r}")
 
     def _go(self) -> None:
-        """GO: acknowledge the target FIRST (LED/display react instantly), then
-        raise its window on a side thread -- the reader thread must keep
-        consuming button events. Focus threads are SERIALIZED (press order ==
-        raise order) and a press still queued when a newer one arrives is
-        dropped (last wins). The whole synchronous chain (ack -> re-render ->
-        snap-home) runs inside the user-action scope so its subject swaps are
-        classified user-driven."""
-        with self._screen.user_action():
-            sess = self._screen.resolve_press_target()
-            log(f"GO -> focus + acknowledge {sess.name if sess else '-'}")
-            if sess is None:
-                return
-            if self.on_ack:
-                self.on_ack(sess)                # raising the window = acknowledged
-            self._screen.snap_home()             # surface the next alert
+        """GO: raise the terminal of EXACTLY the session shown on the glass
+        (WYSIWYG). The ack happens first so the LED/display react instantly,
+        then the window is raised on a side thread -- the reader thread must
+        keep consuming button events. Focus threads are SERIALIZED (press order
+        == raise order) and a press still queued when a newer one arrives is
+        dropped (last wins).
+
+        Screen behaviour: if the shown session was an ALERT (something to
+        triage), snap home so the next alert surfaces (n alerts = n presses).
+        If it was a CALM session (the user just wanted its terminal), STAY on
+        it -- do not jump to an alert elsewhere."""
+        sess = self._screen.resolve_press_target()
+        log(f"GO -> focus {sess.name if sess else '-'}")
+        if sess is None:
+            return
+        was_alert = sess.unacked_alert()
+        if self.on_ack:
+            self.on_ack(sess)                    # raising the window = acknowledged
+        if was_alert:
+            self._screen.snap_home()             # advance to the next alert
+        else:
+            self._screen.stay_on(sess)           # keep the focused terminal shown
         with self._focus_gen_lock:
             self._focus_gen += 1
             gen = self._focus_gen
@@ -1087,17 +1062,16 @@ class ButtonReader(threading.Thread):
         threading.Thread(target=run, name="focus", daemon=True).start()
 
     def _ack_only(self) -> None:
-        """GO long-press: acknowledge the target's alert WITHOUT touching any
-        window. A no-op when the target has nothing to acknowledge."""
-        with self._screen.user_action():
-            sess = self._screen.resolve_press_target()
-            if sess is None or not sess.unacked_alert():
-                log("ACK (long press): nothing to acknowledge")
-                return
-            log(f"ACK (long press) -> {sess.name} (no focus)")
-            if self.on_ack:
-                self.on_ack(sess)                # silences the LED + re-renders
-            self._screen.snap_home()             # surface the next alert
+        """GO long-press: acknowledge the shown session's alert WITHOUT touching
+        any window. A no-op when the shown session has nothing to acknowledge."""
+        sess = self._screen.resolve_press_target()
+        if sess is None or not sess.unacked_alert():
+            log("ACK (long press): nothing to acknowledge")
+            return
+        log(f"ACK (long press) -> {sess.name} (no focus)")
+        if self.on_ack:
+            self.on_ack(sess)                    # silences the LED + re-renders
+        self._screen.snap_home()                 # surface the next alert
 
     def stop(self) -> None:
         self._stop_evt.set()
@@ -1326,7 +1300,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         # Best-effort: silence the LED and leave an honest frame on the way out.
         try:
             link.write_line("V|OFF")
-            link.write_line("F|0|MATE|daemon stopped|")
+            link.write_line("F|0|MATE|daemon stopped||")
         except Exception:
             pass
         link.close()

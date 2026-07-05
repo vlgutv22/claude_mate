@@ -17,15 +17,15 @@ There are three interfaces:
 The daemon keeps ONE urgency-sorted **triage queue** of sessions and renders
 ONE screen: the *selected* session — normally the **queue head**, i.e. the
 thing that needs the human most. The firmware is a dumb renderer: it holds
-exactly one pre-composed frame and draws it. All ordering, selection,
-truncation and layout live in the daemon.
+exactly one pre-composed frame (four size-1 rows) and draws it. All ordering,
+selection, truncation and layout live in the daemon.
 
 ```
 +---------------------+
-|api-server           |   size-2 session name (10 chars) — flashes (inverts
-|                     |   ~2.5 Hz) while its alert is unacknowledged
-|WAIT  0:42 Opus xhigh|   state tag + time-in-state + model/effort
-|2/6 !?*>>.           |   queue position + whole-fleet glyph strip
+|api-server           |   r0: session name — flashes (inverts ~2.5 Hz) while
+|WAIT  0:42           |   r1: state tag + time-in-state    its alert is unacked
+|Opus 4.8  xhigh      |   r2: model + effort
+|2/6 E|B|W|D|I        |   r3: queue position + one status LETTER per session
 +---------------------+
 ```
 
@@ -34,21 +34,21 @@ There are **no UI modes**. The three buttons mean the same thing at all times:
 | Button (left→right) | Short press | Held |
 |---|---|---|
 | **PREV** | selection one step **up** the queue | auto-repeats (400 ms, then 5/s) |
-| **GO**   | acknowledge + **RAISE** the selected session's terminal window | at 500 ms: acknowledge **without** raising (release then ignored) |
+| **GO**   | **RAISE** the terminal of the session **shown on the glass** (acknowledging its alert) | at 500 ms: acknowledge **without** raising (release then ignored) |
 | **NEXT** | selection one step **down** the queue | auto-repeats (400 ms, then 5/s) |
 
 **Window contract:** navigation NEVER touches macOS windows. The only window
 operation in the entire system is GO, and it only **raises/activates** — the
 daemon never collapses, resizes, or miniaturizes anything.
 
-**Screen ownership:** the display changes subject on its own ONLY when the user
-is idle (no press for **10 s**). After a GO/ACK the selection snaps home to the
-(new) queue head, so *n* pending alerts are handled with exactly *n* presses.
+**WYSIWYG:** GO/ACK act on **exactly the session whose frame is on the glass** —
+never a freshly recomputed queue head. So a press can only ever raise the
+terminal whose name the user is actually looking at.
 
-**Press-grace guard:** if the screen swapped subjects *on its own* less than
-**0.5 s** before a GO/ACK arrived while the user was reading an unacknowledged
-alert, the press applies to the alert that was being read — never to a window
-the user did not choose.
+**Screen ownership:** the display changes subject on its own ONLY when the user
+is idle (no press for **10 s**). Acknowledging an **alert** with GO/ACK snaps
+home to the next alert (so *n* alerts = *n* presses); focusing a **calm**
+session (nothing to triage) keeps it on the glass instead of jumping away.
 
 ---
 
@@ -67,24 +67,25 @@ input buffer at 96 bytes and drops malformed/oversized lines).
 
 | Line | Meaning |
 |------|---------|
-| `F\|<flash>\|<name>\|<info>\|<fleet>` | **The whole screen**, pre-rendered. See field table below. Always exactly 5 fields (the daemon appends a trailing `\|` when the last field is empty). |
+| `F\|<flash>\|<r0>\|<r1>\|<r2>\|<r3>` | **The whole screen**, pre-rendered as four size-1 rows. See field table below. At least 6 fields; `r3` is the **last** field and may itself contain `\|`. |
 | `V\|<kind>` | LED alert control (indication LED only; never touches the OLED). `<kind>` is `START`, `INPUT`, `DONE`, `ERROR`, or `OFF`. See **LED** below. |
 | `P` | Ping / keepalive, sent every ~15 s. The Arduino replies with `K` (NOT `H` — `H` means "I rebooted" and triggers a full resend + LED re-arm, which would restart the blink phase every ping). |
 
-**`F` line fields:**
+**`F` line fields** — each row is ≤ 21 chars (size-1), drawn top to bottom:
 
 | Field   | Description |
 |---------|-------------|
-| `flash` | `1`: the firmware inverts the size-2 name band at ~2.5 Hz (an unacknowledged alert is on screen). `0`: steady. |
-| `name`  | Up to **10 chars**, drawn size-2 at the top. The daemon truncates and, when two long sibling names collide at 10 chars, disambiguates with a middle squeeze (`proj~a-one`). |
-| `info`  | Up to **21 chars**, drawn size-1: `TAG time model effort` — the 4-char state tag (`ERR `/`WAIT`/`DONE`/`WORK`/`IDLE`), the time in that state (mm:ss, or h:mm past an hour), and a best-fit model/effort string. |
-| `fleet` | Up to **21 chars**, drawn size-1: `pos/total ` + one glyph per session in queue order — `!` error, `?` waiting, `*` done, `>` working, `.` idle. When the strip does not fit, it is cut with a trailing `+`. |
+| `flash` | `1`: the firmware inverts **row 0** (the name) at ~2.5 Hz (an unacknowledged alert is on screen). `0`: steady. |
+| `r0` (name) | Session name. The daemon truncates to the row width and, when two long sibling names collide, disambiguates with a middle squeeze (first 9 + `~` + last 10, e.g. `webapp-ba~ervice-one`). |
+| `r1` (state) | `TAG  time` — the 4-char state tag (`ERR`/`WAIT`/`DONE`/`WORK`/`IDLE`) and the time in that state (mm:ss, or h:mm past an hour). |
+| `r2` (meta) | Best-fit `model  effort` (empty for hook-driven sessions with no scraped metadata). |
+| `r3` (fleet) | `pos/total ` + one status **letter** per session in queue order, `\|`-separated: `E` error, `B` waiting (blocked), `W` working, `D` done, `I` idle. When the strip does not fit, it is cut with a trailing `+`. Because `r3` is the last field, the firmware stops tokenizing at the 5th `\|` and takes the rest verbatim — which is what lets the strip use `\|` as its on-screen divider. |
 
 The daemon sends an `F` line whenever the rendered bytes change: immediately on
 any state change or button, and ~1/s while a displayed time ticks. Identical
 frames are not re-sent (except on handshake).
 
-With no sessions the daemon sends `F|0|MATE|no sessions|`.
+With no sessions the daemon sends `F|0|MATE|no sessions||`.
 
 #### LED — `V|<kind>`
 
@@ -136,8 +137,8 @@ press (emit once at 500 ms; the release is then swallowed).
 | `K`   | Keepalive ack — the reply to `P`. The daemon ignores it. |
 | `B\|P` | **PREV** pressed (D4) — selection one step up the queue. Repeats while held. |
 | `B\|N` | **NEXT** pressed (D3) — selection one step down the queue. Repeats while held. |
-| `B\|G` | **GO** short press (D2) — acknowledge the selected session's alert and raise its terminal window (raise only). |
-| `B\|K` | **GO** long press (D2, held ≥ ~500 ms) — acknowledge WITHOUT raising anything. No-op when nothing is unacknowledged. |
+| `B\|G` | **GO** short press (D2) — raise the terminal of the session **shown on the glass** (raise only), acknowledging its alert. |
+| `B\|K` | **GO** long press (D2, held ≥ ~500 ms) — acknowledge the shown session's alert WITHOUT raising anything. No-op when nothing is unacknowledged. |
 
 **Reset note:** opening the USB serial port resets the Nano (~1.5 s). The `H`
 handshake plus the daemon re-sending state on `H` is exactly what makes the
@@ -264,6 +265,8 @@ silenced).
   subject out from under the cursor (only the `pos/total` number changes).
 * While the user is interacting (any press within 10 s) the screen never
   changes subject on its own.
-* After 10 s without a press — and immediately after any GO/ACK — the selection
-  snaps home to the queue head.
+* GO/ACK act on the session **currently shown** (WYSIWYG). After acknowledging
+  an **alert** the selection snaps home to the next alert; after focusing a
+  **calm** session it stays on that session.
+* After 10 s without a press the selection returns to the live queue head.
 * PREV/NEXT wrap around the queue ends.

@@ -112,19 +112,15 @@ def saw_before(idx, pred):
     with display_lock:
         return any(pred(l) for l in display[:idx])
 
-def wait_for(idx, pred, timeout=2.0):
-    """Poll until a line matching pred appears at/after idx. Returns success."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if saw_after(idx, pred):
-            return True
-        time.sleep(0.02)
-    return False
-
 def frame_subject(f):
-    """Name field of an F|flash|name|info|fleet line ('' if malformed)."""
+    """Name field (r0) of an F|flash|r0|r1|r2|r3 line ('' if malformed)."""
     parts = f.split("|")
-    return parts[2] if len(parts) >= 5 else ""
+    return parts[2] if len(parts) >= 6 else ""
+
+def frame_fleet(f):
+    """Fleet field (r3, last) of an F| line, kept intact incl. its '|' dividers."""
+    parts = f.split("|", 5)
+    return parts[5] if len(parts) >= 6 else ""
 
 def mark():
     with display_lock:
@@ -233,39 +229,34 @@ with display_lock:
 pin_no_swap = all(frame_subject(f) != "quux" for f in pin_frames)
 feed("end|sidQ|quux"); time.sleep(0.8)
 
-print("\n-- phase 9: done alert + uniqueness truncation of long sibling names --")
-# The subject is still PINNED (phase 8's interaction window), so the done
-# alert won't surface until the window expires during phase 10's wait; the
-# uniqueness assertion is computed there, scanning frames from this mark on.
+print("\n-- phase 9: done alert + uniqueness squeeze of long sibling names --")
+# Names >21 chars sharing a long prefix: they collide when truncated to the row
+# width, so the daemon middle-squeezes them (first 9 + '~' + last 10) to keep
+# them distinct. The subject is still PINNED (phase 8's window), so the done
+# alert surfaces only after the window expires in phase 10.
 idx_done = mark()
-feed("done|sidA|project-alpha-one")
-feed("working|sidB|project-alpha-two"); time.sleep(1.5)
+feed("done|sidA|webapp-backend-service-one")
+feed("working|sidB|webapp-backend-service-two"); time.sleep(1.5)
 
-print("\n-- phase 10: press-grace: autonomous subject swap right before GO --")
-# Wait out the interaction window so the screen is free to move on its own,
-# then land a fresh, worse alert (error) which auto-surfaces over the unacked
-# 'done' alert being read -- and press GO immediately. The press must apply to
-# the PREVIOUS subject (project-alpha-one, sidA), not the just-arrived beta.
+print("\n-- phase 10: WYSIWYG -- GO focuses EXACTLY the shown session + uniqueness --")
+# Wait out the interaction window so the done alert auto-surfaces as the head.
 print("   (waiting out the 10s interaction window...)")
 time.sleep(10.5)
-# The window expired mid-wait: the done alert auto-surfaced. Its frames carry
-# the disambiguated sibling name (phase 9's assertion).
 with display_lock:
     done_frames = [l for l in display[idx_done:] if l.startswith("F|")]
-uniq_names = any("proj~a-one" in f for f in done_frames)
-# The screen must now rest on the done alert (queue head, project-alpha-one).
-idx_grace = mark()
-feed("error|sidE|beta")
-# Poll until the autonomous swap frame (flashing beta) is actually on the wire,
-# then press IMMEDIATELY -- the poll interval keeps the press inside the 0.5s
-# grace window, and a starved daemon fails loudly instead of passing vacuously.
-grace_swap_seen = wait_for(idx_grace, lambda l: l.startswith("F|1|beta"))
+    shown10 = frame_subject([l for l in display if l.startswith("F|")][-1])
+# The colliding siblings render squeezed (contain '~'); the head's name is one.
+uniq_names = ("~" in shown10) and any("~" in frame_subject(f) for f in done_frames)
+# The done alert (webapp-backend-service-one, sidA) is the head and on the glass.
+# GO must focus EXACTLY it (deep link session=sidA), never a recomputed target.
+focus_before10 = [l.strip() for l in open(focuslog)] if os.path.exists(focuslog) else []
 arduino_send("B|G"); time.sleep(1.5)
-focus_lines = [l.strip() for l in open(focuslog)] if os.path.exists(focuslog) else []
-grace_focused_prev = any("session=sidA" in l for l in focus_lines)
-grace_not_beta = not any("session=sidE" in l for l in focus_lines)
+focus_after10 = [l.strip() for l in open(focuslog)] if os.path.exists(focuslog) else []
+new_focus10 = focus_after10[len(focus_before10):]
+wysiwyg_head = ("~" in shown10
+                and any("session=sidA" in l for l in new_focus10))
 
-print("\n-- phase 11: navigation moves NO windows; GO sends ONLY 'focus' --")
+print("\n-- phase 11: WYSIWYG on a NON-head calm session; nav moves NO windows --")
 # Attach ctrl sockets to SEVERAL sessions the browse will dwell on, so a
 # reintroduced settle-timer preview (the old 0.45s terminal-follow) would be
 # caught red-handed in nav_window_ops.
@@ -274,7 +265,7 @@ ctrl_a = fake_ctrl("webapp")
 ctrl_i = fake_ctrl("infra")
 feed(f"working|sidW|webapp2|{ctrl_w}")
 feed(f"working|sid-1|webapp|{ctrl_a}")
-feed(f"waiting|sid-3|infra|{ctrl_i}")
+feed(f"waiting|sid-3|infra|{ctrl_i}")   # infra is the ALERT head; webapp2 is calm
 time.sleep(1.2)
 with ctrl_lock:
     ops_before_nav = len(ctrl_ops)
@@ -284,8 +275,9 @@ for ev in ("B|N", "B|N", "B|N", "B|P", "B|P"):
 time.sleep(1.0)
 with ctrl_lock:
     nav_window_ops = ctrl_ops[ops_before_nav:]
-# Now navigate TO webapp2 and GO: exactly one 'focus', never 'collapse'.
-# Find it by pressing NEXT up to queue-size times, checking the subject.
+# Navigate TO webapp2 (a CALM working session that is NOT the head -- the head
+# is the infra WAIT alert). This reproduces the user's bug: GO must raise
+# webapp2 (what's shown), never the head alert, and STAY on webapp2 afterward.
 focused_webapp2 = False
 for _ in range(8):
     with display_lock:
@@ -296,11 +288,17 @@ for _ in range(8):
     arduino_send("B|N"); time.sleep(0.5)
 with ctrl_lock:
     ops_before_go = len(ctrl_ops)   # the find-loop navs must have moved nothing
+idx_go11 = mark()
 arduino_send("B|G"); time.sleep(2.0)
 with ctrl_lock:
     go_ops = ctrl_ops[ops_before_go:]
     all_ops = list(ctrl_ops)
 nav_moved_nothing = (len(nav_window_ops) == 0 and ops_before_go == ops_before_nav)
+# Calm focus -> the screen STAYS on webapp2 (does not jump to the infra alert).
+with display_lock:
+    frames_after_go11 = [l for l in display[idx_go11:] if l.startswith("F|")]
+stayed_on_calm = (bool(frames_after_go11)
+                  and frame_subject(frames_after_go11[-1]) == "webapp2")
 
 proc.terminate()
 try:
@@ -317,23 +315,24 @@ def check(name, ok):
     print(f"  [{'PASS' if ok else 'FAIL'}] {name}")
 
 def wellformed(f):
-    return len(f.split("|")) >= 5
+    return len(f.split("|")) >= 6          # F|flash|r0|r1|r2|r3 (r3 may add more)
 
 # ---- the single-frame protocol ------------------------------------------------
-check("empty boot shows the no-sessions frame (F|0|MATE|no sessions|)",
+check("empty boot shows the no-sessions frame (F|0|MATE|no sessions||)",
       saw(lambda l: l.startswith("F|0|MATE|no sessions")))
-check("every F| frame is well-formed (5 fields)",
+check("every F| frame is well-formed (>=6 fields)",
       all(wellformed(l) for l in display if l.startswith("F|")))
-check("working session frame: webapp + WORK tag, not flashing",
-      saw(lambda l: l.startswith("F|0|webapp|WORK") ))
-check("model/effort rendered on the info row (Opus... xhigh)",
+check("working session frame: webapp name (r0) + WORK tag (r1), not flashing",
+      saw(lambda l: l.startswith("F|0|webapp|WORK")))
+check("model/effort rendered on its own row (Opus... xhigh)",
       saw(lambda l: l.startswith("F|") and "xhigh" in l and "Opus" in l))
 check("waiting session auto-surfaces and flashes (F|1|infra|WAIT...)",
       saw_after(idx_wait, lambda l: l.startswith("F|1|infra|WAIT")))
 check("error outranks waiting: api auto-surfaces flashing (F|1|api|ERR...)",
       saw_after(idx_err, lambda l: l.startswith("F|1|api|ERR")))
-check("fleet strip shows the queue shape (!?> for err/wait/work)",
-      saw(lambda l: l.startswith("F|") and "!?>" in l.split("|")[-1]))
+check("fleet row: '|'-separated status letters (E/B/W/D/I)",
+      saw(lambda l: l.startswith("F|") and "|" in frame_fleet(l)
+          and any(c in frame_fleet(l) for c in "EBWDI")))
 
 # ---- LED (V|<KIND>) ------------------------------------------------------------
 check("V|OFF clears the loop at startup (before the first alert)",
@@ -371,22 +370,21 @@ check("a new alert inside the interaction window does NOT steal the screen",
 check("...but the LED updates immediately (V|INPUT while pinned)", pin_led)
 
 # ---- naming --------------------------------------------------------------------
-check("sibling long names disambiguated (proj~a-one)", uniq_names)
+check("sibling long names disambiguated (middle '~' squeeze)", uniq_names)
 
-# ---- press-grace wrong-target guard --------------------------------------------
-check("press-grace: the autonomous beta swap frame rendered BEFORE GO was sent",
-      grace_swap_seen)
-check("press-grace: GO right after an autonomous swap acts on the PREVIOUS "
-      "subject (focused sidA, the alert being read)", grace_focused_prev)
-check("press-grace: the just-arrived alert was NOT focused (no session=sidE)",
-      grace_not_beta)
+# ---- WYSIWYG: GO acts on EXACTLY the session on the glass (the user's bug) ------
+check("GO on the shown head alert focuses exactly it (shown sibling -> sidA)",
+      wysiwyg_head)
+check("GO on a shown NON-head calm session focuses IT, not the head alert "
+      "(webapp2 raised while infra is the head)",
+      [c for (c, t) in go_ops] == ["focus"] if focused_webapp2 else False)
+check("focusing a calm session STAYS on it (no jump to the queue head)",
+      stayed_on_calm)
 
 # ---- window-op invariants (the reason for the redesign) -------------------------
 check("navigation sends ZERO window ops to wrapper ctrl sockets "
       "(browse + find loops, dwelling on ctrl-socket sessions)",
       nav_moved_nothing)
-check("GO on a wrapper session sends exactly one 'focus'",
-      [c for (c, t) in go_ops] == ["focus"] if focused_webapp2 else False)
 check("the daemon NEVER sends 'collapse' (raise-only, always; non-vacuous)",
       bool(all_ops) and all(c == "focus" for (c, t) in all_ops))
 

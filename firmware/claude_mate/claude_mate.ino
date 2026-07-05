@@ -10,14 +10,15 @@
  * THE INTERFACE: one screen, one queue, three buttons.
  *
  * The daemon keeps an urgency-sorted triage queue of sessions
- * (error > waiting > done > working > idle) and pre-renders ONE frame:
+ * (error > waiting > done > working > idle) and pre-renders ONE frame as four
+ * size-1 rows:
  *
  *     +---------------------+
- *     |api-server           |   size-2 session name (10 chars) -- flashes
- *     |                     |   (inverts ~2.5 Hz) while its alert is unacked
- *     |WAIT  0:42 Opus xhigh|   state + time-in-state + model/effort
- *     |2/6 !?*>>.           |   queue position + whole-fleet glyph strip
- *     +---------------------+
+ *     |api-server           |   r0: session name -- flashes (inverts ~2.5 Hz)
+ *     |WAIT  0:42           |   r1: state tag + time-in-state
+ *     |Opus 4.8  xhigh      |   r2: model + effort
+ *     |2/6 W|B|E|D|I        |   r3: queue position + one status LETTER per
+ *     +---------------------+       session, '|'-separated (E/B/W/D/I)
  *
  * The firmware is a dumb renderer: it holds exactly one frame (3 text rows +
  * a flash flag) and draws it. All ordering, selection, truncation, and text
@@ -56,11 +57,16 @@
  *
  * SERIAL PROTOCOL (115200 8N1, ASCII lines terminated by '\n', fields split '|')
  *   Daemon -> Arduino:
- *     F|<flash>|<name>|<info>|<fleet>    the whole screen, pre-rendered.
- *         flash = 1: invert the size-2 name band at ~2.5 Hz (unacked alert)
- *         name  = up to 10 chars, drawn size-2 at the top
- *         info  = up to 21 chars, drawn size-1 (state + time + model/effort)
- *         fleet = up to 21 chars, drawn size-1 (position + fleet glyph strip)
+ *     F|<flash>|<r0>|<r1>|<r2>|<r3>      the whole screen, pre-rendered as four
+ *                                        size-1 rows (each up to 21 chars).
+ *         flash = 1: invert row 0 (the name) at ~2.5 Hz (unacked alert)
+ *         r0    = session name
+ *         r1    = state tag + time-in-state
+ *         r2    = model + effort
+ *         r3    = queue position + '|'-separated status letters. r3 is the LAST
+ *                 field and MAY contain literal '|' (the tokenizer stops at the
+ *                 5th bar and takes the rest verbatim) -- that is what lets the
+ *                 fleet strip use '|' as its on-screen divider.
  *     V|<kind>                           LED alert control (light only):
  *                                        START one-shot start blink; INPUT /
  *                                        ERROR / DONE looping "until
@@ -113,9 +119,8 @@
 #define REPEAT_MS      200UL   // ...then one repeat event every 200ms (5/s)
 
 // ---- Screen text geometry ----------------------------------------------------
-#define NAME_CHARS     10      // size-2 top band: 10 chars of 12px
 #define ROW_CHARS      21      // size-1 rows: 21 chars of 6px
-#define NAME_BAND_H    16      // the size-2 band is 16px tall (y 0..15)
+#define ROW_H          8       // each size-1 row is 8px tall (4 rows fill 32px)
 
 // ---- Alert-indicator tuning --------------------------------------------------
 // The alert output is the LED on D8 (digital on/off). Urgency reads through the
@@ -136,10 +141,9 @@ static uint8_t lineLen = 0;
 static bool  lineOverflow = false;   // drop the rest of an over-long line
 
 // ---- Current frame (the whole UI state; the daemon owns everything else) -----
-static char  frameName[NAME_CHARS + 1]  = {0};  // size-2 top band text
-static char  frameInfo[ROW_CHARS + 1]   = {0};  // size-1 middle row
-static char  frameFleet[ROW_CHARS + 1]  = {0};  // size-1 bottom row
-static bool  frameFlash = false;     // invert the name band at ~2.5 Hz
+// Four size-1 rows, drawn top-to-bottom. row[0] (the name) inverts while flash.
+static char  frameRow[4][ROW_CHARS + 1] = {{0}};
+static bool  frameFlash = false;     // invert row 0 (the name) at ~2.5 Hz
 static bool  haveFrame  = false;     // false until the first F| arrives
 static bool  linkLost   = false;     // daemon silent > LINK_WATCHDOG_MS
 static bool  gBlinkOn   = true;      // shared blink phase for the flash band
@@ -330,22 +334,17 @@ static void ledForKind(const char *k) {
 static void drawFrame() {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
-
-  // Size-2 name band (y 0..15). The flash flag inverts the whole band on the
-  // shared blink phase, so an unacked alert's name pulses at ~2.5 Hz.
-  display.setTextSize(2);
-  display.setCursor(0, 0);
-  display.print(frameName);
-  if (frameFlash && gBlinkOn) {
-    display.fillRect(0, 0, SCREEN_WIDTH, NAME_BAND_H, SSD1306_INVERSE);
-  }
-
-  // Two size-1 rows: info (state + time + model/effort) and fleet strip.
   display.setTextSize(1);
-  display.setCursor(0, 16);
-  display.print(frameInfo);
-  display.setCursor(0, 24);
-  display.print(frameFleet);
+
+  // Four size-1 rows stacked 8px apart. Row 0 is the name; when its alert is
+  // unacknowledged the whole row inverts on the shared blink phase (~2.5 Hz).
+  for (uint8_t r = 0; r < 4; r++) {
+    display.setCursor(0, r * ROW_H);
+    display.print(frameRow[r]);
+  }
+  if (frameFlash && gBlinkOn) {
+    display.fillRect(0, 0, SCREEN_WIDTH, ROW_H, SSD1306_INVERSE);
+  }
 
   display.display();
 }
@@ -398,23 +397,24 @@ static void handleLine(char *line) {
                                          // which would restart the pattern
                                          // phase every 15 s.
 
-    case 'F': {  // F|<flash>|<name>|<info>|<fleet> -- the whole screen
-      char *fields[5];
+    case 'F': {  // F|<flash>|<r0>|<r1>|<r2>|<r3> -- the whole screen
+      // Split off exactly the first 5 '|'; fields[5] (=r3) then holds the rest
+      // of the line VERBATIM, including any literal '|' (the fleet divider).
+      char *fields[6];
       uint8_t n = 0;
       char *p = line;
       fields[n++] = p;                   // fields[0] = "F"
-      while (n < 5) {
+      while (n < 6) {
         char *bar = strchr(p, '|');
         if (!bar) break;
         *bar = 0;
         p = bar + 1;
         fields[n++] = p;
       }
-      if (n < 5) break;                  // malformed: ignore
+      if (n < 6) break;                  // malformed: ignore
       frameFlash = (fields[1][0] == '1');
-      copyField(frameName,  sizeof(frameName),  fields[2]);
-      copyField(frameInfo,  sizeof(frameInfo),  fields[3]);
-      copyField(frameFleet, sizeof(frameFleet), fields[4]);
+      for (uint8_t r = 0; r < 4; r++)
+        copyField(frameRow[r], sizeof(frameRow[r]), fields[2 + r]);
       haveFrame = true;
       requestRender();
       break;
