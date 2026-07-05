@@ -2,11 +2,12 @@
 
 Claude Mate is a USB hardware companion for Claude Code. It is an Arduino Nano
 driving a small I2C OLED, three buttons, and an **indication LED**. The daemon
-keeps ONE urgency-sorted **triage queue** of sessions and the OLED shows ONE
-screen — the *selected* session (normally the queue head, i.e. the thing that
-needs the human most): four size-1 rows — the session name, the state +
-time-in-state, the model + effort, and a whole-fleet letter strip (with the
-queue position). The LED blinks a
+keeps ONE **stable, alphabetically-ordered** **triage queue** of sessions (tabs
+never shuffle as their states change) and the OLED shows ONE screen — the
+*selected* session (after 10 s idle, the most-urgent unacknowledged alert
+auto-surfaced at its stable position): four size-1 rows — the session name, the
+state + time-in-state, the model + effort, and a whole-fleet letter strip (with
+the queue position). The LED blinks a
 status-distinct pattern (driven by the daemon) for the worst unacknowledged
 alert, looping until you acknowledge it. It shows the live status of one or
 more Claude Code sessions running in the VS Code native extension (and/or the
@@ -35,9 +36,10 @@ Unix domain socket  /tmp/claude-mate.sock
         v
 Python daemon  (daemon/claude_mate_daemon.py)
         |   - keeps session-state model keyed by session_id
-        |   - sorts ONE triage queue: unacknowledged alerts first
-        |     (error > waiting > done, oldest first), then everything
-        |     else by class (error > waiting > done > working > idle)
+        |   - keeps ONE triage queue in STABLE order (alphabetical by
+        |     name, tiebroken by session key) — tabs never shuffle
+        |   - urgency (worst unacked: error > waiting > done, oldest
+        |     first) is separate: drives the LED + idle auto-surface only
         |   - pre-renders ONE screen:  F|<flags>|<sel>|<r0>|<r1>|<r2>|<r3>
         |   - drives the LED:  V|<kind> for the worst unacked alert class
         v
@@ -139,17 +141,21 @@ accepted press it also inverts the whole panel for ~80 ms as instant feedback.
 
 ## Triage-queue logic
 
-There are **no UI modes** and no aggregate status word. The single source of
-truth for ordering is the **triage queue**, recomputed on every change:
+There are **no UI modes** and no aggregate status word. The **triage queue** is a
+**stable, alphabetically-ordered** list of sessions — tabs keep their position as
+their states change and never shuffle under the user:
 
 ```
-every UNACKNOWLEDGED alert first  (error > waiting > done, oldest first)
-then everything else by class     (error > waiting > done > working > idle)
+tab order:  STABLE — alphabetical by name (tiebreak: session key)
+urgency:    worst UNACKNOWLEDGED alert (error > waiting > done, oldest first)
+            → drives the LED loop class + the idle auto-surface ONLY
 ```
 
-This keeps the invariant that after each GO/ACK the queue head IS the next
-thing the LED is blinking about — an already-acknowledged error never hides a
-fresh waiting alert.
+Urgency is computed **separately** from the order. It decides only what the LED
+blinks about and — after 10 s of no presses — which alert the screen
+auto-surfaces (at its stable position; if nothing is unacknowledged it rests on
+the first tab). An already-acknowledged error never hides a fresh waiting alert
+in the LED/auto-surface, but the tab order itself never reorders.
 
 An alert is born on the transition into `error`/`waiting`/`done` and dies in
 exactly four ways — nothing else removes one, so none can be lost silently:
@@ -199,31 +205,33 @@ it was last told to show via an `F|<flags>|<sel>|<r0>|<r1>|<r2>|<r3>` line.
   alert is unacknowledged); **r1** the state (4-char tag
   `ERR `/`WAIT`/`DONE`/`WORK`/`IDLE` + time in that state); **r2** the best-fit
   model + effort on its own row; **r3** the fleet strip (`pos/total` + one
-  status letter per session in queue order, packed with no separator — `E`
-  error, `B` waiting, `W` working, `D` done, `I` idle; cut with a trailing `+`
-  when it doesn't fit). An unacknowledged alert's letter is sent **lowercase**
+  status letter per session in stable (alphabetical) order, space-separated —
+  `E` error, `B` waiting, `W` working, `D` done, `I` idle; cut with a trailing
+  `+` when it doesn't fit). An unacknowledged alert's letter is sent **lowercase**
   so the firmware **blinks** it — the acked/unacked state of every tab is
   visible in the strip.
 - **Screen ownership:** the display changes subject on its own ONLY when the
-  user is idle (no press for **10 s**), when it returns to the queue head. A
-  GO/ACK **stays on the tab** it acted on — the device never auto-switches tabs
-  on a press.
-- **Active-tab square / FOLLOW:** the shown session's fleet letter is drawn in
-  a wide filled square (a lit block, letter knocked out) so you can see which
-  tab is on screen. Double-clicking GO toggles **FOLLOW** mode (a ► marker by the
-  state row): PREV/NEXT then also raise the selected terminal, ~250 ms after
-  the selection settles (raise only — never ack or collapse).
+  user is idle (no press for **10 s**), when it auto-surfaces the most-urgent
+  unacknowledged alert at its stable position (else the first tab). A GO/ACK
+  **stays on the tab** it acted on — the device never auto-switches tabs on a
+  press.
+- **Active-tab highlight / FOLLOW:** the shown session's fleet letter is drawn in
+  a **wide (~11 px) filled rectangle centred on it** (a lit block, letter knocked
+  out) so you can see which tab is on screen. Double-clicking GO toggles
+  **FOLLOW** mode (a ► marker by the state row): PREV/NEXT then also raise the
+  selected terminal, ~250 ms after the selection settles (raise only — never ack
+  or collapse).
 - **Navigation:** **PREV** / **NEXT** step the selection up/down the queue,
   wrap around the ends, and auto-repeat while held (400 ms to start, then
-  5/s). Selection is tracked by session **key**, so queue re-sorts never move
-  the subject out from under the cursor (only the `pos/total` number changes).
+  5/s). Selection is tracked by session **key**, so the subject stays put as
+  sessions come and go (only the `pos/total` number changes).
 - **WYSIWYG:** GO/ACK act on exactly the session whose frame is on the glass —
-  never a freshly recomputed queue head. So a press can only ever raise the
+  never a freshly recomputed most-urgent alert. So a press can only ever raise the
   terminal whose name the user is actually looking at.
 - The daemon sends an `F` line whenever the rendered bytes change: immediately
   on any state change or button, and ~1/s while a displayed time ticks.
   Identical frames are not re-sent (except on handshake). With **zero
-  sessions** it sends `F|0|MATE|no sessions||`.
+  sessions** it sends `F|0|-1|MATE|no sessions||`.
 
 Long sibling names that collide at the row width are disambiguated with a
 middle squeeze (first 9 + `~` + last 10, e.g. `webapp-ba~ervice-one`). The

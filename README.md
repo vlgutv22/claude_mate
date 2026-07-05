@@ -15,16 +15,16 @@ in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
         │ api-server            │   ← r0: session name (flashes while its alert
         │ WAIT  0:42            │   ← r1: state · time-in-state    is unacknowledged)
         │ Opus 4.8  xhigh       │   ← r2: model · effort
-        │ 2/6 EBWDI             │   ← r3: queue position · whole-fleet letter strip
-        └───────────────────────┘       (the active tab's letter sits in a filled square)
+        │ 2/6 E B W D I         │   ← r3: queue position · whole-fleet letter strip
+        └───────────────────────┘       (the active tab's letter sits in a wide centred filled rectangle)
               (•) indication LED               ← blinks per alert class, until you ack
           [ PREV ]   [ GO ]   [ NEXT ]         ← three buttons — same meaning, always
    PREV/NEXT: step the triage queue (hold = auto-repeat)   GO: short = ack + raise · double = FOLLOW · long = ack only
 
    the flash: name row inverting = unacknowledged (needs you) · steady = seen
-   the strip: E error · B waiting · W working · D done · I idle — one letter per session, queue order
+   the strip: E error · B waiting · W working · D done · I idle — one letter per session, stable order
               a letter BLINKS while that tab's alert is unacknowledged; it goes steady once you ack it
-   the box:   the active tab's letter is a wide filled square (letter knocked out) — shows which tab is on screen
+   the box:   the active tab's letter is a wide centred filled rectangle (letter knocked out) — shows which tab is on screen
    FOLLOW:    double-click GO → a ► marker appears; PREV/NEXT then also raise the selected terminal (raise only)
    the LED:   START 1 s blink · INPUT even blink · DONE 4-blink cascade · ERROR fast strobe  (loops until you GO/ack)
 ```
@@ -36,9 +36,11 @@ in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
 **Claude Mate** is an Arduino Nano + 0.91" I2C OLED + 3 buttons + an
 **indication LED**, paired with a lightweight Python daemon on your Mac.
 
-The daemon keeps ONE urgency-sorted **triage queue** of every Claude Code
-session and renders ONE screen: the session that most needs you, over a
-whole-fleet letter strip. The LED blinks a status-distinct pattern for the worst
+The daemon keeps ONE **stable, alphabetically-ordered** **triage queue** of every
+Claude Code session (tabs never shuffle as their states change) and renders ONE
+screen: the *selected* session, over a whole-fleet letter strip. Urgency is
+tracked **separately** — it drives the LED and the idle auto-surface, never the
+tab order. The LED blinks a status-distinct pattern for the worst
 *unacknowledged* alert — so a single tab finishing, blocking, or erroring is
 *seen* even while the rest of your fleet keeps working. It keeps blinking until
 you deal with it. There are **no UI modes**: the three buttons — **PREV · GO ·
@@ -69,11 +71,12 @@ hooks are the zero-dependency feed. Use whichever fits each session.
 
 ## Features
 
-- **One urgency-sorted triage queue** — every session, ordered so the thing
-  that needs you most is on top: **unacknowledged alerts first (error →
-  waiting → done, oldest first), then everything else by class (error →
-  waiting → done → working → idle)**. The screen normally shows the queue
-  head; **PREV** / **NEXT** step the same order manually (hold to auto-repeat,
+- **One stable, alphabetically-ordered triage queue** — every session in a
+  fixed order (alphabetical by name, tiebroken by session key) so tabs **never
+  shuffle under you** as their states change. **Urgency** is computed
+  **separately** (worst unacknowledged alert: error → waiting → done, oldest
+  first) and drives only the LED and the idle auto-surface — never the tab
+  order. **PREV** / **NEXT** step the order manually (hold to auto-repeat,
   wrapping at the ends), and while you're browsing (any press within ~10 s)
   the screen never changes subject on its own.
 - **No UI modes** — the three buttons mean the same thing at all times:
@@ -84,14 +87,15 @@ hooks are the zero-dependency feed. Use whichever fits each session.
   ~80 ms — instant "the device heard you" feedback.
 - **No auto-switch** — a GO/ACK stays on the tab it acted on; the device never
   jumps to another tab on a press. After ~10 s without a press the screen
-  returns to the queue head on its own, so the next alert surfaces without
-  yanking the view mid-press.
+  auto-surfaces the most-urgent unacknowledged alert at its stable position
+  (else rests on the first tab), so the next alert surfaces without yanking the
+  view mid-press.
 - **Navigation never touches windows** — the ONLY window operation in the
   whole system is GO, and it only **raises/activates**; the daemon never
   collapses, resizes, or miniaturizes anything.
 - **GO is WYSIWYG** — GO/ACK act on exactly the session whose name is on the
-  glass, never a freshly recomputed queue head. So a press can only ever raise
-  the terminal you are actually looking at.
+  glass, never a freshly recomputed most-urgent alert. So a press can only ever
+  raise the terminal you are actually looking at.
 - **Status-distinct LED alerts** — the indication LED blinks the pattern of the
   *worst unacknowledged* alert across the whole fleet:
   - **START** — a job (re)started → one long 1 s blink (one-shot).
@@ -113,9 +117,9 @@ hooks are the zero-dependency feed. Use whichever fits each session.
   the top name row inverts at ~2.5 Hz; once acknowledged it goes steady. At
   a glance you know whether you've seen it.
 - **Whole-fleet strip** — the bottom row shows your queue position
-  (`pos/total`) plus one status letter per session in queue order (packed,
-  no separator): `E` error · `B` waiting · `W` working · `D` done · `I` idle.
-  A letter **blinks** while that tab's alert is unacknowledged.
+  (`pos/total`) plus one status letter per session in stable (alphabetical)
+  order, **space-separated**: `E` error · `B` waiting · `W` working · `D` done ·
+  `I` idle. A letter **blinks** while that tab's alert is unacknowledged.
 - **Live time-in-state** — the state row counts up how long the session has
   been in its current state: for a `working` tab that IS the live turn
   runtime; for an alert it is how long it has been waiting on *you*.
@@ -155,8 +159,8 @@ hooks are the zero-dependency feed. Use whichever fits each session.
                             ▼
    ┌──────────────────────────────────────────────┐
    │   Python daemon (Mac)                        │
-   │   • ONE triage queue + "done-until-acked"    │   (unacked error > waiting > done first,
-   │   • ONE pre-rendered screen                  │    then everything else by class)
+   │   • ONE triage queue + "done-until-acked"    │   (STABLE alphabetical order —
+   │   • ONE pre-rendered screen                  │    tabs never shuffle; urgency separate)
    │       F|<flags>|<sel>|<r0>|<r1>|<r2>|<r3>          │
    │   • LED policy  V|<START/INPUT/DONE/ERR/OFF> │   worst unacked class, loops until ack
    │   • GO: raise the session's window — RAISE   │
@@ -190,11 +194,12 @@ Two control flows worth calling out:
   state (the current frame + re-arming the LED loop), so the display recovers
   cleanly after any reconnect.
 
-> The **triage queue** (unacknowledged **error > waiting > done** first, then
-> everything else by class) is the daemon's whole priority model: it decides
-> what the screen shows, what one GO press acts on, and what the LED blinks
-> about. The OLED's top row is the selected session's **name**; its state
-> (`ERR`/`WAIT`/`DONE`/`WORK`/`IDLE`) leads the second row.
+> The **triage queue** is a **stable, alphabetically-ordered** list of sessions —
+> tabs never reorder as their states change. **Urgency** (worst unacknowledged
+> **error > waiting > done**, oldest first) is tracked **separately** and drives
+> only the LED and the idle auto-surface (which most-urgent alert the screen
+> rests on), never the tab order. The OLED's top row is the selected session's
+> **name**; its state (`ERR`/`WAIT`/`DONE`/`WORK`/`IDLE`) leads the second row.
 
 ---
 
@@ -338,20 +343,22 @@ id is provided). Each session is in one of these states:
 | `done`    | `Stop` (then held until acknowledged)  | Turn completed OK — keeps alerting until you GO/ack |
 | `idle`    | Inactivity (TTL) / acknowledged done   | No active turn                            |
 
-The daemon re-sorts the **triage queue** on every change:
+The daemon keeps the **triage queue** in a **stable, alphabetical order** (tabs
+never shuffle as their states change) and computes **urgency separately**:
 
 ```
-every UNACKNOWLEDGED alert first  (error > waiting > done, oldest first)
-then everything else by class     (error > waiting > done > working > idle)
+tab order:  STABLE — alphabetical by name (tiebreak: session key)
+urgency:    worst UNACKNOWLEDGED alert (error > waiting > done, oldest first)
+            → drives the LED loop + the idle auto-surface only, never the order
 ```
 
-That queue is the **priority model**: its head is what the screen shows (unless
-you're browsing), what one GO press acts on, and what the LED blinks about —
-the LED pattern is always the class of the worst *unacknowledged* alert
-(`ERROR` > `INPUT` > `DONE`), dropping to `V|OFF` when nothing needs you. The
-invariant: after each GO/ACK the queue head IS the next thing the LED is
-blinking about, so an already-acknowledged error never hides a fresh waiting
-alert. With zero sessions the OLED shows `MATE / no sessions`.
+Urgency is the **priority model** for two things only: what the LED blinks about,
+and — after ~10 s of no presses — which alert the screen auto-surfaces (at its
+stable position; if nothing is unacknowledged it rests on the first tab). The LED
+pattern is always the class of the worst *unacknowledged* alert (`ERROR` >
+`INPUT` > `DONE`), dropping to `V|OFF` when nothing needs you. GO/ACK act on the
+session **currently shown** (WYSIWYG) and never move the tab order. With zero
+sessions the OLED shows `MATE / no sessions`.
 
 ---
 
@@ -413,16 +420,17 @@ The device interface was rewritten from scratch — **one screen, one queue,
 three buttons**:
 
 - **UI modes are gone.** No SCROLL/LIST toggle, no carousel, no detail card, no
-  mode long-press. The daemon keeps ONE urgency-sorted triage queue
-  (unacknowledged error > waiting > done first, then everything else by class)
-  and pre-renders ONE screen — four size-1 rows (name · state+time ·
-  model+effort · position+fleet strip); the firmware is a dumb one-frame
-  renderer.
+  mode long-press. The daemon keeps ONE **stable, alphabetically-ordered** triage
+  queue (tabs never shuffle; urgency is tracked separately, for the LED + idle
+  auto-surface only) and pre-renders ONE screen — four size-1 rows (name ·
+  state+time · model+effort · position+fleet strip); the firmware is a dumb
+  one-frame renderer.
 - **Buttons are PREV / GO / NEXT everywhere.** GO short = acknowledge + raise
   the shown window (WYSIWYG); GO **double-click** = toggle FOLLOW mode; GO long
   = acknowledge only; PREV/NEXT auto-repeat while held. A GO/ACK **stays on the
-  tab** it acted on (no auto-switch); after ~10 s idle the selection returns to
-  the queue head.
+  tab** it acted on (no auto-switch); after ~10 s idle the display auto-surfaces
+  the most-urgent unacknowledged alert at its stable position (else the first
+  tab).
 - **Navigation never touches windows** (except in FOLLOW mode, which raises
   only). The old terminal-follow preview (collapse/expand on every navigation)
   is gone; the daemon never sends `collapse`.
