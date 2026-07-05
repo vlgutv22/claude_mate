@@ -30,8 +30,10 @@ selection, truncation and layout live in the daemon.
 ```
 
 The **active tab** (the session shown above) has its fleet letter drawn in a
-**filled square** in r3 — a lit block with the letter knocked out — so you can
-see at a glance which tab is on screen.
+**wide filled square** in r3 — a lit block with the letter knocked out — so you
+can see at a glance which tab is on screen. Any tab with an **unacknowledged
+alert** has its letter **blinking** in the strip, so you can tell acked from
+unacked without hunting.
 
 The three buttons mean the same thing at all times:
 
@@ -86,11 +88,11 @@ input buffer at 96 bytes and drops malformed/oversized lines).
 | Field   | Description |
 |---------|-------------|
 | `flags` | Bitfield. **bit0**: invert **row 0** (the name) at ~2.5 Hz (an unacknowledged alert is on screen). **bit1**: FOLLOW mode is on (draw a ► marker by the state row). |
-| `sel`   | The character column **within `r3`** of the active tab's fleet letter (`-1` = none). The firmware fills that letter's cell (a lit square with the letter knocked out). |
+| `sel`   | The character column **within `r3`** of the active tab's fleet letter (`-1` = none). The firmware fills a **wide** block (~10 px) centred on that letter — a lit square with the letter knocked out. |
 | `r0` (name) | Session name. The daemon truncates to the row width and, when two long sibling names collide, disambiguates with a middle squeeze (first 9 + `~` + last 10, e.g. `webapp-ba~ervice-one`). |
 | `r1` (state) | `TAG  time` — the 4-char state tag (`ERR`/`WAIT`/`DONE`/`WORK`/`IDLE`) and the time in that state (mm:ss, or h:mm past an hour). |
 | `r2` (meta) | Best-fit `model  effort` (empty for hook-driven sessions with no scraped metadata). |
-| `r3` (fleet) | `pos/total ` + one status **letter** per session in queue order, `\|`-separated: `E` error, `B` waiting (blocked), `W` working, `D` done, `I` idle. When the strip does not fit, it is cut with a trailing `+`. Because `r3` is the last field, the firmware stops tokenizing at the 6th `\|` and takes the rest verbatim — which is what lets the strip use `\|` as its on-screen divider. |
+| `r3` (fleet) | `pos/total ` + one status **letter** per session in queue order, `\|`-separated: `E` error, `B` waiting (blocked), `W` working, `D` done, `I` idle. An **unacknowledged alert's letter is sent LOWERCASE** — the firmware draws it uppercase but **blinks** it, so you can see which tabs still need acknowledging (they stop blinking as you ack them). When the strip does not fit, it is cut with a trailing `+`. Because `r3` is the last field, the firmware stops tokenizing at the 6th `\|` and takes the rest verbatim — which is what lets the strip use `\|` as its on-screen divider. |
 
 The daemon sends an `F` line whenever the rendered bytes change: immediately on
 any state change or button, and ~1/s while a displayed time ticks. Identical

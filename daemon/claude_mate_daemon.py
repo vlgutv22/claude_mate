@@ -666,7 +666,14 @@ class Screen:
                 break
         head = f"{pos}/{len(queue)} "
         room = ROW_CHARS - len(head)
-        strip = "|".join(STATE_LETTER.get(s.state, "I") for s in queue)
+        # One letter per session; an UNACKNOWLEDGED alert's letter is sent
+        # LOWERCASE so the firmware BLINKS it -- you can see at a glance which
+        # tabs still need acknowledging (they stop blinking as you ack them).
+        letters = []
+        for s in queue:
+            ltr = STATE_LETTER.get(s.state, "I")
+            letters.append(ltr.lower() if s.unacked_alert() else ltr)
+        strip = "|".join(letters)
         if len(strip) > room:
             strip = strip[:max(0, room - 1)] + "+"
         r3 = head + strip

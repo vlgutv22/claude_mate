@@ -400,10 +400,13 @@ check("error outranks waiting: api auto-surfaces flashing (api/ERR)",
                 and frame_r1(l).startswith("ERR") and frame_flash(l)))
 check("fleet row: '|'-separated status letters (E/B/W/D/I)",
       saw(lambda l: l.startswith("F|") and "|" in frame_fleet(l)
-          and any(c in frame_fleet(l) for c in "EBWDI")))
+          and any(c in frame_fleet(l).upper() for c in "EBWDI")))
 check("active-tab box: sel points at a fleet LETTER in r3",
       saw(lambda l: l.startswith("F|") and 0 <= frame_sel(l) < len(frame_fleet(l))
           and frame_fleet(l)[frame_sel(l)].isalpha()))
+check("unacked alerts show as LOWERCASE in the strip (blink); acked/calm upper",
+      saw_after(idx_err, lambda l: l.startswith("F|")
+                and any(c.islower() for c in frame_fleet(l))))
 
 # ---- LED (V|<KIND>) ------------------------------------------------------------
 check("V|OFF clears the loop at startup (before the first alert)",

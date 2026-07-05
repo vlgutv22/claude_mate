@@ -201,14 +201,16 @@ it was last told to show via an `F|<flags>|<sel>|<r0>|<r1>|<r2>|<r3>` line.
   model + effort on its own row; **r3** the fleet strip (`pos/total` + one
   status letter per session in queue order, `|`-separated — `E` error,
   `B` waiting, `W` working, `D` done, `I` idle; cut with a trailing `+` when it
-  doesn't fit).
+  doesn't fit). An unacknowledged alert's letter is sent **lowercase** so the
+  firmware **blinks** it — the acked/unacked state of every tab is visible in
+  the strip.
 - **Screen ownership:** the display changes subject on its own ONLY when the
   user is idle (no press for **10 s**), when it returns to the queue head. A
   GO/ACK **stays on the tab** it acted on — the device never auto-switches tabs
   on a press.
 - **Active-tab square / FOLLOW:** the shown session's fleet letter is drawn in
-  a filled square (a lit block, letter knocked out) so you can see which tab is
-  on screen. Double-clicking GO toggles **FOLLOW** mode (a ► marker by the
+  a wide filled square (a lit block, letter knocked out) so you can see which
+  tab is on screen. Double-clicking GO toggles **FOLLOW** mode (a ► marker by the
   state row): PREV/NEXT then also raise the selected terminal, ~250 ms after
   the selection settles (raise only — never ack or collapse).
 - **Navigation:** **PREV** / **NEXT** step the selection up/down the queue,

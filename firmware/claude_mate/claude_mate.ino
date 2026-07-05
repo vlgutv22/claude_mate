@@ -18,10 +18,11 @@
  *     |WAIT  0:42           |   r1: state tag + time-in-state
  *     |Opus 4.8  xhigh      |   r2: model + effort
  *     |2/6 W|B|E|D|I        |   r3: queue position + one status LETTER per
- *     +---------------------+       session, '|'-separated (E/B/W/D/I). The
- *                                   active tab's letter sits in a filled
- *                                   square (letter knocked out). A small ">"
- *                                   triangle by the state row = FOLLOW mode on.
+ *     +---------------------+       session, '|'-separated (E/B/W/D/I). An
+ *                                   UNACKED alert's letter BLINKS (sent
+ *                                   lowercase). The active tab's letter sits in
+ *                                   a wide filled square (letter knocked out).
+ *                                   A ">" triangle by the state row = FOLLOW on.
  *
  * The firmware is a dumb renderer: it holds exactly one frame (3 text rows +
  * a flash flag) and draws it. All ordering, selection, truncation, and text
@@ -69,10 +70,11 @@
  *         r0    = session name
  *         r1    = state tag + time-in-state
  *         r2    = model + effort
- *         r3    = queue position + '|'-separated status letters. r3 is the LAST
- *                 field and MAY contain literal '|' (the tokenizer stops at the
- *                 6th bar and takes the rest verbatim) -- that is what lets the
- *                 fleet strip use '|' as its on-screen divider.
+ *         r3    = queue position + '|'-separated status letters (an unacked
+ *                 alert's letter is LOWERCASE -> drawn uppercase but blinking).
+ *                 r3 is the LAST field and MAY contain literal '|' (the
+ *                 tokenizer stops at the 6th bar and takes the rest verbatim)
+ *                 -- that is what lets the fleet strip use '|' as its divider.
  *     V|<kind>                           LED alert control (light only):
  *                                        START one-shot start blink; INPUT /
  *                                        ERROR / DONE looping "until
@@ -349,22 +351,44 @@ static void drawFrame() {
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
 
-  // Four size-1 rows stacked 8px apart. Row 0 is the name; when its alert is
-  // unacknowledged the whole row inverts on the shared blink phase (~2.5 Hz).
-  for (uint8_t r = 0; r < 4; r++) {
+  // Rows 0-2 print straight. Row 3 (fleet strip) prints char by char so an
+  // UNACKNOWLEDGED alert's letter -- sent LOWERCASE -- draws uppercase but can
+  // BLINK, showing at a glance which tabs still need acknowledging.
+  for (uint8_t r = 0; r < 3; r++) {
     display.setCursor(0, r * ROW_H);
     display.print(frameRow[r]);
+  }
+  display.setCursor(0, 24);
+  for (uint8_t c = 0; frameRow[3][c]; c++) {
+    char ch = frameRow[3][c];
+    if (ch >= 'a' && ch <= 'z') ch -= 32;        // unacked letter -> uppercase
+    display.write(ch);
   }
   if (frameFlash && gBlinkOn) {
     display.fillRect(0, 0, SCREEN_WIDTH, ROW_H, SSD1306_INVERSE);
   }
 
-  // Active-tab selection square: fill the selected fleet letter's 6x8 cell.
-  // Inverting a lit-letter cell yields a solid lit (blue) square with the
-  // letter knocked out (black/off pixels) -- clear on a monochrome panel.
+  // Blink the UNACKNOWLEDGED-alert fleet letters (lowercase on the wire): invert
+  // their cells on the blink phase. Skip the active tab -- its wider selection
+  // square already highlights it.
+  if (gBlinkOn) {
+    for (uint8_t c = 0; frameRow[3][c]; c++) {
+      char ch = frameRow[3][c];
+      if (ch >= 'a' && ch <= 'z' && (int8_t)c != frameSel) {
+        display.fillRect((int16_t)c * 6, 24, 6, ROW_H, SSD1306_INVERSE);
+      }
+    }
+  }
+
+  // Active-tab selection square: a WIDE filled block centred on the selected
+  // fleet letter. Inverting yields a solid lit (blue) block with the letter
+  // knocked out (black/off pixels) -- clear on a monochrome panel.
   if (frameSel >= 0) {
-    int16_t bx = (int16_t)frameSel * 6;          // 6px per size-1 char
-    display.fillRect(bx, 24, 6, ROW_H, SSD1306_INVERSE);
+    int16_t bx = (int16_t)frameSel * 6 - 2;      // 2px margin each side (10px wide)
+    if (bx < 0) bx = 0;
+    int16_t bw = 10;
+    if (bx + bw > SCREEN_WIDTH) bw = SCREEN_WIDTH - bx;
+    display.fillRect(bx, 24, bw, ROW_H, SSD1306_INVERSE);
   }
   // FOLLOW mode: a small filled "play" triangle at the right of the state row
   // (r1 is always short, so it never collides).
@@ -632,7 +656,12 @@ void loop() {
   bool nb = (now / 400) & 1;
   if (nb != gBlinkOn) {
     gBlinkOn = nb;
-    if (haveFrame && !linkLost && frameFlash) requestRender();
+    // Re-render if the name flashes OR any fleet letter is unacked (lowercase),
+    // so both blink cleanly.
+    bool blinkStrip = false;
+    for (uint8_t c = 0; frameRow[3][c]; c++)
+      if (frameRow[3][c] >= 'a' && frameRow[3][c] <= 'z') { blinkStrip = true; break; }
+    if (haveFrame && !linkLost && (frameFlash || blinkStrip)) requestRender();
   }
 
   // Perform a pending redraw once the serial burst has drained (>=8ms of RX

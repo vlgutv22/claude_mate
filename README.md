@@ -23,7 +23,8 @@ in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
 
    the flash: name row inverting = unacknowledged (needs you) · steady = seen
    the strip: E error · B waiting · W working · D done · I idle — one letter per session, queue order
-   the box:   the active tab's letter is a filled square (letter knocked out) — shows which tab is on screen
+              a letter BLINKS while that tab's alert is unacknowledged; it goes steady once you ack it
+   the box:   the active tab's letter is a wide filled square (letter knocked out) — shows which tab is on screen
    FOLLOW:    double-click GO → a ► marker appears; PREV/NEXT then also raise the selected terminal (raise only)
    the LED:   START 1 s blink · INPUT even blink · DONE 4-blink cascade · ERROR fast strobe  (loops until you GO/ack)
 ```
