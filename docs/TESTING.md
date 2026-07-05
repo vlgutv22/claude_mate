@@ -185,21 +185,23 @@ python3 $REPO/daemon/claude_mate_daemon.py --mock
 `--mock` injects a few fake sessions that cycle through states (including a
 `waiting` session, so all four words appear). Watch the real hardware:
 
-- The **screen** rests on the queue head — the most urgent session (an unacked
-  `error` first, then `waiting`, then `done`); its name row **flashes** while
-  the alert is unacknowledged. As the mock states cycle, the subject follows
-  the worst unacked alert.
+- The **screen** auto-surfaces the most-urgent unacked session (an unacked
+  `error` first, then `waiting`, then `done`) at its stable position; its name
+  row **flashes** while the alert is unacknowledged. As the mock states cycle,
+  the surfaced subject follows the worst unacked alert — but the tab **order**
+  (the fleet strip) stays alphabetical and never shuffles.
 - The **LED** plays the pattern of the worst unacked class (`V|ERROR` strobe >
   `V|INPUT` blink > `V|DONE` cascade), looping until acknowledged; a calm
   `V|START` blink fires when a session starts working with nothing else pending.
-- Press **NEXT** / **PREV** → the selection steps down/up the queue (wraps);
-  the screen then stays where you put it for ~10 s after your last press.
+- Press **NEXT** / **PREV** → the selection steps down/up the stable
+  (alphabetical) order (wraps); the screen then stays where you put it for
+  ~10 s after your last press.
 - Press **GO** → the daemon acknowledges the session **shown on the glass**
   (WYSIWYG) and attempts to raise its window (in mock, watch the daemon log for
   the focus call); the display **stays on that tab** (no auto-switch).
 - **Hold GO** (~0.5 s) → acknowledges WITHOUT any window op; the flashing and
   the LED loop stop, and the display stays on the tab. (After ~10 s idle the
-  view returns to the queue head, surfacing the next alert.)
+  view auto-surfaces the next most-urgent unacked alert, at its stable position.)
 - **Double-click GO** → toggles FOLLOW mode (a ► marker appears); PREV/NEXT
   then also raise the selected terminal after it settles.
 

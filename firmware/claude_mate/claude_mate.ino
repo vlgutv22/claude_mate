@@ -9,9 +9,9 @@
  *
  * THE INTERFACE: one screen, one queue, three buttons.
  *
- * The daemon keeps an urgency-sorted triage queue of sessions
- * (error > waiting > done > working > idle) and pre-renders ONE frame as four
- * size-1 rows:
+ * The daemon keeps a STABLE, alphabetically-ordered list of sessions (tabs
+ * never shuffle; urgency drives the LED + idle auto-surface only) and
+ * pre-renders ONE frame as four size-1 rows:
  *
  *     +---------------------+
  *     |api-server           |   r0: session name -- flashes (inverts ~2.5 Hz)

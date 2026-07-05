@@ -53,7 +53,7 @@ then only to **raise/activate** the selected terminal — the daemon never
 collapses, resizes, or miniaturizes anything.
 
 **WYSIWYG:** GO/ACK act on **exactly the session whose frame is on the glass** —
-never a freshly recomputed queue head. So a press can only ever raise the
+never a freshly recomputed most-urgent alert. So a press can only ever raise the
 terminal whose name the user is actually looking at.
 
 **No auto-switch:** a GO/ACK **stays on the tab it acted on** — the device

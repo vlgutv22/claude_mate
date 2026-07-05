@@ -55,7 +55,7 @@ struct Demo {
   const char *r0;      // name row (<=21 chars)
   const char *r1;      // state tag + time
   const char *r2;      // model + effort
-  const char *r3;      // position + packed fleet status letters
+  const char *r3;      // position + space-separated fleet status letters
   bool flash;          // alert: flash the name row
 };
 const Demo DEMOS[] = {
