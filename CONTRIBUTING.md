@@ -7,6 +7,12 @@ test your changes.
 By participating you agree to abide by our
 [Code of Conduct](CODE_OF_CONDUCT.md).
 
+> **License of contributions.** Claude Mate is licensed **CC BY-NC 4.0**
+> (Creative Commons Attribution-NonCommercial — see [LICENSE](LICENSE)).
+> Contributions are welcome for **personal, non-commercial** use; by submitting a
+> change you agree it is offered under that same non-commercial license.
+> **Commercial use of the project is not permitted.**
+
 ---
 
 ## Project layout

@@ -12,6 +12,20 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
+### 2026-07-07 — Project goal, non-commercial license, enclosure + photos
+
+- **Repositioned** around the actual goal: cutting the cognitive overload of
+  orchestrating many Claude Code agent sessions at once — across different
+  accounts and projects. Added a **Roadmap**: iteration 1 is Arduino + macOS
+  (this repo); iteration 2 is a wireless **ESP32 Wi-Fi** remote (no USB tether).
+- **License changed from MIT to CC BY-NC 4.0** (Creative Commons
+  Attribution-NonCommercial). Personal use and contributions are welcome;
+  **commercial use is prohibited**. Covers the software, firmware, hardware
+  design, 3D model, photos, and docs.
+- **Added `assets/`** — photos of the built device and a printable 3D enclosure
+  model (`assets/3d-model/claude_mate_v2.3mf`). The README now leads with a hero
+  photo and an *Enclosure & 3D model* section.
+
 ### 2026-07-07 — Sticky selection
 
 - **The selection is now fully sticky.** The ~10 s idle auto-surface is gone:

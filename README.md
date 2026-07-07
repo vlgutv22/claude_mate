@@ -2,21 +2,30 @@
 
 [![CI](https://github.com/vlgutv22/claude_mate/actions/workflows/ci.yml/badge.svg)](https://github.com/vlgutv22/claude_mate/actions/workflows/ci.yml)
 [![Made for Claude Code](https://img.shields.io/badge/made%20for-Claude%20Code-D97757)](https://claude.com/claude-code)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: CC BY-NC 4.0](https://img.shields.io/badge/license-CC%20BY--NC%204.0-lightgrey.svg)](LICENSE)
 [![Platform: macOS](https://img.shields.io/badge/platform-macOS-000000?logo=apple&logoColor=white)](docs/INSTALL.md)
 [![Daemon: Python 3.9+](https://img.shields.io/badge/daemon-Python%203.9%2B-3776AB?logo=python&logoColor=white)](daemon/claude_mate_daemon.py)
 [![Firmware: Arduino Nano](https://img.shields.io/badge/firmware-Arduino%20Nano-00979D?logo=arduino&logoColor=white)](firmware/claude_mate)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
-A tiny USB hardware companion that shows the **live status of your Claude Code
-sessions** on a small OLED, **blinks an indication LED** the moment one of
-them needs you — finishes, gets blocked, or errors — and lets you **jump
-straight to the session that needs you** with a single button press.
+<p align="center">
+  <img src="assets/photos/IMG_4912.jpg" alt="Claude Mate — the assembled device on a desk, its OLED showing a live Claude Code session" width="640">
+</p>
 
-Plug it into your Mac, run the daemon, and feed it either via the Claude Code
-**hooks** or via the new **PTY wrapper** (`claude-mate-wrap`). The device becomes
-an ambient, always-on status pane for every Claude Code session you have open —
-in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
+**Claude Mate exists to cut the cognitive overload of orchestrating many
+AI-agent sessions at once** — a wall of Claude Code tabs spread across different
+accounts and projects, each finishing, blocking, or erroring on its own
+schedule. Instead of scanning every terminal to find the one that stalled, you
+glance at a small desk device: one screen and an indication LED tell you *which*
+session needs you *right now*, and a single button jumps you straight to it.
+
+This is **iteration one** — an Arduino-based USB device for macOS. The next
+iteration is a wireless **ESP32 Wi-Fi** remote, so the companion no longer has
+to be tethered to the Mac (see [Roadmap](#roadmap)).
+
+You feed it from the Claude Code **hooks** or the **PTY wrapper**
+(`claude-mate-wrap`); it becomes an ambient, always-on triage pane for every
+session you have open — in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
 
 ```
         ┌───────────────────────┐
@@ -48,9 +57,10 @@ in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
 - [Features](#features)
 - [Architecture](#architecture)
 - [LED alerts & the acknowledge model](#led-alerts--the-acknowledge-model)
-- [Bill of Materials](#bill-of-materials)
+- [Bill of Materials](#bill-of-materials) · [Enclosure & 3D model](#enclosure--3d-model)
 - [Quick start](#quick-start) · [Configuration](#configuration)
 - [How the status maps to your sessions](#how-the-status-maps-to-your-sessions)
+- [Roadmap](#roadmap)
 - [Repository layout](#repository-layout)
 - [Limitations](#limitations)
 - [Changelog](#changelog)
@@ -290,6 +300,23 @@ out left→right as **PREV | GO | NEXT**.
 
 ---
 
+## Enclosure & 3D model
+
+The device lives in a two-part 3D-printed enclosure — a terracotta body with a
+felt-textured faceplate, with cut-outs for the 0.91" OLED and the three
+buttons. The printable model is
+[`assets/3d-model/claude_mate_v2.3mf`](assets/3d-model/claude_mate_v2.3mf) (3MF —
+open it in Bambu Studio, PrusaSlicer, or Cura). Print one for **personal use**
+under the project's non-commercial license.
+
+| On the desk | Printed enclosure | Inside |
+|:---:|:---:|:---:|
+| [<img src="assets/photos/IMG_4911.jpg" width="250" alt="Claude Mate on a desk in front of the monitor">](assets/photos/IMG_4911.jpg) | [<img src="assets/photos/IMG_4896.jpg" width="250" alt="3D-printed enclosure parts laid out">](assets/photos/IMG_4896.jpg) | [<img src="assets/photos/IMG_4900.jpg" width="250" alt="Wired PCB going into the enclosure">](assets/photos/IMG_4900.jpg) |
+
+More build photos are in [`assets/photos/`](assets/photos/).
+
+---
+
 ## Quick start
 
 1. **Build & flash the firmware** (`firmware/claude_mate/claude_mate.ino`) onto
@@ -416,6 +443,26 @@ sessions the OLED shows `MATE / no sessions`.
 
 ---
 
+## Roadmap
+
+Claude Mate is built in iterations, each removing more friction than the last.
+
+- **Iteration 1 — Arduino + macOS (this repo).** An Arduino Nano drives the
+  OLED, the three buttons, and the indication LED over **USB serial**; a Python
+  daemon on the Mac keeps the triage queue, renders the screen, and raises
+  windows. Tethered by USB to the machine it watches.
+- **Iteration 2 — ESP32 Wi-Fi remote (next).** Move to an **ESP32** so the
+  device talks to the daemon **over Wi-Fi** instead of USB — a genuinely
+  wireless desk remote you can place anywhere, with no cable to the Mac. Same
+  triage model and line protocol; the transport becomes the network. (A richer
+  display and on-battery operation are natural follow-ons.)
+
+The goal stays fixed across every iteration: **one calm surface that tells you
+which agent needs you, so running many of them in parallel stops taxing your
+attention.**
+
+---
+
 ## Repository layout
 
 ```
@@ -423,6 +470,7 @@ claude_mate/
 ├── README.md
 ├── LICENSE · CONTRIBUTING.md · CODE_OF_CONDUCT.md · SECURITY.md
 ├── patterns.json                  # hot-reloadable state-detection tuning
+├── assets/                       # device photos + printable 3D enclosure (.3mf)
 ├── bin/
 │   └── claude-mate-wrap           # PTY wrapper: live state + terminal FOCUS (pyte)
 ├── daemon/
@@ -485,4 +533,17 @@ chip, and the move to a fully sticky selection.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). © 2026 Claude Mate contributors.
+**Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0)** —
+see [LICENSE](LICENSE). This covers the whole repo: the software, the Arduino
+firmware, the hardware design, the 3D-printable enclosure, the photos, and the
+documentation.
+
+- ✅ **Personal, non-commercial use** — build one for yourself, modify it, share
+  it, and contribute changes back, with attribution.
+- ❌ **No commercial use** — you may not sell the device, the models, or a
+  service built on this work, or otherwise use it for commercial advantage.
+
+Because of the non-commercial restriction this is **source-available** rather
+than an OSI-approved "open-source" license — but the source is fully open for
+personal use and contributions. © 2026 Volodymyr Gutorov and the Claude Mate
+contributors.
