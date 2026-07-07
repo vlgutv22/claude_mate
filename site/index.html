@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Mate — an ambient companion for your Claude Code agents</title>
+<meta name="description" content="A tiny USB desk device that cuts the cognitive overload of orchestrating many Claude Code agent sessions — it shows which session needs you and jumps you to it. Open, non-commercial, Arduino + macOS today, ESP32 Wi-Fi next.">
+<meta property="og:title" content="Claude Mate">
+<meta property="og:description" content="An ambient desk companion that tells you which Claude Code agent needs you — and takes you there with one button.">
+<meta property="og:type" content="website">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='4' y='7' width='24' height='18' rx='4' fill='%23d97757'/%3E%3Crect x='8' y='11' width='16' height='7' rx='1.5' fill='%230b0b0b'/%3E%3Ccircle cx='10' cy='21' r='1.5' fill='%230b0b0b'/%3E%3Ccircle cx='16' cy='21' r='1.5' fill='%230b0b0b'/%3E%3Ccircle cx='22' cy='21' r='1.5' fill='%230b0b0b'/%3E%3C/svg%3E">
+<style>
+  :root{
+    --paper:#faf9f5; --raise:#ffffff; --ink:#26241f; --muted:#6d6b63;
+    --accent:#d97757; --accent-deep:#b8542f; --line:#e8e5dc;
+    --oled:#63e0e8; --term-bg:#1d1c1a; --term-line:#2c2a27;
+    --radius:14px; --maxw:900px;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --paper:#211f1d; --raise:#2a2825; --ink:#efece4; --muted:#a8a49a;
+      --accent:#e08a6b; --accent-deep:#e9a488; --line:#38352f;
+      --term-bg:#161513; --term-line:#2c2a27;
+    }
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; background:var(--paper); color:var(--ink);
+    font:400 17px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:var(--maxw); margin:0 auto; padding:0 22px}
+  h1,h2,h3{font-family:Georgia,"Iowan Old Style","Times New Roman",serif; font-weight:600; line-height:1.15; letter-spacing:-.01em}
+  a{color:var(--accent-deep); text-decoration:none}
+  a:hover{text-decoration:underline}
+  code,.mono{font-family:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace}
+  code{background:rgba(217,119,87,.11); color:var(--accent-deep); padding:.08em .38em; border-radius:5px; font-size:.86em}
+
+  /* top bar */
+  header.bar{border-bottom:1px solid var(--line); position:sticky; top:0; background:color-mix(in srgb,var(--paper) 88%, transparent); backdrop-filter:saturate(1.2) blur(8px); z-index:5}
+  .bar .wrap{display:flex; align-items:center; justify-content:space-between; height:58px}
+  .brand{display:flex; align-items:center; gap:9px; font-weight:600}
+  .brand .dot{width:22px;height:16px;border-radius:5px;background:var(--accent);position:relative;flex:none}
+  .brand .dot::after{content:"";position:absolute;left:4px;top:4px;right:4px;height:5px;border-radius:2px;background:var(--term-bg)}
+  .bar nav{display:flex; gap:20px; font-size:15px}
+  .bar nav a{color:var(--muted)}
+  .bar nav a:hover{color:var(--ink); text-decoration:none}
+  @media(max-width:640px){.bar nav{display:none}}
+
+  /* hero */
+  .hero{padding:64px 0 28px; text-align:center}
+  .kicker{font-family:ui-monospace,"SF Mono",Menlo,monospace; font-size:13px; letter-spacing:.06em; color:var(--accent-deep); text-transform:lowercase}
+  .hero h1{font-size:clamp(38px,6vw,62px); margin:.28em 0 .1em}
+  .hero p.lede{font-size:clamp(18px,2.4vw,21px); color:var(--muted); max-width:660px; margin:.4em auto 0}
+  .cta{display:flex; gap:12px; justify-content:center; flex-wrap:wrap; margin:26px 0 8px}
+  .btn{display:inline-flex; align-items:center; gap:8px; padding:11px 20px; border-radius:10px; font-weight:600; font-size:15px; border:1px solid transparent}
+  .btn.primary{background:var(--accent); color:#fff}
+  .btn.primary:hover{background:var(--accent-deep); text-decoration:none}
+  .btn.ghost{border-color:var(--line); color:var(--ink); background:var(--raise)}
+  .btn.ghost:hover{border-color:var(--accent); text-decoration:none}
+  .hero-img{margin:34px auto 0; max-width:620px}
+  .hero-img img{width:100%; height:auto; border-radius:var(--radius); border:1px solid var(--line); display:block; box-shadow:0 24px 60px -32px rgba(80,50,30,.5)}
+  .cap{color:var(--muted); font-size:13.5px; margin-top:10px}
+
+  section{padding:52px 0; border-top:1px solid var(--line)}
+  section h2{font-size:clamp(26px,3.6vw,34px); margin:0 0 6px}
+  section .sub{color:var(--muted); margin:0 0 26px; max-width:640px}
+
+  /* problem cards */
+  .cols{display:grid; grid-template-columns:repeat(3,1fr); gap:16px}
+  @media(max-width:720px){.cols{grid-template-columns:1fr}}
+  .card{background:var(--raise); border:1px solid var(--line); border-radius:var(--radius); padding:20px}
+  .card h3{font-size:18px; margin:0 0 6px}
+  .card p{margin:0; color:var(--muted); font-size:15px}
+  .card .ic{font-size:22px; margin-bottom:8px; display:block}
+
+  /* terminal device mock */
+  .term{background:var(--term-bg); border:1px solid var(--term-line); border-radius:var(--radius); overflow:hidden; box-shadow:0 20px 50px -30px rgba(0,0,0,.6)}
+  .term .tt{display:flex; align-items:center; gap:7px; padding:11px 14px; border-bottom:1px solid var(--term-line)}
+  .term .tt i{width:11px;height:11px;border-radius:50%;display:block;opacity:.85}
+  .term .tt i:nth-child(1){background:#ef6a5e}.term .tt i:nth-child(2){background:#f4bf50}.term .tt i:nth-child(3){background:#61c554}
+  .term .tt span{margin-left:8px;color:#8a877f;font:12px ui-monospace,Menlo,monospace}
+  .screen{padding:20px 18px; font:15px/1.5 ui-monospace,"SF Mono",Menlo,monospace; color:#cfe9ea}
+  .screen .oled{color:var(--oled); white-space:pre; margin:0; font-size:clamp(13px,2.6vw,16px)}
+  .screen .prompt{color:var(--accent); }
+  .legend{display:grid; grid-template-columns:1fr 1fr; gap:6px 22px; margin-top:16px; color:#9fb0b1; font-size:13.5px}
+  @media(max-width:560px){.legend{grid-template-columns:1fr}}
+  .legend b{color:#dfeff0; font-weight:600}
+
+  /* parts */
+  .parts{list-style:none; margin:0; padding:0; display:grid; grid-template-columns:1fr 1fr; gap:0 34px}
+  @media(max-width:640px){.parts{grid-template-columns:1fr}}
+  .parts li{display:flex; gap:12px; padding:14px 0; border-bottom:1px solid var(--line); align-items:baseline}
+  .parts .q{font:600 13px ui-monospace,Menlo,monospace; color:var(--accent-deep); flex:none; min-width:26px}
+  .parts .n{font-weight:600}
+  .parts .d{color:var(--muted); font-size:14.5px}
+
+  /* gallery */
+  .gal{display:grid; grid-template-columns:repeat(4,1fr); gap:12px}
+  @media(max-width:720px){.gal{grid-template-columns:repeat(2,1fr)}}
+  .gal a{display:block; border-radius:11px; overflow:hidden; border:1px solid var(--line); aspect-ratio:1/1}
+  .gal img{width:100%; height:100%; object-fit:cover; display:block; transition:transform .3s ease}
+  .gal a:hover img{transform:scale(1.05)}
+
+  /* roadmap */
+  .road{display:grid; grid-template-columns:1fr 1fr; gap:16px}
+  @media(max-width:720px){.road{grid-template-columns:1fr}}
+  .road .card{position:relative}
+  .tag{display:inline-block; font:600 11px ui-monospace,Menlo,monospace; letter-spacing:.04em; text-transform:uppercase; padding:3px 9px; border-radius:20px; margin-bottom:10px}
+  .tag.now{background:var(--accent); color:#fff}
+  .tag.next{background:transparent; color:var(--accent-deep); border:1px solid var(--accent)}
+
+  footer{border-top:1px solid var(--line); padding:40px 0 60px; color:var(--muted); font-size:14.5px}
+  footer .flinks{display:flex; gap:20px; flex-wrap:wrap; margin-bottom:16px}
+  footer .flinks a{color:var(--ink)}
+  .lic{background:var(--raise); border:1px solid var(--line); border-radius:var(--radius); padding:16px 18px}
+  .lic b{color:var(--ink)}
+  .pill{display:inline-block;font-size:12px;font-family:ui-monospace,Menlo,monospace;color:var(--accent-deep);border:1px solid var(--accent);border-radius:20px;padding:2px 10px}
+</style>
+</head>
+<body>
+
+<header class="bar"><div class="wrap">
+  <div class="brand"><span class="dot"></span> Claude&nbsp;Mate</div>
+  <nav>
+    <a href="#why">Why</a>
+    <a href="#glass">The device</a>
+    <a href="#parts">Parts</a>
+    <a href="#build">Build</a>
+    <a href="#roadmap">Roadmap</a>
+    <a href="https://github.com/vlgutv22/claude_mate">GitHub</a>
+  </nav>
+</div></header>
+
+<main>
+<div class="wrap">
+  <section class="hero" style="border-top:none">
+    <div class="kicker">▸ an ambient companion for claude code</div>
+    <h1>Know which agent needs you.</h1>
+    <p class="lede">Claude Mate is a tiny USB desk device that cuts the <b>cognitive overload of
+      orchestrating many Claude&nbsp;Code sessions at once</b> — across different accounts and
+      projects. One glance tells you which session finished, is blocked, or errored; one button
+      takes you straight to it.</p>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/vlgutv22/claude_mate">View on GitHub</a>
+      <a class="btn ghost" href="https://github.com/vlgutv22/claude_mate/blob/main/docs/INSTALL.md">Build &amp; install →</a>
+    </div>
+    <div class="hero-img">
+      <img src="assets/photos/IMG_4912.jpg" alt="The assembled Claude Mate device — a felt-and-terracotta enclosure with an OLED showing a live Claude Code session and three buttons.">
+      <div class="cap">Iteration one: Arduino&nbsp;Nano&nbsp;+&nbsp;OLED, USB to a Mac. <span class="pill">ESP32 Wi-Fi next</span></div>
+    </div>
+  </section>
+</div>
+
+<div class="wrap">
+  <section id="why">
+    <h2>The problem it solves</h2>
+    <p class="sub">Running a fleet of agents means a wall of terminals, each on its own schedule.
+      The tax isn't the work — it's <em>watching</em> for which one stalled. Claude Mate moves that
+      watching off your screen and onto one calm surface.</p>
+    <div class="cols">
+      <div class="card"><span class="ic">🗂️</span><h3>One triage queue</h3>
+        <p>Every session in a stable, alphabetical order — tabs never shuffle under you. Different
+          accounts and projects, one list.</p></div>
+      <div class="card"><span class="ic">💡</span><h3>An LED that means it</h3>
+        <p>A status-distinct blink for the worst unacknowledged alert — finished, waiting, or errored —
+          looping until you deal with it.</p></div>
+      <div class="card"><span class="ic">⏎</span><h3>One button, there</h3>
+        <p>Press <b>GO</b> and the exact terminal for the session on screen is raised. No hunting
+          across windows.</p></div>
+    </div>
+  </section>
+</div>
+
+<div class="wrap">
+  <section id="glass">
+    <h2>What's on the glass</h2>
+    <p class="sub">A 0.91″ OLED renders one pre-composed screen — the selected session over a
+      whole-fleet strip. Three buttons, one meaning, always: <b>PREV · GO · NEXT</b>.</p>
+    <div class="term">
+      <div class="tt"><i></i><i></i><i></i><span>claude-mate · 128×32 OLED</span></div>
+      <div class="screen">
+<pre class="oled">api-server
+WAIT  0:42        work
+Opus 4.8 xhigh   5h82%
+2/6  E B W D I</pre>
+        <div class="legend">
+          <div><b>row 0</b> — session name (flashes while unacked)</div>
+          <div><b>row 1</b> — state · time-in-state · account</div>
+          <div><b>row 2</b> — model · effort · remaining plan limit</div>
+          <div><b>row 3</b> — queue position · whole-fleet letter strip</div>
+          <div><b>strip</b> — <span style="color:var(--oled)">E</span>rror · <span style="color:var(--oled)">B</span> waiting · <span style="color:var(--oled)">W</span>orking · <span style="color:var(--oled)">D</span>one · <span style="color:var(--oled)">I</span>dle</div>
+          <div><b>LED</b> — START · INPUT · DONE · ERROR, looping until you ack</div>
+        </div>
+      </div>
+    </div>
+    <p class="cap" style="text-align:center">Fed by the Claude&nbsp;Code <a href="https://github.com/vlgutv22/claude_mate/tree/main/hooks">hooks</a>
+      or the <a href="https://github.com/vlgutv22/claude_mate/blob/main/bin/claude-mate-wrap">PTY&nbsp;wrapper</a>,
+      which reads live TUI state and raises the exact terminal on GO.</p>
+  </section>
+</div>
+
+<div class="wrap">
+  <section id="parts">
+    <h2>Parts</h2>
+    <p class="sub">A handful of common components. Full pinout and notes in
+      <a href="https://github.com/vlgutv22/claude_mate/blob/main/docs/WIRING.md">docs/WIRING.md</a>;
+      the bill of materials lives in the
+      <a href="https://github.com/vlgutv22/claude_mate/blob/main/README.md#bill-of-materials">README</a>.</p>
+    <ul class="parts">
+      <li><span class="q">1×</span><span><span class="n"><a href="https://store.arduino.cc/products/arduino-nano">Arduino Nano</a></span> (ATmega328P) <span class="d">— any USB-serial clone works</span></span></li>
+      <li><span class="q">1×</span><span><span class="n">SSD1306 0.91″ 128×32 OLED</span>, I²C <span class="d">— addr 0x3C; 0.96″ 128×64 also works</span></span></li>
+      <li><span class="q">3×</span><span><span class="n">Momentary push buttons</span> <span class="d">— PREV · GO · NEXT (INPUT_PULLUP)</span></span></li>
+      <li><span class="q">1×</span><span><span class="n">Indication LED + ~220&nbsp;Ω–1&nbsp;kΩ resistor</span> <span class="d">— on D8, the sole alert output</span></span></li>
+      <li><span class="q">1×</span><span><span class="n">USB cable</span> <span class="d">— data-capable, to the Mac</span></span></li>
+      <li><span class="q">—</span><span><span class="n">3D-printed enclosure</span> <span class="d">— printable model below</span></span></li>
+    </ul>
+    <p class="cap">Software: a Python daemon (<code>pyserial</code>) on macOS + the firmware’s only
+      library dependency, <a href="https://github.com/adafruit/Adafruit-GFX-Library">Adafruit&nbsp;GFX</a>
+      (the SSD1306 is driven by a bundled software-I²C driver).</p>
+  </section>
+</div>
+
+<div class="wrap">
+  <section id="build">
+    <h2>Build it &amp; make it yours</h2>
+    <p class="sub">Print the enclosure, wire the parts, flash the firmware, run the daemon.
+      Photos and the printable model are in the repo’s
+      <a href="https://github.com/vlgutv22/claude_mate/tree/main/assets">assets</a>.</p>
+    <div class="cta" style="justify-content:flex-start;margin-top:0 0 22px">
+      <a class="btn primary" href="assets/3d-model/claude_mate_v2.3mf" download>⬇ Download the enclosure (.3mf)</a>
+      <a class="btn ghost" href="https://github.com/vlgutv22/claude_mate/tree/main/assets/photos">All photos →</a>
+    </div>
+    <div class="gal" style="margin-top:22px">
+      <a href="assets/photos/IMG_4911.jpg"><img src="assets/photos/IMG_4911.jpg" alt="Claude Mate on a desk in front of the monitor"></a>
+      <a href="assets/photos/IMG_4896.jpg"><img src="assets/photos/IMG_4896.jpg" alt="The 3D-printed enclosure parts"></a>
+      <a href="assets/photos/IMG_4899.jpg"><img src="assets/photos/IMG_4899.jpg" alt="The lit OLED and buttons, enclosure open"></a>
+      <a href="assets/photos/IMG_4900.jpg"><img src="assets/photos/IMG_4900.jpg" alt="The wired PCB going into the enclosure"></a>
+    </div>
+  </section>
+</div>
+
+<div class="wrap">
+  <section id="roadmap">
+    <h2>Roadmap</h2>
+    <p class="sub">Built in iterations, each removing more friction than the last. The goal never
+      changes — one calm surface that tells you which agent needs you.</p>
+    <div class="road">
+      <div class="card"><span class="tag now">Iteration 1 · now</span>
+        <h3>Arduino + macOS</h3>
+        <p>An Arduino Nano drives the OLED, buttons, and LED over USB serial; a Python daemon on
+          the Mac keeps the queue, renders the screen, and raises windows.</p></div>
+      <div class="card"><span class="tag next">Iteration 2 · next</span>
+        <h3>ESP32 Wi-Fi remote</h3>
+        <p>Move to an ESP32 so the device talks to the daemon over Wi-Fi instead of USB — a truly
+          wireless desk remote you can place anywhere, no cable to the Mac.</p></div>
+    </div>
+  </section>
+</div>
+
+<div class="wrap">
+  <footer>
+    <div class="flinks">
+      <a href="https://github.com/vlgutv22/claude_mate">Repository</a>
+      <a href="https://github.com/vlgutv22/claude_mate/blob/main/docs/INSTALL.md">Install</a>
+      <a href="https://github.com/vlgutv22/claude_mate/blob/main/docs/WIRING.md">Wiring</a>
+      <a href="https://github.com/vlgutv22/claude_mate/blob/main/docs/PROTOCOL.md">Protocol</a>
+      <a href="https://github.com/vlgutv22/claude_mate/blob/main/CONTRIBUTING.md">Contribute</a>
+    </div>
+    <div class="lic">
+      <b>License — CC BY-NC 4.0.</b> Free for <b>personal, non-commercial</b> use: build one, modify it,
+      and contribute back with attribution. <b>Commercial use is not permitted.</b>
+      See <a href="https://github.com/vlgutv22/claude_mate/blob/main/LICENSE">LICENSE</a>.
+    </div>
+    <p style="margin-top:16px">Made for <a href="https://claude.com/claude-code">Claude&nbsp;Code</a>. Not affiliated with Anthropic.</p>
+  </footer>
+</div>
+</main>
+</body>
+</html>
