@@ -16,10 +16,10 @@ Run `claude` THROUGH this wrapper (alias claude=claude-mate-wrap). It:
      wrapped terminals).
   4. Listens on a per-session control socket for window commands, auto-picking
      the method from $TERM_PROGRAM (iTerm2 / Terminal.app / VS Code / tmux /
-     generic): 'focus' raises (and un-minimizes) ONLY THIS terminal window (via
-     AXRaise, so sibling windows of the same terminal app are NOT dragged
-     forward; needs Accessibility permission, else it falls back to activating
-     the app) — sent on the GO button;
+     generic): 'focus' raises (and un-minimizes) THIS terminal window — selects
+     the session's tab and brings its window to the front via the terminal app's
+     own scripting (macOS Automation; no Accessibility permission needed) — sent
+     on the GO button;
      'collapse' miniaturizes it — sent when the card moves on. Commands are
      acked in two stages — 'go' on receipt (liveness), 'ok' only after the
      window op completes — so the daemon can order window ops ACROSS sessions
@@ -267,117 +267,6 @@ def _osa(script):
     except Exception:
         pass
 
-def _osa_out(script):
-    """Run an AppleScript and return its stdout (stripped), or "" on any error."""
-    try:
-        r = subprocess.run(["osascript", "-e", script],
-                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                           timeout=4, text=True)
-        return (r.stdout or "").strip()
-    except Exception:
-        return ""
-
-def _raise_window_only():
-    """Fallback only: raise a window whose title STILL contains our unique TITLE,
-    via AXRaise (one window, no app-wide activate). Unreliable once Claude has
-    rewritten the terminal title mid-session -- which is exactly why the primary
-    path below identifies the window by TTY, not title. Needs Accessibility."""
-    return _osa_out(f'''
-        tell application "System Events"
-          repeat with p in (every process whose background only is false)
-            repeat with w in (windows of p)
-              if name of w contains "{TITLE}" then
-                try
-                  set value of attribute "AXMinimized" of w to false
-                end try
-                perform action "AXRaise" of w
-                return "ok"
-              end if
-            end repeat
-          end repeat
-        end tell
-        return ""''') == "ok"
-
-def _axraise_at(proc, x, y):
-    """Raise EXACTLY the window of process `proc` at screen point (x, y) -- the
-    position we just read from the terminal's own AppleScript for the tab matched
-    by TTY. AXRaise brings that ONE window to the front WITHOUT activating the app,
-    so sibling terminal windows are never dragged forward. Position is stable (the
-    title is not -- Claude overwrites it). Needs Accessibility. Returns True on
-    success."""
-    return _osa_out(f'''
-        tell application "System Events"
-          if not (exists process "{proc}") then return ""
-          tell process "{proc}"
-            repeat with w in windows
-              set pp to position of w
-              set dx to (item 1 of pp) - {x}
-              if dx < 0 then set dx to -dx
-              set dy to (item 2 of pp) - {y}
-              if dy < 0 then set dy to -dy
-              if dx <= 8 and dy <= 8 then
-                try
-                  set value of attribute "AXMinimized" of w to false
-                end try
-                perform action "AXRaise" of w
-                return "ok"
-              end if
-            end repeat
-          end tell
-        end tell
-        return ""''') == "ok"
-
-def _axraise_from(pos, proc):
-    """Parse 'x,y' returned by the terminal's AppleScript and AXRaise that exact
-    window of `proc`. Returns True on success, False if unparseable / not raised."""
-    if not pos or "," not in pos:
-        return False
-    try:
-        x, y = (int(float(v)) for v in pos.split(",", 1))
-    except ValueError:
-        return False
-    return _axraise_at(proc, x, y)
-
-def _terminal_front_by_tty():
-    """Front THIS session's Terminal.app window via Terminal's own scripting --
-    the fallback when AXRaise is blocked because Accessibility is not granted (the
-    pre-AXRaise wrapper did exactly this and it worked without any permission).
-    `set selected of t` alone only picks the tab and leaves its window behind, so a
-    bare `activate` surfaces whatever window happened to be frontmost (the wrong
-    one -- the "focuses the wrong window" symptom). We therefore bring the matched
-    window itself to the front (index 1 + frontmost) and activate.
-
-    Important: we find the window's id in a read-only pass and then raise it via an
-    explicit `window whose id is ...` reference. Reordering a window (set index /
-    frontmost) mutates Terminal's `windows` collection, and doing that on the loop
-    variable while still iterating raises the WRONG window; a stable id reference
-    after the loop avoids that. Automation only -- no Accessibility. Returns True
-    if the TTY was matched."""
-    if not MY_TTY:
-        return False
-    return _osa_out(f'''
-        tell application "Terminal"
-          set targetId to missing value
-          repeat with w in windows
-            repeat with t in tabs of w
-              try
-                if (tty of t) is "{MY_TTY}" then
-                  set selected of t to true
-                  set targetId to id of w
-                end if
-              end try
-            end repeat
-          end repeat
-          if targetId is missing value then return ""
-          set tw to (first window whose id is targetId)
-          set miniaturized of tw to false
-          activate
-          set index of tw to 1
-          set frontmost of tw to true
-          return "ok"
-        end tell
-        return ""''') == "ok"
-
 def focus_self():
     # If we're inside tmux, also select our pane/window.
     pane = os.environ.get("TMUX_PANE")
@@ -392,75 +281,74 @@ def focus_self():
 
     tp = TERM_PROGRAM.lower()
     if tp == "iterm.app":
-        # Find THIS session's window by its TTY (never changes), select the right
-        # tab/session inside it, and read the window's on-screen position. NO
-        # `activate` (that raises every iTerm window). Then AXRaise just that one
-        # window by position -- reliable even after Claude rewrites the title.
-        pos = _osa_out(f'''
+        # Match the session by its TTY (exact), fall back to title. Restore the
+        # window first in case the nav preview miniaturized it.
+        _osa(f'''
             tell application "iTerm2"
+              activate
               repeat with w in windows
                 repeat with t in tabs of w
                   repeat with s in sessions of t
                     try
-                      if (tty of s) is "{MY_TTY}" then
+                      if (tty of s) is "{MY_TTY}" or (name of s contains "{TITLE}") then
                         set miniaturized of w to false
                         select w
                         tell t to select
                         select s
-                        set b to bounds of w
-                        return ((item 1 of b) as string) & "," & ((item 2 of b) as string)
+                        return
                       end if
                     end try
                   end repeat
                 end repeat
               end repeat
-            end tell
-            return ""''')
-        if _axraise_from(pos, "iTerm2"):
-            return
-        if not _raise_window_only():
-            _osa('tell application "iTerm2" to activate')   # last resort (grant Accessibility for single-window)
+            end tell''')
     elif tp == "apple_terminal":
-        # Same idea for Terminal.app: match the tab by TTY, read its window
-        # position, then AXRaise that one window. No app-wide `activate`.
-        pos = _osa_out(f'''
+        # Bring Terminal forward, then make THIS tab (matched by its TTY) the
+        # selected, front window. Un-miniaturize first: the daemon's nav
+        # preview may have collapsed this window to the Dock, and selecting a
+        # tab of a miniaturized window would not restore it. (macOS raises an
+        # app's windows as a group; we ensure ours ends up on top + focused.)
+        _osa(f'''
             tell application "Terminal"
+              activate
               repeat with w in windows
                 repeat with t in tabs of w
                   try
                     if (tty of t) is "{MY_TTY}" then
                       set miniaturized of w to false
                       set selected of t to true
-                      set b to bounds of w
-                      return ((item 1 of b) as string) & "," & ((item 2 of b) as string)
+                      set frontmost of w to true
+                      return
                     end if
                   end try
                 end repeat
               end repeat
-            end tell
-            return ""''')
-        if _axraise_from(pos, "Terminal"):
-            return
-        # AXRaise needs Accessibility; without it, front the CORRECT window using
-        # Terminal's own scripting (Automation only) rather than a blind activate
-        # that would leave whatever window was already frontmost on top.
-        if _terminal_front_by_tty():
-            return
-        if not _raise_window_only():
-            _osa('tell application "Terminal" to activate')  # last resort
+            end tell''')
     elif tp == "vscode":
         # Can't target a specific integrated-terminal pane externally; raise VS Code.
         _osa('tell application "Visual Studio Code" to activate')
     elif tp == "ghostty":
-        if not _raise_window_only():
-            _osa('tell application "Ghostty" to activate')
+        _osa('tell application "Ghostty" to activate')
     elif tp in ("warpterminal", "warp"):
-        if not _raise_window_only():
-            _osa('tell application "Warp" to activate')
+        _osa('tell application "Warp" to activate')
     else:
-        # Generic: best-effort single-window raise by title (may miss once the
-        # title is overwritten; no app-wide activate, so we never raise siblings).
-        _raise_window_only()
+        # Generic: ask System Events to raise any window whose title matches
+        # (un-minimizing it first in case the nav preview collapsed it).
+        _osa(f'''
+            tell application "System Events"
+              set procs to (every process whose background only is false)
+              repeat with p in procs
+                repeat with w in (windows of p)
+                  if name of w contains "{TITLE}" then
+                    try
+                      set value of attribute "AXMinimized" of w to false
+                    end try
+                    set frontmost of p to true
+                    perform action "AXRaise" of w
+                  end if
+                end repeat
+              end repeat
+            end tell''')
 
 def collapse_self():
     """Miniaturize THIS session's terminal window (the daemon's SCROLL-nav
