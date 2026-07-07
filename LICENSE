@@ -1,22 +1,4 @@
-Claude Mate — Creative Commons Attribution-NonCommercial 4.0 International
-
 Copyright (c) 2026 Volodymyr Gutorov and the Claude Mate contributors
-
-This entire work — the software (daemon, PTY wrapper, hooks), the Arduino
-firmware, the hardware design, the 3D-printable enclosure model under assets/,
-the photographs, and all documentation — is licensed under the Creative Commons
-Attribution-NonCommercial 4.0 International License (CC BY-NC 4.0).
-
-  * COMMERCIAL USE IS NOT PERMITTED.
-  * You MAY use, build, modify, and share this work for personal, non-commercial
-    purposes, and contribute your changes back, as long as you give appropriate
-    credit and indicate any changes.
-  * Contributions submitted to this project are offered under these same terms.
-
-Human-readable summary: https://creativecommons.org/licenses/by-nc/4.0/
-Full legal code follows below.
-
-=======================================================================
 
 Attribution-NonCommercial 4.0 International
 
