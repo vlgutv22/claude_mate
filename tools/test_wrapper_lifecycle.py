@@ -55,8 +55,12 @@ def launch(fake, sock, split_io=False):
     """Run the wrapper around `fake`. Returns (proc, m_in, m_out).
     split_io=True gives the wrapper SEPARATE stdin/stdout ptys so the test can EOF
     its stdin (close m_in) while still reading its output (m_out)."""
+    # Hermetic: empty accounts dir (a real profile would pop the account
+    # picker and hang on the PTY), usage polling off.
     env = dict(os.environ, CLAUDE_MATE_SOCK=sock, CLAUDE_REAL=fake,
-               TERM_PROGRAM="iTerm.app")
+               TERM_PROGRAM="iTerm.app",
+               CLAUDE_MATE_ACCOUNTS_DIR=os.path.join(tmp, "no-accounts"),
+               CLAUDE_MATE_USAGE_POLL_S="0")
     if split_io:
         m_in, s_in = pty.openpty()
         m_out, s_out = pty.openpty()

@@ -39,17 +39,27 @@ wins. `mkdir ~/.claude-accounts/work` (or picking a new name at the prompt)
 creates a profile; claude asks /login there on first run. No profile dirs ->
 no picker, nothing changes.
 
+Account + remaining limit on the device: the wrapper also reports WHICH account
+this session runs as (the profile name, or 'default') and how much of that
+account's plan limit is LEFT -- a background thread reads the session's OAuth
+token (never writes it) and polls Anthropic's usage endpoint every
+CLAUDE_MATE_USAGE_POLL_S seconds. The daemon shows the account on the state row
+and the remaining-limit chip (e.g. '5h82%' = 82% of the 5-hour window left,
+'wk31%' = 31% of the week left -- whichever window is more depleted) on the
+model+effort row.
+
 Config (env):
   CLAUDE_MATE_SOCK          daemon socket (default /tmp/claude-mate.sock)
   CLAUDE_MATE_DEBUG         if set to a path, append screen+state snapshots there
   CLAUDE_REAL               explicit path to the real `claude` binary (else autodetected)
   CLAUDE_MATE_ACCOUNTS_DIR  profile root (default ~/.claude-accounts)
   CLAUDE_MATE_ACCOUNT       profile name to use without showing the picker
+  CLAUDE_MATE_USAGE_POLL_S  remaining-limit poll period (default 120; <=0 disables)
 
 Requires: pyte  (pip install pyte)
 """
 import os, sys, pty, tty, termios, fcntl, struct, signal, select, socket, \
-       threading, time, re, json, uuid, subprocess, shutil, atexit
+       threading, time, re, json, uuid, subprocess, shutil, atexit, hashlib
 
 try:
     import pyte
@@ -227,16 +237,20 @@ def set_winsize(fd, rows, cols):
 def send_daemon(state):
     """Best-effort one-line report to the daemon. Never raises.
 
-    Wire format: state|SID|NAME|CTRL_SOCK|MODEL|EFFORT  (model/effort may be
-    empty until captured from the screen; the daemon and firmware both treat
-    the trailing fields as optional, so older peers stay compatible)."""
+    Wire format: state|SID|NAME|CTRL_SOCK|MODEL|EFFORT|ACCOUNT|LIMIT
+    (model/effort are empty until captured from the screen; account/limit are
+    empty until known. The daemon treats ALL trailing fields as optional, so
+    older peers stay compatible)."""
     model = g_meta["model"].replace("|", "/")
     effort = g_meta["effort"].replace("|", "/")
+    account = g_meta["account"].replace("|", "/")
+    limit = g_meta["limit"].replace("|", "/")
     try:
         c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         c.settimeout(0.5)
         c.connect(DAEMON_SOCK)
-        c.sendall(f"{state}|{SID}|{NAME}|{CTRL_SOCK}|{model}|{effort}\n".encode())
+        c.sendall(f"{state}|{SID}|{NAME}|{CTRL_SOCK}|{model}|{effort}"
+                  f"|{account}|{limit}\n".encode())
         c.close()
     except OSError:
         pass
@@ -466,8 +480,10 @@ _MODEL_RE = re.compile(
 _EFFORT_RE = re.compile(
     r'◉\s*(low|medium|high|xhigh|max|ultracode)\b', re.I)
 
-# Last-known model/effort for THIS session (sticky cache).
-g_meta = {"model": "", "effort": ""}
+# Last-known model/effort for THIS session (sticky cache), plus the account
+# it runs as (set once at startup) and the remaining-limit chip (refreshed by
+# the usage poller thread). All four ride along on every daemon report.
+g_meta = {"model": "", "effort": "", "account": "", "limit": ""}
 
 def parse_meta(screen_text):
     """Refresh g_meta from the current screen if model/effort are visible."""
@@ -762,6 +778,103 @@ def select_account(flag_name, interactive):
         use_profile(ans)   # a name: existing profile or a new one to create
 
 # --------------------------------------------------------------------------- #
+# Account + remaining-limit reporting (shown on the device's r1/r2 right edges)
+# --------------------------------------------------------------------------- #
+# The wrapper knows which account this session runs as (selected above) and can
+# read that account's usage. Claude Code stores the OAuth access token per
+# config dir: in <cfg>/.credentials.json where that file exists, else in the
+# macOS Keychain under service "Claude Code-credentials" -- with a
+# "-<sha256(cfg_dir)[:8]>" suffix when CLAUDE_CONFIG_DIR is set (verified
+# against a real profile). The token is only ever READ; refreshing stays
+# claude's job (refresh tokens rotate, so writing here could log the account
+# out from under it).
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+try:
+    USAGE_POLL_S = float(os.environ.get("CLAUDE_MATE_USAGE_POLL_S", "120"))
+except ValueError:
+    USAGE_POLL_S = 120.0
+
+def account_label():
+    """Short account name for the device: the CLAUDE_CONFIG_DIR basename (the
+    profile name for ~/.claude-accounts/<name>), or 'default' for ~/.claude."""
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR", "")
+    if not cfg:
+        return "default"
+    return os.path.basename(os.path.normpath(cfg)).lstrip(".") or "default"
+
+def _access_token():
+    """This session's OAuth access token, or ''. File first (Linux / explicit
+    installs), then the Keychain (the macOS default)."""
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR", "")
+    path = os.path.join(cfg or os.path.expanduser("~/.claude"),
+                        ".credentials.json")
+    raw = ""
+    try:
+        with open(path) as fh:
+            raw = fh.read()
+    except OSError:
+        service = "Claude Code-credentials"
+        if cfg:
+            service += "-" + hashlib.sha256(cfg.encode()).hexdigest()[:8]
+        try:
+            out = subprocess.run(
+                ["security", "find-generic-password", "-s", service, "-w"],
+                capture_output=True, text=True, timeout=5)
+            raw = out.stdout.strip() if out.returncode == 0 else ""
+        except Exception:
+            return ""
+    try:
+        return ((json.loads(raw) or {}).get("claudeAiOauth")
+                or {}).get("accessToken", "") or ""
+    except ValueError:
+        return ""
+
+def _fetch_usage(token):
+    """GET the usage endpoint via curl, not urllib: curl uses the system trust
+    store (python.org builds often ship without CA certs and would fail TLS
+    verification), and the token travels via a stdin config file, never argv
+    (argv is world-readable in `ps`). Returns the parsed JSON or None."""
+    cfg = (f'url = "{USAGE_URL}"\n'
+           f'header = "Authorization: Bearer {token}"\n'
+           'header = "anthropic-beta: oauth-2025-04-20"\n')
+    try:
+        out = subprocess.run(["curl", "-sS", "-m", "10", "-K", "-"],
+                             input=cfg, capture_output=True, text=True,
+                             timeout=15)
+        if out.returncode != 0:
+            return None
+        return json.loads(out.stdout)
+    except Exception:
+        return None
+
+def _format_limit(data):
+    """Compact remaining-limit chip for the OLED, <= 6 chars. The BINDING
+    window (whichever has less left) wins: '5h82%' = 82% of the 5-hour window
+    remaining, 'wk31%' = 31% of the week left. '' if usage is unavailable
+    (console/API-key accounts have no plan windows)."""
+    try:
+        r5 = 100.0 - float(data["five_hour"]["utilization"])
+        r7 = 100.0 - float(data["seven_day"]["utilization"])
+    except (KeyError, TypeError, ValueError):
+        return ""
+    r5 = max(0, min(100, round(r5)))
+    r7 = max(0, min(100, round(r7)))
+    return f"wk{r7}%" if r7 < r5 else f"5h{r5}%"
+
+def usage_poller():
+    """Refresh g_meta['limit'] every USAGE_POLL_S. On any failure (offline,
+    expired token, no plan limits) the last-known value is KEPT: claude
+    refreshes the token as it runs, so the next poll heals on its own. The
+    monitor thread notices the changed g_meta and reports it to the daemon."""
+    while True:
+        tok = _access_token()
+        if tok:
+            lim = _format_limit(_fetch_usage(tok) or {})
+            if lim:
+                g_meta["limit"] = lim
+        time.sleep(max(30.0, USAGE_POLL_S))
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def main():
@@ -771,6 +884,7 @@ def main():
     sys.argv[1:] = argv
     select_account(flag_name,
                    interactive=sys.stdin.isatty() and sys.stdout.isatty())
+    g_meta["account"] = account_label()   # ride along on every daemon report
     # pyte is required to mirror the TUI; without it we cannot wrap. Run the real
     # claude unwrapped via real_claude() (which skips THIS shim) -- never bare
     # "claude", which in the global-shim deployment would re-exec the wrapper
@@ -815,7 +929,7 @@ def main():
 
     state = {"cur": "idle", "reported": None, "pending": None,
              "pending_src": "idle", "since": 0.0, "last_sent": 0.0,
-             "meta_reported": ("", "")}
+             "meta_reported": ("", "", "", "")}
     dbg = open(DEBUG, "a") if DEBUG else None
 
     def evaluate():
@@ -836,9 +950,10 @@ def main():
         # Promote a pending state once it has been stable long enough.
         if state["pending"] != state["cur"] and (now - state["since"]) >= hold:
             state["cur"] = state["pending"]
-        # Report on a state change, when model/effort first become known (or
-        # change), or as a periodic keepalive.
-        meta = (g_meta["model"], g_meta["effort"])
+        # Report on a state change, when model/effort/account/limit first
+        # become known (or change), or as a periodic keepalive.
+        meta = (g_meta["model"], g_meta["effort"],
+                g_meta["account"], g_meta["limit"])
         if (state["cur"] != state["reported"] or meta != state["meta_reported"]
                 or (now - state["last_sent"]) >= KEEPALIVE_S):
             state["reported"] = state["cur"]
@@ -891,6 +1006,8 @@ def main():
                 pass
 
     threading.Thread(target=ctrl_listener, daemon=True).start()
+    if USAGE_POLL_S > 0:
+        threading.Thread(target=usage_poller, daemon=True).start()
     send_daemon("idle")  # register immediately on launch
 
     # Periodic evaluator (catches quiescence after output stops). `_running` lets

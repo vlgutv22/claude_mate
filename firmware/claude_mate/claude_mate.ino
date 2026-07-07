@@ -68,8 +68,8 @@
  *         sel   = column in r3 of the active tab's fleet letter (-1 = none);
  *                 that letter's cell is filled (lit square, letter knocked out)
  *         r0    = session name
- *         r1    = state tag + time-in-state
- *         r2    = model + effort
+ *         r1    = state tag + time-in-state (+ account, right-aligned)
+ *         r2    = model + effort (+ remaining-limit chip, right-aligned)
  *         r3    = queue position + packed status letters, no separator (an
  *                 unacked alert's letter is LOWERCASE -> drawn uppercase but
  *                 blinking). r3 is the LAST field (the tokenizer stops at the
@@ -123,7 +123,8 @@
 // ---- Protocol constants ------------------------------------------------------
 #define SERIAL_BAUD    115200
 #define LINE_MAX       96      // cap input line length to bound RAM use
-                               // (the F frame worst case is ~60 bytes)
+                               // (the F frame worst case -- all four rows at the
+                               // full 21 chars + prefix -- is 94 bytes, so it fits)
 #define DEBOUNCE_MS    40UL    // ~40ms button debounce (snappy short taps)
 #define LONGPRESS_MS   500UL   // GO held this long -> long-press (acknowledge)
 #define REPEAT_DELAY_MS 400UL  // PREV/NEXT held this long -> start auto-repeat

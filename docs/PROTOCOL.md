@@ -22,11 +22,19 @@ draws it. All ordering, selection, truncation and layout live in the daemon.
 ```
 +---------------------+
 |api-server           |   r0: session name — flashes (inverts ~2.5 Hz) while
-|WAIT  0:42           |   r1: state tag + time-in-state    its alert is unacked
-|Opus 4.8  xhigh      |   r2: model + effort
-|2/6 E B W D I        |   r3: queue position + one status LETTER per session;
-+---------------------+       the active tab's letter sits in a filled rectangle
+|WAIT  0:42       work|   r1: state tag + time-in-state    its alert is unacked
+|Opus 4.8 xhigh  5h82%|       + the ACCOUNT the session runs as (right-aligned)
+|2/6 E B W D I        |   r2: model + effort + REMAINING-LIMIT chip (right)
++---------------------+   r3: queue position + one status LETTER per session;
+                              the active tab's letter sits in a filled rectangle
 ```
+
+The **account** (`work`, `default`, …) is which Claude login the session runs
+as (the PTY wrapper's `--account` profile). The **remaining-limit chip** shows
+how much of that account's plan limit is left, for whichever window is more
+depleted: `5h82%` = 82% of the 5-hour window remaining, `wk31%` = 31% of the
+week left. Both come from the PTY wrapper and are empty (row right edges stay
+blank) for hook-driven sessions.
 
 The **active tab** (the session shown above) has its fleet letter drawn in a
 **wide filled rectangle** in r3 — a lit block with the letter centred and
@@ -90,8 +98,8 @@ input buffer at 96 bytes and drops malformed/oversized lines).
 | `flags` | Bitfield. **bit0**: invert **row 0** (the name) at ~2.5 Hz (an unacknowledged alert is on screen). **bit1**: FOLLOW mode is on (draw a ► marker by the state row). |
 | `sel`   | The character column **within `r3`** of the active tab's fleet letter (`-1` = none). The firmware fills a **wide** rectangle (~11 px) **centred** on that letter — a lit block with the letter knocked out. |
 | `r0` (name) | Session name. The daemon truncates to the row width and, when two long sibling names collide, disambiguates with a middle squeeze (first 9 + `~` + last 10, e.g. `webapp-ba~ervice-one`). |
-| `r1` (state) | `TAG  time` — the 4-char state tag (`ERR`/`WAIT`/`DONE`/`WORK`/`IDLE`) and the time in that state (mm:ss, or h:mm past an hour). |
-| `r2` (meta) | Best-fit `model  effort` (empty for hook-driven sessions with no scraped metadata). |
+| `r1` (state) | `TAG  time` — the 4-char state tag (`ERR`/`WAIT`/`DONE`/`WORK`/`IDLE`) and the time in that state (mm:ss, or h:mm past an hour) — plus the session's **account** right-aligned (≥ 2-space gap, truncated to fit; omitted when unknown). |
+| `r2` (meta) | Best-fit `model effort`, plus the **remaining-limit chip** (e.g. `5h82%`) right-aligned (≥ 2-space gap); the model+effort best-fit degrades into the room the chip leaves. Empty for hook-driven sessions with no scraped metadata. |
 | `r3` (fleet) | `pos/total ` + one status **letter** per session in the stable (alphabetical) order, **space-separated**: `E` error, `B` waiting (blocked), `W` working, `D` done, `I` idle. An **unacknowledged alert's letter is sent LOWERCASE** — the firmware draws it uppercase but **blinks** it, so you can see which tabs still need acknowledging (they stop blinking as you ack them). When the strip does not fit, it is cut with a trailing `+`. `r3` is the last field (the firmware stops tokenizing at the 6th `\|` and takes the rest verbatim). |
 
 The daemon sends an `F` line whenever the rendered bytes change: immediately on
@@ -168,7 +176,7 @@ every replug.
 **Framing:** one **newline-terminated** line per message.
 
 ```
-<state>|<session_id>|<name>[|<ctrl_sock>|<model>|<effort>]
+<state>|<session_id>|<name>[|<ctrl_sock>|<model>|<effort>|<account>|<limit>]
 ```
 
 | Field        | Description |
@@ -179,10 +187,13 @@ every replug.
 | `ctrl_sock`  | (PTY wrapper) per-session control socket GO's `focus` connects to. Empty for hooks. |
 | `model`      | (PTY wrapper) model in use, e.g. `Opus 4.8`. Empty until scraped / for hooks. |
 | `effort`     | (PTY wrapper) effort level, e.g. `xhigh`. Empty until scraped / for hooks. |
+| `account`    | (PTY wrapper) account/profile the session runs as, e.g. `work` or `default`. Empty for hooks. |
+| `limit`      | (PTY wrapper) remaining-limit chip for that account, e.g. `5h82%` (82% of the 5-hour window left) or `wk31%` (31% of the week left) — whichever window is more depleted. Refreshed every `CLAUDE_MATE_USAGE_POLL_S` (default 120 s) from Anthropic's OAuth usage endpoint; empty until the first successful poll / for hooks. |
 
 The hook path sends only the first three fields; the PTY wrapper appends the
-control socket and (once scraped) the model + effort. All trailing fields are
-optional — the daemon defaults missing ones to empty.
+control socket, (once scraped) the model + effort, and (once known) the
+account + remaining limit. All trailing fields are optional — the daemon
+defaults missing ones to empty.
 
 The hook is **fire-and-forget**: it connects with a short timeout, writes one
 line, and exits **0** regardless of outcome. If the daemon/socket is down it
@@ -231,6 +242,7 @@ The daemon keeps a dictionary of sessions, **keyed by `session_id`** (or by
 | `last_update_ts` | Timestamp of the last update for this session. |
 | `state_since`    | When the current state began — the displayed time is always *time in state* (for `working` that IS the live turn runtime; for an alert it is how long it has been waiting on the human). |
 | `model`/`effort` | Best-effort strings scraped by the PTY wrapper. |
+| `account`/`limit`| The account the session runs as + its remaining-limit chip (PTY wrapper; sticky once seen). |
 | `focus_ctrl`     | The wrapper control socket path, if any. |
 | `acked`          | Has the human seen this alert? |
 

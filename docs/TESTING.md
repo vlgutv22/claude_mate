@@ -82,7 +82,7 @@ Confirm the **hardware** works independently of the protocol. Flash the selftest
 sketch (`firmware/selftest/selftest.ino`) and watch the board. On boot it now:
 
 - **Cycles a 4-row demo frame** (name / state+time / model+effort /
-  position+fleet letters) through `ERR → WAIT → DONE → WORK → IDLE` on the OLED
+  position+fleet letters — the selftest predates the account/limit chips) through `ERR → WAIT → DONE → WORK → IDLE` on the OLED
   every ~3 s in the real interface layout, printing each one over serial, and
   **plays the matching LED pattern on D8** on each change (ERROR strobe, INPUT
   blink, DONE cascade, START one-shot, dark on IDLE) → display + LED OK.
@@ -119,11 +119,12 @@ Flash the **real firmware**. Open the Arduino IDE **Serial Monitor** at
    (`F|<flags>|<sel>|<r0>|<r1>|<r2>|<r3>`):
 
    ```
-   F|1|4|api-server|WAIT  0:42|Opus 4.8  xhigh|1/3 B W D
+   F|1|4|api-server|WAIT  0:42       work|Opus 4.8 xhigh  5h82%|1/3 B W D
    ```
 
    → the OLED shows the frame as four size-1 rows: the name `api-server` on r0
-   **flashing** (`flags` bit0 = 1), the state + time on r1, the model + effort
+   **flashing** (`flags` bit0 = 1), the state + time (+ the account,
+   right-aligned) on r1, the model + effort (+ the remaining-limit chip)
    on r2, and the position + space-separated fleet letters on r3 with the
    letter at column `4` (the `B`) in a **wide centred filled rectangle** (a lit
    block, letter knocked out). Add bit1 to `flags` (send `3` instead of `1`)

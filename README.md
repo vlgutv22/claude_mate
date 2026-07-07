@@ -13,8 +13,8 @@ in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
 ```
         ┌───────────────────────┐
         │ api-server            │   ← r0: session name (flashes while its alert
-        │ WAIT  0:42            │   ← r1: state · time-in-state    is unacknowledged)
-        │ Opus 4.8  xhigh       │   ← r2: model · effort
+        │ WAIT  0:42       work │   ← r1: state · time-in-state · account   is unacknowledged)
+        │ Opus 4.8 xhigh  5h82% │   ← r2: model · effort · remaining limit
         │ 2/6 E B W D I         │   ← r3: queue position · whole-fleet letter strip
         └───────────────────────┘       (the active tab's letter sits in a wide centred filled rectangle)
               (•) indication LED               ← blinks per alert class, until you ack
@@ -25,6 +25,8 @@ in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
    the strip: E error · B waiting · W working · D done · I idle — one letter per session, stable order
               a letter BLINKS while that tab's alert is unacknowledged; it goes steady once you ack it
    the box:   the active tab's letter is a wide centred filled rectangle (letter knocked out) — shows which tab is on screen
+   the right edges: which ACCOUNT the session runs as (its wrapper profile) · how much of that account's plan
+              limit is LEFT (5h82% = 82% of the 5-hour window · wk31% = 31% of the week — the tighter one shows)
    FOLLOW:    double-click GO → a ► marker appears; PREV/NEXT then also raise the selected terminal (raise only)
    the LED:   START 1 s blink · INPUT even blink · DONE 4-blink cascade · ERROR fast strobe  (loops until you GO/ack)
 ```
@@ -317,6 +319,7 @@ Step-by-step guides:
 | `CLAUDE_REAL`          | autodetect            | Explicit path to the real `claude` binary |
 | `CLAUDE_MATE_ACCOUNTS_DIR` | `~/.claude-accounts` | Root of account profile dirs (see below) |
 | `CLAUDE_MATE_ACCOUNT`  | unset                 | Profile name to use, skipping the picker |
+| `CLAUDE_MATE_USAGE_POLL_S` | `120`             | Remaining-limit poll period in seconds (`<= 0` disables) |
 
 **Account profiles** — Claude Code holds one login per config dir, so the
 wrapper can run different terminals under different accounts by pointing each
@@ -331,6 +334,17 @@ selects a profile non-interactively, and an already-exported
 `CLAUDE_CONFIG_DIR` always wins. A fresh profile starts logged out — claude
 prompts `/login` there on first run — and keeps its own settings, history, and
 MCP config. With no profile dirs, nothing changes.
+
+**Account + remaining limit on the device** — each wrapped session reports
+which account it runs as (the profile name, or `default`), shown right-aligned
+on the state row, and how much of that account's plan limit is left, shown as
+a chip on the model+effort row: `5h82%` = 82% of the 5-hour window remaining,
+`wk31%` = 31% of the week — whichever window is more depleted. The wrapper
+reads the session's own OAuth token (from `<config-dir>/.credentials.json`, or
+the macOS Keychain where Claude Code keeps it) and polls Anthropic's usage
+endpoint every `CLAUDE_MATE_USAGE_POLL_S` seconds (default 120; `<= 0`
+disables). Read-only: the wrapper never refreshes or rewrites credentials —
+that stays claude's job.
 
 **Detection tuning** lives in [`patterns.json`](patterns.json) — case-insensitive
 substrings matched against the rendered TUI, grouped as `error` / `waiting` /
@@ -412,9 +426,13 @@ claude_mate/
   GUI is not feasible, so GO — taking you to the session — is the intended
   response.
 - **Model/effort strings are best-effort.** The model/effort row (e.g.
-  `Opus 4.8  xhigh`) is scraped from the live TUI by the PTY wrapper and
+  `Opus 4.8 xhigh`) is scraped from the live TUI by the PTY wrapper and
   stays empty for hook-only sessions or until scraped. Claude Mate never
   fabricates it; treat this as an extension point.
+- **The remaining-limit chip is best-effort too.** It comes from Anthropic's
+  OAuth usage endpoint (an undocumented interface that may change), polled with
+  the session's own token. Offline / expired-token / console-account sessions
+  simply show no chip (or keep the last known value until a poll succeeds).
 - **FOCUS targets the wrapper's terminal first, then VS Code.** A wrapped session
   raises its own terminal window (matched by TTY) reliably — and raise is the
   *only* window operation; nothing is ever collapsed or resized. Hook-only
@@ -439,8 +457,8 @@ three buttons**:
   mode long-press. The daemon keeps ONE **stable, alphabetically-ordered** triage
   queue (tabs never shuffle; urgency is tracked separately, for the LED + idle
   auto-surface only) and pre-renders ONE screen — four size-1 rows (name ·
-  state+time · model+effort · position+fleet strip); the firmware is a dumb
-  one-frame renderer.
+  state+time+account · model+effort+remaining-limit · position+fleet strip);
+  the firmware is a dumb one-frame renderer.
 - **Buttons are PREV / GO / NEXT everywhere.** GO short = acknowledge + raise
   the shown window (WYSIWYG); GO **double-click** = toggle FOLLOW mode; GO long
   = acknowledge only; PREV/NEXT auto-repeat while held. A GO/ACK **stays on the

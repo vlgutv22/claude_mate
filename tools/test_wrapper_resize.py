@@ -110,7 +110,11 @@ def drained():
     with olock:
         return "".join(out)
 
-env = dict(os.environ, CLAUDE_MATE_SOCK=sock, CLAUDE_REAL=fake)
+# Hermetic: empty accounts dir (a real profile would pop the account picker
+# and hang on the PTY), usage polling off.
+env = dict(os.environ, CLAUDE_MATE_SOCK=sock, CLAUDE_REAL=fake,
+           CLAUDE_MATE_ACCOUNTS_DIR=os.path.join(tmp, "no-accounts"),
+           CLAUDE_MATE_USAGE_POLL_S="0")
 print(f"== launching wrapper ({os.path.basename(WRAP)}) ==")
 proc = subprocess.Popen([sys.executable, WRAP], stdin=s, stdout=s,
                         stderr=subprocess.PIPE, env=env)

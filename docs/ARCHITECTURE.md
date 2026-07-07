@@ -6,8 +6,9 @@ keeps ONE **stable, alphabetically-ordered** **triage queue** of sessions (tabs
 never shuffle as their states change) and the OLED shows ONE screen — the
 *selected* session (after 10 s idle, the most-urgent unacknowledged alert
 auto-surfaced at its stable position): four size-1 rows — the session name, the
-state + time-in-state, the model + effort, and a whole-fleet letter strip (with
-the queue position). The LED blinks a
+state + time-in-state (+ the account the session runs as), the model + effort
+(+ a remaining-limit chip, e.g. `5h82%` = 82% of the 5-hour window left), and a
+whole-fleet letter strip (with the queue position). The LED blinks a
 status-distinct pattern (driven by the daemon) for the worst unacknowledged
 alert, looping until you acknowledge it. It shows the live status of one or
 more Claude Code sessions running in the VS Code native extension (and/or the
@@ -51,8 +52,9 @@ Arduino Nano (ATmega328P)
         +--> OLED SSD1306 128x32 (software I2C, addr 0x3C)  draws the one frame it
         |                                            was last sent: four size-1
         |                                            rows — name (flashing ~2.5 Hz
-        |                                            while unacked), state+time,
-        |                                            model+effort, fleet strip
+        |                                            while unacked), state+time
+        |                                            +account, model+effort
+        |                                            +remaining-limit, fleet strip
         +--> indication LED (D8)                    plays V|<kind>: START one-shot;
                                                      INPUT/DONE/ERROR loop until V|OFF
 
@@ -203,8 +205,9 @@ it was last told to show via an `F|<flags>|<sel>|<r0>|<r1>|<r2>|<r3>` line.
 - **What a frame shows:** four size-1 rows (≤ 21 chars each) — **r0** the
   selected session's name (full width, ~21 chars, inverting ~2.5 Hz while its
   alert is unacknowledged); **r1** the state (4-char tag
-  `ERR `/`WAIT`/`DONE`/`WORK`/`IDLE` + time in that state); **r2** the best-fit
-  model + effort on its own row; **r3** the fleet strip (`pos/total` + one
+  `ERR `/`WAIT`/`DONE`/`WORK`/`IDLE` + time in that state, plus the session's
+  account right-aligned); **r2** the best-fit model + effort plus the
+  remaining-limit chip right-aligned (e.g. `5h82%`); **r3** the fleet strip (`pos/total` + one
   status letter per session in stable (alphabetical) order, space-separated —
   `E` error, `B` waiting, `W` working, `D` done, `I` idle; cut with a trailing
   `+` when it doesn't fit). An unacknowledged alert's letter is sent **lowercase**
@@ -313,6 +316,11 @@ These are deliberate, documented boundaries — not bugs:
   scraped from the live TUI by the PTY wrapper and stays empty for hook-only
   sessions or until scraped. The daemon **never fabricates** it; it fits
   whatever it reliably knows into the 21-char row.
+- **Account + remaining limit come from the wrapper too.** The account is the
+  wrapper's profile name (`default` for ~/.claude); the remaining-limit chip is
+  polled from Anthropic's OAuth usage endpoint with the session's own token
+  (read-only — refreshing credentials stays claude's job) and shows the more
+  depleted of the 5-hour / weekly windows. Hook-only sessions show neither.
 - **Focus depends on the deep link (hook-only sessions).** A wrapped session
   raises its own terminal via its control socket. Hook-only sessions use the
   VS Code deep link derived from the session id (VERIFIED FACTS:

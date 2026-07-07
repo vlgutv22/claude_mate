@@ -128,6 +128,9 @@ def frame_subject(f):
 def frame_r1(f):
     p = f.split("|")
     return p[4] if len(p) >= 7 else ""
+def frame_r2(f):
+    p = f.split("|")
+    return p[5] if len(p) >= 7 else ""
 def frame_fleet(f):
     """Fleet field (r3, last), kept intact incl. its '|' dividers."""
     p = f.split("|", 6)
@@ -175,7 +178,7 @@ print("\n-- phase 1: empty boot -> MATE/no-sessions frame, LED cleared --")
 time.sleep(0.5)
 
 print("\n-- phase 2: one working session -> WORK frame + V|START --")
-feed("working|sid-1|webapp||Opus 4.8|xhigh"); time.sleep(1.5)
+feed("working|sid-1|webapp||Opus 4.8|xhigh|work|5h82%"); time.sleep(1.5)
 
 print("\n-- phase 3: a session starts waiting -> auto-surfaces, flashes, V|INPUT --")
 idx_wait = mark()
@@ -414,6 +417,13 @@ check("working session frame: webapp name (r0) + WORK tag (r1), not flashing",
           and not frame_flash(l)))
 check("model/effort rendered on its own row (Opus... xhigh)",
       saw(lambda l: l.startswith("F|") and "xhigh" in l and "Opus" in l))
+check("account rendered right-aligned on the state row (r1 ends ' work')",
+      saw(lambda l: frame_subject(l) == "webapp"
+          and frame_r1(l).endswith(" work")))
+check("remaining-limit chip right-aligned on the meta row (r2 = model+effort "
+      "+ '5h82%')",
+      saw(lambda l: frame_subject(l) == "webapp" and "Opus" in frame_r2(l)
+          and frame_r2(l).endswith(" 5h82%")))
 check("waiting session auto-surfaces and flashes (infra/WAIT, flash bit set)",
       saw_after(idx_wait, lambda l: frame_subject(l) == "infra"
                 and frame_r1(l).startswith("WAIT") and frame_flash(l)))

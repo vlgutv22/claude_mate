@@ -66,9 +66,14 @@ def drain():
         if not d: break
 threading.Thread(target=drain, daemon=True).start()
 
+# Hermetic: an EMPTY accounts dir (real profiles in ~/.claude-accounts would
+# pop the interactive account picker and hang on the PTY), usage polling off
+# (no keychain/network from a test run).
 env = dict(os.environ, CLAUDE_MATE_SOCK=sock, CLAUDE_REAL=fake,
            PATH=stubdir + os.pathsep + os.environ.get("PATH", ""),
-           TERM_PROGRAM="iTerm.app")
+           TERM_PROGRAM="iTerm.app",
+           CLAUDE_MATE_ACCOUNTS_DIR=os.path.join(tmp, "no-accounts"),
+           CLAUDE_MATE_USAGE_POLL_S="0")
 print("== launching wrapper around fake claude ==")
 proc = subprocess.Popen([sys.executable, WRAP], stdin=s, stdout=s,
                         stderr=subprocess.PIPE, env=env)

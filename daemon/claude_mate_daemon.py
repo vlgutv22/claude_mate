@@ -16,9 +16,12 @@ The "brain" of the Claude Mate USB hardware companion. It:
      the selected session (normally the queue head, i.e. the thing that needs
      the human most) as a pre-composed 4-row (all size-1) text frame:
 
-         F|<flash>|<name>|<state+time>|<model+effort>|<pos + fleet letters>
+         F|<flags>|<sel>|<name>|<state+time · account>|<model+effort · limit>
+          |<pos + fleet letters>
 
-     The firmware is a dumb renderer; ALL layout/ordering/selection lives here.
+     (account = which login the session runs as, limit = its remaining-limit
+     chip, both right-aligned; empty for hook-driven sessions.) The firmware
+     is a dumb renderer; ALL layout/ordering/selection lives here.
   4. Reads button events from the Arduino on a background thread. The buttons
      mean the same thing at all times (no modes):
         H     -> handshake; the daemon resends the full current state.
@@ -183,6 +186,8 @@ class Session:
     state_since: float = field(default_factory=time.time)  # when current state began
     model: str = ""                # model in use, e.g. "Opus 4.8" (PTY wrapper)
     effort: str = ""               # effort level, e.g. "xhigh" (PTY wrapper)
+    account: str = ""              # account the session runs as, e.g. "work" (PTY wrapper)
+    limit: str = ""                # remaining-limit chip, e.g. "5h82%" (PTY wrapper)
     focus_ctrl: str = ""           # PTY-wrapper control socket for FOCUS (if any)
     acked: bool = True             # alert (done/waiting/error) seen by the human?
     last_ack_state: str = ""       # alert class most recently acknowledged...
@@ -210,7 +215,8 @@ class Registry:
 
     def update(self, state: str, sid: str, name: str, cwd: str = "",
                focus_ctrl: str = "", model: str = "",
-               effort: str = "") -> Optional[str]:
+               effort: str = "", account: str = "",
+               limit: str = "") -> Optional[str]:
         """Apply a status update from a hook, the PTY wrapper, or the mock injector.
 
         Returns the one-shot LED KIND for this session's own transition
@@ -243,6 +249,10 @@ class Registry:
                 sess.model = model
             if effort:
                 sess.effort = effort
+            if account:
+                sess.account = account
+            if limit:
+                sess.limit = limit
             prev_state = sess.state
             sess.last_update_ts = now
 
@@ -638,8 +648,9 @@ class Screen:
                  subject: Optional[Session]) -> Tuple[str, Optional[str], bool]:
         """Build the F| line for the current state:
             F|<flags>|<sel>|<r0>|<r1>|<r2>|<r3>
-        with four size-1 rows (r0 name / r1 state+time / r2 model+effort /
-        r3 position + '|'-separated fleet letters). `flags` is a bitfield
+        with four size-1 rows (r0 name / r1 state+time + account / r2
+        model+effort + remaining-limit chip / r3 position + fleet letters).
+        `flags` is a bitfield
         (bit0 = flash the name, bit1 = FOLLOW mode -> fill the switch box);
         `sel` is the character column WITHIN r3 of the active tab's fleet
         letter to box (-1 = none). Returns (line, subject_key, flash). r3 is
@@ -656,8 +667,22 @@ class Screen:
         tag = STATE_TAG.get(subject.state, "IDLE")
         t = _fmt_time(subject.display_seconds())
         r1 = f"{tag:<4}  {t}"[:ROW_CHARS]
+        # Account the session runs as (PTY wrapper), right-aligned on the
+        # state row with a >= 2-space gap; truncated to what fits.
+        acct = _sanitize(subject.account).strip()
+        room = ROW_CHARS - len(r1) - 2
+        if acct and room >= 2:
+            r1 += acct[:room].rjust(ROW_CHARS - len(r1))
 
-        r2 = _fit_meta(subject.model, subject.effort, ROW_CHARS)
+        # Remaining-limit chip (e.g. "5h82%"), right-aligned on the meta row;
+        # model+effort best-fit into what the chip leaves (>= 2-space gap).
+        lim = _sanitize(subject.limit).strip()[:8]
+        if lim:
+            left = _fit_meta(subject.model, subject.effort,
+                             ROW_CHARS - len(lim) - 2)
+            r2 = (left + lim.rjust(ROW_CHARS - len(left)))[:ROW_CHARS]
+        else:
+            r2 = _fit_meta(subject.model, subject.effort, ROW_CHARS)
 
         pos = 1
         for i, s in enumerate(queue):
@@ -993,9 +1018,10 @@ class SocketServer(threading.Thread):
             return
         if not line:
             return
-        # Expected: "<state>|<session_id>|<name>|<ctrl_sock?>|<model?>|<effort?>".
-        # The hook path sends only the first three fields; the PTY wrapper adds
-        # the control socket and (when it has scraped them) the model + effort.
+        # Expected: "<state>|<session_id>|<name>|<ctrl_sock?>|<model?>|<effort?>
+        # |<account?>|<limit?>". The hook path sends only the first three
+        # fields; the PTY wrapper adds the control socket, the scraped model +
+        # effort, the account it runs as, and the remaining-limit chip.
         # state may be "end" (from the PTY wrapper) to remove the session.
         parts = line.split("|")
         state = parts[0].strip() if len(parts) > 0 else ""
@@ -1004,6 +1030,8 @@ class SocketServer(threading.Thread):
         ctrl = parts[3].strip() if len(parts) > 3 else ""  # wrapper focus socket
         model = parts[4].strip() if len(parts) > 4 else ""
         effort = parts[5].strip() if len(parts) > 5 else ""
+        account = parts[6].strip() if len(parts) > 6 else ""
+        limit = parts[7].strip() if len(parts) > 7 else ""
         if not state:
             log(f"ignoring malformed socket line: {line!r}")
             return
@@ -1016,7 +1044,8 @@ class SocketServer(threading.Thread):
             return
         log(f"socket update: state={state} sid={sid or '-'} name={name or '-'}")
         haptic = self._reg.update(state, sid, name, focus_ctrl=ctrl,
-                                  model=model, effort=effort)
+                                  model=model, effort=effort,
+                                  account=account, limit=limit)
         self._on_update()
         if haptic and self._on_haptic:
             log(f"LED: {haptic} transition for {name or sid} ({state})")
@@ -1295,15 +1324,15 @@ class MockInjector(threading.Thread):
         for (sid, name, cwd), st in zip(fakes, seeds):
             self._reg.update(st, sid, name, cwd)
         demo_meta = {
-            "webapp": ("Opus 4.8", "xhigh"),
-            "api":    ("Sonnet 4.6", "high"),
-            "infra":  ("Haiku 4.5", "medium"),
-            "notes":  ("Opus 4.8", "max"),
+            "webapp": ("Opus 4.8", "xhigh", "work", "5h82%"),
+            "api":    ("Sonnet 4.6", "high", "default", "5h97%"),
+            "infra":  ("Haiku 4.5", "medium", "default", "wk31%"),
+            "notes":  ("Opus 4.8", "max", "work", "5h82%"),
         }
-        with self._reg._lock:  # set demo model / effort strings directly
+        with self._reg._lock:  # set demo model/effort/account/limit directly
             for s in self._reg._sessions.values():
                 if s.name in demo_meta:
-                    s.model, s.effort = demo_meta[s.name]
+                    s.model, s.effort, s.account, s.limit = demo_meta[s.name]
         self._on_update()
 
         step = 0
