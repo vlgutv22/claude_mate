@@ -1,0 +1,82 @@
+name: 🐛 Bug report
+description: Something in the daemon, wrapper, hooks, or firmware isn't behaving.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for taking the time to file a bug! Please fill in as much as you can.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you see, and what did you expect instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Run `python3 daemon/claude_mate_daemon.py ...`
+        2. ...
+        3. See ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: feed
+    attributes:
+      label: How are you feeding the daemon?
+      options:
+        - Claude Code hooks
+        - PTY wrapper (claude-mate-wrap)
+        - Both
+        - "--mock (no feed / no hardware)"
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Which component(s)?
+      multiple: true
+      options:
+        - Daemon (Python)
+        - PTY wrapper
+        - Hooks
+        - Firmware (Arduino)
+        - Docs / packaging
+    validations:
+      required: true
+
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      description: macOS version, Python version, board (Nano clone / USB-serial chip), terminal app.
+      placeholder: "macOS 15.5, Python 3.12, Arduino Nano (CH340), iTerm2"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / output
+      description: >-
+        Daemon output, `~/Library/Logs` entries, or `CLAUDE_MATE_DEBUG` snapshots.
+        Redact anything sensitive (tokens, paths).
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues for a duplicate.
+          required: true
+        - label: I tried the latest `main`.
+          required: false

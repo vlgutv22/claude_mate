@@ -1,5 +1,13 @@
 # Claude Mate
 
+[![CI](https://github.com/vlgutv22/claude_mate/actions/workflows/ci.yml/badge.svg)](https://github.com/vlgutv22/claude_mate/actions/workflows/ci.yml)
+[![Made for Claude Code](https://img.shields.io/badge/made%20for-Claude%20Code-D97757)](https://claude.com/claude-code)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Platform: macOS](https://img.shields.io/badge/platform-macOS-000000?logo=apple&logoColor=white)](docs/INSTALL.md)
+[![Daemon: Python 3.9+](https://img.shields.io/badge/daemon-Python%203.9%2B-3776AB?logo=python&logoColor=white)](daemon/claude_mate_daemon.py)
+[![Firmware: Arduino Nano](https://img.shields.io/badge/firmware-Arduino%20Nano-00979D?logo=arduino&logoColor=white)](firmware/claude_mate)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+
 A tiny USB hardware companion that shows the **live status of your Claude Code
 sessions** on a small OLED, **blinks an indication LED** the moment one of
 them needs you — finishes, gets blocked, or errors — and lets you **jump
@@ -30,6 +38,23 @@ in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
    FOLLOW:    double-click GO → a ► marker appears; PREV/NEXT then also raise the selected terminal (raise only)
    the LED:   START 1 s blink · INPUT even blink · DONE 4-blink cascade · ERROR fast strobe  (loops until you GO/ack)
 ```
+
+---
+
+## Contents
+
+- [What it is](#what-it-is)
+- [Two ways to feed it](#two-ways-to-feed-it)
+- [Features](#features)
+- [Architecture](#architecture)
+- [LED alerts & the acknowledge model](#led-alerts--the-acknowledge-model)
+- [Bill of Materials](#bill-of-materials)
+- [Quick start](#quick-start) · [Configuration](#configuration)
+- [How the status maps to your sessions](#how-the-status-maps-to-your-sessions)
+- [Repository layout](#repository-layout)
+- [Limitations](#limitations)
+- [Changelog](#changelog)
+- [License](#license)
 
 ---
 
@@ -268,9 +293,9 @@ out left→right as **PREV | GO | NEXT**.
 ## Quick start
 
 1. **Build & flash the firmware** (`firmware/claude_mate/claude_mate.ino`) onto
-   the Arduino Nano. Install the libraries via the Arduino Library Manager:
-   **Adafruit GFX** and **Adafruit SSD1306** (the OLED is the only thing that
-   needs a library).
+   the Arduino Nano. Install **Adafruit GFX** via the Arduino Library Manager —
+   it is the only external library needed (the SSD1306 itself is driven by the
+   bundled `softssd1306.h`, a software-I2C `Adafruit_GFX` subclass).
 2. **Run the daemon** on your Mac:
    ```sh
    python3 daemon/claude_mate_daemon.py
@@ -447,75 +472,11 @@ claude_mate/
 
 ---
 
-## What changed (2026-07-07)
+## Changelog
 
-- **The selection is now fully sticky.** The ~10 s idle auto-surface is gone:
-  the screen **never** switches tabs on its own. Alerts elsewhere announce
-  themselves via the LED and their blinking fleet letters; you browse with
-  PREV/NEXT.
-- **FOLLOW's ► marker no longer overdraws the account name.** While FOLLOW is
-  on, the daemon keeps the last two columns of the state row blank (the
-  right-aligned account shifts left), so the play triangle has its own space.
-
----
-
-## What changed (2026-07-05)
-
-The device interface was rewritten from scratch — **one screen, one queue,
-three buttons**:
-
-- **UI modes are gone.** No SCROLL/LIST toggle, no carousel, no detail card, no
-  mode long-press. The daemon keeps ONE **stable, alphabetically-ordered** triage
-  queue (tabs never shuffle; urgency is tracked separately, for the LED + idle
-  auto-surface only) and pre-renders ONE screen — four size-1 rows (name ·
-  state+time+account · model+effort+remaining-limit · position+fleet strip);
-  the firmware is a dumb one-frame renderer.
-- **Buttons are PREV / GO / NEXT everywhere.** GO short = acknowledge + raise
-  the shown window (WYSIWYG); GO **double-click** = toggle FOLLOW mode; GO long
-  = acknowledge only; PREV/NEXT auto-repeat while held. A GO/ACK **stays on the
-  tab** it acted on (no auto-switch); after ~10 s idle the display auto-surfaces
-  the most-urgent unacknowledged alert at its stable position (else the first
-  tab).
-- **Navigation never touches windows** (except in FOLLOW mode, which raises
-  only). The old terminal-follow preview (collapse/expand on every navigation)
-  is gone; the daemon never sends `collapse`.
-- **Serial protocol simplified.** Down: `F|<flags>|<sel>|<r0>|<r1>|<r2>|<r3>` +
-  `V|<kind>` + `P`. Up: `H` + `B|P` / `B|N` / `B|G` / `B|K`. The old
-  `D|` / `S|` / `T|` / `I` lines and `B|1`..`B|5` are gone.
-- **Firmware additions:** a boot splash, a **LINK LOST** screen after ~30 s of
-  daemon silence, and an ~80 ms whole-panel invert blip on every accepted
-  press. LED semantics are unchanged (START one-shot; INPUT / ERROR / DONE loop
-  until acknowledged; OFF).
-- The hook, the PTY wrapper, the socket protocol, and the wiring are unchanged
-  (button *roles* renamed: D4 MODE → PREV, D2 SUBMIT → GO).
-
----
-
-## What changed (2026-06-29)
-
-A big iteration day. Highlights:
-
-- **Hardware redesign:** dropped the stepper-driven status wheel; the device is
-  now a **0.91" 128×32 OLED + micro vibration motor + 3 buttons**. The OLED shows
-  a per-session status card (state + live timer + acknowledge dot).
-- **New PTY wrapper** (`bin/claude-mate-wrap`): wrap `claude` to read its **live
-  TUI state** (errors, prompts, pickers, background-workflow "still busy") and to
-  raise the **exact terminal** on FOCUS (by TTY). Safe to install as a global
-  `claude` shim.
-- **Per-session haptics + acknowledge model:** the motor buzzes for *each
-  session's own* start/finish/block/error (`V|<KIND>`). The DONE and ERROR alerts
-  **loop** in the firmware (waiting re-taps every ~10 s) until you FOCUS, which
-  sends `V|OFF`; a finished turn stays "done" until seen. The OLED carries a
-  blinking/hollow ack dot.
-- **No blind auto-carousel:** the screen auto-surfaces the single most-urgent
-  unacknowledged tab; NEXT/PREV browse manually and pause auto-surface ~10 s.
-- **Tighter detection:** `patterns.json` (hot-reloadable), state matching scoped
-  to the live status region (bottom ~20 lines) + footer-only picker phrases,
-  option-pickers treated as **waiting**, and `usage limit reached` treated as
-  **error**.
-- **Live time-in-state** timer; gentle **looping** DONE/ERROR haptics (soft
-  heartbeat / alarm) that stop on FOCUS via `V|OFF`; assorted reliability fixes
-  (loop-idempotent sends, daemon-silence watchdog, handshake resend, nav-pause order).
+Dated release notes live in **[CHANGELOG.md](CHANGELOG.md)** — the from-zero
+interface rewrite, account profiles, the on-device account + remaining-limit
+chip, and the move to a fully sticky selection.
 
 ---
 

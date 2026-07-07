@@ -1,0 +1,39 @@
+name: 💡 Feature request / idea
+description: Suggest an improvement to Claude Mate.
+title: "[idea] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: What are you trying to do that's hard or impossible today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - Device UI / LED
+        - State detection (patterns.json)
+        - Wrapper / terminal focus
+        - Daemon
+        - Firmware / hardware
+        - Docs / packaging
+    validations:
+      required: false

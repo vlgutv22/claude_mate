@@ -27,8 +27,9 @@ The firmware targets an **Arduino Nano (ATmega328P)** with an SSD1306 0.91"
 ### Arduino IDE
 
 1. Open `firmware/claude_mate/claude_mate.ino`.
-2. Install the OLED driver library (e.g. Adafruit SSD1306 + Adafruit GFX) via
-   the Library Manager.
+2. Install the **Adafruit GFX** library via the Library Manager — it is the
+   only external dependency (the SSD1306 is driven by the bundled
+   `softssd1306.h`, a software-I2C `Adafruit_GFX` subclass).
 3. Select **Tools → Board → Arduino Nano** and the correct processor
    (old/new bootloader as appropriate for your clone).
 4. Select the serial port and click **Upload**.
@@ -40,9 +41,11 @@ arduino-cli compile --fqbn arduino:avr:nano firmware/claude_mate
 arduino-cli upload  --fqbn arduino:avr:nano -p /dev/cu.usbserial-XXXX firmware/claude_mate
 ```
 
-The only firmware library dependency is the OLED driver (**Adafruit SSD1306** +
-**Adafruit GFX**) — there is no AccelStepper/stepper anymore. The vibration
-motor on D5 is driven with plain `digitalWrite` timing, no library required.
+The only firmware library dependency is **Adafruit GFX**; the SSD1306 itself is
+driven by the bundled `softssd1306.h` (a software-I2C `Adafruit_GFX` subclass —
+the Nano's hardware-I2C SCL pin was damaged, so SCL is bit-banged on A3; see the
+header comment). There is no stepper and no vibration motor: the sole alert
+output is the **indication LED on D8**, driven with plain `digitalWrite` timing.
 
 See [docs/WIRING.md](docs/WIRING.md) for the full pinout.
 
@@ -87,8 +90,8 @@ For end-to-end setup including the hooks, follow
   must come from the standard library.
 - Keep it clean, commented, and runnable with
   `python3 daemon/claude_mate_daemon.py`.
-- Use **threads + locks** for the serial reader, socket server, and carousel.
-  No busy-wait spinning.
+- Use **threads + locks** for the serial reader, the socket server, and the
+  render/refresh loop. No busy-wait spinning.
 - Keep the serial port open continuously; auto-detect and auto-reconnect; never
   crash on a missing port.
 - The `--mock` flag must keep working — it is how reviewers demo the device.
@@ -122,14 +125,16 @@ For end-to-end setup including the hooks, follow
 Validate changes from the bottom up, the same ladder used in
 [docs/TESTING.md](docs/TESTING.md):
 
-1. **Daemon in `--mock` mode** — exercises the display/word/carousel logic with
-   fake sessions and no hardware or Claude.
+1. **Daemon in `--mock` mode** — exercises the triage-queue, screen-rendering,
+   and LED-policy logic with fake sessions and no hardware or Claude.
 2. **Serial loopback / protocol** — verify the `|`-delimited lines the daemon
-   emits and the `H` / `B|<n>` lines it consumes (see
+   emits (`F|…`, `V|…`, `P`) and the `H` / `B|P` / `B|N` / `B|G` / `B|K` lines it
+   consumes (see
    [docs/PROTOCOL.md](docs/PROTOCOL.md)).
-3. **Firmware on the bench** — flash the Nano, confirm the OLED cycles the word
-   (FREE/WIP/BLOCKED/WTF), the vibration motor buzzes on each change, and all
-   three buttons (FOCUS/NEXT/PREV) respond.
+3. **Firmware on the bench** — flash the Nano, confirm the OLED renders the
+   frame the daemon sends, the indication LED plays the alert patterns
+   (START / INPUT / DONE / ERROR), and all three buttons (**PREV / GO / NEXT**)
+   respond.
 4. **End-to-end** — run the daemon against real hardware, install the hooks, and
    drive real Claude Code sessions through `working → waiting → error → done`.
 

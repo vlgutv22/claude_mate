@@ -1,0 +1,23 @@
+version: 2
+updates:
+  # Keep GitHub Actions used by the CI workflow current.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
+
+  # The daemon's only runtime dependency (pyserial) and the wrapper's (pyte).
+  - package-ecosystem: pip
+    directory: "/daemon"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "deps"
+  - package-ecosystem: pip
+    directory: "/bin"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "deps"

@@ -24,9 +24,12 @@ physical USB device.
   to the socket path) can write session messages to the daemon. The socket lives
   under a world-writable directory (`/tmp`) by default; set `CLAUDE_MATE_SOCK` to
   a path in a directory only you can access if you want to restrict this.
-- **FOCUS actions.** A FOCUS button press causes the daemon to run a local
-  command (a VS Code deep link via `open`, with a window-raise fallback for a
-  known working directory). These act on locally-known session data only.
+- **FOCUS actions.** A GO (FOCUS) button press causes the daemon to raise a
+  window: for a wrapped session it connects to that session's local control
+  socket and the wrapper raises **its own terminal** (AppleScript / `open`);
+  hook-only sessions fall back to a VS Code deep link, then a window-raise for
+  the workspace folder. These act on locally-known session data only, and the
+  operation is **raise-only** — nothing is ever moved, resized, or closed.
 - **Untrusted serial input.** The daemon treats input from the serial device as
   untrusted and parses it defensively; the firmware likewise tolerates and
   discards malformed lines.
