@@ -11,8 +11,8 @@ Prerequisites: a Mac, **Python 3.9+**, the **Arduino IDE**, and your assembled
 hardware (see [WIRING.md](WIRING.md)). The only third-party Python dependency is
 **pyserial**.
 
-The project lives at `/Users/vlgutv/Projects/claude_mate` (referred to below as
-`$REPO`).
+Put the project wherever you like — this guide refers to its root as `$REPO`
+(e.g. `~/src/claude_mate`).
 
 ---
 
