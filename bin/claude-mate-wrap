@@ -17,9 +17,11 @@ Run `claude` THROUGH this wrapper (alias claude=claude-mate-wrap). It:
   4. Listens on a per-session control socket for window commands, auto-picking
      the method from $TERM_PROGRAM (iTerm2 / Terminal.app / VS Code / tmux /
      generic): 'focus' raises (and un-minimizes) THIS terminal window — selects
-     the session's tab and brings its window to the front via the terminal app's
-     own scripting (macOS Automation; no Accessibility permission needed) — sent
-     on the GO button;
+     the session's tab and brings its window to the front (macOS Automation, no
+     Accessibility permission). Terminal.app's activate+frontmost has a one-raise
+     lag that surfaces the wrong window, so there we skip activate when Terminal
+     is already frontmost and front our exact window directly (de-miniaturize if
+     collapsed, else set-frontmost) — sent on the GO button;
      'collapse' miniaturizes it — sent when the card moves on. Commands are
      acked in two stages — 'go' on receipt (liveness), 'ok' only after the
      window op completes — so the daemon can order window ops ACROSS sessions
@@ -260,10 +262,10 @@ def send_daemon(state):
 # --------------------------------------------------------------------------- #
 # Focus: raise THIS terminal window, method chosen from $TERM_PROGRAM
 # --------------------------------------------------------------------------- #
-def _osa(script):
+def _osa(script, timeout=4):
     try:
         subprocess.run(["osascript", "-e", script],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=4)
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout)
     except Exception:
         pass
 
@@ -303,27 +305,61 @@ def focus_self():
               end repeat
             end tell''')
     elif tp == "apple_terminal":
-        # Bring Terminal forward, then make THIS tab (matched by its TTY) the
-        # selected, front window. Un-miniaturize first: the daemon's nav
-        # preview may have collapsed this window to the Dock, and selecting a
-        # tab of a miniaturized window would not restore it. (macOS raises an
-        # app's windows as a group; we ensure ours ends up on top + focused.)
+        # Raise THIS window (matched by its TTY) to the front of Terminal.app,
+        # reliably, with NO Accessibility permission.
+        #
+        # The naive `activate` + `set frontmost of w to true` is broken: after
+        # `activate`, Terminal fronts whatever its *current key window* is and a
+        # `set frontmost` only lands on the NEXT `activate` -- a one-raise LAG
+        # that surfaces the window you picked LAST time (raise #3 brings #2
+        # forward). `activate` is the whole problem: it re-keys Terminal's own
+        # last window and stomps our selection. So we AVOID it whenever we can
+        # and never let it fight our selection:
+        #   - Only `activate` when Terminal is NOT already the frontmost app
+        #     (needed just to cross over from another app on GO). Reading which
+        #     process is frontmost via System Events needs no Accessibility --
+        #     only *manipulating* windows through it would.
+        #   - Then front OUR window directly, with no `activate` after it to
+        #     re-key: de-miniaturize it if it's collapsed (the one op that
+        #     dependably fronts a minimized window), else `set frontmost` (which
+        #     is reliable for a visible window once `activate` isn't stomping it).
+        # No miniaturize/restore dance -> no window flicker. Note "front window"
+        # here means the lowest-index NON-miniaturized window; a miniaturized
+        # window can still report index 1, so don't gate on index.
         _osa(f'''
+            tell application "System Events"
+              set termFront to ((name of first process whose frontmost is true) is "Terminal")
+            end tell
+            if not termFront then
+              tell application "Terminal" to activate
+              repeat 30 times
+                delay 0.03
+                tell application "System Events"
+                  if ((name of first process whose frontmost is true) is "Terminal") then exit repeat
+                end tell
+              end repeat
+            end if
             tell application "Terminal"
-              activate
+              set tg to missing value
               repeat with w in windows
                 repeat with t in tabs of w
                   try
                     if (tty of t) is "{MY_TTY}" then
-                      set miniaturized of w to false
                       set selected of t to true
-                      set frontmost of w to true
-                      return
+                      set tg to w
+                      exit repeat
                     end if
                   end try
                 end repeat
+                if tg is not missing value then exit repeat
               end repeat
-            end tell''')
+              if tg is missing value then return
+              if miniaturized of tg then
+                set miniaturized of tg to false
+              else
+                set frontmost of tg to true
+              end if
+            end tell''', timeout=8)
     elif tp == "vscode":
         # Can't target a specific integrated-terminal pane externally; raise VS Code.
         _osa('tell application "Visual Studio Code" to activate')
