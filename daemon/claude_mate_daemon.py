@@ -35,17 +35,17 @@ The "brain" of the Claude Mate USB hardware companion. It:
         B|K   -> GO (long press): acknowledge the shown session's alert WITHOUT
                  touching any window.
      A GO/ACK never auto-switches tabs -- it stays on the session it acted on.
-     (After 10 s idle the screen returns to the queue head on its own, so the
-     next alert surfaces without yanking the view mid-press.)
      Double-clicking GO toggles FOLLOW mode: PREV/NEXT then also raise the
      selected terminal (raise only, after the selection settles).
   5. Drives the indication LED via V|<KIND>: the pattern for the WORST
      unacknowledged alert class, looping until acknowledged (V|OFF).
 
-Screen ownership rule: the display changes subject on its own ONLY when the
-user is idle (no button press for HOME_AFTER_S). A GO/ACK acts on EXACTLY the
-session whose frame is on the glass -- never a freshly recomputed head -- so a
-press can only ever raise the terminal the user is actually looking at.
+Screen ownership rule: the display NEVER changes subject on its own -- only
+PREV/NEXT/GO move it. Alerts on other tabs signal through the LED and their
+blinking fleet letters; the view stays where the user left it. A GO/ACK acts
+on EXACTLY the session whose frame is on the glass -- never a freshly
+recomputed head -- so a press can only ever raise the terminal the user is
+actually looking at.
 
 Only third-party dependency: pyserial.
 
@@ -98,9 +98,6 @@ DEFAULT_BAUD = 115200
 PORT_GLOBS = ("/dev/cu.usbserial*", "/dev/cu.usbmodem*")
 
 # Timings (seconds).
-HOME_AFTER_S = 10.0          # no press for this long -> selection returns to
-                             # the queue head; until then the screen NEVER
-                             # changes subject on its own
 DOUBLE_CLICK_S = 0.30        # two GO short-presses within this window = a
                              # double-click (toggles FOLLOW mode). A single GO
                              # is deferred this long to disambiguate.
@@ -312,9 +309,9 @@ class Registry:
 
     def top_alert(self) -> Optional["Session"]:
         """The most urgent unacknowledged session needing the human (error >
-        waiting > done, oldest first), or None. Drives the LED loop class and
-        the idle auto-surface. Sorted by URGENCY independently of the display
-        order (which is a stable alphabetical order, see queue())."""
+        waiting > done, oldest first), or None. Drives the LED loop class.
+        Sorted by URGENCY independently of the display order (which is a
+        stable alphabetical order, see queue())."""
         with self._lock:
             items = [s for s in self._sessions.values() if s.unacked_alert()]
         items.sort(key=lambda s: (STATE_ORDER.get(s.state, 99), s.state_since))
@@ -341,8 +338,8 @@ class Registry:
     def queue(self) -> List[Session]:
         """The display/navigation order: STABLE, alphabetical by name (then key
         as a deterministic tiebreak). Tabs keep their position as their states
-        change -- they never shuffle under the user. Urgency drives the LED and
-        the idle auto-surface separately (see top_alert()), not this order."""
+        change -- they never shuffle under the user. Urgency drives the LED
+        separately (see top_alert()), not this order."""
         with self._lock:
             items = list(self._sessions.values())
         items.sort(key=lambda s: (s.name.lower(), s.key))
@@ -541,8 +538,10 @@ class Screen:
         self._lock = threading.Lock()
         # Selection: a session KEY, or None meaning "the queue head". Tracked
         # by key so re-sorts never move the subject out from under the cursor.
+        # STICKY: only PREV/NEXT/GO (and the head fallback when the selected
+        # session vanishes) ever move it -- the screen never switches tabs on
+        # its own.
         self._sel_key: Optional[str] = None
-        self._last_press = 0.0
         # Last frame actually sent (dedup) + the key of the subject CURRENTLY
         # ON THE GLASS. A GO/ACK press acts on exactly this key (WYSIWYG), so
         # the raised terminal always matches the name the user is looking at.
@@ -558,9 +557,6 @@ class Screen:
 
     # ---- selection -------------------------------------------------------- #
 
-    def _interacting(self, now: float) -> bool:
-        return (now - self._last_press) < HOME_AFTER_S
-
     def _subject(self, queue: List[Session]) -> Optional[Session]:
         """The session the screen shows: the selected key if it still exists,
         else the queue head."""
@@ -575,10 +571,8 @@ class Screen:
 
     def nav(self, delta: int) -> None:
         """PREV/NEXT: move the selection by `delta` in queue order (wraps)."""
-        now = time.time()
         with self._lock:
             queue = self._reg.queue()
-            self._last_press = now
             if not queue:
                 return
             cur = self._subject(queue)
@@ -592,14 +586,12 @@ class Screen:
         self.refresh()
 
     def stay_on(self, sess: Optional[Session]) -> None:
-        """After focusing a CALM session (nothing to triage): keep it on the
-        glass instead of jumping to some alert elsewhere -- the user asked to
-        see this terminal, so the device stays on it."""
+        """After a GO/ACK: pin the selection to the session the press acted on
+        (and redraw, e.g. so its flash stops) -- the device stays on it."""
         if sess is None:
             return
         with self._lock:
             self._sel_key = sess.key
-            self._last_press = time.time()
         self.refresh()
 
     def toggle_follow(self) -> bool:
@@ -630,12 +622,9 @@ class Screen:
         """The session a GO/ACK press applies to: EXACTLY the one whose frame is
         on the glass (WYSIWYG). Never a freshly recomputed head -- so a press
         can only ever act on the name the user is actually looking at. Falls
-        back to the queue head only if the shown session has vanished. Also
-        counts this press for the interaction window."""
-        now = time.time()
+        back to the queue head only if the shown session has vanished."""
         with self._lock:
             queue = self._reg.queue()
-            self._last_press = now
             if self._shown_key is not None:
                 for s in queue:
                     if s.key == self._shown_key:
@@ -651,7 +640,7 @@ class Screen:
         with four size-1 rows (r0 name / r1 state+time + account / r2
         model+effort + remaining-limit chip / r3 position + fleet letters).
         `flags` is a bitfield
-        (bit0 = flash the name, bit1 = FOLLOW mode -> fill the switch box);
+        (bit0 = flash the name, bit1 = FOLLOW mode -> draw the play marker);
         `sel` is the character column WITHIN r3 of the active tab's fleet
         letter to box (-1 = none). Returns (line, subject_key, flash). r3 is
         LAST and may contain literal '|' (the firmware stops tokenizing at the
@@ -668,11 +657,15 @@ class Screen:
         t = _fmt_time(subject.display_seconds())
         r1 = f"{tag:<4}  {t}"[:ROW_CHARS]
         # Account the session runs as (PTY wrapper), right-aligned on the
-        # state row with a >= 2-space gap; truncated to what fits.
+        # state row with a >= 2-space gap; truncated to what fits. FOLLOW's
+        # play triangle is drawn over the last two columns of this row, so
+        # those stay blank while following (the account shifts/truncates left
+        # instead of being overdrawn).
         acct = _sanitize(subject.account).strip()
-        room = ROW_CHARS - len(r1) - 2
+        width = ROW_CHARS - (2 if follow else 0)
+        room = width - len(r1) - 2
         if acct and room >= 2:
-            r1 += acct[:room].rjust(ROW_CHARS - len(r1))
+            r1 += acct[:room].rjust(width - len(r1))
 
         # Remaining-limit chip (e.g. "5h82%"), right-aligned on the meta row;
         # model+effort best-fit into what the chip leaves (>= 2-space gap).
@@ -723,22 +716,16 @@ class Screen:
         commit-time are ordered -- a preempted caller can never commit a stale
         frame over a newer one (Screen -> Registry lock nesting is safe: the
         registry never takes the Screen lock)."""
-        now = time.time()
         with self._lock:
             queue = self._reg.queue()
-            if not self._interacting(now):
-                # Idle: auto-surface the most-urgent unacked alert (at its
-                # stable position); if nothing needs the human, rest on the
-                # first tab. The tab ORDER never changes -- only which one is
-                # shown.
-                top = self._reg.top_alert()
-                self._sel_key = top.key if top is not None else None
             subject = self._subject(queue)
-            if self._interacting(now) and subject is not None:
-                # Interacting: PIN whatever is rendered, so the screen cannot
-                # change subject on its own inside the interaction window
-                # (covers a pinned session vanishing -> head fallback, and an
-                # idle screen whose first press should anchor the subject).
+            if subject is not None:
+                # The screen NEVER switches tabs on its own: anchor the
+                # selection to whatever is rendered (the first tab when nothing
+                # was ever selected, the head fallback after the selected
+                # session vanished), so it stays put until the user navigates.
+                # Alerts elsewhere signal via the LED and their blinking fleet
+                # letters only.
                 self._sel_key = subject.key
             line, key, flash = self._compose(queue, subject)
             changed = (line != self._last_frame)
@@ -1203,8 +1190,7 @@ class ButtonReader(threading.Thread):
     def _go(self) -> None:
         """A confirmed single GO: raise the terminal of EXACTLY the session
         shown on the glass (WYSIWYG), acknowledge it, and STAY on it -- the
-        device never auto-switches tabs on a press. (After 10 s idle the screen
-        returns to the queue head on its own.)"""
+        device never auto-switches tabs."""
         sess = self._screen.resolve_press_target()
         log(f"GO -> focus {sess.name if sess else '-'}")
         if sess is None:
@@ -1270,8 +1256,8 @@ class SerialMaintainer(threading.Thread):
 
 class Ticker(threading.Thread):
     """1 Hz housekeeping: prunes stale sessions, keeps the displayed times
-    ticking (the frame is re-sent only when its bytes actually change), snaps
-    the selection home after the interaction window, and keeps the LED honest."""
+    ticking (the frame is re-sent only when its bytes actually change), and
+    keeps the LED honest."""
 
     def __init__(self, screen: Screen, registry: Registry) -> None:
         super().__init__(name="ticker", daemon=True)

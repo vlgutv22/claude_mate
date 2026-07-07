@@ -64,11 +64,11 @@ collapses, resizes, or miniaturizes anything.
 never a freshly recomputed most-urgent alert. So a press can only ever raise the
 terminal whose name the user is actually looking at.
 
-**No auto-switch:** a GO/ACK **stays on the tab it acted on** — the device
-never jumps to another tab on a press. The screen only changes subject when you
-navigate, or after **10 s** of no presses, when it auto-surfaces the most-urgent
-unacknowledged alert (at its stable position) — so the next alert surfaces on
-its own without yanking the view mid-press. The tab **order** never changes.
+**No auto-switch, ever:** the selection is **sticky** — the screen only
+changes subject when you navigate (PREV/NEXT), and a GO/ACK **stays on the tab
+it acted on**. An alert on another tab announces itself through the LED and its
+blinking fleet letter, never by stealing the screen. The tab **order** never
+changes either.
 
 ---
 
@@ -270,9 +270,9 @@ worst UNACKNOWLEDGED alert  (error > waiting > done, oldest first)
 ```
 
 * the **LED** loop class, and
-* the **idle auto-surface**: after 10 s of no presses the display shows this
-  most-urgent alert (at its stable position). If nothing is unacknowledged it
-  rests on the first tab.
+* which **fleet letters blink** (unacked alerts are sent lowercase).
+
+It never moves the selection: the shown tab is sticky.
 
 ### Ack lifecycle
 
@@ -295,12 +295,10 @@ silenced).
 
 * Tab order is **stable (alphabetical)** — tabs never change position as their
   states change. Selection is tracked by session **key**.
-* While the user is interacting (any press within 10 s) the screen never
-  changes subject on its own.
+* The selection is **sticky**: the screen never changes subject on its own.
+  Only when the selected session ends does it fall back to the first tab.
 * GO/ACK act on the session **currently shown** (WYSIWYG) and **stay** on it —
-  the device never auto-switches tabs on a press.
-* After 10 s without a press the display auto-surfaces the most-urgent
-  unacknowledged alert (at its stable position), else rests on the first tab.
+  the device never auto-switches tabs.
 * PREV/NEXT wrap around the ends.
 * **FOLLOW** (double-click GO) makes PREV/NEXT also raise the selected terminal
   after the selection settles (~250 ms); double-click again to turn it off.

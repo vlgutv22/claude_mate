@@ -41,8 +41,8 @@ in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
 The daemon keeps ONE **stable, alphabetically-ordered** **triage queue** of every
 Claude Code session (tabs never shuffle as their states change) and renders ONE
 screen: the *selected* session, over a whole-fleet letter strip. Urgency is
-tracked **separately** — it drives the LED and the idle auto-surface, never the
-tab order. The LED blinks a status-distinct pattern for the worst
+tracked **separately** — it drives the LED and the blinking fleet letters,
+never the tab order or which tab is shown. The LED blinks a status-distinct pattern for the worst
 *unacknowledged* alert — so a single tab finishing, blocking, or erroring is
 *seen* even while the rest of your fleet keeps working. It keeps blinking until
 you deal with it. There are **no UI modes**: the three buttons — **PREV · GO ·
@@ -77,21 +77,19 @@ hooks are the zero-dependency feed. Use whichever fits each session.
   fixed order (alphabetical by name, tiebroken by session key) so tabs **never
   shuffle under you** as their states change. **Urgency** is computed
   **separately** (worst unacknowledged alert: error → waiting → done, oldest
-  first) and drives only the LED and the idle auto-surface — never the tab
-  order. **PREV** / **NEXT** step the order manually (hold to auto-repeat,
-  wrapping at the ends), and while you're browsing (any press within ~10 s)
-  the screen never changes subject on its own.
+  first) and drives only the LED and the blinking fleet letters — never the
+  tab order. **PREV** / **NEXT** step the order manually (hold to auto-repeat,
+  wrapping at the ends); the screen **never changes subject on its own**.
 - **No UI modes** — the three buttons mean the same thing at all times:
   **PREV · GO · NEXT**. A short **GO** acknowledges the shown alert **and
   raises its window**; a **long-press of GO** (~0.5 s) acknowledges it
   **without** touching any window. Buttons fire instantly (edge-accepted
   ~40 ms debounce), and every accepted press inverts the whole panel for
   ~80 ms — instant "the device heard you" feedback.
-- **No auto-switch** — a GO/ACK stays on the tab it acted on; the device never
-  jumps to another tab on a press. After ~10 s without a press the screen
-  auto-surfaces the most-urgent unacknowledged alert at its stable position
-  (else rests on the first tab), so the next alert surfaces without yanking the
-  view mid-press.
+- **No auto-switch, ever** — the selection is **sticky**: only PREV/NEXT/GO
+  move it, and a GO/ACK stays on the tab it acted on. An alert on another tab
+  announces itself through the LED and its **blinking fleet letter**; the view
+  stays exactly where you left it until you navigate.
 - **Navigation never touches windows** — the ONLY window operation in the
   whole system is GO, and it only **raises/activates**; the daemon never
   collapses, resizes, or miniaturizes anything.
@@ -199,8 +197,8 @@ Two control flows worth calling out:
 > The **triage queue** is a **stable, alphabetically-ordered** list of sessions —
 > tabs never reorder as their states change. **Urgency** (worst unacknowledged
 > **error > waiting > done**, oldest first) is tracked **separately** and drives
-> only the LED and the idle auto-surface (which most-urgent alert the screen
-> rests on), never the tab order. The OLED's top row is the selected session's
+> only the LED and the blinking fleet letters, never the tab order or the shown
+> tab (the selection is sticky). The OLED's top row is the selected session's
 > **name**; its state (`ERR`/`WAIT`/`DONE`/`WORK`/`IDLE`) leads the second row.
 
 ---
@@ -379,12 +377,13 @@ never shuffle as their states change) and computes **urgency separately**:
 ```
 tab order:  STABLE — alphabetical by name (tiebreak: session key)
 urgency:    worst UNACKNOWLEDGED alert (error > waiting > done, oldest first)
-            → drives the LED loop + the idle auto-surface only, never the order
+            → drives the LED loop + the blinking fleet letters only,
+              never the order and never the shown tab
 ```
 
-Urgency is the **priority model** for two things only: what the LED blinks about,
-and — after ~10 s of no presses — which alert the screen auto-surfaces (at its
-stable position; if nothing is unacknowledged it rests on the first tab). The LED
+Urgency is the **priority model** for two things only: what the LED blinks
+about, and which fleet letters blink on the strip. The shown tab is **sticky**:
+the screen never switches on its own — you navigate with PREV/NEXT. The LED
 pattern is always the class of the worst *unacknowledged* alert (`ERROR` >
 `INPUT` > `DONE`), dropping to `V|OFF` when nothing needs you. GO/ACK act on the
 session **currently shown** (WYSIWYG) and never move the tab order. With zero
@@ -445,6 +444,18 @@ claude_mate/
   tweak — which you can do live, no restart.
 - **macOS-focused.** The daemon and wrapper target a Mac (serial device naming,
   `open`, AppleScript focus). Other platforms would need port/focus adjustments.
+
+---
+
+## What changed (2026-07-07)
+
+- **The selection is now fully sticky.** The ~10 s idle auto-surface is gone:
+  the screen **never** switches tabs on its own. Alerts elsewhere announce
+  themselves via the LED and their blinking fleet letters; you browse with
+  PREV/NEXT.
+- **FOLLOW's ► marker no longer overdraws the account name.** While FOLLOW is
+  on, the daemon keeps the last two columns of the state row blank (the
+  right-aligned account shifts left), so the play triangle has its own space.
 
 ---
 

@@ -186,23 +186,24 @@ python3 $REPO/daemon/claude_mate_daemon.py --mock
 `--mock` injects a few fake sessions that cycle through states (including a
 `waiting` session, so all four words appear). Watch the real hardware:
 
-- The **screen** auto-surfaces the most-urgent unacked session (an unacked
-  `error` first, then `waiting`, then `done`) at its stable position; its name
-  row **flashes** while the alert is unacknowledged. As the mock states cycle,
-  the surfaced subject follows the worst unacked alert — but the tab **order**
-  (the fleet strip) stays alphabetical and never shuffles.
+- The **screen** stays on the tab you selected (it starts on the first tab
+  and NEVER switches on its own); the shown session's name row **flashes**
+  while its own alert is unacknowledged. Alerts on other tabs show as
+  **blinking fleet letters** in the strip — the tab **order** stays
+  alphabetical and never shuffles.
 - The **LED** plays the pattern of the worst unacked class (`V|ERROR` strobe >
   `V|INPUT` blink > `V|DONE` cascade), looping until acknowledged; a calm
   `V|START` blink fires when a session starts working with nothing else pending.
 - Press **NEXT** / **PREV** → the selection steps down/up the stable
-  (alphabetical) order (wraps); the screen then stays where you put it for
-  ~10 s after your last press.
+  (alphabetical) order (wraps); the screen then stays where you put it —
+  indefinitely.
 - Press **GO** → the daemon acknowledges the session **shown on the glass**
   (WYSIWYG) and attempts to raise its window (in mock, watch the daemon log for
   the focus call); the display **stays on that tab** (no auto-switch).
 - **Hold GO** (~0.5 s) → acknowledges WITHOUT any window op; the flashing and
-  the LED loop stop, and the display stays on the tab. (After ~10 s idle the
-  view auto-surfaces the next most-urgent unacked alert, at its stable position.)
+  the LED loop stop, and the display stays on the tab. (Any remaining unacked
+  alerts keep blinking their fleet letters and driving the LED — the view
+  doesn't move.)
 - **Double-click GO** → toggles FOLLOW mode (a ► marker appears); PREV/NEXT
   then also raise the selected terminal after it settles.
 
@@ -250,17 +251,19 @@ and the hooks merged (see [INSTALL.md](INSTALL.md)):
 1. Open a Claude Code session (VS Code extension or CLI) and **submit a prompt**
    (`UserPromptSubmit`) → a `WORK` frame appears and a one-shot `V|START`
    blink fires (if nothing else needs you).
-2. Trigger a **Notification** (e.g. a permission prompt) → the session
-   auto-surfaces as a flashing `WAIT` frame and the `V|INPUT` blink **loops**
-   until you GO / hold GO / answer in the terminal.
+2. Trigger a **Notification** (e.g. a permission prompt) → the `V|INPUT`
+   blink **loops** and that session's fleet letter blinks until you navigate
+   to it and GO / hold GO / answer in the terminal (shown, its `WAIT` frame
+   flashes; the screen does not jump there on its own).
 3. Let a turn **complete** (`Stop`) → a flashing `DONE` frame and a `V|DONE`
    cascade that **loops** until acknowledged.
 4. Cause an **API error** (`StopFailure`) → a flashing `ERR` frame and a
    `V|ERROR` strobe that **loops** until acknowledged. (`StopFailure` fires
    instead of `Stop` on API errors — they never both fire.)
-5. Open multiple sessions and confirm the queue orders them unacked-alerts
-   first (`error` → `waiting` → `done`, oldest first), then the rest by class;
-   the fleet strip on the bottom row shows one letter per session.
+5. Open multiple sessions and confirm the fleet strip on the bottom row shows
+   one letter per session in a stable alphabetical order (unacked alerts
+   blink lowercase→uppercase), and that the shown tab never changes on its
+   own.
 6. Press **GO** on a shown session → its terminal window is **raised** (wrapper
    sessions) or VS Code focuses via the deep link / workspace fallback (see
    the focus Limitations in [ARCHITECTURE.md](ARCHITECTURE.md)). Confirm

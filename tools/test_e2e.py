@@ -12,8 +12,8 @@ End-to-end test of the Claude Mate daemon with NO hardware.
     are asserted, not assumed
 
 Drives a scenario and asserts the F| frames (the single pre-rendered screen),
-the V| LED lines, the triage-queue ordering, the press-grace wrong-target
-guard, and the focus URI.
+the V| LED lines, the STICKY selection (the screen never switches tabs on its
+own -- alerts signal via LED + blinking fleet letters), and the focus URI.
 
 Run:   python3 tools/test_e2e.py      (needs pyserial: pip install pyserial)
 """
@@ -180,24 +180,36 @@ time.sleep(0.5)
 print("\n-- phase 2: one working session -> WORK frame + V|START --")
 feed("working|sid-1|webapp||Opus 4.8|xhigh|work|5h82%"); time.sleep(1.5)
 
-print("\n-- phase 3: a session starts waiting -> auto-surfaces, flashes, V|INPUT --")
+print("\n-- phase 3: a session starts waiting -> V|INPUT + fleet blink; the "
+      "screen STAYS on webapp --")
 idx_wait = mark()
 feed("waiting|sid-3|infra"); time.sleep(1.5)
+with display_lock:
+    wait_frames = [l for l in display[idx_wait:] if l.startswith("F|")]
+wait_no_steal = bool(wait_frames) and all(frame_subject(f) == "webapp"
+                                          for f in wait_frames)
+wait_blink = any("b" in frame_fleet(f) for f in wait_frames)
 
-print("\n-- phase 4: an API error arrives -> outranks waiting, V|ERROR --")
+print("\n-- phase 4: an API error arrives -> V|ERROR; the screen still STAYS --")
 idx_err = mark()
 feed("error|sid-2|api"); time.sleep(1.5)
+with display_lock:
+    err_frames = [l for l in display[idx_err:] if l.startswith("F|")]
+err_no_steal = bool(err_frames) and all(frame_subject(f) == "webapp"
+                                        for f in err_frames)
+err_blink = any("e" in frame_fleet(f) for f in err_frames)
 
 print("\n-- phase 5: handshake H -> full resend (frame + re-armed LED loop) --")
 idx_H = mark()
 arduino_send("H"); time.sleep(1.5)
 
 print("\n-- phase 6: PREV/NEXT browse the queue; no window ops, no acks --")
-# Queue now: api(ERR,unacked) > infra(WAIT,unacked) > webapp(WORK).
+# Queue (stable alphabetical): api, infra, webapp. The screen still sits on
+# webapp -- the alerts never moved it.
 idx_nav = mark()
-arduino_send("B|N"); time.sleep(0.8)      # down: api -> infra
-arduino_send("B|N"); time.sleep(0.8)      # down: infra -> webapp
 arduino_send("B|P"); time.sleep(0.8)      # up:   webapp -> infra
+arduino_send("B|P"); time.sleep(0.8)      # up:   infra  -> api
+arduino_send("B|N"); time.sleep(0.8)      # down: api    -> infra
 with display_lock:
     nav_frames = [l for l in display[idx_nav:] if l.startswith("F|")]
 # The 1 Hz ticker interleaves time-update frames of the SAME subject between
@@ -239,11 +251,10 @@ with display_lock:
     k_led_off = any(l == "V|OFF" for l in display[idx_k:])
 k_stayed = bool(k_frames) and frame_subject(k_frames[-1]) == "api"
 
-print("\n-- phase 8b: a new alert must NOT steal the screen inside the "
-      "interaction window (subject pinned; LED updates immediately) --")
-# We pressed B|K moments ago, so the 10s interaction window is open and the
-# subject is pinned. A fresh waiting alert must move the LED (V|INPUT) but NOT
-# the shown subject.
+print("\n-- phase 8b: a new alert must NEVER steal the screen (no "
+      "auto-surface; LED updates immediately) --")
+# The subject is wherever the user left it (api). A fresh waiting alert must
+# move the LED (V|INPUT) but NOT the shown subject.
 idx_pin = mark()
 feed("waiting|sidQ|quux"); time.sleep(2.0)
 with display_lock:
@@ -255,29 +266,36 @@ feed("end|sidQ|quux"); time.sleep(0.8)
 print("\n-- phase 9: done alert + uniqueness squeeze of long sibling names --")
 # Names >21 chars sharing a long prefix: they collide when truncated to the row
 # width, so the daemon middle-squeezes them (first 9 + '~' + last 10) to keep
-# them distinct. The subject is still PINNED (phase 8's window), so the done
-# alert surfaces only after the window expires in phase 10.
-idx_done = mark()
+# them distinct. The screen must NOT jump to the new done alert; phase 10
+# asserts it is still on api even after a long idle.
 feed("done|sidA|webapp-backend-service-one")
 feed("working|sidB|webapp-backend-service-two"); time.sleep(1.5)
 
-print("\n-- phase 10: WYSIWYG -- GO focuses EXACTLY the shown session + uniqueness --")
-# Wait out the interaction window so the done alert auto-surfaces as the head.
-print("   (waiting out the 10s interaction window...)")
-time.sleep(10.5)
+print("\n-- phase 10: selection is STICKY across an idle stretch + WYSIWYG --")
+# The old 10s idle auto-surface is GONE: even after a long pause the done
+# alert must NOT be surfaced -- the screen stays where the user left it (api).
+print("   (idling 11s to prove nothing auto-surfaces...)")
+time.sleep(11.0)
 with display_lock:
-    done_frames = [l for l in display[idx_done:] if l.startswith("F|")]
     shown10 = frame_subject([l for l in display if l.startswith("F|")][-1])
-# The colliding siblings render squeezed (contain '~'); the head's name is one.
-uniq_names = ("~" in shown10) and any("~" in frame_subject(f) for f in done_frames)
-# The done alert (webapp-backend-service-one, sidA) is the head and on the glass.
-# GO must focus EXACTLY it (deep link session=sidA), never a recomputed target.
+sticky_idle = (shown10 == "api")
+# Navigate TO the done sibling: its name renders middle-squeezed ('~') yet GO
+# must focus EXACTLY it (deep link session=sidA), never a recomputed target.
+found_squeezed = False
+for _ in range(10):
+    with display_lock:
+        cur = [l for l in display if l.startswith("F|")]
+    s = frame_subject(cur[-1]) if cur else ""
+    if "~" in s and s.endswith("-one"):
+        found_squeezed = True
+        break
+    arduino_send("B|N"); time.sleep(0.5)
 focus_before10 = [l.strip() for l in open(focuslog)] if os.path.exists(focuslog) else []
 arduino_send("B|G"); time.sleep(1.5)
 focus_after10 = [l.strip() for l in open(focuslog)] if os.path.exists(focuslog) else []
 new_focus10 = focus_after10[len(focus_before10):]
-wysiwyg_head = ("~" in shown10
-                and any("session=sidA" in l for l in new_focus10))
+wysiwyg_squeezed = (found_squeezed
+                    and any("session=sidA" in l for l in new_focus10))
 
 print("\n-- phase 11: WYSIWYG on a NON-head calm session; nav moves NO windows --")
 # Attach ctrl sockets to SEVERAL sessions the browse will dwell on, so a
@@ -288,7 +306,7 @@ ctrl_a = fake_ctrl("webapp")
 ctrl_i = fake_ctrl("infra")
 feed(f"working|sidW|webapp2|{ctrl_w}")
 feed(f"working|sid-1|webapp|{ctrl_a}")
-feed(f"waiting|sid-3|infra|{ctrl_i}")   # infra is the ALERT head; webapp2 is calm
+feed(f"waiting|sid-3|infra|{ctrl_i}")   # infra alerts again; webapp2 is calm
 time.sleep(1.2)
 with ctrl_lock:
     ops_before_nav = len(ctrl_ops)
@@ -298,9 +316,9 @@ for ev in ("B|N", "B|N", "B|N", "B|P", "B|P"):
 time.sleep(1.0)
 with ctrl_lock:
     nav_window_ops = ctrl_ops[ops_before_nav:]
-# Navigate TO webapp2 (a CALM working session that is NOT the head -- the head
-# is the infra WAIT alert). This reproduces the user's bug: GO must raise
-# webapp2 (what's shown), never the head alert, and STAY on webapp2 afterward.
+# Navigate TO webapp2 (a CALM working session, while infra has a WAIT alert
+# elsewhere). This reproduces the user's bug: GO must raise webapp2 (what's
+# shown), never a recomputed alert target, and STAY on webapp2 afterward.
 focused_webapp2 = False
 for _ in range(8):
     with display_lock:
@@ -331,7 +349,9 @@ for s in ("sid-1|webapp", "sid-2|api", "sid-3|infra", "sidW|webapp2",
     feed("end|" + s)
 time.sleep(1.0)
 fa, fb, fc = fake_ctrl("folA"), fake_ctrl("folB"), fake_ctrl("folC")
-feed(f"working|sidFA|folA|{fa}")
+# folA carries an ACCOUNT so the FOLLOW play-marker reservation is observable:
+# while FOLLOW is on, r1 must end 2 columns early (the marker's cells).
+feed(f"working|sidFA|folA|{fa}|||acct1")
 feed(f"working|sidFB|folB|{fb}")
 feed(f"working|sidFC|folC|{fc}")
 time.sleep(1.2)
@@ -346,6 +366,12 @@ with ctrl_lock:
 arduino_send("B|G"); time.sleep(0.10); arduino_send("B|G"); time.sleep(1.0)
 with display_lock:
     follow_on_frame = any(frame_follow(l) for l in display[idx_f:] if l.startswith("F|"))
+    # While FOLLOW is on, the daemon keeps r1's last 2 columns blank for the
+    # play triangle: folA's frame must still END with its account, 2 short.
+    fol_on = [l for l in display[idx_f:]
+              if l.startswith("F|") and frame_follow(l)]
+follow_r1_reserved = any(frame_r1(f).endswith("acct1")
+                         and len(frame_r1(f)) <= 19 for f in fol_on)
 with ctrl_lock:
     dbl_raised = ctrl_ops[ops_before_dbl:]        # toggle-on raises the shown one
 # In FOLLOW, a nav must auto-raise the newly-shown terminal after the settle.
@@ -424,12 +450,12 @@ check("remaining-limit chip right-aligned on the meta row (r2 = model+effort "
       "+ '5h82%')",
       saw(lambda l: frame_subject(l) == "webapp" and "Opus" in frame_r2(l)
           and frame_r2(l).endswith(" 5h82%")))
-check("waiting session auto-surfaces and flashes (infra/WAIT, flash bit set)",
-      saw_after(idx_wait, lambda l: frame_subject(l) == "infra"
-                and frame_r1(l).startswith("WAIT") and frame_flash(l)))
-check("error outranks waiting: api auto-surfaces flashing (api/ERR)",
-      saw_after(idx_err, lambda l: frame_subject(l) == "api"
-                and frame_r1(l).startswith("ERR") and frame_flash(l)))
+check("a waiting alert does NOT steal the screen (stays on webapp)",
+      wait_no_steal)
+check("...it blinks its fleet letter instead (lowercase 'b')", wait_blink)
+check("an error alert does NOT steal the screen either (still webapp)",
+      err_no_steal)
+check("...it blinks its fleet letter instead (lowercase 'e')", err_blink)
 check("fleet row: status letters (E/B/W/D/I), space-separated, no '|'",
       saw(lambda l: l.startswith("F|") and "|" not in frame_fleet(l)
           and any(c in frame_fleet(l).upper() for c in "EBWDI")))
@@ -455,8 +481,8 @@ check("handshake H re-arms the active LED loop (V|ERROR re-sent after reset)",
 # ---- navigation ----------------------------------------------------------------
 def has_run(seq, run):
     return any(seq[i:i + len(run)] == run for i in range(len(seq)))
-check("NEXT/PREV walk the queue (api -> infra -> webapp -> infra)",
-      has_run(nav_subjects, ["infra", "webapp", "infra"]))
+check("NEXT/PREV walk the queue (webapp -> infra -> api -> infra)",
+      has_run(nav_subjects, ["infra", "api", "infra"]))
 infra_navs = [f for f in nav_frames if frame_subject(f) == "infra"]
 check("browsing acks nothing (infra still flashing when REVISITED)",
       bool(infra_navs) and frame_flash(infra_navs[-1]))
@@ -470,21 +496,23 @@ check("GO long (B|K) acknowledges WITHOUT focusing (no new open calls)",
 check("GO long (B|K) STAYS on the acked tab (still api)", k_stayed)
 check("last unacked alert acked -> LED off (V|OFF)", k_led_off)
 
-# ---- screen ownership (the 10s interaction window) -------------------------------
-check("a new alert inside the interaction window does NOT steal the screen",
+# ---- screen ownership (STICKY selection: the screen never moves itself) ---------
+check("a new alert NEVER steals the screen (no auto-surface)",
       pin_no_swap and bool(pin_frames))
-check("...but the LED updates immediately (V|INPUT while pinned)", pin_led)
+check("...but the LED updates immediately (V|INPUT while elsewhere)", pin_led)
+check("selection survives an 11s idle stretch (done alert did NOT surface; "
+      "still on api)", sticky_idle)
 
 # ---- naming --------------------------------------------------------------------
-check("sibling long names disambiguated (middle '~' squeeze)", uniq_names)
+check("sibling long names disambiguated (middle '~' squeeze)", found_squeezed)
 
 # ---- WYSIWYG: GO acts on EXACTLY the session on the glass (the user's bug) ------
-check("GO on the shown head alert focuses exactly it (shown sibling -> sidA)",
-      wysiwyg_head)
-check("GO on a shown NON-head calm session focuses IT, not the head alert "
-      "(webapp2 raised while infra is the head)",
+check("GO on the shown squeezed sibling focuses exactly it (-> sidA)",
+      wysiwyg_squeezed)
+check("GO on a shown CALM session focuses IT, not the urgent alert elsewhere "
+      "(webapp2 raised while infra waits)",
       [c for (c, t) in go_ops] == ["focus"] if focused_webapp2 else False)
-check("focusing a calm session STAYS on it (no jump to the queue head)",
+check("focusing a calm session STAYS on it (no jump elsewhere)",
       stayed_on_calm)
 
 # ---- window-op invariants (the reason for the redesign) -------------------------
@@ -499,6 +527,8 @@ check("FOLLOW starts OFF (no follow bit before the double-click)",
       follow_off_at_start)
 check("double-click GO turns FOLLOW ON (follow bit set in frames)",
       follow_on_frame)
+check("FOLLOW reserves the play-marker cells: r1 ends 2 columns early with "
+      "the account intact (<=19 chars, ends 'acct1')", follow_r1_reserved)
 check("turning FOLLOW on raises the shown terminal immediately",
       any(c == "focus" for (c, t) in dbl_raised))
 check("in FOLLOW, PREV/NEXT auto-raise the selected terminal (raise only)",

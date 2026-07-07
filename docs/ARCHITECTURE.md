@@ -4,8 +4,8 @@ Claude Mate is a USB hardware companion for Claude Code. It is an Arduino Nano
 driving a small I2C OLED, three buttons, and an **indication LED**. The daemon
 keeps ONE **stable, alphabetically-ordered** **triage queue** of sessions (tabs
 never shuffle as their states change) and the OLED shows ONE screen — the
-*selected* session (after 10 s idle, the most-urgent unacknowledged alert
-auto-surfaced at its stable position): four size-1 rows — the session name, the
+*selected* session (the selection is **sticky**: only PREV/NEXT/GO ever move
+it): four size-1 rows — the session name, the
 state + time-in-state (+ the account the session runs as), the model + effort
 (+ a remaining-limit chip, e.g. `5h82%` = 82% of the 5-hour window left), and a
 whole-fleet letter strip (with the queue position). The LED blinks a
@@ -40,7 +40,7 @@ Python daemon  (daemon/claude_mate_daemon.py)
         |   - keeps ONE triage queue in STABLE order (alphabetical by
         |     name, tiebroken by session key) — tabs never shuffle
         |   - urgency (worst unacked: error > waiting > done, oldest
-        |     first) is separate: drives the LED + idle auto-surface only
+        |     first) is separate: drives the LED + fleet blink only
         |   - pre-renders ONE screen:  F|<flags>|<sel>|<r0>|<r1>|<r2>|<r3>
         |   - drives the LED:  V|<kind> for the worst unacked alert class
         v
@@ -150,14 +150,14 @@ their states change and never shuffle under the user:
 ```
 tab order:  STABLE — alphabetical by name (tiebreak: session key)
 urgency:    worst UNACKNOWLEDGED alert (error > waiting > done, oldest first)
-            → drives the LED loop class + the idle auto-surface ONLY
+            → drives the LED loop class + the blinking fleet letters ONLY
 ```
 
 Urgency is computed **separately** from the order. It decides only what the LED
-blinks about and — after 10 s of no presses — which alert the screen
-auto-surfaces (at its stable position; if nothing is unacknowledged it rests on
-the first tab). An already-acknowledged error never hides a fresh waiting alert
-in the LED/auto-surface, but the tab order itself never reorders.
+blinks about and which fleet letters blink; the shown tab is **sticky** — the
+screen never switches subject on its own. An already-acknowledged error never
+hides a fresh waiting alert in the LED, but the tab order itself never
+reorders.
 
 An alert is born on the transition into `error`/`waiting`/`done` and dies in
 exactly four ways — nothing else removes one, so none can be lost silently:
@@ -213,11 +213,10 @@ it was last told to show via an `F|<flags>|<sel>|<r0>|<r1>|<r2>|<r3>` line.
   `+` when it doesn't fit). An unacknowledged alert's letter is sent **lowercase**
   so the firmware **blinks** it — the acked/unacked state of every tab is
   visible in the strip.
-- **Screen ownership:** the display changes subject on its own ONLY when the
-  user is idle (no press for **10 s**), when it auto-surfaces the most-urgent
-  unacknowledged alert at its stable position (else the first tab). A GO/ACK
-  **stays on the tab** it acted on — the device never auto-switches tabs on a
-  press.
+- **Screen ownership:** the display NEVER changes subject on its own — only
+  PREV/NEXT/GO move the selection (it falls back to the first tab only when
+  the selected session ends). A GO/ACK **stays on the tab** it acted on — the
+  device never auto-switches tabs.
 - **Active-tab highlight / FOLLOW:** the shown session's fleet letter is drawn in
   a **wide (~11 px) filled rectangle centred on it** (a lit block, letter knocked
   out) so you can see which tab is on screen. Double-clicking GO toggles

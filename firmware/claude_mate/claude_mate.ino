@@ -10,8 +10,9 @@
  * THE INTERFACE: one screen, one queue, three buttons.
  *
  * The daemon keeps a STABLE, alphabetically-ordered list of sessions (tabs
- * never shuffle; urgency drives the LED + idle auto-surface only) and
- * pre-renders ONE frame as four size-1 rows:
+ * never shuffle; urgency drives the LED + the blinking fleet letters only --
+ * the screen never switches tabs on its own) and pre-renders ONE frame as
+ * four size-1 rows:
  *
  *     +---------------------+
  *     |api-server           |   r0: session name -- flashes (inverts ~2.5 Hz)
@@ -64,7 +65,8 @@
  *     F|<flags>|<sel>|<r0>|<r1>|<r2>|<r3>  the whole screen, pre-rendered as
  *                                        four size-1 rows (each up to 21 chars).
  *         flags = bitfield: bit0 = flash row 0 (the name) at ~2.5 Hz (unacked
- *                 alert); bit1 = FOLLOW mode (fill the active-tab switch box)
+ *                 alert); bit1 = FOLLOW mode (draw the play triangle by r1;
+ *                 the daemon keeps r1's last two columns blank while set)
  *         sel   = column in r3 of the active tab's fleet letter (-1 = none);
  *                 that letter's cell is filled (lit square, letter knocked out)
  *         r0    = session name
@@ -392,8 +394,9 @@ static void drawFrame() {
     if (bx + bw > SCREEN_WIDTH) bw = SCREEN_WIDTH - bx;
     display.fillRect(bx, 24, bw, ROW_H, SSD1306_INVERSE);
   }
-  // FOLLOW mode: a small filled "play" triangle at the right of the state row
-  // (r1 is always short, so it never collides).
+  // FOLLOW mode: a small filled "play" triangle at the right of the state row.
+  // The daemon keeps the last two columns of r1 blank while FOLLOW is on (the
+  // right-aligned account text shifts left), so the marker never overdraws it.
   if (frameFollow) {
     display.fillTriangle(119, 9, 119, 14, 125, 11, SSD1306_WHITE);
   }
