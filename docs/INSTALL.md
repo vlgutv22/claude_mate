@@ -187,6 +187,38 @@ so it is safe to keep loaded all the time.
 
 ---
 
+## 5. Grant Accessibility permission (single-window focus)
+
+When you press **GO** on the device, the wrapper raises **only that session's**
+terminal window — matched by its TTY and lifted with `AXRaise`, so sibling
+windows of the same terminal app are never dragged forward. `AXRaise` goes
+through macOS's Accessibility API, so your **terminal app** must be granted
+Accessibility permission.
+
+Open **System Settings → Privacy & Security → Accessibility**, then enable your
+terminal app (**Terminal**, **iTerm**, etc.). If it is not in the list, add it
+with **+**. **Quit and reopen the terminal app** afterwards — the permission is
+only picked up on a fresh launch.
+
+Verify it is granted (run inside the terminal app you use for sessions):
+
+```sh
+osascript -e 'tell application "System Events" to get position of window 1 of (first process whose frontmost is true)'
+```
+
+A coordinate pair like `{123, 45}` means Accessibility is granted. The error
+`osascript is not allowed assistive access` means it is **not** — flip the toggle
+and relaunch the terminal.
+
+> **Symptom if you skip this:** GO selects the correct **tab** (that only needs
+> the Automation permission macOS prompts for on first use) but the wrong
+> **window** comes to the front. Without Accessibility the wrapper falls back to
+> fronting the right window through the terminal's own scripting, which also
+> raises sibling windows as a group — granting Accessibility is what gets you
+> true single-window focus.
+
+---
+
 ## Verifying the install
 
 Follow [TESTING.md](TESTING.md) from the bottom up: confirm the port appears in
