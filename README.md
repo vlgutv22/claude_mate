@@ -458,11 +458,14 @@ claude_mate/
   the session's own token. Offline / expired-token / console-account sessions
   simply show no chip (or keep the last known value until a poll succeeds).
 - **FOCUS targets the wrapper's terminal first, then VS Code.** A wrapped session
-  raises its own terminal window (matched by TTY) reliably — and raise is the
-  *only* window operation; nothing is ever collapsed or resized. Hook-only
-  sessions fall back to a VS Code deep link, then to raising the VS Code window
-  for the workspace folder — the exact deep-link URI lives behind a single
-  config constant so it is trivial to update.
+  raises **only its own** terminal window (matched by TTY, brought forward with
+  `AXRaise`) — not the whole app's window group, so GO never drags sibling
+  terminal windows forward. This needs **Accessibility** permission for your
+  terminal app; without it the wrapper falls back to activating the app (which
+  raises its windows as a group). Raise is the *only* window operation; nothing
+  is ever collapsed or resized. Hook-only sessions fall back to a VS Code deep
+  link, then to raising the VS Code window for the workspace folder — the exact
+  deep-link URI lives behind a single config constant so it is trivial to update.
 - **Detection is screen-scrape-based (wrapper).** State is inferred from the
   rendered TUI using `patterns.json`. It is scoped to the live status region to
   avoid false positives, but unusual terminal themes/locales may need a pattern
