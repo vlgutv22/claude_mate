@@ -315,6 +315,22 @@ Step-by-step guides:
 | `CLAUDE_MATE_PATTERNS` | `<repo>/patterns.json`  | Detection patterns file (hot-reloaded) |
 | `CLAUDE_MATE_DEBUG`    | unset                 | If set to a path, append screen + state snapshots there (debugging) |
 | `CLAUDE_REAL`          | autodetect            | Explicit path to the real `claude` binary |
+| `CLAUDE_MATE_ACCOUNTS_DIR` | `~/.claude-accounts` | Root of account profile dirs (see below) |
+| `CLAUDE_MATE_ACCOUNT`  | unset                 | Profile name to use, skipping the picker |
+
+**Account profiles** — Claude Code holds one login per config dir, so the
+wrapper can run different terminals under different accounts by pointing each
+session at its own `CLAUDE_CONFIG_DIR`. Every subdirectory of
+`~/.claude-accounts` is a profile; create one with `mkdir -p
+~/.claude-accounts/work` (or by typing a new name at the picker). Once at
+least one profile exists, every interactive start shows a picker listing each
+profile with the email logged into it — press Enter for your default
+`~/.claude` login, or pick a number. `claude --account work …` (the flag is
+consumed by the wrapper, never passed to claude) or `CLAUDE_MATE_ACCOUNT=work`
+selects a profile non-interactively, and an already-exported
+`CLAUDE_CONFIG_DIR` always wins. A fresh profile starts logged out — claude
+prompts `/login` there on first run — and keeps its own settings, history, and
+MCP config. With no profile dirs, nothing changes.
 
 **Detection tuning** lives in [`patterns.json`](patterns.json) — case-insensitive
 substrings matched against the rendered TUI, grouped as `error` / `waiting` /

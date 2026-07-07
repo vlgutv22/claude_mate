@@ -30,10 +30,21 @@ State model (matches the daemon): working | waiting | error | idle
   error    an API error / retry is visible.
   idle     at the prompt, nothing pending.
 
+Account profiles: each subdirectory of ~/.claude-accounts is a separate Claude
+Code login (used as that session's CLAUDE_CONFIG_DIR), so different terminals
+can run different accounts at once. When profile dirs exist, an interactive
+start shows a picker (Enter = default ~/.claude login); `--account NAME` or
+$CLAUDE_MATE_ACCOUNT skips it, and an already-set $CLAUDE_CONFIG_DIR always
+wins. `mkdir ~/.claude-accounts/work` (or picking a new name at the prompt)
+creates a profile; claude asks /login there on first run. No profile dirs ->
+no picker, nothing changes.
+
 Config (env):
-  CLAUDE_MATE_SOCK   daemon socket (default /tmp/claude-mate.sock)
-  CLAUDE_MATE_DEBUG  if set to a path, append screen+state snapshots there
-  CLAUDE_REAL        explicit path to the real `claude` binary (else autodetected)
+  CLAUDE_MATE_SOCK          daemon socket (default /tmp/claude-mate.sock)
+  CLAUDE_MATE_DEBUG         if set to a path, append screen+state snapshots there
+  CLAUDE_REAL               explicit path to the real `claude` binary (else autodetected)
+  CLAUDE_MATE_ACCOUNTS_DIR  profile root (default ~/.claude-accounts)
+  CLAUDE_MATE_ACCOUNT       profile name to use without showing the picker
 
 Requires: pyte  (pip install pyte)
 """
@@ -659,9 +670,107 @@ def exec_real_claude(extra_argv):
     os._exit(127)
 
 # --------------------------------------------------------------------------- #
+# Account profiles — pick a CLAUDE_CONFIG_DIR before exec'ing claude
+# --------------------------------------------------------------------------- #
+# Claude Code keeps ONE login per config dir ($CLAUDE_CONFIG_DIR, default
+# ~/.claude + ~/.claude.json). Pointing different wrapped terminals at different
+# config dirs is the only way to hold different accounts at once. Profiles live
+# as subdirectories of ACCOUNTS_DIR; "default" means no override (~/.claude).
+# Opt-in: no profile dirs -> no picker, the wrapper behaves exactly as before.
+ACCOUNTS_DIR = os.path.expanduser(
+    os.environ.get("CLAUDE_MATE_ACCOUNTS_DIR", "~/.claude-accounts"))
+
+def account_email(cfg_dir=None):
+    """Best-effort email of the account logged into a config dir ('' if none).
+    The default profile's state file is ~/.claude.json (NOT inside ~/.claude);
+    with CLAUDE_CONFIG_DIR set, claude writes it as <dir>/.claude.json."""
+    path = (os.path.join(cfg_dir, ".claude.json") if cfg_dir
+            else os.path.expanduser("~/.claude.json"))
+    try:
+        with open(path) as fh:
+            return (json.load(fh).get("oauthAccount") or {}).get("emailAddress", "")
+    except (OSError, ValueError):
+        return ""
+
+def list_profiles():
+    try:
+        return sorted(d for d in os.listdir(ACCOUNTS_DIR)
+                      if os.path.isdir(os.path.join(ACCOUNTS_DIR, d)))
+    except OSError:
+        return []
+
+def strip_account_flag(argv):
+    """Pull our --account NAME / --account=NAME out of argv so it never reaches
+    the real claude (which would reject the unknown flag)."""
+    out, name, i = [], None, 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--account" and i + 1 < len(argv):
+            name, i = argv[i + 1], i + 2
+            continue
+        if a.startswith("--account="):
+            name, i = a.split("=", 1)[1], i + 1
+            continue
+        out.append(a)
+        i += 1
+    return name, out
+
+def use_profile(name):
+    """Point the child claude at profile `name` (created on first use; claude
+    shows /login there on first run). 'default' / '' keeps ~/.claude."""
+    if not name or name == "default":
+        return
+    d = os.path.join(ACCOUNTS_DIR, name)
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError as e:
+        sys.stderr.write(f"[claude-mate-wrap] cannot create profile {d}: {e}\n")
+        os._exit(1)
+    os.environ["CLAUDE_CONFIG_DIR"] = d
+
+def select_account(flag_name, interactive):
+    """Decide which account profile this session runs under.
+    Precedence: existing $CLAUDE_CONFIG_DIR (never second-guess an explicit
+    env) > --account flag > $CLAUDE_MATE_ACCOUNT > interactive picker (only
+    when profiles exist) > default. Runs BEFORE the PTY fork / raw mode, so
+    plain print/input are safe here and nothing is registered with the daemon
+    yet if the user aborts with Ctrl-C."""
+    if os.environ.get("CLAUDE_CONFIG_DIR"):
+        return
+    name = flag_name or os.environ.get("CLAUDE_MATE_ACCOUNT")
+    if name is not None:
+        use_profile(name)
+        return
+    profiles = list_profiles()
+    if not interactive or not profiles:
+        return
+    print("claude-mate — select account (Enter = default, or type a new name):")
+    print(f"  0) default   {account_email() or '(not logged in)'}")
+    for i, p in enumerate(profiles, 1):
+        email = account_email(os.path.join(ACCOUNTS_DIR, p))
+        print(f"  {i}) {p:<10} {email or '(not logged in)'}")
+    try:
+        ans = input("account> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        os._exit(130)
+    if not ans or ans == "0":
+        return
+    if ans.isdigit() and 1 <= int(ans) <= len(profiles):
+        use_profile(profiles[int(ans) - 1])
+    else:
+        use_profile(ans)   # a name: existing profile or a new one to create
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def main():
+    # Account selection first: it must apply on EVERY exec path below (wrapped,
+    # pyte-missing, non-interactive), and must finish before raw mode / PTY fork.
+    flag_name, argv = strip_account_flag(sys.argv[1:])
+    sys.argv[1:] = argv
+    select_account(flag_name,
+                   interactive=sys.stdin.isatty() and sys.stdout.isatty())
     # pyte is required to mirror the TUI; without it we cannot wrap. Run the real
     # claude unwrapped via real_claude() (which skips THIS shim) -- never bare
     # "claude", which in the global-shim deployment would re-exec the wrapper
