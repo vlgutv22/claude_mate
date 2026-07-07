@@ -338,6 +338,46 @@ def _axraise_from(pos, proc):
         return False
     return _axraise_at(proc, x, y)
 
+def _terminal_front_by_tty():
+    """Front THIS session's Terminal.app window via Terminal's own scripting --
+    the fallback when AXRaise is blocked because Accessibility is not granted (the
+    pre-AXRaise wrapper did exactly this and it worked without any permission).
+    `set selected of t` alone only picks the tab and leaves its window behind, so a
+    bare `activate` surfaces whatever window happened to be frontmost (the wrong
+    one -- the "focuses the wrong window" symptom). We therefore bring the matched
+    window itself to the front (index 1 + frontmost) and activate.
+
+    Important: we find the window's id in a read-only pass and then raise it via an
+    explicit `window whose id is ...` reference. Reordering a window (set index /
+    frontmost) mutates Terminal's `windows` collection, and doing that on the loop
+    variable while still iterating raises the WRONG window; a stable id reference
+    after the loop avoids that. Automation only -- no Accessibility. Returns True
+    if the TTY was matched."""
+    if not MY_TTY:
+        return False
+    return _osa_out(f'''
+        tell application "Terminal"
+          set targetId to missing value
+          repeat with w in windows
+            repeat with t in tabs of w
+              try
+                if (tty of t) is "{MY_TTY}" then
+                  set selected of t to true
+                  set targetId to id of w
+                end if
+              end try
+            end repeat
+          end repeat
+          if targetId is missing value then return ""
+          set tw to (first window whose id is targetId)
+          set miniaturized of tw to false
+          activate
+          set index of tw to 1
+          set frontmost of tw to true
+          return "ok"
+        end tell
+        return ""''') == "ok"
+
 def focus_self():
     # If we're inside tmux, also select our pane/window.
     pane = os.environ.get("TMUX_PANE")
@@ -400,6 +440,11 @@ def focus_self():
             end tell
             return ""''')
         if _axraise_from(pos, "Terminal"):
+            return
+        # AXRaise needs Accessibility; without it, front the CORRECT window using
+        # Terminal's own scripting (Automation only) rather than a blind activate
+        # that would leave whatever window was already frontmost on top.
+        if _terminal_front_by_tty():
             return
         if not _raise_window_only():
             _osa('tell application "Terminal" to activate')  # last resort
