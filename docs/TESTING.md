@@ -25,7 +25,8 @@ passes.
 
 ## Level −1 — Automated tests (no hardware, no Claude)
 
-Two self-contained tests exercise the Mac side before you touch any hardware:
+Self-contained tests exercise the Mac side before you touch any hardware
+(`tools/test_*.py` — CI runs the whole glob):
 
 ```sh
 pip install pyserial                  # one-time, for the e2e test
@@ -50,10 +51,20 @@ python3 tools/test_e2e.py             # fake Arduino over a PTY + a fake PTY-wra
 
 python3 tools/test_settings_merge.py  # proves the installer's settings.json merge
                                       # preserves your existing config and is idempotent
+
+python3 tools/test_detect.py          # the wrapper's screen scrape: which rendered
+                                      # TUI frames read working/waiting/error/idle —
+                                      # incl. the background-work tells that must
+                                      # NOT read idle (needs pyte)
+
+python3 tools/test_hook_state.py      # the hook's wire line per Stop payload —
+                                      # incl. "the turn ended but work is still in
+                                      # flight" reporting working instead of done
 ```
 
-Both print a `PASS`/`FAIL` checklist and exit non-zero on failure, so they double
-as CI smoke tests. They never touch your real `~/.claude` or serial ports.
+Each prints a `PASS`/`FAIL` checklist and exits non-zero on failure, so they
+double as CI smoke tests. They never touch your real `~/.claude`, the daemon
+socket, or serial ports.
 
 ---
 

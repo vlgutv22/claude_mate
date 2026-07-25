@@ -31,6 +31,8 @@ Claude Code hook event (UserPromptSubmit, Notification, Stop, StopFailure)
         v
 ~/.claude/hooks/claude-status.sh        (fire-and-forget, always exits 0)
         |   one newline-terminated line:  <state>|<session_id>|<name>
+        |   (a Stop whose payload still lists background_tasks — or a one-shot
+        |    session_cron — reports 'working': the turn ended, the work did not)
         v
 Unix domain socket  /tmp/claude-mate.sock
         |
