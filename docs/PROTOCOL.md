@@ -217,8 +217,20 @@ daemon **never sends it**.
 |------------------------|----------------|
 | `UserPromptSubmit`     | `working`      |
 | `Notification`         | `waiting`      |
-| `Stop`                 | `done`         |
+| `Stop`                 | `done` — or `working`, see below |
 | `StopFailure`          | `error`        |
+
+> **A `Stop` with work still in flight reports `working`, not `done`.** The
+> `Stop` payload carries `background_tasks[]` (background work that is running
+> or pending: dynamic workflows, background agents, backgrounded shells,
+> monitors, MCP tasks) and `session_crons[]` (scheduled tasks that will wake the
+> session later). When `background_tasks` is non-empty — or a cron is a
+> **one-shot** wakeup (`recurring: false`), i.e. this turn continuing later —
+> the hook reports `working`, and the finish is reported by the next `Stop` that
+> lands with nothing in flight. Recurring crons are not counted: a session that
+> merely owns a daily schedule is finished for now, and suppressing its DONE
+> forever would hide it from the device. Both fields are optional, so a Claude
+> Code build that omits them behaves exactly as before.
 
 > **No `SessionEnd` hook is installed.** The daemon's `idle` state is **not**
 > driven by any socket message — it is reached purely via the
@@ -250,7 +262,7 @@ The daemon keeps a dictionary of sessions, **keyed by `session_id`** (or by
 
 | State     | Entered when |
 |-----------|--------------|
-| `working` | `UserPromptSubmit` fired — a turn is in progress. |
+| `working` | `UserPromptSubmit` fired — a turn is in progress. Also a turn that **ended with background work still in flight** (hook: `Stop` + `background_tasks`; PTY wrapper: the background-work tells on screen). |
 | `waiting` | `Notification` fired — needs permission / Claude asked something. |
 | `error`   | `StopFailure` fired — turn ended on an API error (5xx / overloaded / timeout). |
 | `done`    | `Stop` fired — turn completed OK. Also `working` → `idle` becomes `done` (finished but not yet acknowledged) and STAYS `done` until acknowledged. |

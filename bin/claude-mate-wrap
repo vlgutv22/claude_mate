@@ -9,8 +9,12 @@ Run `claude` THROUGH this wrapper (alias claude=claude-mate-wrap). It:
      stdin/stdout transparently — you use Claude exactly as normal.
   2. Mirrors the full TUI into a headless terminal emulator (pyte) and reads the
      *current screen* every update, so it sees EVERYTHING: the spinner, API
-     errors/retries, permission prompts, and "Waiting for N dynamic workflow to
-     finish" (i.e. it knows the session is still busy after the turn "ends").
+     errors/retries, permission prompts, and every BACKGROUND-WORK tell Claude
+     renders once the foreground turn ends — the "Waiting for N dynamic workflow
+     to finish" banner, the turn recap's "· 1 shell still running" suffix, and
+     the live in-flight chip in the hint row ("… · 1 shell · ← for agents"),
+     which is the one that also covers work that is merely QUEUED (i.e. it knows
+     the session is still busy after the turn "ends").
   3. Reports state changes to the Claude Mate daemon over its Unix socket, and
      auto-registers on start / removes on exit (the display mirrors your open
      wrapped terminals).
@@ -29,7 +33,9 @@ Run `claude` THROUGH this wrapper (alias claude=claude-mate-wrap). It:
      top) without stalling long on a wedged wrapper.
 
 State model (matches the daemon): working | waiting | error | idle
-  working  TUI is generating, OR a background dynamic-workflow is still running.
+  working  TUI is generating, OR background work (a dynamic workflow, a
+           background agent, a backgrounded shell, a monitor, an MCP task) is
+           still running or queued.
   waiting  a permission prompt / question is on screen (needs your input).
   error    an API error / retry is visible.
   idle     at the prompt, nothing pending.
@@ -601,11 +607,71 @@ _LIVE_SPINNER_RE = re.compile(
 # indent + one glyph) and match the exact "Waiting for <N> ... to finish" shape,
 # so prose about background work ("still waiting for the agent to finish") never
 # fires -- there is no leading count, or "waiting" is not the first word.
+#
+# The banner also WRAPS in a narrow terminal ("Waiting for 2 background agents
+# and 1 dynamic workflow to finish" is 64 columns before Claude's own padding),
+# which used to drop "to finish" onto the next screen line and lose the match --
+# so the count may instead be followed by the banner's own nouns.
 _BG_WORK_RE = re.compile(
     r'^[ \t]*[^\w\s]?[ \t]*'                   # line start: optional indent + one glyph
     r'waiting for\s+\d+\s+'                    # "Waiting for 1 " (a live count)
-    r'[^\n]*?\bto finish\b',                   # "... dynamic workflow / agents / tool to finish"
+    r'(?:[^\n]*?\bto finish\b'                 # "... dynamic workflow / agents / tool to finish"
+    r'|background agents?\b'                   # ...or the banner wrapped before "to finish"
+    r'|dynamic workflows?\b)',
     re.I | re.M)
+
+# Claude's TURN-DURATION line, when the turn ended with background work still
+# registered but NOT counted into the banner above (a backgrounded shell, a
+# monitor, an MCP task, a teammate -- anything that is not an agent/workflow the
+# banner names). It reads:
+#
+#   "✻ Sautéed for 2m 33s · 1 background dynamic workflow still running"
+#   "✻ Cooked for 45s · 2 shells still running"
+#
+# Same rationale as the banner: it can sit far above the bottom region and it
+# coexists with the idle prompt, so it is matched over the whole screen. Quote-
+# resistance is the shape of the line itself -- a verb + "for <elapsed>" at a
+# line start, then a "·" separator, then "still running" -- which prose about a
+# process ("the dev server is still running") does not have.
+_BG_TURN_END_RE = re.compile(
+    r'^[ \t]*[^\w\s]?[ \t]*'                   # line start: optional indent + one glyph
+    r'\w+[ \t]+for[ \t]+\d+\s*(?:ms|[hms])\b'  # "Sautéed for 2m 33s" (past-tense recap)
+    r'[^\n]*?·[^\n]*?\bstill running\b',       # "... · 2 shells still running"
+    re.I | re.M)
+
+# Claude's LIVE IN-FLIGHT CHIP in the hint row under the prompt box. Whenever
+# background work is registered -- RUNNING **or PENDING** -- Claude adds a dim,
+# dot-separated chip naming it, and it is there in BOTH states (captured from a
+# real session, background shell in flight):
+#
+#   busy: "⏵⏵ bypass permissions on · 1 shell · esc to interrupt · ← for agents"
+#   idle: "⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage"
+#
+# This is the tell that stays TRUE. The banner and the turn recap above are
+# transcript text -- printed once, never updated, scrolled away by the next
+# output -- whereas the chip is redrawn every frame and disappears the instant
+# the last task ends. It is also what queued-but-not-yet-started work looks like
+# on screen: the session the device kept reading as IDLE, buzzing DONE while the
+# work ran on.
+#
+# The chip's wording is Claude's own summary of the task set, so the phrases are
+# enumerated rather than guessed. Quote-resistance comes from WHERE it is read:
+# only the footer region (the prompt box + hint row), never the conversation.
+_BG_CHIP_RE = re.compile(
+    r'(?:·[ \t]*|^[ \t]{0,4})\d+[ \t]+'        # a "· <N> " chip (or one opening the row)
+    r'(?:shells?|monitors?|local agents?|teams?'
+    r'|MCP (?:task|job)s?|background (?:tasks?|dynamic workflows?)'
+    r'|remote dynamic workflows?|cloud sessions?|loops?)\b',
+    re.I | re.M)
+
+# The same fact on Claude's compact status row, which renders a dim, RIGHT-
+# ALIGNED "<N> in background" instead of the chip. Cheap to also accept.
+#
+# Quote-resistance: right alignment guarantees a run of padding in front of it
+# and the counter ENDS the line, so the number must sit at a line start or after
+# 2+ spaces with nothing but blanks after "background" -- prose ("2 in background
+# mode", "leaves 3 in background.") does not fit that shape.
+_BG_COUNT_RE = re.compile(r'(?:^|[ \t]{2,})\d+ in background[ \t]*$', re.I | re.M)
 
 def detect_state(screen_text):
     # Read only Claude's LIVE STATUS REGION (the bottom of the visible screen),
@@ -643,12 +709,22 @@ def detect_state(screen_text):
                 any(p in busy_tail for p in _patterns["busy"])
                 or bool(_WORKING_METER_RE.search(busy_tail))
                 or bool(_LIVE_SPINNER_RE.search(full)))
-    # Background work (a dynamic workflow / agents / a tool still running) keeps
-    # the session "working" even though the foreground turn ended and the prompt is
-    # idle. Its banner is a live line that clears on completion, so -- unlike the
-    # quote-prone spinner/meter -- it is read over the whole screen and is NOT
-    # gated on the idle prompt (which shows WHILE the background work runs).
-    bg_work = bool(_BG_WORK_RE.search(full))
+    # Background work (a dynamic workflow, an agent, a backgrounded shell, a
+    # monitor, an MCP task -- running OR still queued) keeps the session "working"
+    # even though the foreground turn ended and the prompt is idle. Claude shows
+    # it four ways, and none of them are gated on the idle prompt (which is up
+    # WHILE the background work runs). The two transcript tells are read over the
+    # whole screen and carry their own structural shape; the two live ones are
+    # read in the footer, where conversation text cannot reach:
+    #   1. the "Waiting for N ... to finish" banner (turn end, agents/workflows),
+    #   2. the turn recap's "· N ... still running" suffix (turn end, the rest),
+    #   3. the in-flight chip in the hint row, and 4. the compact status row's
+    #      "N in background" -- the live pair, still true after the transcript
+    #      lines scroll away, and the only tells for work that is merely QUEUED.
+    bg_work = (bool(_BG_WORK_RE.search(full))
+               or bool(_BG_TURN_END_RE.search(full))
+               or bool(_BG_CHIP_RE.search(footer))
+               or bool(_BG_COUNT_RE.search(full)))
     busy_now = live_work or bg_work
 
     # Strong, specific error strings win even mid-stream (a genuine API error
@@ -664,7 +740,10 @@ def detect_state(screen_text):
         return ("waiting", "specific")
     # A genuine picker is NOT generating: the live "esc to interrupt" / meter hint
     # wins over generic picker words that may be incidental near the bottom.
-    if not busy_now and any(p in footer for p in _patterns.get("waiting_footer", [])):
+    # Only the FOREGROUND spinner vetoes it, though -- background work says
+    # nothing about whether a picker is up, and a session that keeps a shell or a
+    # workflow running would otherwise stop reporting that it needs you.
+    if not live_work and any(p in footer for p in _patterns.get("waiting_footer", [])):
         return ("waiting", "footer")
     if busy_now:
         return ("working", "busy")

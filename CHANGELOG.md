@@ -12,6 +12,48 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
+### 2026-07-25 — A turn that ends with background work no longer reads IDLE
+
+- **Fixed: the device showed IDLE (and buzzed a premature DONE) while a
+  background dynamic workflow, background agents, a backgrounded shell, a
+  monitor or an MCP task were still running — or still queued.** Claude's reply
+  finishes and the prompt comes back, but the session is not done; the wrapper
+  only recognised one of the three tells Claude renders for that, and only in
+  its unwrapped form.
+- **PTY wrapper — three new background-work signals:**
+  - the turn recap's suffix — `✻ Crunched for 1m 56s · 1 shell still running` —
+    which covers the work the banner does not name;
+  - the **live in-flight chip** in the hint row under the prompt box
+    (`⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage`) — the
+    tell that also covers **queued** work and scheduled loops, and that keeps
+    updating after the transcript lines scroll away. It is read only in the
+    footer region, where conversation text cannot reach;
+  - the same fact on Claude's compact status row (`N in background`).
+  The `Waiting for N … to finish` banner is now also matched when it **wraps**
+  in a narrow terminal. A to-do left `in progress` in the task panel is
+  deliberately *not* a busy signal — it is a plan item, not a running task.
+  Verified against frames captured from a live session: the exact idle frame
+  that used to read `idle` now reads `working`.
+- **Background work no longer masks "needs your input".** The generic
+  question-picker footer is vetoed by the **foreground spinner only** — a
+  session that keeps a shell or a workflow running still reports `waiting` when
+  it asks you something.
+- **Hooks — `Stop` now reports what Claude tells it.** The payload's
+  `background_tasks` (running/pending background work) and one-shot
+  `session_crons` (a `/loop` tick, a `ScheduleWakeup`, a one-shot cron — this
+  turn continuing later) downgrade `done` to `working`; the finish is reported
+  by the next `Stop` that lands with nothing in flight. Recurring crons are not
+  counted, so a session that merely owns a daily schedule still reports DONE.
+  Both fields are optional — older Claude Code builds behave as before.
+- **Added `tools/test_hook_state.py`** (18 checks over the hook's wire line per
+  payload, via a new `CLAUDE_MATE_DRY_RUN=1` that prints the line instead of
+  sending it) and **15 new `tools/test_detect.py` cases**, including a frame
+  captured verbatim from a live session, the input-precedence guards, and the
+  false-positive guards (prose about work "still running" or "N in background",
+  chip-shaped text in the conversation rather than the hint row, and the
+  reported screenshot itself: an in-progress to-do with nothing actually in
+  flight must stay IDLE).
+
 ### 2026-07-07 — Project goal, non-commercial license, enclosure + photos
 
 - **Repositioned** around the actual goal: cutting the cognitive overload of

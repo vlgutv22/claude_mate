@@ -203,6 +203,107 @@ CASES = [
      "● Recap of the last run:\n"
      "  - I'm still waiting for 1 agent to finish reviewing the diff.\n"
      + PROMPT, "idle"),
+    # END-OF-TURN BACKGROUND WORK, part 2 (#9). Claude has three tells for "the
+    # reply is done but work is not", and the device read two of them as IDLE:
+    # a turn-duration recap with a "· N ... still running" suffix, and the live
+    # right-aligned "N in background" counter drawn above the prompt box. The
+    # counter is the important one -- it covers work that is merely QUEUED and,
+    # unlike the transcript lines, it stays true until the work really ends.
+    # Captured verbatim from a live session (Claude Code 2.1.220) with one
+    # backgrounded shell in flight: the turn recap carries the suffix AND the
+    # hint row carries the in-flight chip, with no "esc to interrupt" in sight.
+    ("turn ended, real captured frame: recap suffix + in-flight chip",
+     "⏺ Watcher armed and a task is held in flight — ending the turn.\n"
+     "✻ Crunched for 1m 56s · 1 shell still running\n"
+     "────────────────────────────────────────────────\n"
+     "❯\n"
+     "────────────────────────────────────────────────\n"
+     "  ⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage", "working"),
+    ("in-flight chip alone (recap already scrolled away)",
+     "⏺ Here is the summary you asked for.\n"
+     + "\n".join(f"  · point {i}" for i in range(12)) + "\n"
+     + "────────────────────────────────────────────────\n"
+     "❯\n"
+     "────────────────────────────────────────────────\n"
+     "  ⏵⏵ bypass permissions on · 2 background dynamic workflows · ← for agents",
+     "working"),
+    ("chip naming a scheduled loop keeps the session working",
+     "⏺ Scheduled the next tick; nothing to do until then.\n"
+     + "\n".join(f"  · note {i}" for i in range(12)) + "\n"
+     + "────────────────────────────────────────────────\n"
+     "❯\n"
+     "────────────────────────────────────────────────\n"
+     "  ⏵⏵ bypass permissions on · 1 loop · ← for agents", "working"),
+    ("no chip in the hint row -> idle (the chip is what distinguishes them)",
+     "⏺ Here is the summary you asked for.\n"
+     + "\n".join(f"  · point {i}" for i in range(12)) + "\n"
+     + "────────────────────────────────────────────────\n"
+     "❯\n"
+     "────────────────────────────────────────────────\n"
+     "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents", "idle"),
+    ("idle, chip-shaped text in the CONVERSATION, not the hint row",
+     "⏺ The footer read \"· 3 shells ·\" while the build ran.\n"
+     + "\n".join(f"  · note {i}" for i in range(12)) + "\n"
+     + PROMPT, "idle"),
+    # Precedence: background work must never mask "needs your input". The
+    # foreground spinner still vetoes a generic picker footer, but a running
+    # shell/workflow must not -- that is the one alert the device exists for.
+    ("a question picker while a background shell runs still reads waiting",
+     "⏺ Which rollout do you want?\n"
+     "  1. Canary   2. Full\n"
+     "  ↑↓ to navigate · Enter to select\n"
+     "  ⏵⏵ bypass permissions on · 1 shell · ← for agents", "waiting"),
+    ("a permission prompt while background work runs still reads waiting",
+     "Do you want to proceed?\n 1. Yes\n 2. No\n"
+     "  ⏵⏵ bypass permissions on · 1 shell · ← for agents", "waiting"),
+    ("turn ended, the live in-background counter is up (running workflow)",
+     "● Kicked off the milestone workflow; I'll report back when it lands.\n"
+     "✻ Sautéed for 2m 33s\n"
+     "  5 tasks (1 done, 1 in progress, 3 open)\n"
+     + "\n".join(f"  ✓ shipped item {i}" for i in range(4)) + "\n"
+     + "                                                    1 in background\n"
+     + PROMPT, "working"),
+    ("turn ended, background work still QUEUED (counter, nothing started yet)",
+     "● Queued both reviewers behind the current build.\n"
+     + "\n".join(f"  · note line {i}" for i in range(6)) + "\n"
+     + "                                                   2 in background\n"
+     + PROMPT, "working"),
+    ("turn ended, turn-duration recap carries a 'still running' suffix",
+     "● Handed the build off; I'll pick the result up when it lands.\n"
+     "✻ Cooked for 45s · 2 shells still running\n"
+     + "\n".join(f"  · detail line {i}" for i in range(10)) + "\n"
+     + PROMPT, "working"),
+    ("turn ended, the background-work banner WRAPPED in a narrow terminal",
+     "● Kicked off the reviewers.\n"
+     "✻ Waiting for 2 background agents and\n"
+     "  1 dynamic workflow to finish\n"
+     + "\n".join(f"  · detail line {i}" for i in range(10)) + "\n"
+     + PROMPT, "working"),
+    # False-positive guards for the two new shapes. The counter must END its line
+    # and sit behind right-alignment padding; the recap suffix needs the
+    # "<verb> for <elapsed> · ... still running" shape, not merely the words.
+    ("idle, prose mentions leaving 2 in background mode",
+     "● I left 2 in background mode while the rest ran up front.\n"
+     + PROMPT, "idle"),
+    ("idle, a sentence happens to END with a count in background",
+     "● The scheduler keeps 3 in background\n"
+     + PROMPT, "idle"),
+    ("idle, prose says a dev server is still running (no recap shape)",
+     "● I ran the suite for 30s · the dev server is still running on :3000.\n"
+     + PROMPT, "idle"),
+    # The reported screenshot, exactly: the turn ended, the task panel still shows
+    # an in-progress TODO and the footer offers the agents view -- but Claude
+    # registered no background work. A to-do left 'in progress' is not a running
+    # task, so this must stay idle or the device could never report DONE again.
+    ("idle, task panel shows an in-progress TODO but nothing is in flight",
+     "✻ Sautéed for 2m 33s\n"
+     "✻ recap: six issues shipped and merged, 29 issues left.\n"
+     "  5 tasks (1 done, 1 in progress, 3 open)\n"
+     "  ✓ P2 registry: ship #2801, #2802, #2804\n"
+     "  ◼ P3 ETL unblockers: ship #2818 then #2823\n"
+     "  ◻ P4 UI: ship #2837-#2844\n"
+     "╭─────────╮\n│ >       │\n╰─────────╯\n"
+     "  bypass permissions on (shift+tab to cycle) · ctrl+t to hide tasks", "idle"),
 ]
 
 fails = 0
