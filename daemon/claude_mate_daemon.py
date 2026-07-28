@@ -1510,6 +1510,7 @@ class ButtonReader(threading.Thread):
         self._mirror_key: Optional[str] = None
         self._mirror_scroll = 0
         self._mirror_timer: Optional[threading.Timer] = None
+        self._mirror_warned = False   # log the "no screen" reason once per open
 
     def run(self) -> None:
         while not self._stop_evt.is_set():
@@ -1642,7 +1643,14 @@ class ButtonReader(threading.Thread):
                 return
             self._mirror_key = sess.key
             self._mirror_scroll = 0
-            log(f"MIRROR on -> {sess.name}")
+            self._mirror_warned = False
+            # The ctrl socket is the whole story when a mirror comes up empty:
+            # sessions are keyed by session id, so a restarted terminal is a
+            # NEW session that merely shares a display name with the old one.
+            # Logging which socket was chosen distinguishes "wrong session" from
+            # "wrapper too old" without guesswork.
+            log(f"MIRROR on -> {sess.name} sid={sess.sid[:8]} "
+                f"ctrl={sess.focus_ctrl or '(none)'}")
         self._mirror_tick()                       # paint immediately, do not
                                                   # wait out the first interval
 
@@ -1685,22 +1693,50 @@ class ButtonReader(threading.Thread):
             return
 
         rows = wrapper_ctrl_screen(sess.focus_ctrl or "")
+        if rows is None and not self._mirror_warned:
+            log(f"MIRROR: no screen from {sess.name} "
+                f"(ctrl={sess.focus_ctrl or '(none)'}) -- hook-only session, or "
+                f"a wrapper started before the mirror command existed")
         if rows is None:
             body = ["", "  no preview for this session.", "",
                     "  only wrapped sessions mirror their",
                     "  terminal -- a hook-only session has",
                     "  no PTY for the daemon to read."]
         else:
-            # Trailing blank rows are the TUI's empty space, not content:
-            # dropping them means scrolling lands on real output.
-            while rows and not rows[-1].strip():
-                rows.pop()
-            # Clamp scroll so it cannot run past the end and show nothing.
-            first = max(0, len(rows) - MIRROR_ROWS)
+            # COLLAPSE runs of blank rows to a single spacer before windowing.
+            # A TUI is not a scrolling log: Claude's screen puts the banner and
+            # conversation at the top, a wide blank gap in the middle, and the
+            # input box at the bottom. Taking the last 17 of 30 raw rows lands
+            # almost entirely in that gap -- observed as a mirror showing one
+            # line of footer and nothing else. Interior whitespace is padding
+            # for an 80x30 terminal and is pure waste on a 17-row window, so one
+            # blank row is kept as a separator and the rest dropped. Single
+            # blanks survive, so paragraph structure still reads.
+            compact: List[str] = []
+            blank_run = 0
+            for r in rows:
+                if r.strip():
+                    blank_run = 0
+                    compact.append(r)
+                else:
+                    blank_run += 1
+                    if blank_run == 1:
+                        compact.append("")
+            while compact and not compact[-1].strip():
+                compact.pop()
+            while compact and not compact[0].strip():
+                compact.pop(0)
+            # Show the TAIL: on a conversation the newest exchange is what you
+            # glanced at the device to see. Scroll walks back from there.
+            first = max(0, len(compact) - MIRROR_ROWS)
             start = max(0, first - scroll)
-            body = rows[start:start + MIRROR_ROWS]
+            body = compact[start:start + MIRROR_ROWS]
 
         title = f"{sess.name} {sess.state}"[:MIRROR_COLS]
+        if not self._mirror_warned:
+            self._mirror_warned = True
+            log(f"MIRROR: sending {len(body)} rows for {sess.name} "
+                f"(fetched {'-' if rows is None else len(rows)})")
         self._link.write_line(f"M|T|{title}")
         for i in range(MIRROR_ROWS):
             text = body[i] if i < len(body) else ""

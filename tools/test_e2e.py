@@ -148,9 +148,15 @@ ctrl_lock = threading.Lock()
 # session name. More rows than the device shows, so the daemon's tail-and-clip
 # is exercised rather than assumed: only the LAST MIRROR_ROWS should appear,
 # and PREV must scroll further back to reveal MIRROR-TOP.
+# Shaped like a real TUI, NOT a scrolling log: content at the top, a wide blank
+# GAP, then a footer pinned at the bottom. That shape broke the first version --
+# a naive tail of the last 17 raw rows landed inside the gap and mirrored one
+# line of footer and nothing else. The gap is what makes this a regression test.
 FAKE_SCREEN = {
-    "folA": (["MIRROR-TOP line %02d" % i for i in range(30)]
-             + ["$ pytest -q", "47 passed in 3.2s", "MIRROR-BOTTOM", "", ""]),
+    "folA": (["MIRROR-TOP line %02d" % i for i in range(20)]
+             + ["$ pytest -q", "47 passed in 3.2s", "MIRROR-BOTTOM"]
+             + [""] * 12
+             + ["  footer: bypass permissions on"]),
 }
 
 def fake_ctrl(name):
@@ -463,6 +469,10 @@ mirror_ended = any(l == "M|END" for l in m_lines)
 # The fake screen is 35 rows for a 17-row view, so the daemon must show the
 # TAIL: the newest output is what matters when you glance at a session.
 mirror_tail = any("MIRROR-BOTTOM" in l for l in m_lines)
+# The blank gap must be COLLAPSED, not windowed into: a naive tail of the raw
+# rows shows the footer and nothing else, which is what shipped first.
+mirror_gap_collapsed = (any("MIRROR-BOTTOM" in l for l in m_lines)
+                        and any("footer:" in l for l in m_lines))
 mirror_clipped = not any("MIRROR-TOP line 00" in l for l in m_lines)
 
 # PREV must scroll the view, NOT move the selection.
@@ -646,8 +656,11 @@ check("B|M opens the mirror (title row + M|END terminator)",
       mirror_titled and mirror_ended)
 check("the mirror shows the TAIL of a screen taller than the view "
       "(newest output visible)", mirror_tail)
-check("...and clips the rest rather than sending all 35 rows",
+check("...and clips the rest rather than sending every row",
       mirror_clipped)
+check("a blank GAP between content and footer is collapsed, not windowed into "
+      "(a raw tail would mirror the footer and nothing else)",
+      mirror_gap_collapsed)
 check("PREV scrolls the mirror back into history (reveals MIRROR-TOP)",
       mirror_scrolled)
 check("B|M again closes it (M|OFF)", mirror_closed)
