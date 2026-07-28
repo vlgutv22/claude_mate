@@ -157,6 +157,30 @@ struct Btn {
 #define CHARGE_TREND_MS   90000UL // baseline age before a trend is judged
 #define CHARGE_TREND_MV   12      // movement needed to call it (beats ADC noise)
 
+// ---- Battery filtering ------------------------------------------------------
+// This node is NOISY: the sense divider is high-impedance with no filter cap,
+// which the SAR ADC's sample-and-hold hates, and WiFi TX bursts dip the rail.
+// Unfiltered it swings the gauge by tens of percent -- and the percent curve is
+// steep (900 mV spans 0-100%, so 1% is only ~9 mV), which magnifies every
+// millivolt of noise into something the eye reads as a broken gauge.
+//
+// Averaging back-to-back samples does NOT help: samples microseconds apart are
+// correlated, so a burst landing in that window spoils all of them equally, and
+// a mean is dragged by any single outlier. Two filters, each for a different
+// timescale:
+//
+//   * MEDIAN of spaced samples -- discards outliers within one poll rather than
+//     averaging them in. Odd count, so the median is a real sample.
+//   * EMA across polls -- the poll-to-poll variation is where the WiFi
+//     correlation lives, and BATT_POLL_MS between polls decorrelates it.
+//
+// A 100 nF cap from the sense pin to GND would fix this properly in hardware
+// (it forms an RC low-pass with the divider), but the divider is on-board and
+// this has to work without modifying it.
+#define BATT_SAMPLES    15    // odd, so the median is an actual sample
+#define BATT_SAMPLE_US  500   // spacing: spreads the burst over ~7 ms
+#define BATT_EMA_SHIFT  3     // weight 1/8 -> settles in ~8 polls (~40 s)
+
 #define BATT_MIN_MV   3000    // below this the reading is treated as "no cell
                               // wired" and the chip is hidden entirely. NOTE:
                               // on this board the charger rail sits at ~4.2 V

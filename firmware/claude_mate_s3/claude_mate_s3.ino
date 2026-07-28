@@ -145,6 +145,8 @@ static bool    netOverflow = false;
 static int      battPercent = -1;      // -1 = no cell wired / gauge disabled
 static uint32_t battMv      = 0;
 static unsigned long lastBattMs = 0;
+static uint32_t battRawMv    = 0;      // this poll's median, before the EMA
+static uint32_t battFiltMv   = 0;      // EMA state (0 = not yet seeded)
 static bool     battCharging = false;  // inferred, not read from a status pin
 static uint32_t battTrendMv  = 0;      // baseline the trend is measured against
 static unsigned long battTrendMs = 0;  // ...and when it was taken (0 = none)
@@ -281,14 +283,43 @@ static int battPercentFromMv(uint32_t mv) {
   return 0;
 }
 
+// Median of BATT_SAMPLES readings taken BATT_SAMPLE_US apart. See the note by
+// BATT_SAMPLES in board_s3.h for why a median of spaced samples beats a mean of
+// a back-to-back burst on this board.
+static uint32_t battMedianMv() {
+  uint16_t s[BATT_SAMPLES];
+  for (uint8_t i = 0; i < BATT_SAMPLES; i++) {
+    s[i] = (uint16_t)analogReadMilliVolts(PIN_BATT_ADC);
+    delayMicroseconds(BATT_SAMPLE_US);
+  }
+  for (uint8_t i = 1; i < BATT_SAMPLES; i++) {   // insertion sort; n is tiny
+    uint16_t v = s[i];
+    int8_t j = (int8_t)i - 1;
+    while (j >= 0 && s[j] > v) { s[j + 1] = s[j]; j--; }
+    s[j + 1] = v;
+  }
+  return s[BATT_SAMPLES / 2];
+}
+
 static void pollBattery() {
 #if PIN_BATT_ADC >= 0
   unsigned long now = millis();
   if (lastBattMs && (now - lastBattMs) < BATT_POLL_MS) return;
   lastBattMs = now;
-  uint32_t acc = 0;
-  for (uint8_t i = 0; i < 8; i++) acc += analogReadMilliVolts(PIN_BATT_ADC);
-  uint32_t mv = (uint32_t)((acc / 8.0f) * BATT_DIVIDER);
+  uint32_t raw = (uint32_t)(battMedianMv() * BATT_DIVIDER);
+  battRawMv = raw;
+  // EMA, seeded on the first poll so the gauge is correct immediately instead
+  // of crawling up from zero for the first minute. Rounded and computed in
+  // signed arithmetic: a plain shift truncates toward zero, which would stall
+  // the filter on small steps in one direction and make it drift only one way.
+  if (!battFiltMv) {
+    battFiltMv = raw;
+  } else {
+    const int32_t W = 1 << BATT_EMA_SHIFT;
+    battFiltMv = (uint32_t)(((int32_t)battFiltMv * (W - 1) +
+                             (int32_t)raw + W / 2) / W);
+  }
+  uint32_t mv = battFiltMv;
   // Nothing wired to the divider reads as a floating near-zero: report "no
   // gauge" rather than a permanent 0% that would look like a dying cell.
   int pc = (mv < BATT_MIN_MV) ? -1 : battPercentFromMv(mv);
@@ -698,12 +729,18 @@ static bool handleConfigLine(char *line) {
       // a wrong BATT_DIVIDER is invisible -- it just shows a plausible, wrong
       // percentage, which is exactly how the 2:1/3:1 mix-up hid for so long.
 #if PIN_BATT_ADC >= 0
+      // Both figures, because they answer different questions: the filtered mV
+      // is what the gauge shows, while raw-vs-filtered is the live noise on the
+      // node -- if those two are far apart the filter is being asked to hide a
+      // hardware problem, not just dither.
       if (battPercent < 0)
-        Serial.printf("batt  : no cell (%u mV raw x%.1f)\n",
-                      (unsigned)battMv, (double)BATT_DIVIDER);
+        Serial.printf("batt  : no cell (%u mV filt, %u raw, x%.1f)\n",
+                      (unsigned)battMv, (unsigned)battRawMv,
+                      (double)BATT_DIVIDER);
       else
-        Serial.printf("batt  : %d%% (%u mV) %s\n", battPercent,
-                      (unsigned)battMv, battCharging ? "charging" : "on battery");
+        Serial.printf("batt  : %d%% (%u mV filt, %u raw) %s\n", battPercent,
+                      (unsigned)battMv, (unsigned)battRawMv,
+                      battCharging ? "charging" : "on battery");
 #else
       Serial.println("batt  : gauge compiled out");
 #endif
