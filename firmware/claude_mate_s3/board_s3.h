@@ -20,15 +20,25 @@
  *
  * WIRING YOU ADD (the bare board has only BOOT + RESET):
  *
- *   Three buttons, each INPUT_PULLUP with its other leg to GND. Physical
- *   layout left -> right, exactly like the Nano build: PREV | GO | NEXT.
+ *   FOUR buttons, each INPUT_PULLUP with its other leg to GND. Physical layout
+ *   left -> right; the first three are exactly the Nano build, so muscle memory
+ *   carries over unchanged:
  *
- *       PREV -> GPIO 4        GO -> GPIO 5        NEXT -> GPIO 6
+ *       PREV -> GPIO 4    GO -> GPIO 5    NEXT -> GPIO 6    ACK -> GPIO 7
  *
- *   GPIO 4/5/6 sit next to each other on the header, are free on this board,
- *   and are not strapping pins -- so a held button cannot change how the chip
- *   boots. BOOT (GPIO 0) doubles as GO, so a board with nothing soldered to it
- *   yet is still usable.
+ *   GPIO 4/5/6/7 sit next to each other on the header, are free on this board
+ *   (verified: an ADC sweep found every one of them floating), and none is a
+ *   strapping pin -- so a held button cannot change how the chip boots. BOOT
+ *   (GPIO 0) doubles as GO, so a board with nothing soldered to it yet is still
+ *   usable.
+ *
+ *   The 4th button is the one the 3-button build could not have. Short press
+ *   ACKNOWLEDGES the shown alert without raising anything -- the commonest
+ *   triage action, previously only reachable by holding GO for half a second.
+ *   Held, it toggles FOLLOW mode, which until now was hidden behind a
+ *   double-click on GO that nobody would discover unaided. Both map onto verbs
+ *   the daemon already understands (K) or now understands (F); GO keeps its
+ *   short/long/double gestures, so nothing regresses for a 3-button device.
  *
  *   Battery: NOTHING TO WIRE on the -1.47B. The board has its own charger and
  *   its own sense divider already landing on GPIO 1 (ADC1_CH0), so the gauge
@@ -78,10 +88,11 @@
 #define BL_BRIGHTNESS 200              // 0-255 backlight duty (battery vs glare)
 
 // ---- Buttons (INPUT_PULLUP, other leg to GND) -------------------------------
-// Physical layout left -> right: PREV | GO | NEXT.
+// Physical layout left -> right: PREV | GO | NEXT | ACK.
 #define PIN_BTN_PREV  4
 #define PIN_BTN_GO    5
 #define PIN_BTN_NEXT  6
+#define PIN_BTN_ACK   7       // 4th button: short = acknowledge, held = FOLLOW
 #define PIN_BTN_BOOT  0       // the onboard BOOT button, a second GO. Held at
                               // power-on it forces the WiFi setup portal.
 

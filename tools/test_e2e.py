@@ -394,6 +394,27 @@ with ctrl_lock:
     off_nav_ops = ctrl_ops[ops_before_offnav:]
 follow_off_no_raise = (len(off_nav_ops) == 0)
 
+print("\n-- phase 12b: B|F (ACK held) toggles FOLLOW with no click window --")
+# The 4-button device toggles FOLLOW with a single unambiguous verb instead of
+# a double-click. FOLLOW is OFF here (the second double-click above turned it
+# off), so ONE B|F must turn it on AND raise the shown terminal -- exactly what
+# the double-click does -- and a second B|F must turn it back off. Sending one
+# press rather than two also proves the daemon is not just counting B|G pairs.
+idx_fb = mark()
+with ctrl_lock:
+    ops_before_fb = len(ctrl_ops)
+arduino_send("B|F"); time.sleep(1.0)
+with display_lock:
+    fb_on_frame = any(frame_follow(l) for l in display[idx_fb:]
+                      if l.startswith("F|"))
+with ctrl_lock:
+    fb_raised = ctrl_ops[ops_before_fb:]
+idx_fb_off = mark()
+arduino_send("B|F"); time.sleep(1.0)
+with display_lock:
+    fb_off_frames = [l for l in display[idx_fb_off:] if l.startswith("F|")]
+fb_off_frame = bool(fb_off_frames) and not frame_follow(fb_off_frames[-1])
+
 print("\n-- phase 13: tab ORDER is stable (alphabetical), never urgency-shuffled --")
 # Clean slate, then two sessions whose alphabetical order (apple < zebra) is the
 # OPPOSITE of their urgency once zebra errors. The strip must keep apple first.
@@ -537,6 +558,14 @@ check("double-click GO again turns FOLLOW OFF",
       follow_off_frame)
 check("with FOLLOW off, navigation raises NOTHING",
       follow_off_no_raise)
+
+# ---- FOLLOW mode via the 4-button device's dedicated verb (B|F) -----------------
+check("B|F (ACK held) turns FOLLOW ON from a SINGLE press -- no click window",
+      fb_on_frame)
+check("B|F turning FOLLOW on raises the shown terminal, like the double-click",
+      any(c == "focus" for (c, t) in fb_raised))
+check("a second B|F turns FOLLOW OFF again",
+      fb_off_frame)
 
 # ---- stable tab order ----------------------------------------------------------
 check("tab order is stable/alphabetical -- an error does NOT shuffle it to front",

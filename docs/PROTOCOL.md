@@ -42,19 +42,28 @@ knocked out — so you can see at a glance which tab is on screen. Any tab with
 an **unacknowledged alert** has its letter **blinking** in the strip, so you can
 tell acked from unacked without hunting.
 
-The three buttons mean the same thing at all times:
+The buttons mean the same thing at all times. The Nano build has **three**; the
+ESP32-S3 build adds a fourth, and the first three are identical on both:
 
 | Button (left→right) | Short press | Held / double |
 |---|---|---|
 | **PREV** | selection one step **up** the queue | auto-repeats (400 ms, then 5/s) |
 | **GO**   | single: **RAISE** the terminal of the session **shown on the glass** (acknowledging its alert) | **double-click** (≤ 300 ms apart): toggle **FOLLOW** mode. Held ≥ 500 ms: acknowledge **without** raising. |
 | **NEXT** | selection one step **down** the queue | auto-repeats (400 ms, then 5/s) |
+| **ACK** *(4-button devices only)* | acknowledge the shown alert **without** raising anything — same as holding GO | Held ≥ 500 ms: toggle **FOLLOW** mode |
 
-**FOLLOW mode** (toggled by double-clicking GO; shown by a small ► marker by
-the state row): while on, PREV/NEXT additionally **raise** the selected
-session's terminal, ~250 ms after the selection settles (so holding to scroll
-never raises the windows it passes over). Raise ONLY — never ack (ack stays on
-GO long-press), never collapse.
+The 4th button adds no new capability; it makes the two actions that were
+buried in GO's gestures reachable directly. Acknowledging is the commonest
+triage move and previously needed a half-second hold, and FOLLOW was only
+reachable by a double-click nobody discovers unaided. A 3-button device loses
+nothing: GO keeps all three gestures.
+
+**FOLLOW mode** (toggled by double-clicking GO, or by holding ACK on a
+4-button device; shown by a small ► marker by the state row): while on,
+PREV/NEXT additionally **raise** the selected session's terminal, ~250 ms after
+the selection settles (so holding to scroll never raises the windows it passes
+over). Raise ONLY — never ack (ack stays on GO long-press and the ACK button),
+never collapse.
 
 **Window contract:** navigation touches macOS windows ONLY in FOLLOW mode, and
 then only to **raise/activate** the selected terminal — the daemon never
@@ -146,11 +155,12 @@ transfer is open.
 
 ### 1b. Arduino → Daemon
 
-The three buttons are, left→right, **PREV | GO | NEXT**. Debounce is ~40 ms
-immediate-fire (an edge is accepted and emitted the same tick). PREV/NEXT emit
-on the **press** edge and auto-repeat while held (400 ms to start, then one
-event per 200 ms). GO distinguishes a short press (emit on release) from a long
-press (emit once at 500 ms; the release is then swallowed).
+The buttons are, left→right, **PREV | GO | NEXT** (plus **ACK** on the
+ESP32-S3's 4-button layout). Debounce is ~40 ms immediate-fire (an edge is
+accepted and emitted the same tick). PREV/NEXT emit on the **press** edge and
+auto-repeat while held (400 ms to start, then one event per 200 ms). GO and ACK
+distinguish a short press (emit on release) from a long press (emit once at
+500 ms; the release is then swallowed).
 
 | Line  | Meaning |
 |-------|---------|
@@ -159,7 +169,8 @@ press (emit once at 500 ms; the release is then swallowed).
 | `B\|P` | **PREV** pressed (D4) — selection one step up the queue. Repeats while held. |
 | `B\|N` | **NEXT** pressed (D3) — selection one step down the queue. Repeats while held. |
 | `B\|G` | **GO** short press (D2). The firmware just emits `B\|G` on each short press; the **daemon** disambiguates a single press (after ~300 ms) from a double-click. A single press raises the terminal of the session **shown on the glass** (raise only), acknowledging its alert. A **double-click** (two `B\|G` within ~300 ms) toggles **FOLLOW** mode. |
-| `B\|K` | **GO** long press (D2, held ≥ ~500 ms) — acknowledge the shown session's alert WITHOUT raising anything. No-op when nothing is unacknowledged. |
+| `B\|K` | **GO** long press (D2, held ≥ ~500 ms) — acknowledge the shown session's alert WITHOUT raising anything. No-op when nothing is unacknowledged. Also sent by a **short press of the ACK button** on a 4-button device: same verb, same effect, no daemon-side distinction. |
+| `B\|F` | **ACK** button held ≥ ~500 ms (4-button devices) — toggle **FOLLOW** mode. Identical in effect to a GO double-click, but unambiguous: no 300 ms window to race, so a deliberate toggle cannot be misread as two hurried raises. Turning it ON raises the shown terminal immediately, exactly as the double-click does. |
 
 **Reset note:** opening the USB serial port resets the Nano (~1.5 s). The `H`
 handshake plus the daemon re-sending state on `H` is exactly what makes the

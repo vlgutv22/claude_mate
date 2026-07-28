@@ -970,7 +970,8 @@ class Screen:
         self.refresh()
 
     def toggle_follow(self) -> bool:
-        """Double-click GO: flip FOLLOW mode. Returns the new state."""
+        """Flip FOLLOW mode. Returns the new state. Reached by a GO
+        double-click, or by holding the 4-button device's ACK button."""
         with self._lock:
             self._follow = not self._follow
             state = self._follow
@@ -1471,8 +1472,10 @@ class ButtonReader(threading.Thread):
                 self._nav(+1)
             elif ev == "G":                      # GO short: focus / (dbl) follow
                 self._go_pressed()
-            elif ev == "K":                      # GO long: acknowledge only
+            elif ev == "K":                      # GO long / ACK button: ack only
                 self._ack_only()
+            elif ev == "F":                      # ACK button held: toggle FOLLOW
+                self._follow_pressed()
             else:
                 log(f"unknown button event: {line!r}")
             return
@@ -1542,6 +1545,28 @@ class ButtonReader(threading.Thread):
                 return
             self._go_timer = None
         self._go()
+
+    def _follow_pressed(self) -> None:
+        """B|F -- the 4-button device's dedicated FOLLOW toggle.
+
+        Same effect as a GO double-click, without the guesswork: there is no
+        DOUBLE_CLICK_S window to race, so a deliberate toggle can never be
+        misread as two hurried raises (nor two hurried raises as a toggle).
+        Held under _go_lock because that is the lock the double-click path
+        toggles under -- otherwise a physical double-click and an F arriving
+        together could interleave and land on the wrong final state.
+
+        A GO press still waiting out its window is deliberately left alone: it
+        was a separate intent and its raise is harmless here (raises serialize
+        last-wins, and turning FOLLOW on raises the same session anyway).
+        """
+        with self._go_lock:
+            on = self._screen.toggle_follow()
+            log(f"FOLLOW button -> {'ON' if on else 'OFF'}")
+            if on:                               # turning it on raises now,
+                sess = self._screen.current_shown()   # same as the dbl-click
+                if sess is not None:
+                    self._raise(sess)
 
     def _raise(self, sess: Optional[Session]) -> None:
         """Raise a session's window on a serialized side thread (raise ONLY).

@@ -31,11 +31,19 @@
  *
  * There are NO modes: the buttons mean the same thing at all times --
  *
- *     PREV (left)   step the selection up the queue      (auto-repeats held)
- *     GO   (middle) short: raise that session's terminal window (+ack)
+ *     PREV          step the selection up the queue      (auto-repeats held)
+ *     GO            short: raise that session's terminal window (+ack)
  *                   long : acknowledge the alert WITHOUT raising anything
  *                   double: toggle FOLLOW (the daemon disambiguates)
- *     NEXT (right)  step the selection down the queue    (auto-repeats held)
+ *     NEXT          step the selection down the queue    (auto-repeats held)
+ *     ACK           short: acknowledge the alert WITHOUT raising anything
+ *                   long : toggle FOLLOW
+ *
+ * The 4th button (ACK) adds no new capability -- it surfaces the two actions
+ * that were buried in GO's gestures. Acknowledging is the commonest triage move
+ * and needed a half-second hold; FOLLOW was reachable only by a double-click
+ * nobody discovers unaided. GO keeps all three gestures, so a 3-button board
+ * behaves exactly as before and BOOT still stands in for GO.
  *
  * The onboard WS2812 replaces the Nano's single LED: the daemon's V|<KIND>
  * alert class picks both a COLOUR and a RHYTHM, and loops until acknowledged.
@@ -754,6 +762,7 @@ static void pumpNet() {
 static Btn prevBtn = {PIN_BTN_PREV, false, 0, 0, false, 0};
 static Btn goBtn   = {PIN_BTN_GO,   false, 0, 0, false, 0};
 static Btn nextBtn = {PIN_BTN_NEXT, false, 0, 0, false, 0};
+static Btn ackBtn  = {PIN_BTN_ACK,  false, 0, 0, false, 0};
 static Btn bootBtn = {PIN_BTN_BOOT, false, 0, 0, false, 0};
 
 static void emitBtn(char c) {
@@ -801,10 +810,42 @@ static void pollGoBtn(Btn &b) {
   }
 }
 
+// The 4th button. Mirrors pollGoBtn's short/long split so the two action
+// buttons feel the same under the thumb, but emits the OTHER two verbs:
+//
+//   short (on release)  K  acknowledge the shown alert, raise nothing
+//   long  (at 500 ms)   F  toggle FOLLOW mode
+//
+// K is what GO's long-press already sends, so a 3-button device loses nothing.
+// F is new: FOLLOW used to be reachable only by double-clicking GO, which is
+// both undiscoverable and easy to trigger by accident when hurrying to raise a
+// terminal twice. Emitting on RELEASE for the short press is what makes the
+// long press possible at all -- press-edge firing would send K before the hold
+// could ever be recognised.
+static void pollAckBtn(Btn &b) {
+  bool raw = (digitalRead(b.pin) == LOW);
+  unsigned long now = millis();
+  if (raw != b.pressed && (now - b.changeMs) >= DEBOUNCE_MS) {
+    b.pressed  = raw;
+    b.changeMs = now;
+    if (raw) {
+      b.pressMs   = now;
+      b.longFired = false;
+    } else if (!b.longFired) {
+      emitBtn('K');                         // acknowledge only
+    }
+  }
+  if (b.pressed && !b.longFired && (now - b.pressMs) >= LONGPRESS_MS) {
+    emitBtn('F');                           // toggle FOLLOW
+    b.longFired = true;                     // ...and swallow the release
+  }
+}
+
 static void pollButtons() {
   pollNavBtn(prevBtn, 'P');
   pollGoBtn(goBtn);
   pollNavBtn(nextBtn, 'N');
+  pollAckBtn(ackBtn);
   pollGoBtn(bootBtn);                       // BOOT is a second GO, so a board
                                             // with nothing soldered still works
 }
@@ -817,6 +858,7 @@ void setup() {
   pinMode(PIN_BTN_PREV, INPUT_PULLUP);
   pinMode(PIN_BTN_GO,   INPUT_PULLUP);
   pinMode(PIN_BTN_NEXT, INPUT_PULLUP);
+  pinMode(PIN_BTN_ACK,  INPUT_PULLUP);
   pinMode(PIN_BTN_BOOT, INPUT_PULLUP);
   rgbLedWrite(PIN_RGB, 0, 0, 0);            // LED dark at boot
   lastRxMs = millis();                      // seed the liveness watchdog
