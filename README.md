@@ -19,9 +19,10 @@ schedule. Instead of scanning every terminal to find the one that stalled, you
 glance at a small desk device: one screen and an indication LED tell you *which*
 session needs you *right now*, and a single button jumps you straight to it.
 
-This is **iteration one** — an Arduino-based USB device for macOS. The next
-iteration is a wireless **ESP32 Wi-Fi** remote, so the companion no longer has
-to be tethered to the Mac (see [Roadmap](#roadmap)).
+There are two devices, speaking one protocol: the original **Arduino Nano** over
+USB, and a cordless **ESP32-S3** with a colour screen that reaches the daemon
+over Wi-Fi and runs on a battery. Either works on its own, or both at once (see
+[Roadmap](#roadmap) and [`firmware/README.md`](firmware/README.md)).
 
 You feed it from the Claude Code **hooks** or the **PTY wrapper**
 (`claude-mate-wrap`); it becomes an ambient, always-on triage pane for every
@@ -473,11 +474,16 @@ Claude Mate is built in iterations, each removing more friction than the last.
   OLED, the three buttons, and the indication LED over **USB serial**; a Python
   daemon on the Mac keeps the triage queue, renders the screen, and raises
   windows. Tethered by USB to the machine it watches.
-- **Iteration 2 — ESP32 Wi-Fi remote (next).** Move to an **ESP32** so the
-  device talks to the daemon **over Wi-Fi** instead of USB — a genuinely
-  wireless desk remote you can place anywhere, with no cable to the Mac. Same
-  triage model and line protocol; the transport becomes the network. (A richer
-  display and on-battery operation are natural follow-ons.)
+- **Iteration 2 — ESP32-S3 Wi-Fi remote (here).** A Waveshare
+  ESP32-S3-LCD-1.47B talks to the daemon **over Wi-Fi** instead of USB — a
+  genuinely wireless desk remote you can put anywhere, running on a Li-ion cell
+  with an on-screen battery gauge. Same triage model, same line protocol; the
+  transport became the network. The colour LCD adds a fourth button that opens
+  a **live mirror of a session's actual terminal**, and the follow-ons that
+  iteration 1 could only hint at — colour-coded alerts, on-battery operation —
+  are in. Iteration 1 is **unchanged and still supported**: both devices speak
+  the identical protocol and can be connected at the same time. See
+  [`firmware/README.md`](firmware/README.md).
 
 The goal stays fixed across every iteration: **one calm surface that tells you
 which agent needs you, so running many of them in parallel stops taxing your

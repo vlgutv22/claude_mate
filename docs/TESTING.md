@@ -23,6 +23,20 @@ passes.
 
 ---
 
+> **Which device?** The ladder below is written for the Arduino Nano, the
+> reference implementation. It applies unchanged to the ESP32-S3 except that you
+> flash with [`firmware/flash_s3.sh`](../firmware/flash_s3.sh) rather than
+> `arduino-cli upload` (that board needs three separate workarounds — see
+> [`firmware/README.md`](../firmware/README.md)), and there is a fourth button.
+>
+> **The automated tests drive the daemon over a serial PTY, so the S3's TCP
+> transport is the one path they do not cover.** A regression that only appears
+> over Wi-Fi is possible and has happened: the terminal mirror first shipped
+> sending rows that were correct over the wire but empty of content, which the
+> serial-based suite could not have caught. When touching the wireless path,
+> test against hardware — or against a throwaway client that performs the
+> nonce/HMAC handshake and speaks the protocol directly.
+
 ## Level −1 — Automated tests (no hardware, no Claude)
 
 Self-contained tests exercise the Mac side before you touch any hardware
@@ -46,8 +60,13 @@ python3 tools/test_e2e.py             # fake Arduino over a PTY + a fake PTY-wra
                                       # disambiguation, and the window-op invariants
                                       # (navigation sends ZERO window ops; GO sends
                                       # exactly one 'focus'; 'collapse' is never
-                                      # sent). Nothing is launched on your Mac:
-                                      # open/code/osascript are stubbed.
+                                      # sent), plus the MIRROR view (B|M opens it,
+                                      # the tail of a taller screen is shown, a
+                                      # blank gap is collapsed rather than
+                                      # windowed into, PREV scrolls WITHOUT moving
+                                      # the selection, and mirroring a terminal
+                                      # never raises it). Nothing is launched on
+                                      # your Mac: open/code/osascript are stubbed.
 
 python3 tools/test_settings_merge.py  # proves the installer's settings.json merge
                                       # preserves your existing config and is idempotent
