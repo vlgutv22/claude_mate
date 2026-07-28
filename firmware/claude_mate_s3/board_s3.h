@@ -146,16 +146,20 @@ struct Btn {
 //   * Below that, charging shows up as a RISING trend. A cell under a constant
 //     load only ever falls, so the sign of the trend separates the two.
 //
-// The trend needs a LONG baseline. A 3.7 -> 4.2 V charge takes roughly an hour,
-// i.e. ~0.14 mV/s, which is far under per-sample ADC noise; comparing against a
-// sample CHARGE_TREND_MS old and demanding CHARGE_TREND_MV of movement gets
-// above the noise floor. The cost is that plugging a charger in takes about
-// that long to be noticed, unless the cell is already near full (where the
-// threshold catches it immediately).
+// The trend needs a LONG baseline, because charging is slow in mV/s terms. The
+// cell here is a 14500 (AA-sized Li-ion, ~800 mAh): at a 300-500 mA charge that
+// is ~0.08-0.14 mV/s, so 10-17 mV over a two-minute window. The threshold sits
+// under that but above the residual noise left by the median+EMA filtering (a
+// few mV), which is what makes this viable at all -- against the unfiltered
+// signal no threshold could separate charging from dither.
+//
+// Scale-dependent, and deliberately so: a much larger cell (an 18650 at the
+// same current) creeps at a quarter of this rate and would slip under the
+// threshold. Tiers 1 and 2 still cover it; only this fallback degrades.
 #define CHARGE_FULL_MV    4150    // at/above this, an external supply is
                                   // holding the rail up -- treat as charging
-#define CHARGE_TREND_MS   90000UL // baseline age before a trend is judged
-#define CHARGE_TREND_MV   12      // movement needed to call it (beats ADC noise)
+#define CHARGE_TREND_MS   120000UL // baseline age before a trend is judged
+#define CHARGE_TREND_MV   8       // movement needed to call it, post-filtering
 
 // ---- Battery filtering ------------------------------------------------------
 // This node is NOISY: the sense divider is high-impedance with no filter cap,
