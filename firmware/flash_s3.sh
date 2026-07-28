@@ -168,8 +168,23 @@ done
 echo
 echo "$FAILS stalled attempts absorbed (a handful is normal on this board)"
 echo "=== booting the app (RTC watchdog, NOT hard-reset) ==="
-"$ESPTOOL" --chip esp32s3 --port "$PORT" --before no-reset --after watchdog-reset \
-  --connect-attempts 2 flash-id 2>&1 | tr '\r' '\n' | grep -iE 'watchdog|fatal' | tail -1
+# This step needs the same retry treatment as the writes: it is one more
+# connection over the same lossy link, and a stall here leaves a perfectly
+# flashed board sitting in download mode -- dark screen, looks like a failure.
+booted=no
+for t in 1 2 3 4 5 6; do
+  if [ $((t % 2)) -eq 1 ]; then bf=no-reset; else bf=usb-reset; fi
+  if "$ESPTOOL" --chip esp32s3 --port "$PORT" --before $bf --after watchdog-reset \
+       --connect-attempts 2 flash-id >"$LOG" 2>&1; then
+    booted=yes
+    echo "  booted (attempt $t via $bf)"
+    break
+  fi
+done
+if [ "$booted" != yes ]; then
+  echo "  WARNING: flash is complete and verified, but the board could not be" >&2
+  echo "  reset into it. It is still in download mode -- rerun, or tap RESET." >&2
+fi
 
 echo
 echo "Flashed. An unprovisioned board comes up in the WiFi setup portal;"

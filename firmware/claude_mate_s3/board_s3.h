@@ -30,19 +30,17 @@
  *   boots. BOOT (GPIO 0) doubles as GO, so a board with nothing soldered to it
  *   yet is still usable.
  *
- *   Battery (optional; the chip is hidden when nothing is wired):
+ *   Battery: NOTHING TO WIRE on the -1.47B. The board has its own charger and
+ *   its own sense divider already landing on GPIO 1 (ADC1_CH0), so the gauge
+ *   works with just a cell plugged into the battery header.
  *
- *       VBAT --[ 100k ]--+--[ 100k ]-- GND
- *                        |
- *                     GPIO 1 (ADC1_CH0)
- *
- *   A LiPo tops out at 4.2 V, over the 3.3 V the ADC can read, so it MUST come
- *   through a divider. Two equal resistors halve it (4.2 V -> 2.1 V); set
- *   BATT_DIVIDER to whatever ratio you actually build. 100k+100k draws ~21 uA,
- *   which is noise next to the display backlight.
- *
- *   Charging is NOT handled here -- use a LiPo charger module (TP4056 or the
- *   like) between the cell and the board's 5V/3V3 rail.
+ *   Waveshare does not publish the sense pin or the divider ratio for this
+ *   revision, so both were measured: sweeping ADC1 (GPIO 1-10) with a cell
+ *   attached, GPIO 1 read a rock-steady 1399 mV while every other pin wandered
+ *   randomly between 40 and 1030 mV -- floating. 1399 mV against a LiPo that
+ *   can only sit between 3.0 and 4.2 V means the divider is 3:1 (4.20 V), not
+ *   the 2:1 a hand-built pair of equal resistors would give (that would imply
+ *   2.80 V, under a LiPo's floor).
  */
 
 #pragma once
@@ -109,10 +107,20 @@ struct Btn {
                               // and would drain the cell for no benefit
 
 // ---- Battery sense ----------------------------------------------------------
-#define PIN_BATT_ADC  1       // ADC1_CH0; set to -1 to compile the gauge out
-#define BATT_DIVIDER  2.0f    // VBAT / measured. 2.0 = two equal resistors
+#define PIN_BATT_ADC  1       // ADC1_CH0, the board's own sense divider; set to
+                              // -1 to compile the gauge out
+#define BATT_DIVIDER  3.0f    // VBAT / measured. 3:1 on the -1.47B (measured --
+                              // see the note above). At 2.0f the gauge reads
+                              // ~2.8 V, falls under BATT_MIN_MV, and the chip
+                              // silently HIDES ITSELF -- which looks like a
+                              // missing feature rather than a wrong constant.
 #define BATT_MIN_MV   3000    // below this the reading is treated as "no cell
-                              // wired" and the chip is hidden entirely
+                              // wired" and the chip is hidden entirely. NOTE:
+                              // on this board the charger rail sits at ~4.2 V
+                              // whenever USB is attached, so with USB plugged
+                              // in the gauge shows ~100% even with no cell --
+                              // the "nothing wired" case is only detectable on
+                              // battery power.
 
 // ---- LAYOUT (320 x 172 landscape) ------------------------------------------
 // The daemon owns all text: it pre-renders FOUR rows of at most 21 characters
