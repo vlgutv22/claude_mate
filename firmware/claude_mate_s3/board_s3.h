@@ -21,16 +21,23 @@
  * WIRING YOU ADD (the bare board has only BOOT + RESET):
  *
  *   FOUR buttons, each INPUT_PULLUP with its other leg to GND. Physical layout
- *   left -> right; the first three are exactly the Nano build, so muscle memory
- *   carries over unchanged:
+ *   left -> right, in ascending GPIO order so the wiring reads like the row of
+ *   switches under the thumb:
  *
- *       PREV -> GPIO 4    GO -> GPIO 5    NEXT -> GPIO 6    ACK -> GPIO 7
+ *       PREV -> GPIO 3    GO -> GPIO 4    NEXT -> GPIO 5    ACK -> GPIO 6
  *
- *   GPIO 4/5/6/7 sit next to each other on the header, are free on this board
- *   (verified: an ADC sweep found every one of them floating), and none is a
- *   strapping pin -- so a held button cannot change how the chip boots. BOOT
+ *   All four are free on this board -- an ADC sweep of GPIO 1-10 found every one
+ *   of them floating, with only the battery sense on GPIO 1 driven. BOOT
  *   (GPIO 0) doubles as GO, so a board with nothing soldered to it yet is still
  *   usable.
+ *
+ *   GPIO 3 IS A STRAPPING PIN, but an inert one here. It selects the JTAG
+ *   source, and that strap is only SAMPLED when EFUSE_JTAG_SEL_ENABLE is
+ *   burned, which is not the factory default -- so on a stock chip the pin is
+ *   an ordinary GPIO. Boot mode is decided by GPIO 0 and GPIO 46, neither of
+ *   which is wired to a button, so no button held through a reset can strand
+ *   the device in download mode. (Worth re-checking with `espefuse summary` if
+ *   these boards ever ship with different eFuses.)
  *
  *   The 4th button is the one the 3-button build could not have. Short press
  *   ACKNOWLEDGES the shown alert without raising anything -- the commonest
@@ -88,11 +95,12 @@
 #define BL_BRIGHTNESS 200              // 0-255 backlight duty (battery vs glare)
 
 // ---- Buttons (INPUT_PULLUP, other leg to GND) -------------------------------
-// Physical layout left -> right: PREV | GO | NEXT | ACK.
-#define PIN_BTN_PREV  4
-#define PIN_BTN_GO    5
-#define PIN_BTN_NEXT  6
-#define PIN_BTN_ACK   7       // 4th button: short = acknowledge, held = FOLLOW
+// Physical layout left -> right: PREV | GO | NEXT | ACK, ascending GPIO.
+#define PIN_BTN_PREV  3       // strapping pin (JTAG select) but inert by
+                              // default -- see the note above
+#define PIN_BTN_GO    4
+#define PIN_BTN_NEXT  5
+#define PIN_BTN_ACK   6       // 4th button: short = acknowledge, held = FOLLOW
 #define PIN_BTN_BOOT  0       // the onboard BOOT button, a second GO. Held at
                               // power-on it forces the WiFi setup portal.
 
