@@ -7,9 +7,14 @@ The "brain" of the Claude Mate USB hardware companion. It:
 
   1. Listens on a Unix-domain socket (CLAUDE_MATE_SOCK) for status lines emitted
      by Claude Code hooks / the PTY wrapper: "<state>|<session_id>|<name>[|...]".
-  2. Manages a single, continuously-open USB serial connection to the Arduino
-     Nano. It auto-detects the port (/dev/cu.usbserial* then /dev/cu.usbmodem*),
-     opens it once, keeps it open, and auto-reconnects if it disappears.
+  2. Manages the device link(s). By default that is a single, continuously-open
+     USB serial connection to the Arduino Nano: it auto-detects the port
+     (/dev/cu.usbserial* then /dev/cu.usbmodem*), opens it once, keeps it open,
+     and auto-reconnects if it disappears. With --tcp it ALSO serves the exact
+     same line protocol over TCP, so a wireless companion (the ESP32-S3 build)
+     can drive the fleet from across the room. Frames fan out to every connected
+     device; button events from any of them are merged into one stream, so a USB
+     Nano and a WiFi device can be used side by side.
   3. Keeps ONE urgency-sorted triage queue of sessions
      (error > waiting > done > working > idle; unacknowledged before
      acknowledged inside a class; oldest event first) and renders ONE screen --
@@ -57,13 +62,21 @@ Config via environment variables:
     CLAUDE_MATE_PORT   serial device (default: autodetect)
     CLAUDE_MATE_SOCK   socket path   (default: /tmp/claude-mate.sock)
     CLAUDE_MATE_BAUD   serial baud   (default: 115200)
+    CLAUDE_MATE_TCP    set to 1 to also serve the protocol over TCP
+    CLAUDE_MATE_TCP_PORT / _TCP_BIND   listener port / bind address
+    CLAUDE_MATE_TOKEN / _TOKEN_FILE    shared secret for TCP devices (required
+                       for --tcp; the token itself never crosses the wire, see
+                       the NetLink handshake)
 """
 
 from __future__ import annotations
 
 import argparse
 import glob
+import hmac
 import os
+import queue
+import secrets
 import signal
 import socket
 import subprocess
@@ -72,7 +85,7 @@ import threading
 import time
 import urllib.parse
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 try:
     import serial  # pyserial
@@ -96,6 +109,19 @@ DEFAULT_BAUD = 115200
 
 # Serial port autodetect order (globs).
 PORT_GLOBS = ("/dev/cu.usbserial*", "/dev/cu.usbmodem*")
+
+# --- Wireless (TCP) transport ---------------------------------------------- #
+# Opt-in (--tcp / CLAUDE_MATE_TCP=1). The device dials US: the daemon's address
+# is stable, a DHCP device's is not.
+DEFAULT_TCP_PORT = 8787
+DEFAULT_TCP_BIND = "0.0.0.0"    # a remote device needs a routable address; the
+                                # listener is token-gated (see NetLink)
+DEFAULT_TOKEN_FILE = "~/.config/claude-mate/token"
+NET_AUTH_TIMEOUT_S = 5.0    # a client must finish the handshake this fast
+NET_MAX_LINE = 512          # drop over-long lines (the longest real one is ~94B)
+NET_MAX_CLIENTS = 4         # bound the fan-out (a Nano + a few wireless devices)
+MDNS_SERVICE = "_claudemate._tcp"   # advertised via macOS dns-sd so the device
+MDNS_NAME = "Claude Mate"           # finds the daemon with zero configuration
 
 # Timings (seconds).
 DOUBLE_CLICK_S = 0.30        # two GO short-presses within this window = a
@@ -458,6 +484,355 @@ class SerialLink:
 
 
 # --------------------------------------------------------------------------- #
+# Wireless link: the same line protocol over TCP (opt-in).
+# --------------------------------------------------------------------------- #
+
+
+def load_token(explicit: Optional[str]) -> Optional[str]:
+    """Resolve the shared secret: --token/env first, then the token file.
+
+    A file keeps the secret out of the LaunchAgent plist (which is readable by
+    every process on the machine); we require it to be non-empty but do not
+    enforce permissions, since the user may deliberately share it.
+    """
+    if explicit:
+        return explicit.strip() or None
+    path = os.path.expanduser(os.environ.get("CLAUDE_MATE_TOKEN_FILE",
+                                             DEFAULT_TOKEN_FILE))
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+
+
+class NetLink:
+    """Serves the daemon<->device line protocol to token-authenticated TCP peers.
+
+    The device is the CLIENT: the daemon's address is stable and discoverable
+    (mDNS), a DHCP device's is not, and dialling out means the device needs no
+    inbound reachability at all.
+
+    HANDSHAKE (the token never crosses the wire, so sniffing one session cannot
+    reveal it and a captured handshake cannot be replayed against a later one):
+
+        daemon -> device   C|<nonce>          32 hex chars, fresh per connection
+        device -> daemon   A|<mac>            hex HMAC-SHA256(token, nonce)
+        daemon -> device   A|OK               ...or A|NO and the socket closes
+
+    After A|OK the socket carries exactly the bytes the serial link would: F|/V|/P
+    down, H/K/B| up. The device sends H, which makes the daemon resend full state
+    -- the same recovery path a Nano replug uses.
+
+    Writes fan out to every authenticated client and reads from all of them merge
+    into one queue, so a USB Nano and a wireless device work side by side. A
+    device that vanishes without a FIN (walked out of WiFi range) is reaped the
+    first time a frame or ping fails to send.
+
+    THREAT MODEL: the payload itself is plaintext. Anyone who can sniff your LAN
+    can read session names, models and states, and an on-path attacker could
+    inject button events into an established connection. Use it on a network you
+    trust; it is off unless you ask for it.
+    """
+
+    def __init__(self, bind: str, port: int, token: str,
+                 rx: "queue.Queue[str]") -> None:
+        self._bind = bind
+        self._port = port
+        self._token = token.encode("utf-8")
+        self._rx = rx
+        self._srv: Optional[socket.socket] = None
+        self._lock = threading.Lock()           # guards _clients
+        self._clients: List[socket.socket] = []
+        self._stop_evt = threading.Event()
+        self._threads: List[threading.Thread] = []
+
+    # ---- lifecycle -------------------------------------------------------- #
+
+    def start(self) -> bool:
+        """Bind + listen and start accepting. False if the port is unusable."""
+        try:
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind((self._bind, self._port))
+            srv.listen(NET_MAX_CLIENTS)
+            srv.settimeout(0.5)                 # so the accept loop can stop
+        except OSError as exc:
+            log(f"TCP listen failed on {self._bind}:{self._port}: {exc}")
+            return False
+        self._srv = srv
+        t = threading.Thread(target=self._accept_loop, name="net-accept",
+                             daemon=True)
+        t.start()
+        self._threads.append(t)
+        log(f"TCP listening on {self._bind}:{self._port} (token required)")
+        return True
+
+    def stop(self) -> None:
+        self._stop_evt.set()
+        if self._srv is not None:
+            try:
+                self._srv.close()
+            except OSError:
+                pass
+            self._srv = None
+        with self._lock:
+            clients, self._clients = self._clients, []
+        for c in clients:
+            self._shutdown(c)
+
+    @staticmethod
+    def _shutdown(sock: socket.socket) -> None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    # ---- accept + authenticate -------------------------------------------- #
+
+    def _accept_loop(self) -> None:
+        while not self._stop_evt.is_set():
+            srv = self._srv
+            if srv is None:
+                return
+            try:
+                conn, addr = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return                          # listener closed: we are done
+            with self._lock:
+                too_many = len(self._clients) >= NET_MAX_CLIENTS
+            if too_many:
+                log(f"TCP refused {addr[0]}: already serving {NET_MAX_CLIENTS}")
+                self._shutdown(conn)
+                continue
+            t = threading.Thread(target=self._serve, args=(conn, addr),
+                                 name="net-client", daemon=True)
+            t.start()
+            self._threads.append(t)
+
+    def _authenticate(self, conn: socket.socket, peer: str) -> bool:
+        """Nonce challenge / HMAC response. False = reject (caller closes)."""
+        nonce = secrets.token_hex(16)
+        expect = hmac.new(self._token, nonce.encode("ascii"),
+                          "sha256").hexdigest()
+        try:
+            conn.settimeout(NET_AUTH_TIMEOUT_S)
+            conn.sendall(f"C|{nonce}\n".encode("ascii"))
+            reply = self._read_line_blocking(conn)
+        except (OSError, socket.timeout):
+            log(f"TCP {peer}: handshake timed out")
+            return False
+        if reply is None or not reply.startswith("A|"):
+            log(f"TCP {peer}: bad handshake {reply!r}")
+            return False
+        # compare_digest keeps the comparison time independent of how much of
+        # the MAC an attacker guessed right.
+        if not hmac.compare_digest(reply[2:].strip().lower(), expect):
+            log(f"TCP {peer}: token rejected")
+            try:
+                conn.sendall(b"A|NO\n")
+            except OSError:
+                pass
+            time.sleep(0.5)                     # take the shine off brute force
+            return False
+        try:
+            conn.sendall(b"A|OK\n")
+        except OSError:
+            return False
+        return True
+
+    @staticmethod
+    def _read_line_blocking(conn: socket.socket) -> Optional[str]:
+        """One newline-terminated line, bounded by NET_MAX_LINE. None on EOF."""
+        buf = bytearray()
+        while len(buf) < NET_MAX_LINE:
+            chunk = conn.recv(1)
+            if not chunk:
+                return None
+            if chunk in (b"\n", b"\r"):
+                if not buf:
+                    continue                    # tolerate CRLF / blank lines
+                break
+            buf += chunk
+        return buf.decode("ascii", errors="replace").strip()
+
+    def _serve(self, conn: socket.socket, addr) -> None:
+        peer = f"{addr[0]}:{addr[1]}"
+        if not self._authenticate(conn, peer):
+            self._shutdown(conn)
+            return
+        try:
+            # Keepalives so a device that drops off WiFi without a FIN is
+            # eventually reaped even if we happen never to write to it.
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            conn.settimeout(None)               # blocking reads from here on
+        except OSError:
+            pass
+        with self._lock:
+            self._clients.append(conn)
+        log(f"TCP device connected: {peer}")
+        try:
+            while not self._stop_evt.is_set():
+                try:
+                    line = self._read_line_blocking(conn)
+                except (OSError, socket.timeout):
+                    break
+                if line is None:
+                    break                       # clean EOF
+                if line:
+                    self._rx.put(line)
+        finally:
+            with self._lock:
+                if conn in self._clients:
+                    self._clients.remove(conn)
+            self._shutdown(conn)
+            log(f"TCP device disconnected: {peer}")
+
+    # ---- the link surface ------------------------------------------------- #
+
+    def has_clients(self) -> bool:
+        with self._lock:
+            return bool(self._clients)
+
+    def write_line(self, line: str) -> bool:
+        """Fan out to every client. True if at least one took the bytes."""
+        data = (line.rstrip("\n") + "\n").encode("ascii", errors="replace")
+        with self._lock:
+            targets = list(self._clients)
+        if not targets:
+            return False
+        dead: List[socket.socket] = []
+        ok = False
+        for c in targets:
+            try:
+                c.sendall(data)
+                ok = True
+            except OSError:
+                dead.append(c)
+        if dead:
+            with self._lock:
+                for c in dead:
+                    if c in self._clients:
+                        self._clients.remove(c)
+            for c in dead:
+                self._shutdown(c)               # its reader thread unblocks
+        return ok
+
+
+class LinkHub:
+    """One device link made of a USB serial port plus a TCP listener.
+
+    Presents exactly the surface the rest of the daemon already used on
+    SerialLink (is_open / ensure_open / write_line / read_line / close), so
+    Screen, ButtonReader and SerialMaintainer are untouched.
+
+    Frames go to BOTH transports; incoming lines from either arrive on one
+    queue. A dedicated pump moves serial input onto that queue so a wireless
+    button press is never stuck behind a blocking serial read.
+    """
+
+    def __init__(self, serial_link: SerialLink, net: NetLink,
+                 rx: "queue.Queue[str]") -> None:
+        self._serial = serial_link
+        self._net = net
+        self._rx = rx
+        self._stop_evt = threading.Event()
+        self._pump = threading.Thread(target=self._pump_serial,
+                                      name="serial-rx-pump", daemon=True)
+        self._pump.start()
+
+    def _pump_serial(self) -> None:
+        while not self._stop_evt.is_set():
+            if not self._serial.is_open():
+                self._stop_evt.wait(0.2)        # nothing to read; don't spin
+                continue
+            line = self._serial.read_line()     # bounded by the read timeout
+            if line:
+                self._rx.put(line)
+
+    # ---- the link surface ------------------------------------------------- #
+
+    def is_open(self) -> bool:
+        return self._serial.is_open() or self._net.has_clients()
+
+    def ensure_open(self) -> bool:
+        """Try to (re)open serial; a connected wireless device also counts as
+        up, so the maintainer does not log a reconnect storm when no USB device
+        is plugged in at all."""
+        opened = self._serial.ensure_open()
+        return opened or self._net.has_clients()
+
+    def write_line(self, line: str) -> bool:
+        # Deliberately not short-circuiting: every connected device must get
+        # every frame, so both writes always run.
+        wired = self._serial.write_line(line)
+        wireless = self._net.write_line(line)
+        return wired or wireless
+
+    def read_line(self) -> Optional[str]:
+        try:
+            return self._rx.get(timeout=0.5)
+        except queue.Empty:
+            return None
+
+    def close(self) -> None:
+        self._stop_evt.set()
+        self._net.stop()
+        self._serial.close()
+
+
+# Anything the rest of the daemon needs from a device link.
+Link = Union[SerialLink, LinkHub]
+
+
+class MdnsAdvertiser:
+    """Advertises the TCP listener as _claudemate._tcp via macOS `dns-sd`.
+
+    Uses the system tool rather than a Bonjour library so the daemon keeps its
+    single third-party dependency (pyserial). Best-effort: no dns-sd, no
+    advertisement -- the device can still be pointed at a host by hand.
+    """
+
+    def __init__(self, port: int) -> None:
+        self._port = port
+        self._proc: Optional[subprocess.Popen] = None
+
+    def start(self) -> None:
+        if not _which("dns-sd"):
+            log("dns-sd not found; skipping mDNS advertisement")
+            return
+        try:
+            self._proc = subprocess.Popen(
+                ["dns-sd", "-R", MDNS_NAME, MDNS_SERVICE, "local",
+                 str(self._port)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+            )
+            log(f"advertising {MDNS_NAME} {MDNS_SERVICE} on port {self._port}")
+        except OSError as exc:
+            log(f"mDNS advertisement failed: {exc}")
+
+    def stop(self) -> None:
+        proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=1.0)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+# --------------------------------------------------------------------------- #
 # Screen: composes the single frame and owns selection + LED state.
 # --------------------------------------------------------------------------- #
 
@@ -532,7 +907,7 @@ class Screen:
     """Owns everything the device shows: the selection, the pre-rendered frame,
     and the LED loop tracker."""
 
-    def __init__(self, link: SerialLink, registry: Registry) -> None:
+    def __init__(self, link: Link, registry: Registry) -> None:
         self._link = link
         self._reg = registry
         self._lock = threading.Lock()
@@ -1045,7 +1420,7 @@ class SocketServer(threading.Thread):
 class ButtonReader(threading.Thread):
     """Reads serial input and dispatches H / B|<x> events."""
 
-    def __init__(self, link: SerialLink, screen: Screen) -> None:
+    def __init__(self, link: Link, screen: Screen) -> None:
         super().__init__(name="button-reader", daemon=True)
         self._link = link
         self._screen = screen
@@ -1220,7 +1595,7 @@ class ButtonReader(threading.Thread):
 class SerialMaintainer(threading.Thread):
     """Keeps the serial port open; reconnects when it drops; sends pings."""
 
-    def __init__(self, link: SerialLink, screen: Screen) -> None:
+    def __init__(self, link: Link, screen: Screen) -> None:
         super().__init__(name="serial-maintainer", daemon=True)
         self._link = link
         self._screen = screen
@@ -1343,7 +1718,8 @@ class MockInjector(threading.Thread):
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Claude Mate daemon: bridges Claude Code hooks to the "
-                    "Arduino triage-queue companion over USB serial.",
+                    "triage-queue companion over USB serial and, with --tcp, "
+                    "over the network.",
     )
     parser.add_argument(
         "--mock",
@@ -1366,6 +1742,31 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=int(os.environ.get("CLAUDE_MATE_BAUD", DEFAULT_BAUD)),
         help=f"serial baud rate (default: {DEFAULT_BAUD})",
     )
+    parser.add_argument(
+        "--tcp",
+        action="store_true",
+        default=os.environ.get("CLAUDE_MATE_TCP", "") == "1",
+        help="also serve the protocol over TCP for wireless devices "
+             "(requires a shared token; off by default)",
+    )
+    parser.add_argument(
+        "--tcp-port",
+        type=int,
+        default=int(os.environ.get("CLAUDE_MATE_TCP_PORT", DEFAULT_TCP_PORT)),
+        help=f"TCP listener port (default: {DEFAULT_TCP_PORT})",
+    )
+    parser.add_argument(
+        "--tcp-bind",
+        default=os.environ.get("CLAUDE_MATE_TCP_BIND", DEFAULT_TCP_BIND),
+        help=f"TCP bind address (default: {DEFAULT_TCP_BIND}; use 127.0.0.1 to "
+             "keep it on this machine)",
+    )
+    parser.add_argument(
+        "--token",
+        default=os.environ.get("CLAUDE_MATE_TOKEN") or None,
+        help=f"shared secret wireless devices authenticate with (default: read "
+             f"from {DEFAULT_TOKEN_FILE})",
+    )
     args = parser.parse_args(argv)
 
     log("starting Claude Mate daemon")
@@ -1375,7 +1776,31 @@ def main(argv: Optional[List[str]] = None) -> int:
     log(f"  mock   : {args.mock}")
 
     registry = Registry()
-    link = SerialLink(args.port, args.baud)
+    serial_link = SerialLink(args.port, args.baud)
+    link: Link = serial_link
+    net: Optional[NetLink] = None
+    mdns: Optional[MdnsAdvertiser] = None
+
+    # Wireless transport is opt-in AND fails closed: an unauthenticated listener
+    # would let anyone on the network read session names and raise windows, so a
+    # missing token disables it rather than weakening it.
+    if args.tcp:
+        token = load_token(args.token)
+        if not token:
+            log("ERROR: --tcp needs a shared token. Set CLAUDE_MATE_TOKEN, pass "
+                f"--token, or write one to {DEFAULT_TOKEN_FILE}. "
+                "Continuing with USB serial only.")
+        else:
+            rx: "queue.Queue[str]" = queue.Queue()
+            candidate = NetLink(args.tcp_bind, args.tcp_port, token, rx)
+            if candidate.start():
+                net = candidate
+                link = LinkHub(serial_link, net, rx)
+                mdns = MdnsAdvertiser(args.tcp_port)
+                mdns.start()
+        log(f"  tcp    : {args.tcp_bind}:{args.tcp_port} "
+            f"({'on' if net else 'DISABLED'})")
+
     screen = Screen(link, registry)
 
     def on_update() -> None:
@@ -1438,12 +1863,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         for t in threads:
             t.join(timeout=1.5)
         # Best-effort: silence the LED and leave an honest frame on the way out.
+        # This reaches wireless devices too, so a battery companion shows
+        # "daemon stopped" instead of a frozen frame until its own watchdog trips.
         try:
             link.write_line("V|OFF")
             link.write_line("F|0|-1|MATE|daemon stopped||")
         except Exception:
             pass
-        link.close()
+        if mdns is not None:
+            mdns.stop()
+        link.close()      # LinkHub.close() also stops the TCP listener
     return 0
 
 
