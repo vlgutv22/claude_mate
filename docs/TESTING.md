@@ -74,7 +74,9 @@ python3 tools/test_settings_merge.py  # proves the installer's settings.json mer
 python3 tools/test_detect.py          # the wrapper's screen scrape: which rendered
                                       # TUI frames read working/waiting/error/idle —
                                       # incl. the background-work tells that must
-                                      # NOT read idle (needs pyte)
+                                      # NOT read idle while work is in flight, and
+                                      # must STOP reading working once it finishes
+                                      # (real captured frames) (needs pyte)
 
 python3 tools/test_hook_state.py      # the hook's wire line per Stop payload —
                                       # incl. "the turn ended but work is still in

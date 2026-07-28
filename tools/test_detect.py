@@ -34,6 +34,12 @@ detect_state = cmw.detect_state
 # we also prove the live region is what governs (not stale prompt chrome).
 PROMPT = "╭─────────╮\n│ >       │\n╰─────────╯\n  ? for shortcuts"
 
+# The prompt box as Claude actually draws it in a wide terminal: two bare rules
+# around the input line. It is what splits the screen into the frozen transcript
+# above and Claude's live chrome (hint row, agents panel) below, so the captured
+# frames below keep it verbatim -- only shortened.
+BOX = "─" * 48
+
 CASES = [
     # name, screen, expected_state
     ("thinking spinner (Forming, no 'esc to interrupt')",
@@ -304,6 +310,91 @@ CASES = [
      "  ◻ P4 UI: ship #2837-#2844\n"
      "╭─────────╮\n│ >       │\n╰─────────╯\n"
      "  bypass permissions on (shift+tab to cycle) · ctrl+t to hide tasks", "idle"),
+
+    # ----------------------------------------------------------------------- #
+    # STALE BACKGROUND-WORK TELLS (#14) -- the device stuck on WIP after the
+    # task was done. Every frame in this block is CAPTURED VERBATIM from a live
+    # session (Claude Code 2.1.x, one frame per second for 200s; only the prompt
+    # box's rules are shortened to keep the fixtures readable).
+    #
+    # The banner and the turn recap are TRANSCRIPT text: printed once, never
+    # rewritten, and nothing scrolls them away while you are away from the
+    # keyboard -- which is exactly when the device is all you can see. Both
+    # captures reported "working" on EVERY frame to the end of the recording,
+    # tens of seconds to minutes after the work had finished, so the daemon
+    # (which alerts DONE only on working -> idle) never buzzed at all.
+    ("captured: shell in flight -- recap + in-flight chip (t=40s)",
+     '⏺ I\'ll start that background shell.\n'
+     '⏺ STARTED\n'
+     '✻ Worked for 4s · 1 shell still running\n'
+     + BOX + '\n❯\n' + BOX + '\n'
+     '  ⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage', "working"),
+    ("captured: the shell EXITED, the recap line still says it is running (t=62s)",
+     '⏺ STARTED\n'
+     '✻ Worked for 4s · 1 shell still running\n'
+     '⏺ Background command "Sleep for 45 seconds" completed (exit code 0)\n'
+     '⏺ The background sleep 45 finished with exit code 0.\n'
+     '✻ Brewed for 2s\n'
+     + BOX + '\n❯\n' + BOX + '\n'
+     '  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents', "idle"),
+    ("captured: background agent in flight -- the banner is Claude's last word (t=19s)",
+     '⏺ Explore(Count .h files in /usr/include)\n'
+     '  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)\n'
+     '⏺ STARTED\n'
+     '✻ Waiting for 1 background agent to finish\n'
+     + BOX + '\n❯\n' + BOX + '\n'
+     '  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents · ↓ to manage\n'
+     '  ⏺ main\n'
+     '  ◯ Explore  Count .h files in /usr/include', "working"),
+    ("captured: the agent RETURNED, the banner still says it is waiting (t=27s)",
+     '⏺ STARTED\n'
+     '✻ Waiting for 1 background agent to finish\n'
+     '⏺ Agent "Count .h files in /usr/include" finished · 9s\n'
+     '⏺ The agent finished: 0.\n'
+     "  /usr/include doesn't exist on this machine — macOS ships SDK headers\n"
+     '  under the CommandLineTools SDK path instead.\n'
+     '✻ Cogitated for 16s\n'
+     "                    You've used 93% of your session limit · /upgrade\n"
+     + BOX + '\n❯\n' + BOX + '\n'
+     '  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents · ↓ to manage\n'
+     '  ⏺ main\n'
+     '  ◯ Explore  Count .h files in /usr/include            9s · ↓ 7.5k tokens', "idle"),
+    # ...and the agents panel row above is the second half of that bug: a
+    # FINISHED subagent keeps its final tally on display until the panel
+    # collapses (27s in the capture), and "↓ 7.5k tokens" is textually a live
+    # activity meter. It renders BELOW the prompt box, which is how the meter
+    # region now excludes it.
+    ("a finished agent's panel row is not a live meter",
+     '⏺ All done — the count is 0.\n'
+     + BOX + '\n❯\n' + BOX + '\n'
+     '  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents · ↓ to manage\n'
+     '  ⏺ main\n'
+     '  ◯ Explore  Count .h files            12s · ↓ 7.5k tokens\n'
+     '  ◯ Explore  Read the changelog         9s · ↓ 2.1k tokens', "idle"),
+    # A tell reprinted by a LATER turn is fresh again -- the gate keys off the
+    # last copy on screen, not the first.
+    ("a stale banner higher up does not veto a freshly reprinted one",
+     '⏺ Waiting for 1 background agent to finish\n'
+     '⏺ Agent "first pass" finished · 9s\n'
+     '⏺ Kicked off the second pass.\n'
+     '✻ Waiting for 1 background agent to finish\n'
+     + BOX + '\n❯\n' + BOX + '\n'
+     '  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents', "working"),
+    # False-positive guards for the two shapes loosened by this change.
+    ("idle, Claude's PROSE opens with 'Waiting for 2 CI jobs to finish'",
+     '⏺ Kicked off the pipeline.\n'
+     '⏺ Waiting for 2 CI jobs to finish before I merge.\n'
+     + BOX + '\n❯\n' + BOX + '\n'
+     '  ⏵⏵ bypass permissions on · ? for shortcuts', "idle"),
+    ("idle, a right-aligned table column reads like the in-background counter",
+     '⏺ Queue depth by lane:\n'
+     '  build                                     2 in background\n'
+     + BOX + '\n❯\n' + BOX + '\n'
+     '  ⏵⏵ bypass permissions on · ? for shortcuts', "idle"),
+    ("idle, a chip-shaped phrase in the line you are TYPING is not Claude's chrome",
+     '⏺ Which of these should I stop?\n'
+     + BOX + '\n❯ kill the 3 shells and the 2 monitors\n' + BOX + '\n'
+     '  ⏵⏵ bypass permissions on · ? for shortcuts', "idle"),
 ]
 
 fails = 0

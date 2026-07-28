@@ -269,8 +269,12 @@ daemon **never sends it**.
 > `Stop` payload carries `background_tasks[]` (background work that is running
 > or pending: dynamic workflows, background agents, backgrounded shells,
 > monitors, MCP tasks) and `session_crons[]` (scheduled tasks that will wake the
-> session later). When `background_tasks` is non-empty — or a cron is a
-> **one-shot** wakeup (`recurring: false`), i.e. this turn continuing later —
+> session later). Each `background_tasks[]` entry carries its own `status`
+> (`running`, `pending`, …); entries in a **terminal** status are already over
+> and are not counted, because the later `Stop` that would correct the downgrade
+> may never arrive. An entry with no `status` at all *is* counted, so a build
+> that omits the field behaves as before. When in-flight work remains — or a
+> cron is a **one-shot** wakeup (`recurring: false`), i.e. this turn continuing later —
 > the hook reports `working`, and the finish is reported by the next `Stop` that
 > lands with nothing in flight. Recurring crons are not counted: a session that
 > merely owns a daily schedule is finished for now, and suppressing its DONE
