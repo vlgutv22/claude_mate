@@ -354,6 +354,45 @@ proc.wait(timeout=10)
 dev2.close()
 
 # --------------------------------------------------------------------------- #
+print("\n-- phase 7: a wireless device must not starve a USB one --")
+# Regression: LinkHub.is_open() answers "is ANY device reachable", so with a
+# wireless client connected it returns True while the serial port is SHUT. The
+# maintainer used to gate reconnection on it and therefore never reopened
+# serial -- a Nano that dropped, or was plugged in after the ESP32 linked, sat
+# on NO LINK forever. Observed on real hardware with both devices attached.
+import importlib.util
+_spec = importlib.util.spec_from_file_location("cm_daemon_under_test", DAEMON)
+_cmd = importlib.util.module_from_spec(_spec)
+# @dataclass resolves annotations through sys.modules[cls.__module__], so the
+# module has to be registered BEFORE exec_module or importing it blows up.
+sys.modules["cm_daemon_under_test"] = _cmd
+_spec.loader.exec_module(_cmd)
+
+class _ClosedSerial:
+    opened = False
+    def is_open(self): return False
+    def ensure_open(self):
+        _ClosedSerial.opened = True      # the maintainer DID try to reopen
+        return False
+
+class _NetWithClient:
+    def has_clients(self): return True
+    def write_line(self, line): return True
+    def stop(self): pass
+
+_hub = _cmd.LinkHub.__new__(_cmd.LinkHub)     # bypass __init__'s real sockets
+_hub._serial = _ClosedSerial()
+_hub._net = _NetWithClient()
+
+check("LinkHub.is_open() still reports up when only WiFi is connected",
+      _hub.is_open() is True)
+check("...but serial_is_open() reports the USB port SHUT, so the maintainer "
+      "keeps retrying it", _hub.serial_is_open() is False)
+_hub.ensure_serial_open()
+check("...and ensure_serial_open() actually reaches the serial port",
+      _ClosedSerial.opened)
+
+# --------------------------------------------------------------------------- #
 print()
 failed = [l for l, ok in results if not ok]
 if failed:

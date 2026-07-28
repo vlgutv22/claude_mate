@@ -419,6 +419,14 @@ class SerialLink:
     def is_open(self) -> bool:
         return self._ser is not None and self._ser.is_open
 
+    # Same names LinkHub exposes, so the maintainer can drive either link type
+    # without caring which transport it got.
+    def serial_is_open(self) -> bool:
+        return self.is_open()
+
+    def ensure_serial_open(self) -> bool:
+        return self.ensure_open()
+
     def ensure_open(self) -> bool:
         """Try to (re)open the port. Returns True if open afterwards."""
         with self._lock:
@@ -771,14 +779,25 @@ class LinkHub:
     # ---- the link surface ------------------------------------------------- #
 
     def is_open(self) -> bool:
+        """Is ANY device reachable? A wireless client counts."""
         return self._serial.is_open() or self._net.has_clients()
 
     def ensure_open(self) -> bool:
         """Try to (re)open serial; a connected wireless device also counts as
-        up, so the maintainer does not log a reconnect storm when no USB device
-        is plugged in at all."""
+        up, so startup does not report "no device" when only WiFi is in use."""
         opened = self._serial.ensure_open()
         return opened or self._net.has_clients()
+
+    # The USB port, asked about on its OWN terms. is_open()/ensure_open() above
+    # answer "is anything reachable", which is right for startup but WRONG for
+    # the maintainer: with a wireless device connected they return True while
+    # the serial port is shut, so a Nano that drops -- or is plugged in later --
+    # would never be reopened and would sit on NO LINK forever.
+    def serial_is_open(self) -> bool:
+        return self._serial.is_open()
+
+    def ensure_serial_open(self) -> bool:
+        return self._serial.ensure_open()
 
     def write_line(self, line: str) -> bool:
         # Deliberately not short-circuiting: every connected device must get
@@ -1840,21 +1859,29 @@ class SerialMaintainer(threading.Thread):
 
     def run(self) -> None:
         was_open = False
+        last_try = 0.0
         while not self._stop_evt.is_set():
-            if not self._link.is_open():
+            # Ask about the USB port SPECIFICALLY, never "is any device up".
+            # With a wireless device connected the latter is True while serial
+            # is shut, so a Nano that drops -- or is plugged in after the ESP32
+            # linked -- would never be reopened and would sit on NO LINK.
+            if not self._link.serial_is_open():
                 if was_open:
                     log("serial disconnected; will reconnect")
                     was_open = False
-                if self._link.ensure_open():
-                    was_open = True
-                    # Give the Nano time to reset; it will send H which triggers
-                    # a full resend. We also push state proactively as a safety net.
-                    time.sleep(2.0)
-                    self._screen.resend_full_state()
-                else:
-                    self._stop_evt.wait(RECONNECT_DELAY)
-                    continue
-            # Periodic keepalive ping.
+                if time.time() - last_try >= RECONNECT_DELAY:
+                    last_try = time.time()
+                    if self._link.ensure_serial_open():
+                        was_open = True
+                        # Give the Nano time to reset; it will send H which
+                        # triggers a full resend. We also push state proactively
+                        # as a safety net.
+                        time.sleep(2.0)
+                        self._screen.resend_full_state()
+            # Ping REGARDLESS of the USB port. Retrying serial used to `continue`
+            # past this, which would have silenced keepalives for a wireless-only
+            # setup -- the very thing the old "any device is up" check was
+            # papering over.
             now = time.time()
             if now - self._last_ping >= PING_PERIOD:
                 self._link.write_line("P")
