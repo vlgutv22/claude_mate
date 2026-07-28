@@ -207,6 +207,19 @@ class MateNet {
 
   void startPortalNow() { startPortal(); }
 
+  // Close the link and power the radio down, for deep sleep. Dropping the TCP
+  // connection POLITELY matters: a half-open socket leaves the daemon holding a
+  // dead client, still listing this device as present, until its own timeout
+  // eventually notices. Turning the radio off also removes the largest current
+  // draw before sleeping, which is the point of the exercise.
+  void shutdown() {
+    _client.stop();
+    if (_state == SETUP) stopPortal();
+    WiFi.disconnect(true);          // true: also switch the radio off
+    WiFi.mode(WIFI_OFF);
+    _state = OFF;
+  }
+
  private:
   // ---- stored config -------------------------------------------------------
   String   _ssid, _pass, _host, _token;

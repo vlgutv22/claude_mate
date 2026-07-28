@@ -41,6 +41,12 @@ sits behind verbs the Nano never sends.
 - **Added: `firmware/README.md`**, which the S3 sketch had been citing while it
   did not exist. Covers both builds, board options, wiring, flashing and
   provisioning.
+- **Added: power off.** Holding MIRROR for 2 s puts the device into deep sleep;
+  a tap wakes it. "Off" is deep sleep rather than zero — the WS2812 has no
+  shutdown pin and idles ~1 mA whenever the rail is up, which dwarfs the ~8 µA
+  the S3 draws asleep, so expect roughly a month of standby on a 14500 and use a
+  switch in the battery lead if you need true zero. Waking reboots; NVS config
+  survives, and `?` reports which kind of boot it was.
 - **Protocol:** new `M|` lines (daemon → device) carry the mirror; new `B|M`
   (mirror button) and `B|F` (direct FOLLOW toggle) are accepted from devices
   that have the buttons for them. Additive in a dispatch that already ignores

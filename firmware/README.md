@@ -154,6 +154,36 @@ The daemon side needs `--tcp` (or `CLAUDE_MATE_TCP=1`) and a token in
 `~/.config/claude-mate/token`. Config lives in NVS, a separate partition, so it
 **survives a reflash**.
 
+### Power off
+
+**Hold MIRROR for 2 s** to power the device off; **tap it** to wake. The hold is
+deliberately much longer than any other gesture — switching off by fumbling a
+button would be a poor joke on a device whose job is to be glanceable.
+
+"Off" means **deep sleep, not zero**. The WS2812 has no shutdown pin and idles
+around 1 mA whenever the rail is up, which dwarfs the ~8 µA the S3 itself draws
+asleep. That works out to roughly a month of standby on a 14500 — off in every
+practical sense, but a switch in the battery lead remains the only true zero.
+
+Waking **reboots**: deep sleep does not resume, it re-runs `setup()`. Config is
+in NVS so nothing is lost, but rejoining Wi-Fi costs a few seconds. `?` reports
+`boot : woke from power-off` or `power-on / reset`, which is the only way to
+tell a deliberate wake from a brownout after the fact.
+
+Three details in the implementation are load-bearing, and all three fail
+silently if skipped:
+
+- The backlight pin is driven low **and latched** (`gpio_hold_en`). Deep sleep
+  releases every GPIO, so an unheld pin floats and the panel can sit there lit,
+  burning the current this is meant to save. The latch survives the reboot, so
+  `setup()` must release it first — otherwise the board wakes to a black screen,
+  indistinguishable from the dead-panel failure a wrong `LCD_BL` causes.
+- It **waits for the button to be released** before sleeping. The wake is
+  level-triggered on LOW, so sleeping with the button still down wakes the chip
+  instantly and reads as "power off is broken".
+- The Wi-Fi link is closed **politely**. A half-open socket leaves the daemon
+  holding a dead client and still listing the device as present.
+
 ### The terminal mirror
 
 Tapping MIRROR opens a live view of the selected session's real terminal,

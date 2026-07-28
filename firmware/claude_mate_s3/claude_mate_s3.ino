@@ -36,7 +36,8 @@
  *                   long : acknowledge the alert WITHOUT raising anything
  *                   double: toggle FOLLOW (the daemon disambiguates)
  *     NEXT          step the selection down the queue    (auto-repeats held)
- *     MIRROR        tap: open/close a live view of the session's TERMINAL
+ *     MIRROR        tap : open/close a live view of the session's TERMINAL
+ *                   hold: power off (deep sleep); tap again to wake
  *
  * MIRROR is the one thing three buttons could not do. Acknowledging and FOLLOW
  * were already reachable through GO, so a 4th button spent on either would have
@@ -45,6 +46,12 @@
  * second and pushes it as M| rows, and while the view is open it reinterprets
  * PREV/NEXT as scroll -- so this firmware still has NO modes: it emits the same
  * verbs regardless and simply draws whichever rows arrive.
+ *
+ * POWER OFF is deep sleep, not zero: the WS2812 has no shutdown pin and idles
+ * ~1 mA whenever the rail is up, dwarfing the ~8 uA the S3 draws asleep. That is
+ * roughly a month of standby on a 14500 -- off in every practical sense, though
+ * a switch in the battery lead is the only true zero. Waking REBOOTS (deep sleep
+ * does not resume), so rejoining WiFi costs a few seconds; NVS config survives.
  *
  * Only WRAPPED sessions can be mirrored. A hook-only session has no PTY for the
  * daemon to read, and says so rather than showing a blank screen that would
@@ -95,6 +102,8 @@
  */
 
 #include <Arduino_GFX_Library.h>
+#include <esp_sleep.h>
+#include <driver/rtc_io.h>
 #include "board_s3.h"
 #include "netcfg.h"
 
@@ -153,6 +162,11 @@ static unsigned long lastBattMs = 0;
 // ---- Mirror (the terminal view) ---------------------------------------------
 // The daemon pre-renders and clips every row to MIRROR_COLS, so this is a plain
 // buffer: no wrapping, no scrolling, no truncation decisions taken here.
+// Why the last boot happened: ESP_SLEEP_WAKEUP_UNDEFINED is a real power-on,
+// EXT1 is a wake from powerOff(). Surfaced in `?` because a device that woke
+// unexpectedly and one that browned out and rebooted look identical otherwise.
+static esp_sleep_wakeup_cause_t wakeCause = ESP_SLEEP_WAKEUP_UNDEFINED;
+
 static bool mirrorOn = false;
 static char mirrorTitle[MIRROR_COLS + 1] = {0};
 static char mirrorRow[MIRROR_ROWS][MIRROR_COLS + 1] = {{0}};
@@ -808,6 +822,9 @@ static bool handleConfigLine(char *line) {
 #else
       Serial.println("batt  : gauge compiled out");
 #endif
+      Serial.printf("boot  : %s\n",
+                    wakeCause == ESP_SLEEP_WAKEUP_EXT1 ? "woke from power-off"
+                                                       : "power-on / reset");
       return true;
 
     case 'W': {                            // W|<ssid>|<password>
@@ -982,6 +999,67 @@ static void pollGoBtn(Btn &b) {
   }
 }
 
+// -----------------------------------------------------------------------------
+// Power off (deep sleep)
+// -----------------------------------------------------------------------------
+// "Off" here means DEEP SLEEP, not zero: the WS2812 has no shutdown pin and
+// idles around 1 mA whenever the rail is up, which dwarfs the ~8 uA the S3
+// itself draws asleep. That is roughly a month of standby on a 14500 -- off in
+// every practical sense, but a physical switch in the battery lead is still the
+// only true zero.
+//
+// Waking runs setup() again from the top: deep sleep does not resume, it
+// reboots. Config lives in NVS so nothing is lost, but rejoining WiFi costs a
+// few seconds.
+static void powerOff() {
+  // Say so while the backlight is still on, then hold it long enough to read.
+  if (gfx) {
+    gfx->fillScreen(C_BG);
+    gfx->setTextSize(2);
+    gfx->setTextColor(C_TEXT);
+    gfx->setCursor(PAD_X, SCREEN_H / 2 - 16);
+    gfx->print("powering off");
+    gfx->setTextSize(1);
+    gfx->setTextColor(C_DIM);
+    gfx->setCursor(PAD_X, SCREEN_H / 2 + 8);
+    gfx->print("press the 4th button to wake");
+    if (buffered) canvas->flush();
+  }
+  // Leave POLITELY: a half-open socket leaves the daemon listing this device as
+  // present until its own timeout notices.
+  net.shutdown();
+  rgbLedWrite(PIN_RGB, 0, 0, 0);
+  delay(900);
+
+  panel->displayOff();
+
+  // The backlight needs BOTH a low level and a latch. Deep sleep releases every
+  // GPIO, so an unheld pin floats and the panel can sit there lit -- burning
+  // exactly the current this is meant to save. analogWrite drives it through
+  // LEDC, which stops in sleep, so detach that first and drive the pad directly
+  // before latching it.
+  analogWrite(LCD_BL, 0);
+  ledcDetach(LCD_BL);
+  pinMode(LCD_BL, OUTPUT);
+  digitalWrite(LCD_BL, LOW);
+  gpio_hold_en((gpio_num_t)LCD_BL);
+  gpio_deep_sleep_hold_en();
+
+  // WAIT FOR RELEASE. The wake is level-triggered on LOW, so sleeping with the
+  // button still down wakes the chip instantly and reads as "power off is
+  // broken".
+  while (digitalRead(PIN_BTN_MIRROR) == LOW) delay(10);
+  delay(80);                                  // let the release settle
+
+  // The internal pull-up must be re-armed through the RTC domain; the ordinary
+  // GPIO pull-up does not survive into deep sleep, and a floating wake pin
+  // would wake the device again immediately.
+  rtc_gpio_pullup_en((gpio_num_t)PIN_BTN_MIRROR);
+  rtc_gpio_pulldown_dis((gpio_num_t)PIN_BTN_MIRROR);
+  esp_sleep_enable_ext1_wakeup(1ULL << PIN_BTN_MIRROR, ESP_EXT1_WAKEUP_ANY_LOW);
+  esp_deep_sleep_start();                     // never returns
+}
+
 // The 4th button: MIRROR. A plain tap, emitted on the press edge -- no repeat
 // while held (that would flap the view on and off) and no long-press meaning.
 // It is the one action that needed a button of its own: acknowledging and
@@ -991,6 +1069,9 @@ static void pollGoBtn(Btn &b) {
 // While the view is open the DAEMON reinterprets PREV/NEXT as scroll, so this
 // firmware never learns that a mode exists: it emits the same two verbs either
 // way and just draws whatever rows arrive.
+// Emitted on RELEASE rather than on the press edge, which is what makes the
+// hold possible at all: firing on press would toggle the mirror on the way to
+// powering off. Still no auto-repeat -- holding must not flap the view.
 static void pollTapBtn(Btn &b, char ev) {
   bool raw = (digitalRead(b.pin) == LOW);
   unsigned long now = millis();
@@ -998,9 +1079,15 @@ static void pollTapBtn(Btn &b, char ev) {
     b.pressed  = raw;
     b.changeMs = now;
     if (raw) {
-      b.pressMs = now;
+      b.pressMs   = now;
+      b.longFired = false;
+    } else if (!b.longFired) {
       emitBtn(ev);
     }
+  }
+  if (b.pressed && !b.longFired && (now - b.pressMs) >= POWEROFF_HOLD_MS) {
+    b.longFired = true;                       // swallow the release
+    powerOff();                               // never returns
   }
 }
 
@@ -1018,6 +1105,18 @@ static void pollButtons() {
 // -----------------------------------------------------------------------------
 
 void setup() {
+  // FIRST, before anything touches the backlight: release the pad latch that
+  // powerOff() set. Deep sleep keeps held GPIOs held THROUGH the reboot, so
+  // skipping this leaves the backlight pinned low and the board wakes to a
+  // black screen -- indistinguishable from the dead-panel failure that a wrong
+  // LCD_BL causes, and just as slow to diagnose.
+  wakeCause = esp_sleep_get_wakeup_cause();
+  if (wakeCause != ESP_SLEEP_WAKEUP_UNDEFINED) {
+    gpio_hold_dis((gpio_num_t)LCD_BL);
+    gpio_deep_sleep_hold_dis();
+    rtc_gpio_deinit((gpio_num_t)PIN_BTN_MIRROR);   // hand the pin back to GPIO
+  }
+
   pinMode(PIN_BTN_PREV, INPUT_PULLUP);
   pinMode(PIN_BTN_GO,   INPUT_PULLUP);
   pinMode(PIN_BTN_NEXT, INPUT_PULLUP);

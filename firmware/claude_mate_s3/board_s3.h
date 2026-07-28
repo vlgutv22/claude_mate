@@ -277,6 +277,10 @@ struct Btn {
                               // for the handshake lines
 #define DEBOUNCE_MS     40UL   // immediate-fire debounce
 #define LONGPRESS_MS    500UL  // GO held this long -> acknowledge only
+// Hold MIRROR this long to power off. Deliberately far longer than
+// LONGPRESS_MS: switching the device off by fumbling a button would be a poor
+// joke on a device whose whole job is to be glanceable.
+#define POWEROFF_HOLD_MS 2000UL
 #define REPEAT_DELAY_MS 400UL  // PREV/NEXT held this long -> auto-repeat
 #define REPEAT_MS       200UL  // ...then one event every 200 ms
 #define BLINK_MS        400UL  // flash / blink half-period (~2.5 Hz)
