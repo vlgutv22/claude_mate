@@ -145,6 +145,9 @@ static bool    netOverflow = false;
 static int      battPercent = -1;      // -1 = no cell wired / gauge disabled
 static uint32_t battMv      = 0;
 static unsigned long lastBattMs = 0;
+static bool     battCharging = false;  // inferred, not read from a status pin
+static uint32_t battTrendMv  = 0;      // baseline the trend is measured against
+static unsigned long battTrendMs = 0;  // ...and when it was taken (0 = none)
 
 // -----------------------------------------------------------------------------
 // LED: one WS2812, the daemon's alert class picks colour AND rhythm
@@ -292,6 +295,44 @@ static void pollBattery() {
   if (pc != battPercent) needRender = true;
   battMv = mv;
   battPercent = pc;
+
+  // Charging: no status line exists on this board, so infer it. See the long
+  // note by CHARGE_FULL_MV in board_s3.h for why this is sound rather than a
+  // guess. Order matters -- the "held at the regulation point" test is checked
+  // first because it is instant, and the trend is only consulted below it.
+  bool chg = battCharging;
+  bool usbHost = false;
+#if ARDUINO_USB_MODE && ARDUINO_USB_CDC_ON_BOOT
+  // Exact and instant, but only for a USB HOST: this watches for SOF frames,
+  // which a laptop sends and a dumb wall charger never does. So it settles the
+  // tethered case outright and leaves the charger case to the voltage tests.
+  usbHost = HWCDC::isPlugged();
+#endif
+  if (pc < 0) {                             // no cell: nothing to charge
+    chg = false;
+    battTrendMs = 0;
+  } else if (usbHost) {
+    chg = true;
+    battTrendMv = mv;
+    battTrendMs = now;
+  } else if (mv >= CHARGE_FULL_MV) {
+    chg = true;
+    battTrendMv = mv;                       // rebase, so dropping back below
+    battTrendMs = now;                      // this starts a clean trend window
+  } else if (!battTrendMs) {
+    battTrendMv = mv;
+    battTrendMs = now;
+  } else if (now - battTrendMs >= CHARGE_TREND_MS) {
+    long d = (long)mv - (long)battTrendMv;
+    if      (d >=  CHARGE_TREND_MV) chg = true;   // climbing: on the charger
+    else if (d <= -CHARGE_TREND_MV) chg = false;  // sinking: on the cell
+    battTrendMv = mv;                       // ...otherwise flat: keep the last
+    battTrendMs = now;                      // verdict rather than flapping
+  }
+  if (chg != battCharging) {
+    battCharging = chg;
+    needRender = true;
+  }
 #endif
 }
 
@@ -348,6 +389,14 @@ static void drawLinkGlyph(int16_t x, int16_t y) {
   }
 }
 
+// A 5x7 lightning bolt for the charging indicator: two triangles meeting at the
+// waist. Small enough to sit inside the 22x11 battery body without crowding the
+// fill bar, and recognisable at this size where a glyph would not be.
+static void drawBolt(int16_t x, int16_t y, uint16_t col) {
+  gfx->fillTriangle(x + 4, y,     x,     y + 4, x + 3, y + 4, col);  // upper
+  gfx->fillTriangle(x + 1, y + 3, x + 4, y + 3, x,     y + 7, col);  // lower
+}
+
 // Battery chip: outline, proportional fill, nub, percentage. Falls back to the
 // WiFi signal in dBm when no cell is wired, so the corner is never dead space.
 static void drawBatteryChip(int16_t right, int16_t y) {
@@ -367,11 +416,19 @@ static void drawBatteryChip(int16_t right, int16_t y) {
   int16_t bodyW = 22, bodyH = 11;
   int16_t bx = right - textW - 4 - bodyW - 2;
   int16_t by = y + 2;
-  uint16_t col = battPercent <= 10 ? C_ERROR : battPercent <= 25 ? C_WAIT : C_DIM;
+  // Charging outranks the low-battery warning colours: a cell at 8% that is on
+  // the charger is good news, and colouring it red would say the opposite.
+  uint16_t col = battCharging ? C_OK
+                 : battPercent <= 10 ? C_ERROR
+                 : battPercent <= 25 ? C_WAIT : C_DIM;
   gfx->drawRect(bx, by, bodyW, bodyH, col);
   gfx->fillRect(bx + bodyW, by + 3, 2, bodyH - 6, col);           // the nub
   int16_t fillW = (int16_t)((bodyW - 4) * battPercent / 100);
   if (fillW > 0) gfx->fillRect(bx + 2, by + 2, fillW, bodyH - 4, col);
+  // The bolt sits ON TOP of the fill in the background colour, so it stays
+  // legible at 100% (all fill) and at 0% (no fill) alike -- a bolt drawn in the
+  // accent colour would vanish into a full bar.
+  if (battCharging) drawBolt(bx + bodyW / 2 - 2, by + 2, C_BG);
   gfx->setTextSize(1);
   gfx->setTextColor(col);
   gfx->setCursor(right - textW, y + 2);
@@ -636,6 +693,20 @@ static bool handleConfigLine(char *line) {
   switch (line[0]) {
     case '?':
       net.printConfig(Serial);
+      // The gauge is inferred (divider ratio measured, charging deduced from
+      // the cell), so print the raw millivolts it is working from. Without this
+      // a wrong BATT_DIVIDER is invisible -- it just shows a plausible, wrong
+      // percentage, which is exactly how the 2:1/3:1 mix-up hid for so long.
+#if PIN_BATT_ADC >= 0
+      if (battPercent < 0)
+        Serial.printf("batt  : no cell (%u mV raw x%.1f)\n",
+                      (unsigned)battMv, (double)BATT_DIVIDER);
+      else
+        Serial.printf("batt  : %d%% (%u mV) %s\n", battPercent,
+                      (unsigned)battMv, battCharging ? "charging" : "on battery");
+#else
+      Serial.println("batt  : gauge compiled out");
+#endif
       return true;
 
     case 'W': {                            // W|<ssid>|<password>

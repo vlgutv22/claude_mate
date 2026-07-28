@@ -125,6 +125,30 @@ struct Btn {
                               // ~2.8 V, falls under BATT_MIN_MV, and the chip
                               // silently HIDES ITSELF -- which looks like a
                               // missing feature rather than a wrong constant.
+// ---- Charging detection -----------------------------------------------------
+// This board gives us NO charge-status line: Waveshare does not publish one,
+// and an ADC sweep of GPIO 1-10 found every pin except the sense divider
+// floating -- a status output would have read solidly high or low. So charging
+// is inferred from the cell itself. That is physics rather than guesswork:
+//
+//   * A LiPo's open-circuit voltage never exceeds ~4.2 V, and this device pulls
+//     100 mA+ with the backlight and WiFi up, which sags it further. Sitting AT
+//     the charger's regulation point therefore means something external is
+//     holding it there -- the charger, in its constant-voltage phase.
+//   * Below that, charging shows up as a RISING trend. A cell under a constant
+//     load only ever falls, so the sign of the trend separates the two.
+//
+// The trend needs a LONG baseline. A 3.7 -> 4.2 V charge takes roughly an hour,
+// i.e. ~0.14 mV/s, which is far under per-sample ADC noise; comparing against a
+// sample CHARGE_TREND_MS old and demanding CHARGE_TREND_MV of movement gets
+// above the noise floor. The cost is that plugging a charger in takes about
+// that long to be noticed, unless the cell is already near full (where the
+// threshold catches it immediately).
+#define CHARGE_FULL_MV    4150    // at/above this, an external supply is
+                                  // holding the rail up -- treat as charging
+#define CHARGE_TREND_MS   90000UL // baseline age before a trend is judged
+#define CHARGE_TREND_MV   12      // movement needed to call it (beats ADC noise)
+
 #define BATT_MIN_MV   3000    // below this the reading is treated as "no cell
                               // wired" and the chip is hidden entirely. NOTE:
                               // on this board the charger rail sits at ~4.2 V
