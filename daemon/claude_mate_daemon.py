@@ -127,6 +127,18 @@ MDNS_NAME = "Claude Mate"           # finds the daemon with zero configuration
 DOUBLE_CLICK_S = 0.30        # two GO short-presses within this window = a
                              # double-click (toggles FOLLOW mode). A single GO
                              # is deferred this long to disambiguate.
+# ---- MIRROR (the device's terminal view) ---------------------------------- #
+# The colour screen fits 53x21 characters at size 1; the status bar takes the
+# top band, leaving MIRROR_ROWS for content. Claude's TUI is 80-120 columns
+# wide, so rows are CLIPPED, not reflowed -- wrapping a TUI whose box drawing
+# and alignment carry meaning turns it into noise, and a clipped-but-truthful
+# view is easier to read than a rewrapped one.
+MIRROR_COLS = 52
+MIRROR_ROWS = 17
+MIRROR_POLL_S = 1.0          # refresh cadence while the view is open; polling
+                             # stops entirely when it is closed, so an unwatched
+                             # fleet costs nothing
+
 FOLLOW_SETTLE_S = 0.25       # in FOLLOW mode, PREV/NEXT raise the selected
                              # terminal only after the selection settles this
                              # long -- so holding to scroll doesn't raise every
@@ -1207,6 +1219,50 @@ def wrapper_ctrl_send(ctrl: str, cmd: str) -> bool:
         return False
 
 
+def wrapper_ctrl_screen(ctrl: str) -> Optional[List[str]]:
+    """Ask a PTY wrapper for its rendered TUI, for the device's mirror view.
+
+    Length-prefixed ("SCREEN <n>", then n rows, then "ok") rather than read
+    until a sentinel: terminal output can contain ANY line, including one that
+    is exactly "ok", which would truncate the mirror at an arbitrary point.
+    The wrapper closes the connection when done, so this reads to EOF.
+
+    Returns the rows, or None when there is nothing to show -- no wrapper (a
+    hook-only session), a dead one, or one predating the mirror command, which
+    answers a bare "ok". None is rendered as "no preview", never as a blank
+    screen that would look like a session sitting idle.
+    """
+    if not ctrl or not os.path.exists(ctrl):
+        return None
+    buf = b""
+    try:
+        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        c.settimeout(WRAPPER_LIVE_TIMEOUT_S)
+        c.connect(ctrl)
+        c.sendall(b"screen\n")
+        deadline = time.monotonic() + WRAPPER_ACK_TIMEOUT_S
+        while True:
+            chunk = c.recv(8192)
+            if not chunk:                      # EOF: the wrapper is done
+                break
+            buf += chunk
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            c.settimeout(remaining)
+        c.close()
+    except OSError:
+        return None
+    lines = buf.decode("utf-8", "replace").split("\n")
+    if not lines or not lines[0].startswith("SCREEN "):
+        return None                            # pre-mirror wrapper
+    try:
+        n = int(lines[0].split()[1])
+    except (IndexError, ValueError):
+        return None
+    return lines[1:1 + n]
+
+
 def focus_session(sess: Optional[Session]) -> None:
     """
     Raise the terminal/editor window of the given session. RAISE ONLY.
@@ -1446,6 +1502,14 @@ class ButtonReader(threading.Thread):
         self._follow_lock = threading.Lock()
         self._follow_timer: Optional[threading.Timer] = None
         self._follow_gen = 0
+        # MIRROR: while open, a repeating timer pulls the shown session's
+        # rendered TUI from its wrapper and pushes it to the device. Keyed by
+        # session so the view follows one session even if the selection is
+        # nudged, and torn down completely when closed -- no timer, no polling.
+        self._mirror_lock = threading.Lock()
+        self._mirror_key: Optional[str] = None
+        self._mirror_scroll = 0
+        self._mirror_timer: Optional[threading.Timer] = None
 
     def run(self) -> None:
         while not self._stop_evt.is_set():
@@ -1466,11 +1530,25 @@ class ButtonReader(threading.Thread):
             return
         if line.startswith("B|") and len(line) >= 3:
             ev = line[2]
-            if ev == "P":                        # PREV: selection up the queue
-                self._nav(-1)
-            elif ev == "N":                      # NEXT: selection down the queue
-                self._nav(+1)
+            # While the terminal view is open PREV/NEXT scroll it instead of
+            # moving the selection. Reinterpreting here keeps the firmware a
+            # dumb renderer -- it emits the same two verbs either way and never
+            # has to know a mode exists.
+            if ev == "P":                        # PREV: selection up / scroll up
+                if self.mirror_open():
+                    self._mirror_scroll_by(+1)   # +1 = further back in history
+                else:
+                    self._nav(-1)
+            elif ev == "N":                      # NEXT: selection down / scroll
+                if self.mirror_open():
+                    self._mirror_scroll_by(-1)
+                else:
+                    self._nav(+1)
+            elif ev == "M":                      # MIRROR button: toggle the view
+                self._mirror_pressed()
             elif ev == "G":                      # GO short: focus / (dbl) follow
+                # Raising the real window supersedes looking at a copy of it.
+                self.mirror_close()
                 self._go_pressed()
             elif ev == "K":                      # GO long / ACK button: ack only
                 self._ack_only()
@@ -1545,6 +1623,103 @@ class ButtonReader(threading.Thread):
                 return
             self._go_timer = None
         self._go()
+
+    # ---- MIRROR: the device's terminal view ------------------------------ #
+
+    def mirror_open(self) -> bool:
+        with self._mirror_lock:
+            return self._mirror_key is not None
+
+    def _mirror_pressed(self) -> None:
+        """B|M -- toggle the terminal view for the session on the glass."""
+        sess = self._screen.current_shown()
+        with self._mirror_lock:
+            if self._mirror_key is not None:      # open -> close
+                self._mirror_close_locked()
+                log("MIRROR off")
+                return
+            if sess is None:
+                return
+            self._mirror_key = sess.key
+            self._mirror_scroll = 0
+            log(f"MIRROR on -> {sess.name}")
+        self._mirror_tick()                       # paint immediately, do not
+                                                  # wait out the first interval
+
+    def _mirror_close_locked(self) -> None:
+        """Tear down the view. Caller holds _mirror_lock."""
+        self._mirror_key = None
+        self._mirror_scroll = 0
+        if self._mirror_timer is not None:
+            self._mirror_timer.cancel()
+            self._mirror_timer = None
+        self._link.write_line("M|OFF")            # hand the glass back to the
+        self._screen.resend_full_state()          # normal frame
+
+    def mirror_close(self) -> None:
+        with self._mirror_lock:
+            if self._mirror_key is not None:
+                self._mirror_close_locked()
+
+    def _mirror_scroll_by(self, delta: int) -> None:
+        """PREV/NEXT scroll the view instead of moving the selection."""
+        with self._mirror_lock:
+            if self._mirror_key is None:
+                return
+            self._mirror_scroll = max(0, self._mirror_scroll + delta)
+        self._mirror_tick()
+
+    def _mirror_tick(self) -> None:
+        """Fetch the wrapper's screen, push it, and re-arm."""
+        with self._mirror_lock:
+            key = self._mirror_key
+            scroll = self._mirror_scroll
+        if key is None:
+            return
+        # PREV/NEXT scroll rather than navigate while the view is open, so the
+        # shown session cannot move under us; a mismatch means it ended or was
+        # pruned, and the view has nothing left to show.
+        sess = self._screen.current_shown()
+        if sess is None or sess.key != key:
+            self.mirror_close()
+            return
+
+        rows = wrapper_ctrl_screen(sess.focus_ctrl or "")
+        if rows is None:
+            body = ["", "  no preview for this session.", "",
+                    "  only wrapped sessions mirror their",
+                    "  terminal -- a hook-only session has",
+                    "  no PTY for the daemon to read."]
+        else:
+            # Trailing blank rows are the TUI's empty space, not content:
+            # dropping them means scrolling lands on real output.
+            while rows and not rows[-1].strip():
+                rows.pop()
+            # Clamp scroll so it cannot run past the end and show nothing.
+            first = max(0, len(rows) - MIRROR_ROWS)
+            start = max(0, first - scroll)
+            body = rows[start:start + MIRROR_ROWS]
+
+        title = f"{sess.name} {sess.state}"[:MIRROR_COLS]
+        self._link.write_line(f"M|T|{title}")
+        for i in range(MIRROR_ROWS):
+            text = body[i] if i < len(body) else ""
+            # Tabs and control bytes would desync the fixed-width layout, and
+            # '|' is the wire's field separator.
+            text = text.expandtabs(8).replace("|", "¦")
+            text = "".join(ch if 32 <= ord(ch) < 127 else " " for ch in text)
+            self._link.write_line(f"M|{i}|{text[:MIRROR_COLS]}")
+        self._link.write_line("M|END")
+
+        with self._mirror_lock:
+            if self._mirror_key is None:          # closed while we were fetching
+                return
+            if self._mirror_timer is not None:
+                self._mirror_timer.cancel()
+            t = threading.Timer(MIRROR_POLL_S, self._mirror_tick)
+            t.daemon = True
+            self._mirror_timer = t
+            t.start()
 
     def _follow_pressed(self) -> None:
         """B|F -- the 4-button device's dedicated FOLLOW toggle.

@@ -36,14 +36,19 @@
  *                   long : acknowledge the alert WITHOUT raising anything
  *                   double: toggle FOLLOW (the daemon disambiguates)
  *     NEXT          step the selection down the queue    (auto-repeats held)
- *     ACK           short: acknowledge the alert WITHOUT raising anything
- *                   long : toggle FOLLOW
+ *     MIRROR        tap: open/close a live view of the session's TERMINAL
  *
- * The 4th button (ACK) adds no new capability -- it surfaces the two actions
- * that were buried in GO's gestures. Acknowledging is the commonest triage move
- * and needed a half-second hold; FOLLOW was reachable only by a double-click
- * nobody discovers unaided. GO keeps all three gestures, so a 3-button board
- * behaves exactly as before and BOOT still stands in for GO.
+ * MIRROR is the one thing three buttons could not do. Acknowledging and FOLLOW
+ * were already reachable through GO, so a 4th button spent on either would have
+ * bought a shortcut; showing the actual terminal was not reachable at all. The
+ * daemon pulls the rendered TUI from that session's PTY wrapper about once a
+ * second and pushes it as M| rows, and while the view is open it reinterprets
+ * PREV/NEXT as scroll -- so this firmware still has NO modes: it emits the same
+ * verbs regardless and simply draws whichever rows arrive.
+ *
+ * Only WRAPPED sessions can be mirrored. A hook-only session has no PTY for the
+ * daemon to read, and says so rather than showing a blank screen that would
+ * look like an idle session.
  *
  * The onboard WS2812 replaces the Nano's single LED: the daemon's V|<KIND>
  * alert class picks both a COLOUR and a RHYTHM, and loops until acknowledged.
@@ -145,6 +150,13 @@ static bool    netOverflow = false;
 static int      battPercent = -1;      // -1 = no cell wired / gauge disabled
 static uint32_t battMv      = 0;
 static unsigned long lastBattMs = 0;
+// ---- Mirror (the terminal view) ---------------------------------------------
+// The daemon pre-renders and clips every row to MIRROR_COLS, so this is a plain
+// buffer: no wrapping, no scrolling, no truncation decisions taken here.
+static bool mirrorOn = false;
+static char mirrorTitle[MIRROR_COLS + 1] = {0};
+static char mirrorRow[MIRROR_ROWS][MIRROR_COLS + 1] = {{0}};
+
 static uint32_t battRawMv    = 0;      // this poll's median, before the EMA
 static uint32_t battFiltMv   = 0;      // EMA state (0 = not yet seeded)
 static bool     battCharging = false;  // inferred, not read from a status pin
@@ -627,9 +639,32 @@ static void drawSetup() {
   gfx->fillRect(0, ACCENT_Y, SCREEN_W, ACCENT_H, C_WORK);
 }
 
+// The terminal view: a title strip, then the rows exactly as the daemon clipped
+// them. Monospace and unstyled on purpose -- this is a window onto a TUI whose
+// own box drawing and alignment carry the meaning, so any prettifying here
+// would fight it.
+static void drawMirror() {
+  gfx->setTextSize(1);
+  gfx->setTextColor(C_WORK);
+  gfx->setCursor(PAD_X, 7);
+  gfx->print(mirrorTitle);
+  gfx->fillRect(0, BAR_RULE_Y, SCREEN_W, 1, C_DIMMER);
+  gfx->setTextColor(C_TEXT);
+  for (uint8_t r = 0; r < MIRROR_ROWS; r++) {
+    if (!mirrorRow[r][0]) continue;
+    gfx->setCursor(PAD_X, MIRROR_Y + r * MIRROR_LH);
+    gfx->print(mirrorRow[r]);
+  }
+}
+
 static void render() {
   gfx->fillScreen(C_BG);
-  if (net.state() == MateNet::SETUP) {
+  if (mirrorOn) {
+    // Deliberately ahead of the SETUP check: the mirror is only ever opened by
+    // a button press on a linked device, so if it is on, it is what was asked
+    // for.
+    drawMirror();
+  } else if (net.state() == MateNet::SETUP) {
     drawSetup();
   } else {
     drawStatusBar();
@@ -706,6 +741,35 @@ static void handleLine(char *line) {
       char *bar = strchr(line, '|');
       if (!bar || bar[1] == 0) break;
       ledForKind(bar + 1);
+      break;
+    }
+
+    case 'M': {  // the terminal MIRROR: M|T|<title>, M|<n>|<text>, M|END, M|OFF
+      char *bar = strchr(line, '|');
+      if (!bar) break;
+      *bar = 0;
+      char *arg = bar + 1;
+      if (!strcmp(arg, "OFF")) {           // daemon closed the view
+        mirrorOn = false;
+        requestRender();
+        break;
+      }
+      if (!strcmp(arg, "END")) {           // a full set of rows has landed:
+        mirrorOn = true;                   // show them in ONE flush, so the
+        requestRender();                   // view never tears mid-update
+        break;
+      }
+      char *bar2 = strchr(arg, '|');
+      if (!bar2) break;
+      *bar2 = 0;
+      char *text = bar2 + 1;               // rest of the line VERBATIM
+      if (!strcmp(arg, "T")) {
+        copyField(mirrorTitle, sizeof(mirrorTitle), text);
+        break;
+      }
+      int row = atoi(arg);
+      if (row >= 0 && row < MIRROR_ROWS)
+        copyField(mirrorRow[row], sizeof(mirrorRow[row]), text);
       break;
     }
 
@@ -870,7 +934,7 @@ static void pumpNet() {
 static Btn prevBtn = {PIN_BTN_PREV, false, 0, 0, false, 0};
 static Btn goBtn   = {PIN_BTN_GO,   false, 0, 0, false, 0};
 static Btn nextBtn = {PIN_BTN_NEXT, false, 0, 0, false, 0};
-static Btn ackBtn  = {PIN_BTN_ACK,  false, 0, 0, false, 0};
+static Btn mirrorBtn = {PIN_BTN_MIRROR, false, 0, 0, false, 0};
 static Btn bootBtn = {PIN_BTN_BOOT, false, 0, 0, false, 0};
 
 static void emitBtn(char c) {
@@ -918,34 +982,25 @@ static void pollGoBtn(Btn &b) {
   }
 }
 
-// The 4th button. Mirrors pollGoBtn's short/long split so the two action
-// buttons feel the same under the thumb, but emits the OTHER two verbs:
+// The 4th button: MIRROR. A plain tap, emitted on the press edge -- no repeat
+// while held (that would flap the view on and off) and no long-press meaning.
+// It is the one action that needed a button of its own: acknowledging and
+// FOLLOW were already reachable through GO's long-press and double-click,
+// whereas showing the terminal was not reachable at all.
 //
-//   short (on release)  K  acknowledge the shown alert, raise nothing
-//   long  (at 500 ms)   F  toggle FOLLOW mode
-//
-// K is what GO's long-press already sends, so a 3-button device loses nothing.
-// F is new: FOLLOW used to be reachable only by double-clicking GO, which is
-// both undiscoverable and easy to trigger by accident when hurrying to raise a
-// terminal twice. Emitting on RELEASE for the short press is what makes the
-// long press possible at all -- press-edge firing would send K before the hold
-// could ever be recognised.
-static void pollAckBtn(Btn &b) {
+// While the view is open the DAEMON reinterprets PREV/NEXT as scroll, so this
+// firmware never learns that a mode exists: it emits the same two verbs either
+// way and just draws whatever rows arrive.
+static void pollTapBtn(Btn &b, char ev) {
   bool raw = (digitalRead(b.pin) == LOW);
   unsigned long now = millis();
   if (raw != b.pressed && (now - b.changeMs) >= DEBOUNCE_MS) {
     b.pressed  = raw;
     b.changeMs = now;
     if (raw) {
-      b.pressMs   = now;
-      b.longFired = false;
-    } else if (!b.longFired) {
-      emitBtn('K');                         // acknowledge only
+      b.pressMs = now;
+      emitBtn(ev);
     }
-  }
-  if (b.pressed && !b.longFired && (now - b.pressMs) >= LONGPRESS_MS) {
-    emitBtn('F');                           // toggle FOLLOW
-    b.longFired = true;                     // ...and swallow the release
   }
 }
 
@@ -953,7 +1008,7 @@ static void pollButtons() {
   pollNavBtn(prevBtn, 'P');
   pollGoBtn(goBtn);
   pollNavBtn(nextBtn, 'N');
-  pollAckBtn(ackBtn);
+  pollTapBtn(mirrorBtn, 'M');
   pollGoBtn(bootBtn);                       // BOOT is a second GO, so a board
                                             // with nothing soldered still works
 }
@@ -966,7 +1021,7 @@ void setup() {
   pinMode(PIN_BTN_PREV, INPUT_PULLUP);
   pinMode(PIN_BTN_GO,   INPUT_PULLUP);
   pinMode(PIN_BTN_NEXT, INPUT_PULLUP);
-  pinMode(PIN_BTN_ACK,  INPUT_PULLUP);
+  pinMode(PIN_BTN_MIRROR, INPUT_PULLUP);
   pinMode(PIN_BTN_BOOT, INPUT_PULLUP);
   rgbLedWrite(PIN_RGB, 0, 0, 0);            // LED dark at boot
   lastRxMs = millis();                      // seed the liveness watchdog

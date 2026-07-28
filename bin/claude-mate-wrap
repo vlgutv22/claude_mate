@@ -479,20 +479,33 @@ def ctrl_listener():
                 data = conn.recv(64).decode(errors="ignore").strip()
             except OSError:
                 data = ""
-            known = data.startswith("focus") or data.startswith("collapse")
-            if known:
+            if data.startswith("screen"):
+                # Mirror request: hand back the rendered TUI so the device can
+                # show what the session is actually doing. Length-prefixed
+                # rather than terminated by a sentinel, because terminal output
+                # can contain any line -- including one that is exactly "ok".
+                rows = g_screen_text.split("\n") if g_screen_text else []
                 try:
-                    conn.sendall(b"go\n")   # liveness: accepted, now running --
-                except OSError:             # the daemon's short first wait ends
-                    pass                    # here instead of at its op deadline
-                if data.startswith("focus"):
-                    focus_self()
-                else:
-                    collapse_self()
-            try:
-                conn.sendall(b"ok\n")       # ack: op done, the next one may run
-            except OSError:
-                pass
+                    conn.sendall(("\n".join(["SCREEN %d" % len(rows)] + rows
+                                            + ["ok"]) + "\n")
+                                 .encode("utf-8", "replace"))
+                except OSError:
+                    pass
+            else:
+                known = data.startswith("focus") or data.startswith("collapse")
+                if known:
+                    try:
+                        conn.sendall(b"go\n")   # liveness: accepted, now running
+                    except OSError:             # -- the daemon's short first wait
+                        pass                    # ends here, not at its deadline
+                    if data.startswith("focus"):
+                        focus_self()
+                    else:
+                        collapse_self()
+                try:
+                    conn.sendall(b"ok\n")   # ack: op done, the next one may run
+                except OSError:
+                    pass
         finally:
             try:
                 conn.close()
@@ -528,6 +541,14 @@ _EFFORT_RE = re.compile(
 # it runs as (set once at startup) and the remaining-limit chip (refreshed by
 # the usage poller thread). All four ride along on every daemon report.
 g_meta = {"model": "", "effort": "", "account": "", "limit": ""}
+
+# The rendered TUI as plain text, republished by evaluate() on every pass. The
+# device's mirror view is served from THIS rather than by reaching into the pyte
+# screen from the ctrl thread: `screen`/`screen_lock` are locals of main(), and
+# taking that lock off-thread self-deadlocks against the feed loop (see the note
+# by the resize handler). Rebinding a str is atomic under the GIL, the same
+# atomic-publish trick used for _patterns, so no lock is needed to read it.
+g_screen_text = ""
 
 def parse_meta(screen_text):
     """Refresh g_meta from the current screen if model/effort are visible."""
@@ -1050,8 +1071,10 @@ def main():
     dbg = open(DEBUG, "a") if DEBUG else None
 
     def evaluate():
+        global g_screen_text
         with screen_lock:
             text = "\n".join(screen.display)
+        g_screen_text = text                   # publish for the mirror view
         parse_meta(text)                       # refresh cached model/effort
         new, src = detect_state(text)
         now = time.monotonic()

@@ -24,7 +24,7 @@
  *   left -> right, in ascending GPIO order so the wiring reads like the row of
  *   switches under the thumb:
  *
- *       PREV -> GPIO 3    GO -> GPIO 4    NEXT -> GPIO 5    ACK -> GPIO 6
+ *       PREV -> GPIO 3    GO -> GPIO 4    NEXT -> GPIO 5    MIRROR -> GPIO 6
  *
  *   All four are free on this board -- an ADC sweep of GPIO 1-10 found every one
  *   of them floating, with only the battery sense on GPIO 1 driven. BOOT
@@ -39,13 +39,16 @@
  *   the device in download mode. (Worth re-checking with `espefuse summary` if
  *   these boards ever ship with different eFuses.)
  *
- *   The 4th button is the one the 3-button build could not have. Short press
- *   ACKNOWLEDGES the shown alert without raising anything -- the commonest
- *   triage action, previously only reachable by holding GO for half a second.
- *   Held, it toggles FOLLOW mode, which until now was hidden behind a
- *   double-click on GO that nobody would discover unaided. Both map onto verbs
- *   the daemon already understands (K) or now understands (F); GO keeps its
- *   short/long/double gestures, so nothing regresses for a 3-button device.
+ *   The 4th button is MIRROR: a tap opens a live view of the selected session's
+ *   actual terminal on the glass, and another tap closes it. It earns the pin
+ *   because it is the only action that was not reachable at all before --
+ *   acknowledging and FOLLOW already live on GO's long-press and double-click,
+ *   so putting either here would have spent a switch on a shortcut.
+ *
+ *   Deliberately tap-only: no auto-repeat (holding would flap the view on and
+ *   off) and no long-press meaning. While the view is open the DAEMON
+ *   reinterprets PREV/NEXT as scroll, so the firmware never learns that a mode
+ *   exists -- it emits the same verbs either way.
  *
  *   Battery: NOTHING TO WIRE on the -1.47B. The board has its own charger and
  *   its own sense divider already landing on GPIO 1 (ADC1_CH0), so the gauge
@@ -95,12 +98,12 @@
 #define BL_BRIGHTNESS 200              // 0-255 backlight duty (battery vs glare)
 
 // ---- Buttons (INPUT_PULLUP, other leg to GND) -------------------------------
-// Physical layout left -> right: PREV | GO | NEXT | ACK, ascending GPIO.
+// Physical layout left -> right: PREV | GO | NEXT | MIRROR, ascending GPIO.
 #define PIN_BTN_PREV  3       // strapping pin (JTAG select) but inert by
                               // default -- see the note above
 #define PIN_BTN_GO    4
 #define PIN_BTN_NEXT  5
-#define PIN_BTN_ACK   6       // 4th button: short = acknowledge, held = FOLLOW
+#define PIN_BTN_MIRROR 6      // 4th button: tap toggles the terminal view
 #define PIN_BTN_BOOT  0       // the onboard BOOT button, a second GO. Held at
                               // power-on it forces the WiFi setup portal.
 
@@ -214,6 +217,16 @@ struct Btn {
 // addresses the active tab by CHARACTER COLUMN within r3 (the `sel` field), so
 // column * advance has to be exact. A proportional font would misplace the
 // selection box.
+// ---- MIRROR (the terminal view) ---------------------------------------------
+// 53 characters fit across at size 1; 52 leaves a hair of right margin. The
+// rows sit under the status bar, 8 px each. MUST match the daemon's
+// MIRROR_COLS / MIRROR_ROWS -- it pre-renders and clips to exactly this, in
+// keeping with the firmware being a dumb renderer.
+#define MIRROR_COLS   52
+#define MIRROR_ROWS   17
+#define MIRROR_Y      28      // first row's baseline, just under the bar
+#define MIRROR_LH     8       // line height at size 1
+
 #define GLYPH_W       6       // built-in font advance at size 1
 #define GLYPH_H       8       // ...and its cell height
 #define ROW_CHARS     21      // the protocol's row width
