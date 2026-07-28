@@ -16,9 +16,16 @@
 #   parked on a one-shot wakeup it scheduled for itself (ScheduleWakeup, a /loop
 #   tick, a one-shot cron). Claude Code says so in the Stop payload:
 #
-#     background_tasks[]  in-flight background work (running/pending)
+#     background_tasks[]  background work, each entry carrying its own status
+#                         ("running", ...) — only NON-terminal ones are in flight
 #     session_crons[]     scheduled tasks that will wake this session later
 #                         (recurring: false == a one-shot continuation)
+#
+#   Claude Code fires another Stop when the work lands (verified: a Stop with
+#   background_tasks:[{"status":"running",...}] is followed by a second Stop
+#   with background_tasks:[] once the agent returns), so the downgrade below is
+#   always corrected by a later event — as long as we do not count work that is
+#   already over. See the status filter in the parser.
 #
 #   Reporting 'done' there is a lie: the device buzzes DONE and shows IDLE while
 #   the session keeps working, then goes quiet for the real finish. So when
@@ -80,9 +87,21 @@ try:
             name = os.path.basename(os.path.normpath(cwd))
         # Work that outlives the turn (see NOT-DONE-YET RULE above). Both keys
         # are optional and only sent on Stop/SubagentStop.
+        # Only work that is still IN FLIGHT counts. Each entry carries a status
+        # -- captured verbatim from a real Stop payload:
+        #   {"id":"aab0d0a9ba2be6473","type":"subagent","status":"running",
+        #    "description":"Count .h files","agent_type":"Explore"}
+        # A task listed with a TERMINAL status is already over, and counting it
+        # would downgrade this Stop from done to working with no later Stop to
+        # correct it -- the device would then sit on WIP for good. An entry with
+        # no status at all is still counted, so a build that omits the field
+        # keeps suppressing a premature DONE exactly as before.
+        over = {"completed", "complete", "done", "finished", "failed", "error",
+                "killed", "cancelled", "canceled", "timed_out", "timeout", "exited"}
         tasks = data.get("background_tasks")
         if isinstance(tasks, list):
-            inflight += sum(1 for t in tasks if isinstance(t, dict))
+            inflight += sum(1 for t in tasks if isinstance(t, dict)
+                            and str(t.get("status", "")).strip().lower() not in over)
         crons = data.get("session_crons")
         if isinstance(crons, list):
             # One-shot wakeups only: they are this turn continuing later. A

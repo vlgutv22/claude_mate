@@ -12,6 +12,63 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
+### 2026-07-26 — …and it leaves WIP again once that work is actually done
+
+- **Fixed: the device stayed on WIP forever after the task finished.** The
+  background-work tells added the day before are Claude's *transcript* text —
+  printed once, never rewritten. A recap still reads `✻ Worked for 4s · 1 shell
+  still running` long after that shell exited, and nothing scrolls it off while
+  you are away from the keyboard, which is exactly when the device is all you
+  can see. The daemon only alerts DONE on `working → idle`, so a session that
+  never left `working` never buzzed at all.
+
+  Measured on two 200-second recordings of live sessions, one frame per second:
+
+  | Session | Work ends | Old detector | New detector |
+  |---------|-----------|--------------|--------------|
+  | backgrounded shell (`sleep 45`) | t=57s | `working` on all 143 remaining frames | `idle` from t=60s |
+  | background agent (Explore) | t=26s | `working` on all 154 remaining frames | `idle` from t=26s |
+
+  The fix is structural rather than a timeout: the three tells that live in the
+  transcript (the `Waiting for N … to finish` banner, the turn recap's
+  `· N … still running` suffix, the task panel's `N in background` counter) now
+  count only while nothing Claude printed **after** them has superseded them.
+  When the work really ends Claude says so on a new line — `⏺ Background command
+  … completed (exit code 0)`, `⏺ Agent … finished · 9s` — so a tell expires on
+  the very frame its work does. Turn-end furniture that legitimately follows one
+  (the task panel, the `❋ recap:` line, a usage warning) expires nothing.
+
+- **Fixed: a finished subagent kept the session on WIP for as long as the agents
+  panel stayed up** (27s in the recording). Claude leaves the completed agent's
+  row on screen with its final tally, `◯ Explore  Count .h files … 9s · ↓ 7.5k
+  tokens`, and `↓ 7.5k tokens` is textually a live activity meter. The meter is
+  now read only *above* the prompt box, which is where Claude's own foreground
+  status line renders; the agents panel below it is excluded.
+
+- **Fixed: the live in-flight chip is now read below the prompt box** rather
+  than from "the last four non-empty lines". That is Claude's own chrome, so
+  neither the conversation nor the text you are typing (`kill the 3 shells`) can
+  reach it, and the chip is still found when an agents panel pushes the hint row
+  further up.
+
+- **Fixed: two shapes that fired on ordinary prose.** The banner now has to name
+  the banner's own nouns, so Claude writing *"⏺ Waiting for 2 CI jobs to finish
+  before I merge."* no longer pins the device (prose is permanent transcript, so
+  that pin never lifted). The `N in background` counter now has to sit alone on
+  its line, so a right-aligned table column reading `build   2 in background`
+  does not match. The banner's phrases (`background agent`, `agent to finish`,
+  `workflow to finish`, `tool to finish`) are gone from the tunable `busy` list
+  in `patterns.json`: as bare substrings they carried neither the structural
+  shape nor the freshness gate, and the structural regex already covers them.
+
+- **Fixed (hook): a `Stop` payload listing an already-finished background task
+  no longer downgrades DONE to `working`.** Each `background_tasks[]` entry
+  carries its own `status` (verified against real payloads:
+  `{"type":"subagent","status":"running",…}`), and Claude Code fires another
+  `Stop` with an empty array once the work lands. Counting a terminal entry
+  would suppress a DONE that no later event ever corrects. An entry with **no**
+  status is still counted, so a build that omits the field behaves as before.
+
 ### 2026-07-25 — A turn that ends with background work no longer reads IDLE
 
 - **Fixed: the device showed IDLE (and buzzed a premature DONE) while a

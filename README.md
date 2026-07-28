@@ -98,8 +98,8 @@ You can drive the daemon from **either or both** of these — mix freely:
 
 | Path | What it is | What it can see |
 |------|-----------|-----------------|
-| **(a) Claude Code hooks** | `hooks/claude-status.sh`, wired to `UserPromptSubmit` / `Notification` / `Stop` / `StopFailure`. Fire-and-forget; never blocks or fails a turn. | Turn boundaries: started, needs-input, finished OK, finished on error — plus the **background work Claude reports on `Stop`** (`background_tasks`, one-shot `session_crons`), so a turn that ends with work still in flight reports `working`, not a premature DONE. Works in the VS Code extension and the CLI. |
-| **(b) PTY wrapper** `bin/claude-mate-wrap` | Run `claude` *through* a wrapper (`alias claude=claude-mate-wrap`). It forks a pseudo-terminal, relays stdin/stdout transparently, and mirrors the TUI into a headless terminal emulator to read the **live screen**. | Everything on screen the hooks can't report: the spinner, **API errors/retries**, **permission prompts**, interactive option-pickers, and every **background-work** tell — the *"Waiting for N dynamic workflow to finish"* banner, the turn recap's *"· 1 shell still running"* suffix and the **live in-flight chip** in the hint row — i.e. it knows a session is **still busy after the turn "ends"**, including work that is only queued. |
+| **(a) Claude Code hooks** | `hooks/claude-status.sh`, wired to `UserPromptSubmit` / `Notification` / `Stop` / `StopFailure`. Fire-and-forget; never blocks or fails a turn. | Turn boundaries: started, needs-input, finished OK, finished on error — plus the **background work Claude reports on `Stop`** (`background_tasks` entries whose own `status` is still in flight, plus one-shot `session_crons`), so a turn that ends with work still running reports `working`, not a premature DONE — while a task listed as already finished is not counted, because the next `Stop` that would correct it may never come. Works in the VS Code extension and the CLI. |
+| **(b) PTY wrapper** `bin/claude-mate-wrap` | Run `claude` *through* a wrapper (`alias claude=claude-mate-wrap`). It forks a pseudo-terminal, relays stdin/stdout transparently, and mirrors the TUI into a headless terminal emulator to read the **live screen**. | Everything on screen the hooks can't report: the spinner, **API errors/retries**, **permission prompts**, interactive option-pickers, and every **background-work** tell — the *"Waiting for N dynamic workflow to finish"* banner, the turn recap's *"· 1 shell still running"* suffix and the **live in-flight chip** in the hint row — i.e. it knows a session is **still busy after the turn "ends"**, including work that is only queued, and knows when it has stopped being busy. |
 
 The wrapper is the more capable feed (true live state, plus terminal focus); the
 hooks are the zero-dependency feed. Use whichever fits each session.
@@ -412,20 +412,34 @@ open and dismiss (the `/effort` or `/model` slider, whose footer is
 while a dynamic workflow, background agents, a backgrounded shell, a monitor or
 an MCP task keep going, and the session must stay `working` until they finish
 (otherwise the device buzzes DONE mid-flight and then shows IDLE for work that
-is still running). Claude renders three tells for it, and the wrapper matches
-all three with **structural regexes** in code — whole-screen and ungated,
-because a substring loose enough to catch them would fire on ordinary prose:
+is still running). Claude renders four tells for it, and the wrapper matches
+them with **structural regexes** in code, because a substring loose enough to
+catch them would fire on ordinary prose:
 
 | Tell | Looks like | Covers |
 |------|-----------|--------|
 | Banner | `✻ Waiting for 2 background agents and 1 dynamic workflow to finish` | Turn end; also matched when it **wraps** in a narrow terminal |
 | Turn recap suffix | `✻ Crunched for 1m 56s · 1 shell still running` | Turn end, for work the banner doesn't name |
-| **In-flight chip** (hint row) | `⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage` | **Everything, including queued work and scheduled loops.** Read only in the footer, where conversation text can't reach — and unlike the two transcript lines it keeps updating, so it stays true after they scroll away |
-| Compact status row | a dim, right-aligned *`N` in background* | The same fact on Claude's compact status row |
+| Task-panel counter | a dim, right-aligned *`N` in background* | The same fact on Claude's task panel |
+| **In-flight chip** (hint row) | `⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage` | **Everything, including queued work and scheduled loops.** Read only *below the prompt box*, where neither the conversation nor the line you are typing can reach |
 
-Two guards come with it. A to-do left `in progress` in the task panel is **not**
-counted — it is a plan item, not a running task, and keying off it would mean
-the device could never report DONE again. And background work never masks
+**The first three are transcript text, so they expire.** Claude prints them
+once and never rewrites them — a recap still reads *"1 shell still running"*
+long after that shell exited, and nothing scrolls it away while you are away
+from the keyboard, which is exactly when the device is all you can see. So each
+counts only while it is still Claude's **last word**: the moment Claude prints
+anything that supersedes it (`⏺ Background command … completed (exit code 0)`,
+`⏺ Agent … finished · 9s`, or simply the next reply), the tell goes quiet. The
+chip needs no such gate — it lives in Claude's live chrome and disappears on its
+own. Verified against two 200-second recordings of real sessions, one per tell;
+the frames are the fixtures in `tools/test_detect.py`.
+
+Three guards come with it. A to-do left `in progress` in the task panel is
+**not** counted — it is a plan item, not a running task, and keying off it would
+mean the device could never report DONE again. A **finished** subagent's row in
+the agents panel keeps its final `9s · ↓ 7.5k tokens` on display, which is
+textually a live activity meter — so the meter is read only above the prompt
+box, never from that panel. And background work never masks
 **needs-your-input**: only the foreground spinner vetoes a question picker, so a
 session that keeps a shell or a workflow running still alerts when it asks you
 something.

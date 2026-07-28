@@ -14,7 +14,10 @@ Run `claude` THROUGH this wrapper (alias claude=claude-mate-wrap). It:
      to finish" banner, the turn recap's "· 1 shell still running" suffix, and
      the live in-flight chip in the hint row ("… · 1 shell · ← for agents"),
      which is the one that also covers work that is merely QUEUED (i.e. it knows
-     the session is still busy after the turn "ends").
+     the session is still busy after the turn "ends"). The tells Claude prints
+     into the TRANSCRIPT count only while they are still its last word: printed
+     text never rewrites itself, so trusting a stale copy — a recap still reading
+     "1 shell still running" after that shell exited — pinned WIP for good.
   3. Reports state changes to the Claude Mate daemon over its Unix socket, and
      auto-registers on start / removes on exit (the display mirrors your open
      wrapped terminals).
@@ -143,16 +146,21 @@ DEFAULT_PATTERNS = {
     "waiting_footer": [
         "to select", "to navigate",
     ],
-    # Signals that appear ONLY when genuinely generating, OR when the turn has
-    # "ended" but background work is still running: the interrupt hint ("esc to
-    # interrupt", distinct from a picker's "esc to cancel"), the "running in the
-    # background" footer, a pending dynamic workflow / tool, and a pending
-    # background agent ("Waiting for N background agent(s) to finish" -- the
-    # Explore/subagent status line, which carries no "esc to interrupt").
+    # Signals that appear ONLY when genuinely generating: the interrupt hint
+    # ("esc to interrupt", distinct from a picker's "esc to cancel") and the
+    # "running in the background" footer.
+    #
+    # The end-of-turn banner's phrases ("background agent", "agent to finish",
+    # "workflow to finish", "tool to finish") used to live here too. They are the
+    # SAME signal _BG_WORK_RE matches, but as bare substrings they carry neither
+    # its structural shape nor the _fresh() gate -- so once Claude had printed
+    # "Waiting for 1 background agent to finish" into the transcript, any frame
+    # that still showed that line read as working, agent long since returned.
+    # (The idle-prompt gate does not save it: Claude's hint row alternates, and
+    # in the captured session it read "(shift+tab to cycle)", not "? for
+    # shortcuts".) _BG_WORK_RE covers every one of them properly.
     "busy": [
         "esc to interrupt", "running in the background",
-        "workflow to finish", "tool to finish",
-        "background agent", "agent to finish",
     ],
 }
 
@@ -591,16 +599,14 @@ _LIVE_SPINNER_RE = re.compile(
 
 # Claude's END-OF-TURN BACKGROUND-WORK banner. The foreground reply has finished
 # (the prompt is available again) but real work is STILL running -- a dynamic
-# workflow, background agents, or a tool. Claude shows a live line like
+# workflow, background agents, or a tool. Claude prints a line like
 #   "Waiting for 1 dynamic workflow to finish"
 #   "Waiting for 2 background agents to finish"
-# that CLEARS the instant the work completes, so it is a trustworthy "still
-# working" tell. Two things make it different from the foreground spinner, and
-# both matter here:
+# Two things make it different from the foreground spinner, and both matter here:
 #   1. it can sit FAR above the bottom region -- the task panel + the prompt box
-#      push it up, well outside BUSY_TAIL_LINES -- so it is matched over the WHOLE
-#      screen (this is exactly why a genuinely-busy session was mis-read idle ->
-#      premature DONE);
+#      push it up, well outside BUSY_TAIL_LINES -- so it is matched over the whole
+#      TRANSCRIPT (this is exactly why a genuinely-busy session was mis-read idle
+#      -> premature DONE);
 #   2. it COEXISTS with the idle prompt ("? for shortcuts" shows while background
 #      work runs), so it must NOT be suppressed by the idle-prompt gate.
 # Quote-resistance is structural instead: it must sit at a LINE START (optional
@@ -608,16 +614,24 @@ _LIVE_SPINNER_RE = re.compile(
 # so prose about background work ("still waiting for the agent to finish") never
 # fires -- there is no leading count, or "waiting" is not the first word.
 #
-# The banner also WRAPS in a narrow terminal ("Waiting for 2 background agents
-# and 1 dynamic workflow to finish" is 64 columns before Claude's own padding),
-# which used to drop "to finish" onto the next screen line and lose the match --
-# so the count may instead be followed by the banner's own nouns.
+# It is TRANSCRIPT text, not a live element -- see _fresh() below, which is what
+# stops it claiming a finished agent forever.
+#
+# What the count must be followed by is one of the banner's OWN nouns, with the
+# trailing "to finish" optional -- which covers both problems at once:
+#   * the banner WRAPS in a narrow terminal ("Waiting for 2 background agents and
+#     1 dynamic workflow to finish" is 64 columns before Claude's own padding),
+#     dropping "to finish" onto the next screen line and losing the match;
+#   * a free-form "waiting for <N> ... to finish" also matches Claude's ordinary
+#     PROSE -- "⏺ Waiting for 2 CI jobs to finish before I merge." is a
+#     line-start sentence with a count and "to finish" -- and prose is permanent
+#     transcript that no later frame ever clears.
 _BG_WORK_RE = re.compile(
     r'^[ \t]*[^\w\s]?[ \t]*'                   # line start: optional indent + one glyph
     r'waiting for\s+\d+\s+'                    # "Waiting for 1 " (a live count)
-    r'(?:[^\n]*?\bto finish\b'                 # "... dynamic workflow / agents / tool to finish"
-    r'|background agents?\b'                   # ...or the banner wrapped before "to finish"
-    r'|dynamic workflows?\b)',
+    r'(?:background\s+)?'                      # "... 2 background agents ..."
+    r'(?:agents?|dynamic workflows?|workflows?|tools?|tasks?)\b'   # the banner's own nouns
+    r'(?:[^\n]*?\bto finish\b)?',              # ...trailing clause, absent when it WRAPS
     re.I | re.M)
 
 # Claude's TURN-DURATION line, when the turn ended with background work still
@@ -629,10 +643,11 @@ _BG_WORK_RE = re.compile(
 #   "✻ Cooked for 45s · 2 shells still running"
 #
 # Same rationale as the banner: it can sit far above the bottom region and it
-# coexists with the idle prompt, so it is matched over the whole screen. Quote-
-# resistance is the shape of the line itself -- a verb + "for <elapsed>" at a
-# line start, then a "·" separator, then "still running" -- which prose about a
-# process ("the dev server is still running") does not have.
+# coexists with the idle prompt, so it is matched over the whole transcript.
+# Quote-resistance is the shape of the line itself -- a verb + "for <elapsed>" at
+# a line start, then a "·" separator, then "still running" -- which prose about a
+# process ("the dev server is still running") does not have. Like the banner it
+# is TRANSCRIPT text and needs the _fresh() gate below.
 _BG_TURN_END_RE = re.compile(
     r'^[ \t]*[^\w\s]?[ \t]*'                   # line start: optional indent + one glyph
     r'\w+[ \t]+for[ \t]+\d+\s*(?:ms|[hms])\b'  # "Sautéed for 2m 33s" (past-tense recap)
@@ -656,7 +671,8 @@ _BG_TURN_END_RE = re.compile(
 #
 # The chip's wording is Claude's own summary of the task set, so the phrases are
 # enumerated rather than guessed. Quote-resistance comes from WHERE it is read:
-# only the footer region (the prompt box + hint row), never the conversation.
+# only BELOW the prompt box (see split_screen), which is Claude's own chrome --
+# neither the conversation nor the line you are typing into can reach it.
 _BG_CHIP_RE = re.compile(
     r'(?:·[ \t]*|^[ \t]{0,4})\d+[ \t]+'        # a "· <N> " chip (or one opening the row)
     r'(?:shells?|monitors?|local agents?|teams?'
@@ -667,11 +683,86 @@ _BG_CHIP_RE = re.compile(
 # The same fact on Claude's compact status row, which renders a dim, RIGHT-
 # ALIGNED "<N> in background" instead of the chip. Cheap to also accept.
 #
-# Quote-resistance: right alignment guarantees a run of padding in front of it
-# and the counter ENDS the line, so the number must sit at a line start or after
-# 2+ spaces with nothing but blanks after "background" -- prose ("2 in background
-# mode", "leaves 3 in background.") does not fit that shape.
-_BG_COUNT_RE = re.compile(r'(?:^|[ \t]{2,})\d+ in background[ \t]*$', re.I | re.M)
+# Quote-resistance: the row carries NOTHING but the counter -- right alignment
+# puts only padding in front of it and it ends the line -- so prose ("2 in
+# background mode", "leaves 3 in background.") does not fit the shape, and
+# neither does a right-aligned table column that happens to read the same
+# ("  build                              2 in background"), which the earlier
+# "line start OR 2+ spaces" form accepted.
+_BG_COUNT_RE = re.compile(r'^[ \t]*\d+ in background[ \t]*$', re.I | re.M)
+
+# --------------------------------------------------------------------------- #
+# Transcript vs live chrome — the two halves of the screen, and their freshness
+# --------------------------------------------------------------------------- #
+# Claude's prompt box cuts the visible screen in two, and the halves have
+# OPPOSITE trust properties:
+#   * ABOVE it is the TRANSCRIPT — what Claude has already printed. Those lines
+#     are frozen: nothing rewrites them, and while you are away from the keyboard
+#     nothing scrolls them off either.
+#   * BELOW it is LIVE CHROME — the hint row and, when subagents exist, the
+#     agents panel. Claude redraws it every frame, so it stops asserting a fact
+#     the moment the fact stops being true, and no conversation text can reach it.
+# Each background-work tell is read against the half it actually lives in.
+_RULE_RE = re.compile(r'^[ \t]*[╭╰┌└├]?[─━═╌┄┈╍]{8,}[╮╯┐┘┤]?[ \t]*$')
+PROMPT_BOX_MAX_LINES = 8      # widest gap between the box's two rules (multi-line input)
+
+def split_screen(nonblank):
+    """(transcript, chrome) — the screen either side of Claude's prompt box.
+
+    `transcript` is everything ABOVE the box; `chrome` is everything below the
+    box's LAST rule, which deliberately excludes the input line itself so text
+    you are typing ("kill the 3 shells") is never read as Claude's own chrome.
+    Returns (None, None) when no prompt box is on screen — a full-screen picker
+    or dialog — and callers then fall back to the plain bottom-of-screen window.
+    """
+    rules = [i for i, ln in enumerate(nonblank) if _RULE_RE.match(ln)]
+    if not rules:
+        return None, None
+    bottom = top = rules[-1]
+    for i in reversed(rules[:-1]):     # walk up over the box's own rule(s)
+        if top - i > PROMPT_BOX_MAX_LINES:
+            break
+        top = i
+    return nonblank[:top], nonblank[bottom + 1:]
+
+# A transcript tell is only true while it is still Claude's LAST word on the
+# subject. Both end-of-turn tells above are printed INTO the transcript, so they
+# never stop claiming what they claimed. Captured from live sessions (the frames
+# are in tools/test_detect.py):
+#
+#   shell  t=13.9s  "✻ Worked for 4s · 1 shell still running"      <- printed
+#          t=57.7s  `sleep 45` exits; the hint-row chip vanishes; the line stays
+#          t=210s   ...the same line, verbatim, session idle at the prompt
+#   agent  t=16.3s  "✻ Waiting for 1 background agent to finish"   <- printed
+#          t=25.9s  "⏺ Agent ... finished · 9s" prints BELOW it; the line stays
+#          t=190s   ...the same line, verbatim, session idle at the prompt
+#
+# Both sessions read "working" for the entire capture. The daemon only alerts
+# DONE on working -> idle, so the device sat on WIP for good and never buzzed --
+# and nothing scrolls those lines away while you are away, which is exactly when
+# the device is the only thing you can see.
+#
+# The gate is structural rather than a timeout: when the work really ends Claude
+# SAYS so on a new line ("⏺ Background command ... completed (exit code 0)",
+# "⏺ Agent ... finished · 9s"), and any further reply is a bullet or a fresh turn
+# recap too -- so a tell expires on the very frame its work does. Turn-end
+# furniture that legitimately follows a tell while work is still in flight (the
+# task panel, the "❋ recap:" line, a usage warning) carries none of these shapes
+# and expires nothing.
+_NEW_OUTPUT_RE = re.compile(
+    r'^[ \t]*(?:[⏺●⎿][ \t]'                    # a reply / tool-call / tool-result bullet
+    r'|[^\w\s]?[ \t]*\w+[ \t]+for[ \t]+\d+\s*(?:ms|[hms])\b)',   # a LATER turn recap
+    re.M)
+
+def _fresh(pattern, transcript_text):
+    """True when `pattern` matches the transcript AND nothing Claude printed
+    after it has superseded it. Uses the LAST match, so an older copy higher up
+    the screen can never veto a freshly reprinted tell."""
+    last = None
+    for last in pattern.finditer(transcript_text):
+        pass
+    return (last is not None
+            and not _NEW_OUTPUT_RE.search(transcript_text[last.end():]))
 
 def detect_state(screen_text):
     # Read only Claude's LIVE STATUS REGION (the bottom of the visible screen),
@@ -687,6 +778,18 @@ def detect_state(screen_text):
     busy_tail = "\n".join(nonblank[-BUSY_TAIL_LINES:]).lower()
     footer = "\n".join(nonblank[-FOOTER_LINES:]).lower()
     full = "\n".join(nonblank)               # whole visible screen (for live lines)
+    transcript, chrome = split_screen(nonblank)
+
+    # Where the live activity METER may be read. It is Claude's own foreground
+    # status line and always renders directly ABOVE the prompt box, so the region
+    # is the bottom of the upper half plus the hint row (which carries "esc to
+    # interrupt"). What it deliberately EXCLUDES is the AGENTS PANEL Claude lists
+    # under the hint row: a finished subagent's row keeps its final tally on
+    # display -- captured verbatim, 27s after the agent had returned --
+    #   "◯ Explore  Count .h files in /usr/include        9s · ↓ 7.5k tokens"
+    # and that dead meter read as live work for as long as the panel stayed up.
+    meter_region = (busy_tail if transcript is None else
+                    "\n".join((transcript + chrome[:1])[-BUSY_TAIL_LINES:]).lower())
 
     # Is the session actively working? Two signals:
     #  1. The live activity meter / "esc to interrupt" / background-work hints in
@@ -707,24 +810,34 @@ def detect_state(screen_text):
     idle_prompt = any(p in footer for p in _IDLE_FOOTER)
     live_work = (not idle_prompt) and (
                 any(p in busy_tail for p in _patterns["busy"])
-                or bool(_WORKING_METER_RE.search(busy_tail))
+                or bool(_WORKING_METER_RE.search(meter_region))
                 or bool(_LIVE_SPINNER_RE.search(full)))
     # Background work (a dynamic workflow, an agent, a backgrounded shell, a
     # monitor, an MCP task -- running OR still queued) keeps the session "working"
     # even though the foreground turn ended and the prompt is idle. Claude shows
     # it four ways, and none of them are gated on the idle prompt (which is up
-    # WHILE the background work runs). The two transcript tells are read over the
-    # whole screen and carry their own structural shape; the two live ones are
-    # read in the footer, where conversation text cannot reach:
+    # WHILE the background work runs). Each is read against the half of the screen
+    # it belongs to (see split_screen), which is what keeps it honest:
     #   1. the "Waiting for N ... to finish" banner (turn end, agents/workflows),
     #   2. the turn recap's "· N ... still running" suffix (turn end, the rest),
-    #   3. the in-flight chip in the hint row, and 4. the compact status row's
-    #      "N in background" -- the live pair, still true after the transcript
-    #      lines scroll away, and the only tells for work that is merely QUEUED.
-    bg_work = (bool(_BG_WORK_RE.search(full))
-               or bool(_BG_TURN_END_RE.search(full))
-               or bool(_BG_CHIP_RE.search(footer))
-               or bool(_BG_COUNT_RE.search(full)))
+    #      and 3. the task panel's "N in background" counter -- all three are
+    #      TRANSCRIPT text, so each counts only while _fresh(): Claude has printed
+    #      nothing since that supersedes it. Without that gate they keep asserting
+    #      work that finished long ago and the device never leaves WIP;
+    #   4. the in-flight chip in the hint row -- live chrome below the box, the
+    #      one tell that is also true for work that is merely QUEUED, and the one
+    #      that survives the transcript lines scrolling away.
+    if transcript is None:
+        # No prompt box on screen (a full-screen picker/dialog). We cannot tell
+        # Claude's chrome from its output, so trust no transcript tell and read
+        # the chip from the plain footer window.
+        bg_work = bool(_BG_CHIP_RE.search(footer))
+    else:
+        transcript_text = "\n".join(transcript)
+        bg_work = (bool(_BG_CHIP_RE.search("\n".join(chrome)))
+                   or _fresh(_BG_WORK_RE, transcript_text)
+                   or _fresh(_BG_TURN_END_RE, transcript_text)
+                   or _fresh(_BG_COUNT_RE, transcript_text))
     busy_now = live_work or bg_work
 
     # Strong, specific error strings win even mid-stream (a genuine API error

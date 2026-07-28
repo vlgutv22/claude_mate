@@ -87,6 +87,26 @@ CASES = [
      "done", stop(background_tasks=[TASK], session_crons=[CRON_RECUR]),
      "working|abc123|claude_mate"),
 
+    # A task that is already OVER must not hold the session on WIP (#14). Each
+    # entry carries its own status -- captured from a real Stop payload:
+    #   {"id":"aab0d0a9...","type":"subagent","status":"running",
+    #    "description":"Count .h files","agent_type":"Explore"}
+    # Counting a terminal one would downgrade this Stop to 'working' with no
+    # later Stop to correct it, and the device would never buzz DONE again.
+    ("Stop listing a COMPLETED background task -> done",
+     "done", stop(background_tasks=[dict(TASK, status="completed")]),
+     "done|abc123|claude_mate"),
+    ("Stop listing a FAILED background task -> done",
+     "done", stop(background_tasks=[dict(TASK, status="failed")]),
+     "done|abc123|claude_mate"),
+    ("Stop with one finished and one still running -> working",
+     "done", stop(background_tasks=[dict(TASK, status="completed"),
+                                    dict(TASK, id="t2", status="running")]),
+     "working|abc123|claude_mate"),
+    ("a task with NO status is still counted (forward-compatible)",
+     "done", stop(background_tasks=[{"id": "t9", "type": "shell"}]),
+     "working|abc123|claude_mate"),
+
     # Only 'done' is downgraded: the other states need you regardless of what
     # else is running, and 'working' is already what we would send.
     ("waiting stays waiting even with work in flight",
