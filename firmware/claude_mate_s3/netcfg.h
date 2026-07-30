@@ -439,7 +439,19 @@ class MateNet {
   // Returns false once the connection is gone; sets LINKED on success.
   bool handleAuthLine(const char *line) {
     if (!strncmp(line, "C|", 2)) {
-      if (_token.isEmpty()) { drop("daemon wants a token, none configured"); return false; }
+      if (_token.isEmpty()) {
+        // SAY SO before hanging up. Closing the socket silently made the daemon
+        // log "bad handshake None", which is indistinguishable from a crashed
+        // device, a truncated read or a network glitch -- and the device knew
+        // the exact answer the whole time. A|NOTOKEN cannot be mistaken for a
+        // real MAC (a hex digest never contains these letters at this length),
+        // and a daemon too old to recognise it just reports a rejected token,
+        // which is still better than nothing.
+        _client.print("A|NOTOKEN\n");
+        _client.flush();
+        drop("no token - set one in the setup portal");
+        return false;
+      }
       char mac[65];
       hmacSha256Hex(_token.c_str(), line + 2, mac);
       _client.printf("A|%s\n", mac);

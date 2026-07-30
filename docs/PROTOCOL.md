@@ -206,6 +206,29 @@ sentinel, because terminal output can contain any line, **including one that is
 exactly `ok`**, which would truncate the mirror at an arbitrary point. A wrapper
 predating the command answers a bare `ok`, which reads as "no preview".
 
+### 1d. The wireless handshake (TCP devices only)
+
+Before any of the above flows, a TCP device proves it knows the shared token:
+
+| Direction | Line | Meaning |
+|---|---|---|
+| daemon → device | `C\|<nonce>` | 32 hex chars, fresh per connection |
+| device → daemon | `A\|<mac>` | hex HMAC-SHA256(token, nonce) |
+| device → daemon | `A\|NOTOKEN` | *"I have no token configured"* — see below |
+| daemon → device | `A\|OK` | authenticated; the protocol above begins |
+| daemon → device | `A\|NO` | rejected; the socket closes |
+
+The token never crosses the wire and the nonce is fresh per connection, so a
+sniffed handshake is worthless.
+
+`A|NOTOKEN` exists because a device with no token used to simply hang up, which
+reached the daemon as `bad handshake None` — indistinguishable from a crash, a
+truncated read or a network fault, when the device knew the exact answer all
+along. A cleared token is the commonest wireless failure there is (it is what
+the setup portal used to cause), so it gets a line of its own and a daemon
+message that says what to do about it. A daemon too old to recognise it reports
+a rejected token, which is still more use than silence.
+
 **Reset note:** opening the USB serial port resets the Nano (~1.5 s). The `H`
 handshake plus the daemon re-sending state on `H` is exactly what makes the
 display recover correctly after every reconnect. The daemon also forgets its

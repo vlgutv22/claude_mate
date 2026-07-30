@@ -316,6 +316,39 @@ check("a device with the WRONG token is refused", not got_in)
 check("...and is told so (A|NO) rather than left hanging", impostor.reject)
 impostor.close()
 
+# A device that knows it has NO token says so instead of hanging up silently.
+# Silence made the daemon log "bad handshake None", which reads like a crash or
+# a network fault -- and a cleared token is the commonest wireless failure there
+# is, so it earns the one message that says what to do about it.
+print("\n-- phase 1b: a device with no token at all says so --")
+notok = socket.create_connection(("127.0.0.1", tcp_port), timeout=5.0)
+notok.settimeout(5.0)
+chal = b""
+while b"\n" not in chal:
+    c = notok.recv(1024)
+    if not c:
+        break
+    chal += c
+check("...the daemon still challenges it", chal.startswith(b"C|"))
+notok.sendall(b"A|NOTOKEN\n")
+verdict = b""
+try:
+    while b"\n" not in verdict:
+        c = notok.recv(1024)
+        if not c:
+            break
+        verdict += c
+except (socket.timeout, OSError):
+    pass
+check("a device reporting A|NOTOKEN is refused with A|NO",
+      verdict.strip() == b"A|NO")
+notok.close()
+check("...and the daemon logs what to DO about it, not 'bad handshake'",
+      wait_for(lambda: any("HAS NO TOKEN" in l for l in daemon_err)))
+check("...naming the token file, so the fix is copy-pasteable",
+      any("claude-mate/token" in l or "token" in l.lower()
+          for l in daemon_err if "HAS NO TOKEN" in l or "token is in" in l))
+
 # --------------------------------------------------------------------------- #
 # Phase 2: the real device authenticates and gets the full state
 # --------------------------------------------------------------------------- #

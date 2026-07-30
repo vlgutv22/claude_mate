@@ -215,6 +215,10 @@ ALERT_SOUNDS = {
 }
 SOUND_MIN_GAP_S = 2.0          # floor between sounds, whatever the state does
 
+# A device with no token redials every couple of seconds; say what to do about
+# it at most this often, or the advice buries itself.
+NO_TOKEN_LOG_GAP_S = 60.0
+
 # Sentinel for "we have not told the firmware a loop state yet", so the first
 # resolve always emits (V|OFF) and clears any stale loop left by a prior daemon.
 _LOOP_UNSET = "\x00unset"
@@ -635,6 +639,7 @@ class NetLink:
         self._clients: List[socket.socket] = []
         self._stop_evt = threading.Event()
         self._threads: List[threading.Thread] = []
+        self._no_token_logged = 0.0             # throttle for _log_no_token
 
     # ---- lifecycle -------------------------------------------------------- #
 
@@ -720,6 +725,19 @@ class NetLink:
         if reply is None or not reply.startswith("A|"):
             log(f"TCP {peer}: bad handshake {reply!r}")
             return False
+        # A device that knows it has no token says so, rather than hanging up and
+        # leaving us to report "bad handshake None" -- which reads like a crash
+        # or a network fault and sends you looking in the wrong place entirely.
+        # It is the commonest wireless failure by far, because it is what a
+        # cleared token looks like, so it gets the one message that says exactly
+        # what to do about it.
+        if reply.strip().upper() == "A|NOTOKEN":
+            self._log_no_token(peer)
+            try:
+                conn.sendall(b"A|NO\n")
+            except OSError:
+                pass
+            return False
         # compare_digest keeps the comparison time independent of how much of
         # the MAC an attacker guessed right.
         if not hmac.compare_digest(reply[2:].strip().lower(), expect):
@@ -735,6 +753,23 @@ class NetLink:
         except OSError:
             return False
         return True
+
+    def _log_no_token(self, peer: str) -> None:
+        """The actionable message, throttled.
+
+        The device redials every couple of seconds, so an unthrottled message
+        would bury the log in copies of itself -- which is its own kind of
+        useless, and exactly what `bad handshake None` was already doing."""
+        now = time.time()
+        if now - self._no_token_logged < NO_TOKEN_LOG_GAP_S:
+            return
+        self._no_token_logged = now
+        path = os.path.expanduser(os.environ.get("CLAUDE_MATE_TOKEN_FILE",
+                                                 DEFAULT_TOKEN_FILE))
+        log(f"TCP {peer}: THE DEVICE HAS NO TOKEN. Open its wifi setup portal "
+            f"(4th button -> MENU -> WI-FI) and paste the token into 'Shared "
+            f"token', or send T|<token> over USB.")
+        log(f"    this daemon's token is in {path}")
 
     @staticmethod
     def _read_line_blocking(conn: socket.socket) -> Optional[str]:
