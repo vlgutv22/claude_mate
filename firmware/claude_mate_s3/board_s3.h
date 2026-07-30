@@ -280,8 +280,12 @@ struct Btn {
 // to change -- while About is a READOUT you lean in for, like the mirror. Five
 // operable rows is what 172 px holds at size 2 with the status bar and the
 // accent bar both in place; About needs more rows than that and no aiming.
+// 5 rows of 24 put the last one at 124..146, which clears the hint at
+// MENU_HINT_Y (150..158) and the accent bar at ACCENT_Y (164). At 26 the fifth
+// row's selection highlight reached 156 and swallowed most of the hint -- the one
+// row where you most need to be told that a long press confirms.
 #define PAGE_ROW_Y      28    // first row's top
-#define PAGE_ROW_H      26    // 5 rows: 28..158, clear of ACCENT_Y
+#define PAGE_ROW_H      24
 #define PAGE_ROWS_VIS   5
 #define PAGE_INFO_Y     32    // About's first row (size 1)
 #define PAGE_INFO_LH    14

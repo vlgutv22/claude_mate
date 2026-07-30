@@ -50,8 +50,9 @@ session you have open — in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
         │══════════════════════════════════════│  ← accent bar in the selected session's state colour
         └──────────────────────────────────────┘
                   (•) WS2812 — rhythm AND colour
-        [ PREV ]  [ GO ]  [ NEXT ]  [ MIRROR ]     ← a fourth button opens the live terminal view
-   MIRROR: tap = mirror the selected session's real terminal · hold 2 s = power off (tap wakes)
+        [ PREV ]  [ GO ]  [ NEXT ]  [ MENU ]       ← a fourth button, with three gestures
+   MENU: tap = the selected session's real terminal · double-tap = the on-device menu
+         hold 2 s = long sleep (a tap wakes the board)
 ```
 
 **Iteration 1 — Arduino Nano, 128×32 mono OLED, USB:**
@@ -108,7 +109,7 @@ daemon on your Mac. Build it either way — or both, at the same time:
 | Board | Arduino Nano (ATmega328P) | Waveshare ESP32-S3-LCD-1.47**B** |
 | Display | 0.91" 128×32 mono OLED (SSD1306) | 1.47" 172×320 colour IPS (ST7789) |
 | Transport | USB serial | **Wi-Fi (TCP)**, USB as fallback |
-| Buttons | 3 — PREV / GO / NEXT | 4 — + **MIRROR** (Kailh Choc low-profile) |
+| Buttons | 3 — PREV / GO / NEXT | 4 — + **MENU** (Kailh Choc low-profile) |
 | Alert light | one LED, rhythm only | WS2812, rhythm **+ colour** |
 | Power | USB | USB **or** a 14500 cell, with a gauge |
 | Extra | — | a **live mirror** of a session's terminal |
@@ -121,7 +122,7 @@ never the tab order or which tab is shown. The LED blinks a status-distinct patt
 *unacknowledged* alert — so a single tab finishing, blocking, or erroring is
 *seen* even while the rest of your fleet keeps working. It keeps blinking until
 you deal with it. There are **no UI modes**: the buttons — **PREV · GO · NEXT**,
-and **MIRROR** on the S3 — mean the same thing at all times.
+and **MENU** on the S3 — mean the same thing at all times.
 
 The single must-have action is **GO**: press it and the window for the
 displayed session is raised so you can deal with it — the integrated VS Code
@@ -138,7 +139,7 @@ of at most 21 characters for both devices; each just draws what it was sent.
 
 ## The terminal mirror (ESP32-S3)
 
-Tapping **MIRROR** opens a live view of the selected session's *actual
+Tapping the **4th button** opens a live view of the selected session's *actual
 terminal* on the device — 52×17 characters, refreshed about once a second.
 **PREV/NEXT** then scroll it instead of moving the selection, and **GO** closes
 it and raises the real window. Only **wrapped** sessions can be mirrored: a
@@ -183,7 +184,7 @@ hooks are the zero-dependency feed. Use whichever fits each session.
   tab order. **PREV** / **NEXT** step the order manually (hold to auto-repeat,
   wrapping at the ends); the screen **never changes subject on its own**.
 - **No UI modes** — the buttons mean the same thing at all times:
-  **PREV · GO · NEXT** (plus **MIRROR** on the S3). A short **GO** acknowledges
+  **PREV · GO · NEXT** (plus **MENU** on the S3). A short **GO** acknowledges
   the shown alert **and raises its window**; a **long-press of GO** (~0.5 s)
   acknowledges it **without** touching any window. Buttons fire instantly
   (edge-accepted ~40 ms debounce), and every accepted press flashes the device
@@ -261,9 +262,25 @@ hooks are the zero-dependency feed. Use whichever fits each session.
   bursts dip the rail. Charging is inferred in tiers from the cell's own
   voltage; the board exposes no charge-status line.
 - **A live terminal mirror** — see [above](#the-terminal-mirror-esp32-s3).
-- **Power off** — hold **MIRROR** for 2 s for deep sleep, tap to wake. Roughly a
-  month of standby on a 14500; the WS2812 has no shutdown pin, so a switch in
-  the battery lead is the only true zero.
+- **An on-device menu** — double-tap the 4th button. Settings (screen sleep,
+  brightness, alert-LED level including a genuine *off*, flip, factory reset),
+  an About readout, the Wi-Fi setup portal, and long sleep. Entirely
+  **firmware-local**: while it is up PREV/GO/NEXT are handled on the device and
+  never emitted, so the queue cannot move while you are aiming at a settings row
+  — and there is **no protocol change and no daemon change** for any of it.
+- **A screen that turns itself off** — after 1–30 minutes, and only when nothing
+  is waiting on you. What counts as waiting comes from the frame the device
+  already has: a flashing name row, any lowercase fleet letter, or a *looping*
+  LED — which the daemon drives from exactly "worst unacknowledged alert", so it
+  is the authoritative signal. An alert turns the screen back on by itself. A
+  `working` fleet does **not** hold it on — an hour of grinding with nothing to
+  say is the case this exists for — and neither does `NO LINK`, because a dead
+  daemon must not be able to burn the cell flat. A press on a dark screen only
+  wakes, and is swallowed: GO raises a window, and obeying a press aimed at a
+  screen you cannot read would sometimes yank you to the wrong session.
+- **Long sleep** — hold the **4th button** for 2 s for deep sleep, tap to wake.
+  Roughly a month of standby on a 14500; the WS2812 has no shutdown pin, so a
+  switch in the battery lead is the only true zero.
 
 ---
 
@@ -304,9 +321,11 @@ hooks are the zero-dependency feed. Use whichever fits each session.
    │    was last sent (dumb)    │  │    and the M| terminal mirror    │
    │  • LED (D8) plays V|<KIND> │  │  • WS2812 plays V|<KIND> in the  │
    │  • PREV/GO/NEXT buttons    │  │    alert class's colour          │
-   │    → B|P B|N B|G B|K       │  │  • + MIRROR button → B|M         │
+   │    → B|P B|N B|G B|K       │  │  • + MENU button → B|M           │
    └────────────────────────────┘  │  • battery gauge, Wi-Fi config   │
              │                     │    in NVS, deep-sleep power-off  │
+             │                     │  • its OWN menu + screen sleep,  │
+             │                     │    which the daemon never sees   │
              │                     └──────────────────────────────────┘
              │  H (hello on boot), B|<x> (buttons)        │
              └───────────────► back to the daemon ◄───────┘
@@ -385,7 +404,7 @@ firmware stops the loop on its own after ~30 s of serial silence and shows the
 | Qty | Part                                    | Notes                                  |
 |-----|-----------------------------------------|----------------------------------------|
 | 1   | **Waveshare ESP32-S3-LCD-1.47B** dev board | 1.47" 172×320 IPS (ST7789), dual-core ESP32-S3, 8 MB PSRAM, 16 MB flash, USB-C. Carries the WS2812, the Li-ion charger and the battery sense divider — so there is nothing else to solder on the board side |
-| 4   | **Kailh Choc low-profile (1350) switches** | PREV · GO · NEXT · **MIRROR**. Tactile ("Chocolate"/brown) or linear, whichever you prefer — the firmware debounces in software either way |
+| 4   | **Kailh Choc low-profile (1350) switches** | PREV · GO · NEXT · **MENU**. Tactile ("Chocolate"/brown) or linear, whichever you prefer — the firmware debounces in software either way |
 | 4   | Choc keycaps (1350 footprint)           | Any low-profile cap that fits Choc stems |
 | 1   | **14500 Li-ion cell, ~800 mAh**          | AA-sized 3.7 V. Plugs straight into the board's battery header — **do not** wire anything to GPIO 1 yourself, the sense divider is already there |
 | 2   | M2 screws                               | Close the printed enclosure             |
@@ -405,7 +424,7 @@ Pinout summary (full details in [`firmware/README.md`](firmware/README.md)):
 | PREV button          | 3         | `INPUT_PULLUP`, emits `B|P`. A strapping pin, but an inert one — `STRAP_JTAG_SEL` is unburned by default |
 | GO button            | 4         | `INPUT_PULLUP`, emits `B|G` / `B|K` — same meanings as on the Nano |
 | NEXT button          | 5         | `INPUT_PULLUP`, emits `B|N`            |
-| **MIRROR** button    | 6         | `INPUT_PULLUP`, emits `B|M` on tap; **hold 2 s = power off**, tap wakes. The hold emits nothing — it sleeps |
+| **MENU** button      | 6         | `INPUT_PULLUP`. Tap emits `B|M` (the mirror); **double-tap opens the on-device menu**; **hold 2 s = long sleep**, a tap wakes. Only the tap emits anything — the menu and the hold are firmware-local |
 | Backlight            | 46        | **On-board.** GPIO 46 on the ‑1.47**B**, 48 on the original ‑1.47 — the only pin that differs between revisions, and the wrong one leaves the panel dark while the ST7789 is driven perfectly |
 | WS2812 alert LED     | 38        | On-board. Plays `V|<kind>` in the alert class's colour |
 | Battery sense        | 1         | On-board 3:1 divider. Nothing to wire   |

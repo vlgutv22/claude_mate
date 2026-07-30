@@ -273,8 +273,23 @@ static bool          ledLoop      = false;
 static bool          ledActive    = false;
 static bool          ledOn        = false;
 static unsigned long ledPhaseMs   = 0;
-static uint8_t       ledR = 0, ledG = 0, ledB = 0;
+static uint8_t       ledR = 0, ledG = 0, ledB = 0;              // driven
+static uint8_t       ledBaseR = 0, ledBaseG = 0, ledBaseB = 0;  // before the cap
 static char          ledKindCode  = 0;   // first letter of the active LOOP kind
+
+// Re-derive the driven colour from the pattern's own colour and the configured
+// cap. Separated out so the Alert LED setting can take effect on a pattern that
+// is ALREADY playing: re-arming it through ledForKind() would not work at all
+// (its anti-glitch guard returns early for a resend of the same looping kind)
+// and would restart the rhythm's phase if it did.
+static void ledApplyCap() {
+  uint8_t cap = cfg.ledBright();
+  ledR = (uint16_t)ledBaseR * cap / 255;
+  ledG = (uint16_t)ledBaseG * cap / 255;
+  ledB = (uint16_t)ledBaseB * cap / 255;
+  if (ledActive && ledOn) rgbLedWrite(PIN_RGB, ledR, ledG, ledB);
+  else                    rgbLedWrite(PIN_RGB, 0, 0, 0);
+}
 
 static void ledPaint(bool on) {
   if (on) rgbLedWrite(PIN_RGB, ledR, ledG, ledB);
@@ -292,15 +307,18 @@ static void startPattern(const LedStep *steps, uint8_t count, bool loop,
   if (count == 0) { stopLed(); return; }
   if (count > ALERT_MAX_STEPS) count = ALERT_MAX_STEPS;
   for (uint8_t i = 0; i < count; i++) ledSteps[i] = steps[i];
-  // Scale to the configured cap so a 5 mm WS2812 at arm's length is a signal,
-  // not a flashbulb -- and so it costs the battery less. Settings can take this
-  // to 0, which is a real silent mode: the pattern still runs, the pixel just
-  // stays dark, and the alert still reaches you through the flashing name row
-  // and fleet letter. LED_BRIGHT remains the default.
-  uint8_t cap = cfg.ledBright();
-  ledR = (uint16_t)r * cap / 255;
-  ledG = (uint16_t)g * cap / 255;
-  ledB = (uint16_t)b * cap / 255;
+  // Keep the pattern's own colour, then scale it to the configured cap so a
+  // 5 mm WS2812 at arm's length is a signal, not a flashbulb -- and so it costs
+  // the battery less. Settings can take the cap to 0, which is a real silent
+  // mode: the pattern still runs, the pixel just stays dark, and the alert still
+  // reaches you through the flashing name row and fleet letter. LED_BRIGHT
+  // remains the default.
+  //
+  // The UNSCALED colour is kept so that changing the cap can re-scale a pattern
+  // that is already playing (see ledApplyCap) instead of re-arming it, which
+  // would restart the rhythm's phase mid-blink.
+  ledBaseR = r; ledBaseG = g; ledBaseB = b;
+  ledApplyCap();
   ledStepCount = count;
   ledStepIdx   = 0;
   ledLoop      = loop;
@@ -981,7 +999,12 @@ static void drawAboutPage() {
 static void render() {
   gfx->fillScreen(C_BG);
   bool blip = (long)(millis() - blipUntil) < 0;
-  if (uiMode == UI_MENU) {
+  // SETUP outranks every firmware-local screen, including the menu. The portal's
+  // credentials exist only on the glass, so nothing may cover them -- and the
+  // portal can start from paths that do not go through the menu at all.
+  if (net.state() == MateNet::SETUP) {
+    drawSetup();
+  } else if (uiMode == UI_MENU) {
     drawStatusBar();
     drawMenu();
     gfx->setTextSize(1);
@@ -997,12 +1020,11 @@ static void render() {
     gfx->fillRect(0, ACCENT_Y, SCREEN_W, ACCENT_H,
                   blip ? C_TEXT : (resetArmedMs ? C_ERROR : C_DIMMER));
   } else if (mirrorOn) {
-    // Deliberately ahead of the SETUP check: the mirror is only ever opened by
-    // a button press on a linked device, so if it is on, it is what was asked
-    // for.
+    // The mirror is only ever opened by a button press on a linked device, so if
+    // it is on, it is what was asked for. (It used to sit ahead of the SETUP
+    // check for that reason; SETUP now wins, because a portal is only ever up
+    // when the device is NOT linked, so the two cannot both be legitimate.)
     drawMirror();
-  } else if (net.state() == MateNet::SETUP) {
-    drawSetup();
   } else {
     drawStatusBar();
     if      (linkLost)   drawLinkLost();
@@ -1331,10 +1353,23 @@ static void pollNavBtn(Btn &b, char ev) {
     if (raw) {
       b.pressMs  = now;
       b.repeatMs = now;
+      // The dark-screen swallow has to be latched for the whole PRESS, not just
+      // its first event. onButton() decides by reading screenOn -- and sets it on
+      // the way out -- so the guard is true only once, and a press held past
+      // REPEAT_DELAY_MS would then auto-repeat into a screen it had just woken:
+      // a press that meant "wake up" walking the daemon's selection, and with
+      // FOLLOW on, raising a terminal by itself. Exactly what the swallow exists
+      // to prevent. Read BEFORE the call, and re-armed on every press edge so a
+      // spent hold cannot disable the next one's repeat.
+      b.longFired = !screenOn;              // reused as "this press is spent"
       onButton(ev);
     }
   }
-  if (b.pressed && (now - b.pressMs) >= REPEAT_DELAY_MS &&
+  // No auto-repeat outside CONDUCTOR. Five menu items and five settings rows
+  // both wrap, so a repeat at 200 ms laps the list several times over and parks
+  // the selection somewhere arbitrary -- on SLEEP, if you are unlucky.
+  if (b.pressed && !b.longFired && uiMode == UI_CONDUCTOR &&
+      (now - b.pressMs) >= REPEAT_DELAY_MS &&
       (now - b.repeatMs) >= REPEAT_MS) {
     b.repeatMs = now;
     onButton(ev);
@@ -1373,6 +1408,18 @@ static void pollGoBtn(Btn &b) {
 // reboots. Config lives in NVS so nothing is lost, but rejoining WiFi costs a
 // few seconds.
 static void powerOff() {
+  // Tell the daemon to stop mirroring. Without this, holding the button while a
+  // terminal view is open leaves the daemon polling that session's wrapper once
+  // a second, forever, for a device that is asleep -- and the board wakes back
+  // into a stale mirror shown as though it were live.
+  if (mirrorOn) { emitBtn('M'); mirrorOn = false; }
+
+  // The backlight may be at zero because hibernate turned it off, and the
+  // goodbye screen below would then be a 900 ms pause at a dark panel: the whole
+  // gesture invisible, which reads as "the hold did nothing".
+  analogWrite(LCD_BL, cfg.blDuty());
+  screenOn = true;
+
   // Say so while the backlight is still on, then hold it long enough to read.
   if (gfx) {
     gfx->fillScreen(C_BG);
@@ -1466,12 +1513,22 @@ static void sleepScreen() {
   // If the terminal mirror was open, close it. Leaving it open would have the
   // daemon polling a wrapper once a second to render rows onto a dark panel --
   // the one place where hibernating saves nothing and costs the Mac work.
-  if (mirrorOn) emitBtn('M');
+  //
+  // mirrorOn is cleared HERE rather than waiting for the daemon's M|OFF, because
+  // emitLine() is fire-and-forget: with the link down the request reaches nobody,
+  // and the flag would still be set on wake, showing a frozen terminal as though
+  // it were live.
+  if (mirrorOn) { emitBtn('M'); mirrorOn = false; }
 }
 
 // Called every loop. Kept in one place so the two directions cannot disagree.
 static void pollHibernate() {
   if (!cfg.hibernates()) { wakeScreen(); return; }
+  // Never over the WiFi setup portal. Its AP name, its per-start password and
+  // its URL exist NOWHERE else -- not in the daemon, not over serial, not even
+  // in NVS, since the password is regenerated on every portal start. Blanking
+  // that screen mid-setup strands you with no way back to the credentials.
+  if (net.state() == MateNet::SETUP) { wakeScreen(); notePoke(); return; }
   if (needsAttention()) {
     // An alert wakes the screen AND re-arms the timer -- note the notePoke()
     // outside wakeScreen(), which early-returns when the screen is already lit.
@@ -1525,6 +1582,13 @@ static void menuButton(char ev) {
   if (ev == 'N') { pageIdx = (uint8_t)((pageIdx + 1) % SR_COUNT);
                    resetArmedMs = 0; return; }
 
+  // 'K' is GO's long press. On the three rows that only cycle a value it means
+  // the same as 'G': LONGPRESS_MS is 500 ms, easy to overshoot, and a press that
+  // changed nothing because you held it a beat too long reads as a dead row. On
+  // FLIP and RESET the long press keeps its own meaning -- it is the confirming
+  // gesture -- so this is not a blanket alias.
+  if (ev == 'K' && pageIdx != SR_FLIP && pageIdx != SR_RESET) ev = 'G';
+
   if (ev == 'G') {                            // short press: change the value
     switch (pageIdx) {
       case SR_SLEEP:  cfg.cycleHib(); break;
@@ -1533,19 +1597,21 @@ static void menuButton(char ev) {
                       break;                               // a preview you can
                                                            // see is the point
       case SR_LED:    cfg.cycleLed();
-                      // Re-arm whatever is playing so the new cap takes effect
-                      // now rather than at the next alert.
-                      if (ledKindCode) {
-                        char k[2] = {ledKindCode, 0};
-                        ledForKind(k);
-                      } else {
-                        rgbLedWrite(PIN_RGB, 0, 0, 0);
-                      }
+                      // Take effect on whatever is playing RIGHT NOW, not at the
+                      // next alert -- picking "off" while a 7 Hz strobe is going
+                      // is exactly when you reach for this setting.
+                      ledApplyCap();
                       break;
       case SR_FLIP:   cfg.toggleFlip();
                       flipNeedsRestart = (cfg.flipped() != flipAtBoot);
                       break;
-      case SR_RESET:  resetArmedMs = millis() | 1UL; break;
+      // Same sentinel trap as MateSettings::touch(): `| 1UL` would stamp one
+      // millisecond into the future on any even millis(), the unsigned subtract
+      // in loop() would underflow, and the arm would disarm itself in the same
+      // loop iteration -- so half the time the confirmation never appeared and
+      // the row looked broken.
+      case SR_RESET:  { unsigned long t = millis(); resetArmedMs = t ? t : 1UL; }
+                      break;
     }
     return;
   }
@@ -1630,10 +1696,16 @@ static void pollTapBtn(Btn &b) {
   // dark to switch it off should not need two goes.
   if (b.pressed && !b.longFired && (now - b.pressMs) >= POWEROFF_HOLD_MS) {
     b.longFired  = true;                      // swallow the release
-    clickPending = false;                     // ...and the pending single tap
     cfg.flush();                              // deferred commit will not run
     powerOff();                               // never returns
   }
+  // Note what is NOT here: cancelling a pending single tap. A tap immediately
+  // followed by a hold lets the tap land first -- it has to, since it fires at
+  // 300 ms and the hold is only knowable at 2000 ms, and deferring the tap that
+  // long would make the mirror unusable. So tap-then-hold opens the mirror and
+  // then powers off. Harmless, because powerOff() closes the mirror on its way
+  // out; before it did, that sequence left the daemon polling a wrapper forever
+  // for a device that was asleep.
 }
 
 // The deferred single tap fires from the loop once the double-click window has
@@ -1670,6 +1742,15 @@ void setup() {
     gpio_hold_dis((gpio_num_t)LCD_BL);
     gpio_deep_sleep_hold_dis();
     rtc_gpio_deinit((gpio_num_t)PIN_BTN_MIRROR);   // hand the pin back to GPIO
+    // The wake is level-triggered on LOW, so the chip resumed the instant the
+    // pin went down and the button is STILL HELD as this runs. Seed the 4th
+    // button as already-pressed and already-spent, so the release that follows
+    // is consumed rather than read as a fresh tap -- and so a firm two-second
+    // press to wake the board does not immediately power it off again.
+    mirrorBtn.pressed   = true;
+    mirrorBtn.changeMs  = millis();
+    mirrorBtn.pressMs   = millis();
+    mirrorBtn.longFired = true;
   }
 
   pinMode(PIN_BTN_PREV, INPUT_PULLUP);

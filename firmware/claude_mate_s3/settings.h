@@ -136,7 +136,16 @@ class MateSettings {
   static uint8_t clampIdx(uint8_t v, size_t n) {
     return v < n ? v : 0;          // a value from a future build reads as 0
   }                                // rather than indexing off the end
-  void touch() { _dirty = millis() | 1UL; }   // never 0: 0 means "clean"
+  // 0 is the "clean" sentinel, so a stamp of 0 has to become something else --
+  // but it must never become something LATER than now. `millis() | 1` looked
+  // tidy and was wrong: for any even millis() it stamps one millisecond into the
+  // future, so commit()'s unsigned `millis() - _dirty` underflows to ~4.29e9,
+  // clears SETTINGS_COMMIT_MS instantly, and the write it was meant to defer
+  // happens on the very next loop pass -- half the time, at random.
+  void touch() {
+    unsigned long t = millis();
+    _dirty = t ? t : 1UL;
+  }
 
   void write() {
     _dirty = 0;                    // cleared first: a failed begin() must not
