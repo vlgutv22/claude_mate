@@ -40,7 +40,7 @@ session you have open — in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
 
 ```
         ┌──────────────────────────────────────┐
-        │ ıl CLAUDE MATE                ▰ 64%  │  ← status bar: Wi-Fi link · battery (with charging)
+        │ ▁▄█ CLAUDE MATE               ▰ 64%  │  ← status bar: Wi-Fi link · battery (with charging)
         ├──────────────────────────────────────┤
         │ api-server                           │  ← r0: session name, in the state's colour
         │ WAIT   0:42                   work   │  ← r1: state · time-in-state · account
