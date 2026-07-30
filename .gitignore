@@ -31,6 +31,11 @@ build/
 *.d
 *.a
 .build/
+# flash_s3.sh's own build dir. `build/` above does not match it and `.build/`
+# does not either, so a `git add firmware/` used to sweep in ~28k lines of
+# arduino-cli cache -- compile_commands.json, includes.cache, sdkconfig and a
+# copy of every sketch header.
+.build-s3/
 *.eep
 *.lst
 *.map

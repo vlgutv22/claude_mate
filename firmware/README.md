@@ -8,9 +8,11 @@ apart, and **both can be connected at once**.
 | Board | Arduino Nano | Waveshare ESP32-S3-LCD-1.47**B** |
 | Display | 128×32 mono OLED (SSD1306) | 172×320 colour IPS (ST7789) |
 | Transport | USB serial | **Wi-Fi (TCP)**, USB as fallback |
-| Buttons | 3 — PREV / GO / NEXT | 4 — PREV / GO / NEXT / **MIRROR**, Kailh Choc (1350) |
-| Alert LED | one LED, rhythm only | WS2812, rhythm **+ colour** |
+| Buttons | 3 — PREV / GO / NEXT | 4 — PREV / GO / NEXT / **MENU**, Kailh Choc (1350) |
+| Alert LED | one LED, rhythm only | WS2812, rhythm **+ colour**, adjustable (incl. off) |
 | Power | USB | USB or a 14500 Li-ion cell, with a battery gauge |
+| On-device UI | — | a menu: settings, about, Wi-Fi setup, sleep |
+| Screen sleep | — | off after 1–30 min when nothing needs you |
 | Flash with | `arduino-cli upload` | **`./flash_s3.sh`** (see below) |
 
 The Nano build is **unchanged** by the S3 work and remains fully supported. The
@@ -46,10 +48,13 @@ no daemon attached — flash it first when bringing up new hardware.
 A cordless companion: colour LCD, four buttons, and a Wi-Fi link to the daemon
 so it can sit anywhere on a battery.
 
-- `claude_mate_s3.ino` — protocol and UI
+- `claude_mate_s3.ino` — protocol, the CONDUCTOR view, the menu, hibernate
 - `board_s3.h` — pin map, layout geometry, palette, battery/charging constants
 - `netcfg.h` — Wi-Fi transport, mDNS discovery, HMAC handshake, NVS config,
   setup portal
+- `settings.h` — the device's own preferences (NVS, `mate-ui` namespace). The
+  only state here that is neither the daemon's nor the network's; none of it is
+  about a session, so the daemon has no business knowing
 
 **Library:** *GFX Library for Arduino* (Arduino_GFX, by moononournation).
 
@@ -77,7 +82,7 @@ The bare board has only BOOT and RESET. Add four momentary switches, each
 (the firmware debounces in software, and all four grounds may share one wire):
 
 ```
-PREV → GPIO 3     GO → GPIO 4     NEXT → GPIO 5     MIRROR → GPIO 6
+PREV → GPIO 3     GO → GPIO 4     NEXT → GPIO 5     MENU → GPIO 6
 ```
 
 The reference build uses **Kailh Choc low-profile (1350) switches** with Choc
@@ -172,11 +177,111 @@ The daemon side needs `--tcp` (or `CLAUDE_MATE_TCP=1`) and a token in
 `~/.config/claude-mate/token`. Config lives in NVS, a separate partition, so it
 **survives a reflash**.
 
-### Power off
+### The 4th button carries three gestures
 
-**Hold MIRROR for 2 s** to power the device off; **tap it** to wake. The hold is
-deliberately much longer than any other gesture — switching off by fumbling a
-button would be a poor joke on a device whose job is to be glanceable.
+It is the only button whose meaning the daemon does not own, which makes it the
+only place the device can grow a UI of its own.
+
+| Gesture | In CONDUCTOR | In the menu |
+|---|---|---|
+| **Tap** | open/close the terminal mirror | back out one level |
+| **Double-tap** | open the menu | — |
+| **Hold 2 s** | long sleep (deep sleep) — a tap wakes the board | same |
+
+A tap is **deferred by 300 ms**, because a first tap is not yet knowably a single
+one. That cost is paid by the least latency-sensitive of the three on purpose:
+the mirror already waits a daemon round-trip, so 300 ms disappears into latency
+that was there anyway. 300 ms is also the daemon's own `DOUBLE_CLICK_S`, so both
+double-taps on this device — GO's FOLLOW toggle and this one — want the same
+rhythm from your thumb.
+
+The hold is deliberately much longer than any other gesture: switching off by
+fumbling a button would be a poor joke on a device whose job is to be
+glanceable. It works with the screen dark, too — reaching for the device to
+switch it off should not need two goes.
+
+### The menu
+
+Firmware-local, and the **only** part of this device the daemon knows nothing
+about. While it is up, PREV/NEXT/GO are handled here and **never emitted** — a
+GO forwarded while you were aiming at a settings row would raise a terminal you
+were not looking at. The daemon simply sees no button events, keeps its frame
+current the whole time, and needs no protocol change.
+
+```
+  ┌──────────────────────────────────────┐
+  │ ▁▄█ CLAUDE MATE               ▰ 64%  │
+  ├──────────────────────────────────────┤
+  │    ┌────────┐                        │
+  │    │  ▤▤▤   │   ⚟      ⓘ     ▟   ☾   │  ← the selected tile is enlarged
+  │    └────────┘                        │
+  │          CONDUCTOR                   │  ← only the selected item is labelled
+  │  PREV/NEXT move   GO open   4th back │
+  └══════════════════════════════════════┘
+```
+
+A horizontal strip rather than a list, and not as a style preference: this panel
+is 320×172, so a vertical list uses a fifth of the width and runs out of height
+at five rows, while a strip has room to spare in the axis it actually has. Only
+the selected item is labelled — five labels are either unreadable at size 1 or
+collide at size 2, and the icons carry the recognition once you have been here
+twice. They are drawn from primitives: at 34–46 px a font glyph is
+unrecognisable, and a bitmap costs flash plus a second place to keep the design.
+
+| Item | What it does |
+|---|---|
+| **CONDUCTOR** | back to the triage view — the daemon's frame, unchanged since iteration 2 shipped |
+| **SETTINGS** | the five rows below |
+| **ABOUT** | link, RSSI, battery % + raw mV, boot cause, firmware version. The serial `?` output, on the glass — which is the only place it can be read on a cordless device with no console attached |
+| **WI-FI** | start the setup portal now. Previously this needed BOOT held through power-on, or `Z` over serial |
+| **SLEEP** | the same deep sleep the 2 s hold does, made discoverable |
+
+### Settings
+
+| Row | Values | Notes |
+|---|---|---|
+| **Sleep screen** | off · 1m · 2m · 5m · 10m · 30m | One row, not a toggle plus a duration — the two can never disagree, and it costs one row on a screen that has five. Defaults to **off**: nobody's screen should start going dark because they took an update |
+| **Brightness** | 5 steps | Non-linear in duty (20/60/120/200/255). Equal duty steps feel like one enormous jump at the bottom and four identical ones at the top. Applied live, so the step you are on is the step you can see |
+| **Alert LED** | off · low · med · high | **off is genuinely dark.** A 7 Hz red strobe is the right answer to a failed turn at a desk and the wrong one in a bedroom — and the alert still arrives, through the flashing name row and fleet letter |
+| **Flip screen** | on / off | Applies **on restart**; the row says so and a long GO does it. Rotation is set once after `begin()`, and re-rotating a live panel is the one failure in this firmware that looks exactly like dead hardware |
+| **Factory reset** | hold GO to confirm | Wipes Wi-Fi, token **and** settings. Asks twice, and the second gesture is a **long** press rather than another tap — you cannot double-tap your way into wiping the token. Disarms itself after 6 s |
+
+Settings live in their own NVS namespace (`mate-ui`), separate from the network
+config, which is what lets a factory reset choose what it destroys. Writes are
+deferred 1.5 s, so holding NEXT through the brightness steps costs one flash
+write rather than five.
+
+### Screen sleep
+
+The backlight is by far the biggest draw on this board — tens of milliamps
+against the ~1 mA the WS2812 idles at — so turning it off is most of the runtime
+available without touching the radio.
+
+It goes off after the configured delay **only when nothing is waiting on you**,
+and what counts as waiting is answered from the frame the device already has:
+the flashing name row, any lowercase fleet letter, or a **looping** LED pattern
+— which the daemon drives from exactly *"worst unacknowledged alert"* and is
+therefore the authoritative signal. An alert turns the screen back on by itself.
+
+Two things deliberately do **not** hold the backlight on:
+
+- **A `working` fleet.** An hour of grinding with nothing to say is precisely
+  the case this setting exists for.
+- **`NO LINK`.** A dead daemon must not be able to burn the cell flat, which is
+  what would happen the moment you carried the device out of Wi-Fi range.
+
+Only the backlight goes off. `displayOff()` would save another milliamp or two
+and would put the wake path one command away from the dead-panel failure above;
+not worth 2 mA. Rendering is skipped while dark (a full flush is ~28 ms of SPI),
+but the frame keeps arriving and being parsed, so waking shows the **current**
+state rather than a stale one that then jumps. The terminal mirror is closed on
+the way down — polling a wrapper once a second to draw onto a dark panel is the
+one case where hibernating saves nothing and costs the Mac work.
+
+**A press on a dark screen only wakes, and is swallowed.** Phone convention, but
+for a specific reason: GO raises a terminal window, so obeying a press aimed at
+a screen you cannot read would occasionally yank you to the wrong session — the
+exact thing this device exists to prevent. The 2 s hold is the one exception.
 
 "Off" means **deep sleep, not zero**. The WS2812 has no shutdown pin and idles
 around 1 mA whenever the rail is up, which dwarfs the ~8 µA the S3 itself draws
@@ -204,11 +309,17 @@ silently if skipped:
 
 ### The terminal mirror
 
-Tapping MIRROR opens a live view of the selected session's real terminal,
-refreshed about once a second; PREV/NEXT then scroll it and GO closes it and
-raises the actual window. Only **wrapped** sessions can be mirrored — a
-hook-only session has no PTY for the daemon to read and says so. See
-[`docs/PROTOCOL.md`](../docs/PROTOCOL.md) for the wire format.
+Tapping the 4th button in **CONDUCTOR** opens a live view of the selected
+session's real terminal, refreshed about once a second; PREV/NEXT then scroll it
+and GO closes it and raises the actual window. Only **wrapped** sessions can be
+mirrored — a hook-only session has no PTY for the daemon to read and says so.
+See [`docs/PROTOCOL.md`](../docs/PROTOCOL.md) for the wire format.
+
+While the view is open the **daemon** reinterprets PREV/NEXT as scroll, so the
+firmware never learns that this particular mode exists: it emits the same two
+verbs either way and draws whatever rows arrive. That is still true of the
+mirror. It is *not* true of the menu, which is the firmware's own and swallows
+those buttons — see [The menu](#the-menu).
 
 Terminal contents cross the network on the same token-authenticated but
 **plaintext** TCP link as everything else. That is a bigger exposure than a

@@ -256,6 +256,40 @@ struct Btn {
 #define ACCENT_Y      164     // full-width state colour bar
 #define ACCENT_H      8
 
+// ---- MENU: the item strip ---------------------------------------------------
+// A horizontal strip with the selected tile enlarged, PS5-style, rather than a
+// vertical list. Not a style preference: this panel is 320x172, so a list uses
+// a fifth of the width and runs out of height at five rows, while a strip has
+// room to spare in the axis it actually has.
+//
+// Only the SELECTED item is labelled. Five labels at once would either be
+// unreadable at size 1 or collide at size 2, and the icons carry the
+// recognition once you have been here twice.
+#define MENU_COUNT      5
+#define MENU_ICON       34    // unselected tile, px square
+#define MENU_ICON_SEL   46    // ...and the selected one
+#define MENU_PITCH      58    // centre-to-centre
+#define MENU_CX0        44    // centre of slot 0: (320 - 4*58) / 2
+#define MENU_CY         80    // vertical centre of the strip
+#define MENU_LABEL_Y    116   // selected item's label (size 2, centred)
+#define MENU_HINT_Y     150   // the what-the-buttons-do line (size 1, dim)
+
+// ---- MENU: a settings / about page -----------------------------------------
+// Settings rows are size 2 and About rows are size 1, deliberately. A settings
+// row is OPERATED -- you aim at it with a thumb and read a value you are about
+// to change -- while About is a READOUT you lean in for, like the mirror. Five
+// operable rows is what 172 px holds at size 2 with the status bar and the
+// accent bar both in place; About needs more rows than that and no aiming.
+// 5 rows of 24 put the last one at 124..146, which clears the hint at
+// MENU_HINT_Y (150..158) and the accent bar at ACCENT_Y (164). At 26 the fifth
+// row's selection highlight reached 156 and swallowed most of the hint -- the one
+// row where you most need to be told that a long press confirms.
+#define PAGE_ROW_Y      28    // first row's top
+#define PAGE_ROW_H      24
+#define PAGE_ROWS_VIS   5
+#define PAGE_INFO_Y     32    // About's first row (size 1)
+#define PAGE_INFO_LH    14
+
 // ---- Palette (RGB565) -------------------------------------------------------
 // State colours differ in BRIGHTNESS as well as hue, so they stay distinct for
 // a red/green-colourblind reader and in direct sunlight.
@@ -271,6 +305,11 @@ struct Btn {
 #define C_OK          RGB565(52, 211, 153)    // link up
 #define C_BAD         RGB565(255, 77, 77)     // link down
 
+// Shown on the About page and by the serial `?`. The only place a flashed
+// device can tell you which build it is running -- which matters because the
+// flash script writes in verified pieces and a partial run is otherwise silent.
+#define FW_VERSION "s3-2.1"
+
 // ---- Timing (identical semantics to the Nano build) ------------------------
 #define SERIAL_BAUD     115200
 #define LINE_MAX        160    // > the 94-byte worst-case F| frame, with room
@@ -281,6 +320,14 @@ struct Btn {
 // LONGPRESS_MS: switching the device off by fumbling a button would be a poor
 // joke on a device whose whole job is to be glanceable.
 #define POWEROFF_HOLD_MS 2000UL
+// Two taps of the 4th button within this window are a DOUBLE-click (open the
+// menu). 300 ms is not a free choice: it is exactly the daemon's
+// DOUBLE_CLICK_S, so both double-click gestures on the device -- GO's FOLLOW
+// toggle and this one -- want the same rhythm from your thumb. A single tap is
+// therefore deferred by this long before it acts, which is why the mirror is
+// the thing on the single tap: it already costs a daemon round-trip, so 300 ms
+// disappears into latency that was there anyway.
+#define DBLCLICK_MS     300UL
 #define REPEAT_DELAY_MS 400UL  // PREV/NEXT held this long -> auto-repeat
 #define REPEAT_MS       200UL  // ...then one event every 200 ms
 #define BLINK_MS        400UL  // flash / blink half-period (~2.5 Hz)

@@ -12,6 +12,51 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
+### 2026-07-30 — A menu on the 4th button, and a screen that turns itself off
+
+**ESP32-S3 only, and nothing outside its firmware changed** — no protocol
+change, no daemon change, and the Nano build untouched. All of this is
+firmware-local because none of it is about a session: it is about the piece of
+hardware, which the daemon has no business knowing.
+
+- **Added: three gestures on the 4th button.** A tap still opens the terminal
+  mirror in the (now named) **CONDUCTOR** view; a **double-tap** opens an
+  on-device menu; the 2 s hold still means long sleep. The tap is now deferred
+  by 300 ms, because a first tap is not yet knowably a single one — a cost paid
+  by the least latency-sensitive of the three on purpose, since the mirror
+  already waits a daemon round-trip. 300 ms is the daemon's own
+  `DOUBLE_CLICK_S`, so both double-taps on the device want the same rhythm.
+- **Added: a menu** — CONDUCTOR · SETTINGS · ABOUT · WI-FI · SLEEP, as a
+  horizontal strip rather than a list, because a 320×172 panel gives a list a
+  fifth of its width and runs it out of height at five rows. While the menu is
+  up PREV/GO/NEXT are handled on the device and never emitted, so the queue
+  cannot move while you are aiming at a row. **ABOUT** puts the serial `?`
+  readout on the glass, which is the only place it can be read on a cordless
+  device with no console attached, and **WI-FI** starts the setup portal —
+  previously reachable only by holding BOOT through power-on or sending `Z`.
+- **Added: screen sleep**, off after 1/2/5/10/30 min and only when nothing is
+  waiting on you, judged from the frame the device already has (flashing name
+  row, any lowercase fleet letter, or a *looping* LED — the daemon drives that
+  from exactly "worst unacknowledged alert"). An alert turns it back on. A
+  `working` fleet deliberately does not hold it on, and neither does `NO LINK`:
+  a dead daemon must not be able to burn the cell flat, which is what would
+  happen the moment you carried the device out of Wi-Fi range. Only the
+  backlight goes off — `displayOff()` would save another milliamp and put the
+  wake path one command from the dead-panel failure this firmware already warns
+  about twice. Defaults to **off**, so nobody's screen starts going dark because
+  they took an update.
+- **Added: settings**, in their own NVS namespace so a factory reset can choose
+  what it destroys — screen sleep, backlight (5 steps, non-linear in duty
+  because equal duty steps feel like one huge jump then four identical ones),
+  alert LED with a genuine **off** (a 7 Hz red strobe is right at a desk and
+  wrong in a bedroom, and the alert still arrives through the name row), flip
+  screen, and factory reset. Writes are deferred 1.5 s, so holding NEXT through
+  the brightness steps costs one flash write instead of five.
+- **A press on a dark screen only wakes, and is swallowed.** Phone convention,
+  but for a specific reason: GO raises a terminal window, so obeying a press
+  aimed at a screen you cannot read would occasionally yank you to the wrong
+  session — the exact thing this device exists to prevent.
+
 ### 2026-07-28 — Iteration 2: a cordless ESP32-S3 companion with a colour screen
 
 **The Arduino Nano build is unchanged and still supported.** Both devices speak
