@@ -1235,6 +1235,16 @@ static bool handleConfigLine(char *line) {
       ESP.restart();
       return true;
 
+    case 'Y':                              // scan and list what the RADIO sees
+      // A headless device that will not join has two very different problems --
+      // the network is not there, or the password is wrong -- and from the
+      // outside they look identical. This is the only way to tell them apart
+      // without a serial console on the router. It also catches the trap that
+      // this chip is 2.4 GHz only: an SSID the Mac joins happily can be
+      // invisible here if the router moved it to 5 GHz.
+      net.scanTo(Serial);
+      return true;
+
     case 'Z':                              // start the setup portal now
       if (line[1]) return false;
       Serial.println("starting setup portal");

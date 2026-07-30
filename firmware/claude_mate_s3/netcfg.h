@@ -191,6 +191,12 @@ class MateNet {
     out.printf("host  : %s\n", _host.isEmpty() ? "(mDNS discovery)" : _host.c_str());
     out.printf("port  : %u\n", _port);
     out.printf("token : %s\n", _token.isEmpty() ? "(unset)" : "(set)");
+    // The driver's own verdict, verbatim. Without it a device that will never
+    // join and a device that is merely slow are indistinguishable over serial.
+    out.printf("wifi  : status=%d %s\n", (int)WiFi.status(),
+               WiFi.status() == WL_CONNECTED ? "connected" : joinFailWhy());
+    if (_dropAt) out.printf("last  : %s (%lus ago)\n", _dropWhy,
+                            (unsigned long)((millis() - _dropAt) / 1000));
     out.printf("state : %s\n", stateName());
     if (WiFi.status() == WL_CONNECTED)
       out.printf("ip    : %s  rssi %d dBm\n",
@@ -217,6 +223,43 @@ class MateNet {
   }
 
   void startPortalNow() { startPortal(); }
+
+  // What the radio can actually see, with the configured SSID called out.
+  // Blocking for a couple of seconds, which is acceptable: it is a diagnostic
+  // typed by a human at a serial console, not something the loop calls.
+  void scanTo(Print &out) {
+    out.println("scanning...");
+    // Stop the join first. pollJoin() re-arms WiFi.begin() every
+    // NET_JOIN_TIMEOUT, and a scan issued while an association attempt is in
+    // flight returns 0 results on this chip -- which reads as "the air is
+    // empty" and sends you diagnosing the wrong thing entirely.
+    // disconnect(false, false): drop the association, but keep the radio on and
+    // keep the stored credentials.
+    WiFi.disconnect(false, false);
+    delay(150);
+    int n = WiFi.scanNetworks(false /*async*/, true /*show hidden*/);
+    if (n <= 0) {
+      out.printf("  (no networks found, n=%d) -- if this repeats with a phone "
+                 "hotspot right beside the device, suspect the radio, not the "
+                 "air.\n", n);
+      startJoin();                       // hand the radio back to the state machine
+      return;
+    }
+    bool sawOurs = false;
+    for (int i = 0; i < n && i < 30; i++) {
+      bool ours = (!_ssid.isEmpty() && WiFi.SSID(i) == _ssid);
+      sawOurs |= ours;
+      out.printf("  %-32s %4d dBm  ch%-3d %s%s\n",
+                 WiFi.SSID(i).c_str(), WiFi.RSSI(i), WiFi.channel(i),
+                 WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "open " : "psk  ",
+                 ours ? " <- configured" : "");
+    }
+    if (!_ssid.isEmpty() && !sawOurs)
+      out.printf("  NOT VISIBLE: '%s'. Wrong band (this radio is 2.4 GHz only),"
+                 " out of range, or hidden.\n", _ssid.c_str());
+    WiFi.scanDelete();
+    startJoin();                         // hand the radio back to the state machine
+  }
 
   // Close the link and power the radio down, for deep sleep. Dropping the TCP
   // connection POLITELY matters: a half-open socket leaves the daemon holding a
@@ -292,10 +335,26 @@ class MateNet {
       return;
     }
     if (millis() - _stateSince > NET_JOIN_TIMEOUT) {
-      // Wrong password, AP out of range, router rebooting -- all look the same
-      // from here, so just start over rather than guessing.
+      // "Wrong password, AP out of range, router rebooting -- all look the same
+      // from here" was true of the retry, but NOT of the reason: the driver
+      // distinguishes them and we were throwing that away, so a device that
+      // could never join just said "joining ..." forever. Retry identically,
+      // but keep what the driver told us -- it is the difference between
+      // retyping a password and moving the device closer to the router.
+      note(joinFailWhy());
       WiFi.disconnect();
       startJoin();
+    }
+  }
+
+  // The one thing that actually distinguishes the join failures.
+  static const char *joinFailWhy() {
+    switch (WiFi.status()) {
+      case WL_NO_SSID_AVAIL:  return "network not found";
+      case WL_CONNECT_FAILED: return "wrong wifi password?";
+      case WL_CONNECTION_LOST: return "wifi connection lost";
+      case WL_IDLE_STATUS:    return "wifi idle - retrying";
+      default:                return "cannot join wifi";
     }
   }
 
@@ -384,6 +443,15 @@ class MateNet {
     if (WiFi.status() != WL_CONNECTED) { drop("wifi lost"); return; }
   }
 
+  // Record a failure reason without tearing the socket down. drop() is for
+  // "the link died"; this is for "an attempt failed and we are retrying".
+  void note(const char *why) {
+    if (!why) return;
+    snprintf(_dropWhy, sizeof(_dropWhy), "%s", why);
+    unsigned long t = millis();
+    _dropAt = t ? t : 1UL;
+  }
+
   void drop(const char *why) {
     // Keep the reason. It used to be discarded, which meant every failure --
     // wrong token, no token, daemon not listening, wifi gone -- presented
@@ -391,15 +459,11 @@ class MateNet {
     // side of the room that reads as "it just doesn't work", and the one thing
     // the user needed to know (which of four things is wrong) was the thing
     // being thrown away.
-    if (why) {
-      snprintf(_dropWhy, sizeof(_dropWhy), "%s", why);
-      // 0 is the "no error" sentinel, so a stamp of 0 must become something
-      // else -- but NOT `millis() | 1`, which rounds UP on any even millis()
-      // and makes the unsigned age comparison underflow to ~4.29e9. That exact
-      // trick has already been fixed twice in this firmware.
-      unsigned long t = millis();
-      _dropAt = t ? t : 1UL;
-    }
+    // 0 is the "no error" sentinel, so a stamp of 0 must become something else
+    // -- but NOT `millis() | 1`, which rounds UP on any even millis() and makes
+    // the unsigned age comparison underflow to ~4.29e9. That exact trick has
+    // already been fixed twice in this firmware. See note().
+    note(why);
     _client.stop();
     _lineLen = 0;
     _lastTry = millis();            // honour the backoff before redialling
