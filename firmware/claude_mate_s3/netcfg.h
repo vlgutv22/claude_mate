@@ -229,20 +229,12 @@ class MateNet {
   // typed by a human at a serial console, not something the loop calls.
   void scanTo(Print &out) {
     out.println("scanning...");
-    // Stop the join first. pollJoin() re-arms WiFi.begin() every
-    // NET_JOIN_TIMEOUT, and a scan issued while an association attempt is in
-    // flight returns 0 results on this chip -- which reads as "the air is
-    // empty" and sends you diagnosing the wrong thing entirely.
-    // disconnect(false, false): drop the association, but keep the radio on and
-    // keep the stored credentials.
-    WiFi.disconnect(false, false);
-    delay(150);
-    int n = WiFi.scanNetworks(false /*async*/, true /*show hidden*/);
+    int n = cleanScan();
     if (n <= 0) {
       out.printf("  (no networks found, n=%d) -- if this repeats with a phone "
                  "hotspot right beside the device, suspect the radio, not the "
                  "air.\n", n);
-      startJoin();                       // hand the radio back to the state machine
+      resumeAfterScan();
       return;
     }
     bool sawOurs = false;
@@ -258,7 +250,20 @@ class MateNet {
       out.printf("  NOT VISIBLE: '%s'. Wrong band (this radio is 2.4 GHz only),"
                  " out of range, or hidden.\n", _ssid.c_str());
     WiFi.scanDelete();
-    startJoin();                         // hand the radio back to the state machine
+    resumeAfterScan();
+  }
+
+  // Hand the radio back to whoever owned it before the scan.
+  //
+  // NOT unconditionally startJoin(): that calls WiFi.mode(WIFI_STA), which
+  // tears down a running softAP. Typing `Y` while the setup portal was up
+  // therefore killed the portal out from under the phone looking at it -- the
+  // diagnostic destroying the thing it was meant to help diagnose. In SETUP the
+  // portal owns the radio and cleanScan() only ever dropped the STA
+  // association, so there is nothing to restore.
+  void resumeAfterScan() {
+    if (_state == SETUP) return;
+    startJoin();
   }
 
   // Close the link and power the radio down, for deep sleep. Dropping the TCP
@@ -322,6 +327,7 @@ class MateNet {
 
   void startJoin() {
     WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);             // startPortal() turns this off
     WiFi.setSleep(true);                     // modem sleep: the point of a battery
     WiFi.begin(_ssid.c_str(), _pass.isEmpty() ? nullptr : _pass.c_str());
     go(JOINING);
@@ -443,6 +449,27 @@ class MateNet {
     if (WiFi.status() != WL_CONNECTED) { drop("wifi lost"); return; }
   }
 
+  // A scan that actually returns results.
+  //
+  // A bare WiFi.scanNetworks() returns 0 whenever an association attempt is in
+  // flight -- and one usually is, from pollJoin()'s retry or from the ESP32's
+  // own background auto-reconnect, which stays armed even in AP_STA mode. The
+  // symptom is the worst kind: not an error, but an empty list, which reads as
+  // "there are no networks here" and sends you diagnosing the radio, or the
+  // room, or your router. It bit the serial diagnostic first and the SETUP
+  // PORTAL second -- and the portal is where it matters, because an empty
+  // network dropdown is the one thing that makes the device unprovisionable.
+  //
+  // disconnect(false, false) drops the association only: the radio stays
+  // powered, the stored credentials survive, and a running softAP (the portal
+  // the user's phone is currently looking at) is untouched.
+  int cleanScan() {
+    WiFi.scanDelete();                 // free any previous results first
+    WiFi.disconnect(false /*wifioff*/, false /*eraseap*/);
+    delay(150);
+    return WiFi.scanNetworks(false /*async*/, true /*show hidden*/);
+  }
+
   // Record a failure reason without tearing the socket down. drop() is for
   // "the link died"; this is for "an attempt failed and we are retrying".
   void note(const char *why) {
@@ -501,6 +528,12 @@ class MateNet {
     snprintf(_apPass, sizeof(_apPass), "%08u", (unsigned)(r % 100000000u));
 
     WiFi.mode(WIFI_AP_STA);          // AP_STA so the portal can still scan
+    // ...but stop the STA fighting it. The ESP32 re-associates in the
+    // background on its own, and any attempt in flight makes scanNetworks()
+    // return zero -- which showed up as an empty network dropdown, the one
+    // failure that makes the device impossible to provision.
+    WiFi.setAutoReconnect(false);
+    WiFi.disconnect(false, false);
     WiFi.softAP(_apName, _apPass);
 
     _dns = new DNSServer();
@@ -528,15 +561,26 @@ class MateNet {
   void serveForm() {
     // Scanning blocks for a couple of seconds, which is fine: in SETUP there is
     // no link to keep alive and the user is waiting on this page anyway.
-    int n = WiFi.scanNetworks();
+    // cleanScan(), not a bare scanNetworks(): see the note there. An empty
+    // dropdown here is fatal -- it is the one failure that makes the device
+    // impossible to provision, and it looks like "there is no wifi" rather than
+    // like a bug.
+    int n = cleanScan();
     String opts;
-    for (int i = 0; i < n && i < 20; i++) {
+    uint8_t shown = 0;
+    for (int i = 0; i < n && shown < 20; i++) {
       String s = WiFi.SSID(i);
-      if (s.isEmpty()) continue;
+      if (s.isEmpty()) continue;          // hidden SSID: nothing to select
       opts += "<option value='" + s + "'>" + s + " (" + WiFi.RSSI(i) + " dBm)</option>";
+      shown++;
     }
+    // Never serve a form you cannot submit. If the scan came back empty the
+    // dropdown alone is a dead end, so offer a text box instead and say what
+    // happened -- the network may simply be hidden, or on 5 GHz.
+    bool manual = (shown == 0);
     String html =
-        F("<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+        F("<!doctype html><meta charset=utf-8>"
+          "<meta name=viewport content='width=device-width,initial-scale=1'>"
           "<title>Claude Mate setup</title><style>"
           "body{font:16px system-ui;margin:0;padding:24px;background:#0b0d10;color:#e8eaed}"
           "h1{font-size:20px;margin:0 0 4px}p{color:#9aa0a6;margin:0 0 20px;font-size:14px}"
@@ -548,9 +592,16 @@ class MateNet {
           "small{color:#6b7280;display:block;margin-top:6px;font-size:12px}"
           "</style><h1>Claude Mate</h1><p>Point this companion at your daemon.</p>"
           "<form method=POST action=/save>"
-          "<label>Network</label><select name=ssid>");
-    html += opts;
-    html += F("</select>"
+          "<label>Network</label>");
+    if (manual) {
+      html += F("<input name=ssid autocomplete=off placeholder='type the network name'>"
+                "<small>No networks were seen in this scan. Type the name - it may "
+                "be hidden, or on 5 GHz, which this radio cannot see. Reload to "
+                "scan again.</small>");
+    } else {
+      html += "<select name=ssid>" + opts + "</select>";
+    }
+    html += F(
               "<label>Password</label><input name=pass type=password autocomplete=off>"
               "<label>Shared token</label><input name=token autocomplete=off ");
     // Tell the user what state the token is in and what to type. "Must match
