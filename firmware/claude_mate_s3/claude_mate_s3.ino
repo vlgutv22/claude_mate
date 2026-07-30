@@ -106,6 +106,7 @@
 #include <driver/rtc_io.h>
 #include "board_s3.h"
 #include "netcfg.h"
+#include "settings.h"
 
 // ---- Display -----------------------------------------------------------------
 // Drawn into an off-screen canvas and flushed in one go: the frame is rebuilt
@@ -124,6 +125,62 @@ static bool buffered = true;
 
 // ---- Wireless transport ------------------------------------------------------
 MateNet net;
+
+// ---- Device settings (firmware-local; see settings.h for why) ---------------
+MateSettings cfg;
+
+// ---- UI mode -----------------------------------------------------------------
+// CONDUCTOR is the triage view this device has always shown: the daemon's frame,
+// its terminal mirror, and nothing of the firmware's own invention. It is named
+// because it is now one of several things the screen can be, and because that is
+// what the device does -- it conducts a fleet of agents the way a conductor
+// conducts an orchestra, watching all of them so you only have to watch one
+// surface.
+//
+// MENU and PAGE are entirely firmware-local. While either is up, PREV/NEXT/GO
+// are handled HERE and never reach the daemon -- which is a real change to the
+// old promise that "this firmware never learns that a mode exists". It has to
+// be: forwarding a GO while you are aiming at a settings row would raise a
+// terminal you were not looking at. The daemon simply sees no button events,
+// needs no protocol change, and keeps its frame current the whole time, so
+// leaving the menu is instant.
+enum UiMode : uint8_t { UI_CONDUCTOR, UI_MENU, UI_PAGE };
+static UiMode uiMode = UI_CONDUCTOR;
+
+enum MenuItem : uint8_t {
+  MI_CONDUCTOR, MI_SETTINGS, MI_ABOUT, MI_WIFI, MI_SLEEP
+};
+static uint8_t menuIdx = MI_CONDUCTOR;
+
+enum PageId : uint8_t { PG_SETTINGS, PG_ABOUT };
+static PageId  pageId  = PG_SETTINGS;
+static uint8_t pageIdx = 0;          // selected row within the page
+
+// Settings rows, in screen order.
+enum SetRow : uint8_t {
+  SR_SLEEP, SR_BRIGHT, SR_LED, SR_FLIP, SR_RESET, SR_COUNT
+};
+// The page does not scroll, so a sixth row would simply not be drawn -- and
+// would look like a bug in the setting rather than in the layout. Adding one
+// means either raising PAGE_ROWS_VIS (and finding the pixels) or teaching the
+// page to scroll; this makes the compiler say so instead of the screen.
+static_assert(SR_COUNT <= PAGE_ROWS_VIS,
+              "settings rows exceed what one page can show without scrolling");
+
+// The factory-reset row asks twice. A single GO arms it and the row says what is
+// about to be destroyed; the confirming gesture is a LONG press, which is a
+// different motion rather than the same one again -- you cannot double-tap your
+// way into wiping the token by accident. It disarms itself if you walk away.
+#define RESET_ARM_MS 6000UL
+static unsigned long resetArmedMs = 0;
+
+// A flip only takes effect through the panel's rotation, which is applied once
+// at begin(). Rather than re-initialising a live display -- the one failure mode
+// in this firmware that looks exactly like a dead panel -- the row says it needs
+// a restart and offers one. Compared against the value we BOOTED with, not a
+// sticky flag, so toggling it twice correctly stops asking.
+static bool flipAtBoot       = false;
+static bool flipNeedsRestart = false;
 
 // ---- Current frame (the whole UI state; the daemon owns everything else) -----
 static char   frameRow[4][ROW_CHARS + 1] = {{0}};
@@ -146,6 +203,24 @@ static unsigned long lastRxMs   = 0;   // last byte from EITHER transport
 // "the device heard you", well before the daemon round-trips a new frame.
 #define BLIP_MS 80UL
 static unsigned long blipUntil = 0;
+
+// ---- Screen sleep (hibernate) ------------------------------------------------
+// The backlight is by far the biggest draw on this board -- tens of milliamps
+// against the ~1 mA the WS2812 idles at -- so turning it off is most of the
+// runtime win available without touching the radio.
+//
+// ONLY the backlight goes off. displayOff() on the ST7789 would save a further
+// milliamp or two, and would put the wake path one command away from the exact
+// failure this firmware already warns about twice: a panel that is driven
+// perfectly and never lights, indistinguishable from a dead board. Not worth it
+// for 2 mA.
+//
+// The frame keeps arriving and keeps being parsed while the screen is dark, so
+// waking shows the CURRENT state rather than a stale one that then jumps. The
+// LED keeps playing its pattern too -- it is the alert channel, and an alert
+// that only lit a screen nobody is looking at would be no alert at all.
+static bool          screenOn   = true;
+static unsigned long lastPokeMs = 0;   // last button press, or last alert
 
 // ---- Serial line assembly ----------------------------------------------------
 static char    usbLine[LINE_MAX];
@@ -217,11 +292,15 @@ static void startPattern(const LedStep *steps, uint8_t count, bool loop,
   if (count == 0) { stopLed(); return; }
   if (count > ALERT_MAX_STEPS) count = ALERT_MAX_STEPS;
   for (uint8_t i = 0; i < count; i++) ledSteps[i] = steps[i];
-  // Scale to LED_BRIGHT so a 5 mm WS2812 at arm's length is a signal, not a
-  // flashbulb -- and so it costs the battery less.
-  ledR = (uint16_t)r * LED_BRIGHT / 255;
-  ledG = (uint16_t)g * LED_BRIGHT / 255;
-  ledB = (uint16_t)b * LED_BRIGHT / 255;
+  // Scale to the configured cap so a 5 mm WS2812 at arm's length is a signal,
+  // not a flashbulb -- and so it costs the battery less. Settings can take this
+  // to 0, which is a real silent mode: the pattern still runs, the pixel just
+  // stays dark, and the alert still reaches you through the flashing name row
+  // and fleet letter. LED_BRIGHT remains the default.
+  uint8_t cap = cfg.ledBright();
+  ledR = (uint16_t)r * cap / 255;
+  ledG = (uint16_t)g * cap / 255;
+  ledB = (uint16_t)b * cap / 255;
   ledStepCount = count;
   ledStepIdx   = 0;
   ledLoop      = loop;
@@ -671,9 +750,253 @@ static void drawMirror() {
   }
 }
 
+// -----------------------------------------------------------------------------
+// Menu rendering
+// -----------------------------------------------------------------------------
+// The five icons are drawn from primitives rather than stored as bitmaps. At
+// 34-46 px a glyph from the built-in font is unrecognisable and a bitmap costs
+// flash and a second place to keep the design; four rects and a circle each is
+// cheaper than either and scales with the tile.
+
+static void iconConductor(int16_t cx, int16_t cy, int16_t s, uint16_t col) {
+  // The frame itself: four stacked rows, the top one long (the name) and the
+  // bottom one short (the fleet strip) -- the shape of what this mode shows.
+  int16_t w = s * 3 / 4, h = s * 5 / 8, x = cx - w / 2, y = cy - h / 2;
+  int16_t lh = h / 4;
+  gfx->fillRect(x, y,              w,         lh - 1, col);
+  gfx->fillRect(x, y + lh,         w * 5 / 8, lh - 1, col);
+  gfx->fillRect(x, y + lh * 2,     w * 7 / 8, lh - 1, col);
+  gfx->fillRect(x, y + lh * 3,     w / 2,     lh - 1, col);
+}
+
+static void iconSettings(int16_t cx, int16_t cy, int16_t s, uint16_t col) {
+  // Three sliders. A gear is the conventional icon and is illegible at this
+  // size; sliders read instantly and say "things you can change" rather than
+  // "machinery".
+  int16_t w = s * 3 / 4, x = cx - w / 2;
+  const int16_t knob[3] = {(int16_t)(w * 2 / 3), (int16_t)(w / 3),
+                           (int16_t)(w * 3 / 4)};
+  for (int i = 0; i < 3; i++) {
+    int16_t y = cy - s / 4 + i * (s / 4);
+    gfx->fillRect(x, y, w, 2, col);
+    gfx->fillCircle(x + knob[i], y + 1, s / 12 + 1, col);
+  }
+}
+
+static void iconAbout(int16_t cx, int16_t cy, int16_t s, uint16_t col) {
+  int16_t r = s * 3 / 8;
+  gfx->drawCircle(cx, cy, r, col);
+  gfx->drawCircle(cx, cy, r - 1, col);
+  gfx->fillRect(cx - 1, cy - r / 2 - 1, 3, 3, col);          // the dot
+  gfx->fillRect(cx - 1, cy - r / 6,     3, r * 5 / 6, col);  // the stem
+}
+
+static void iconWifi(int16_t cx, int16_t cy, int16_t s, uint16_t col) {
+  // Ascending bars rather than arcs: the same shape the status bar already uses
+  // for signal strength, so the two are obviously about the same thing.
+  int16_t bw = s / 7, gap = s / 5, x = cx - (gap * 3) / 2, base = cy + s / 3;
+  for (int i = 0; i < 4; i++) {
+    int16_t h = (s / 5) + i * (s / 6);
+    gfx->fillRect(x + i * gap, base - h, bw, h, col);
+  }
+}
+
+static void iconSleep(int16_t cx, int16_t cy, int16_t s, uint16_t col) {
+  // A crescent: a filled disc with a background-coloured disc bitten out of it.
+  // Works because the tile is always drawn on C_BG.
+  int16_t r = s * 3 / 8;
+  gfx->fillCircle(cx, cy, r, col);
+  gfx->fillCircle(cx + r / 2, cy - r / 3, r * 7 / 8, C_BG);
+}
+
+struct MenuDef {
+  const char *label;
+  void (*icon)(int16_t, int16_t, int16_t, uint16_t);
+  uint16_t colour;
+};
+// Colours are the palette's, reused for their existing meanings: the triage view
+// in the "working" blue it spends most of its life showing, sleep in idle grey,
+// and the two that change the device in white so they do not read as a status.
+static const MenuDef MENU[MENU_COUNT] = {
+  {"CONDUCTOR", iconConductor, C_WORK},
+  {"SETTINGS",  iconSettings,  C_TEXT},
+  {"ABOUT",     iconAbout,     C_TEXT},
+  {"WI-FI",     iconWifi,      C_DONE},
+  {"SLEEP",     iconSleep,     C_IDLE},
+};
+
+// Centre text of the given size at x.
+static void drawCentred(int16_t cx, int16_t y, uint8_t size, const char *s,
+                        uint16_t col) {
+  int16_t w = (int16_t)strlen(s) * GLYPH_W * size;
+  gfx->setTextSize(size);
+  gfx->setTextColor(col);
+  gfx->setCursor(cx - w / 2, y);
+  gfx->print(s);
+}
+
+static void drawMenu() {
+  for (uint8_t i = 0; i < MENU_COUNT; i++) {
+    bool     sel = (i == menuIdx);
+    int16_t  cx  = MENU_CX0 + i * MENU_PITCH;
+    int16_t  s   = sel ? MENU_ICON_SEL : MENU_ICON;
+    uint16_t col = sel ? MENU[i].colour : C_DIMMER;
+    if (sel) {
+      // A rounded plate behind the selected tile. The enlargement alone reads
+      // as selection on a still screen but not while you are stepping through,
+      // where the eye tracks the box rather than the size.
+      gfx->drawRoundRect(cx - s / 2 - 4, MENU_CY - s / 2 - 4,
+                         s + 8, s + 8, 6, col);
+    }
+    MENU[i].icon(cx, MENU_CY, s, col);
+  }
+  // The label wants to sit under its tile, but "CONDUCTOR" at size 2 is 108 px
+  // and the outer tiles are 44 px from the edge -- so clamp the centre to keep
+  // the whole word on the glass rather than truncate it.
+  const char *label = MENU[menuIdx].label;
+  int16_t     lw    = (int16_t)strlen(label) * GLYPH_W * 2;
+  int16_t     cx    = MENU_CX0 + menuIdx * MENU_PITCH;
+  int16_t     lo    = PAD_X + lw / 2, hi = SCREEN_W - PAD_X - lw / 2;
+  if (cx < lo) cx = lo;
+  if (cx > hi) cx = hi;
+  drawCentred(cx, MENU_LABEL_Y, 2, label, MENU[menuIdx].colour);
+}
+
+// One settings row: label left, value right in the accent colour.
+static void drawSetRow(uint8_t row, int16_t y, bool sel) {
+  const char *label = "";
+  const char *value = "";
+  char        buf[20];
+  uint16_t    vcol = C_TEXT;
+
+  switch (row) {
+    case SR_SLEEP:
+      label = "Sleep screen";
+      value = cfg.hibLabel();
+      vcol  = cfg.hibernates() ? C_DONE : C_DIM;
+      break;
+    case SR_BRIGHT: {
+      label = "Brightness";
+      // A five-block meter rather than a number: 120 means nothing, four blocks
+      // out of five means something.
+      char *p = buf;
+      for (uint8_t i = 0; i < BL_STEPS; i++) *p++ = i <= cfg.blIdx() ? '#' : '.';
+      *p = 0;
+      value = buf;
+      break;
+    }
+    case SR_LED:
+      label = "Alert LED";
+      value = cfg.ledLabel();
+      vcol  = cfg.ledBright() ? C_WAIT : C_DIM;
+      break;
+    case SR_FLIP:
+      label = "Flip screen";
+      if (flipNeedsRestart) {
+        value = "restart";
+        vcol  = C_WAIT;
+      } else {
+        value = cfg.flipped() ? "on" : "off";
+        vcol  = cfg.flipped() ? C_DONE : C_DIM;
+      }
+      break;
+    case SR_RESET:
+      label = "Factory reset";
+      if (resetArmedMs) { value = "HOLD GO"; vcol = C_ERROR; }
+      else              { value = "\x10";    vcol = C_DIM; }   // a right arrow
+      break;
+  }
+
+  if (sel) gfx->fillRect(0, y, SCREEN_W, PAGE_ROW_H - 2, C_DIMMER);
+  gfx->setTextSize(2);
+  gfx->setTextColor(sel ? C_TEXT : C_DIM);
+  gfx->setCursor(PAD_X, y + (PAGE_ROW_H - 2 - GLYPH_H * 2) / 2);
+  gfx->print(label);
+  int16_t vw = (int16_t)strlen(value) * GLYPH_W * 2;
+  gfx->setTextColor(vcol);
+  gfx->setCursor(SCREEN_W - PAD_X - vw, y + (PAGE_ROW_H - 2 - GLYPH_H * 2) / 2);
+  gfx->print(value);
+}
+
+static void drawSettingsPage() {
+  for (uint8_t r = 0; r < SR_COUNT && r < PAGE_ROWS_VIS; r++)
+    drawSetRow(r, PAGE_ROW_Y + r * PAGE_ROW_H, r == pageIdx);
+  gfx->setTextSize(1);
+  gfx->setTextColor(resetArmedMs ? C_ERROR : C_DIM);
+  gfx->setCursor(PAD_X, MENU_HINT_Y);
+  gfx->print(resetArmedMs ? "hold GO to wipe wifi + token + settings"
+                          : "PREV/NEXT row   GO change   4th back");
+}
+
+// About: a readout, at size 1, because these are numbers you lean in for and
+// there are more of them than five. This is the serial `?` output, on the glass
+// -- which is the only place it can be read on a cordless device with no console
+// attached, and it is how you tell a flat cell from a wrong BATT_DIVIDER.
+static void drawAboutPage() {
+  char rssiBuf[16], battBuf[40], sleepBuf[28];
+
+  if (net.connected()) snprintf(rssiBuf, sizeof(rssiBuf), "%d dBm", net.rssi());
+  else                 snprintf(rssiBuf, sizeof(rssiBuf), "--");
+
+#if PIN_BATT_ADC >= 0
+  if (battPercent < 0)
+    snprintf(battBuf, sizeof(battBuf), "no cell (%u mV raw)",
+             (unsigned)battRawMv);
+  else
+    snprintf(battBuf, sizeof(battBuf), "%d%%  %u mV  %s", battPercent,
+             (unsigned)battMv, battCharging ? "charging" : "on battery");
+#else
+  snprintf(battBuf, sizeof(battBuf), "gauge compiled out");
+#endif
+
+  snprintf(sleepBuf, sizeof(sleepBuf), "screen %s  led %s",
+           cfg.hibLabel(), cfg.ledLabel());
+
+  const char *k[] = {"link", "wifi", "batt", "boot", "sleep", "fw"};
+  const char *v[] = {
+      net.statusText(),
+      rssiBuf,
+      battBuf,
+      wakeCause == ESP_SLEEP_WAKEUP_EXT1 ? "woke from sleep" : "power-on / reset",
+      sleepBuf,
+      FW_VERSION,
+  };
+
+  gfx->setTextSize(1);
+  int16_t y = PAGE_INFO_Y;
+  for (uint8_t i = 0; i < 6; i++) {
+    gfx->setTextColor(C_DIM);
+    gfx->setCursor(PAD_X, y);
+    gfx->print(k[i]);
+    gfx->setTextColor(C_TEXT);
+    gfx->setCursor(PAD_X + 6 * GLYPH_W, y);
+    gfx->print(v[i]);
+    y += PAGE_INFO_LH;
+  }
+  gfx->setTextColor(C_DIM);
+  gfx->setCursor(PAD_X, MENU_HINT_Y);
+  gfx->print("4th button: back");
+}
+
 static void render() {
   gfx->fillScreen(C_BG);
-  if (mirrorOn) {
+  bool blip = (long)(millis() - blipUntil) < 0;
+  if (uiMode == UI_MENU) {
+    drawStatusBar();
+    drawMenu();
+    gfx->setTextSize(1);
+    gfx->setTextColor(C_DIM);
+    gfx->setCursor(PAD_X, MENU_HINT_Y);
+    gfx->print("PREV/NEXT move   GO open   4th back");
+    gfx->fillRect(0, ACCENT_Y, SCREEN_W, ACCENT_H,
+                  blip ? C_TEXT : MENU[menuIdx].colour);
+  } else if (uiMode == UI_PAGE) {
+    drawStatusBar();
+    if (pageId == PG_SETTINGS) drawSettingsPage();
+    else                       drawAboutPage();
+    gfx->fillRect(0, ACCENT_Y, SCREEN_W, ACCENT_H,
+                  blip ? C_TEXT : (resetArmedMs ? C_ERROR : C_DIMMER));
+  } else if (mirrorOn) {
     // Deliberately ahead of the SETUP check: the mirror is only ever opened by
     // a button press on a linked device, so if it is on, it is what was asked
     // for.
@@ -825,6 +1148,17 @@ static bool handleConfigLine(char *line) {
       Serial.printf("boot  : %s\n",
                     wakeCause == ESP_SLEEP_WAKEUP_EXT1 ? "woke from power-off"
                                                        : "power-on / reset");
+      // The firmware-local settings, so a device that is misbehaving can be
+      // diagnosed without guessing at what someone set in the menu. `screen`
+      // reporting "off" is the difference between a broken backlight and a
+      // hibernate timeout doing its job.
+      Serial.printf("ui    : %s  screen %s%s  bright %u/%u  led %s  flip %s\n",
+                    uiMode == UI_CONDUCTOR ? "conductor"
+                                           : uiMode == UI_MENU ? "menu" : "page",
+                    cfg.hibLabel(), screenOn ? "" : " (asleep now)",
+                    (unsigned)(cfg.blIdx() + 1), (unsigned)BL_STEPS,
+                    cfg.ledLabel(), cfg.flipped() ? "on" : "off");
+      Serial.printf("fw    : %s\n", FW_VERSION);
       return true;
 
     case 'W': {                            // W|<ssid>|<password>
@@ -961,6 +1295,33 @@ static void emitBtn(char c) {
   requestRender();
 }
 
+// Forward declarations: the button layer routes to whichever of the two owners
+// of the buttons is currently in charge.
+static void menuButton(char ev);
+static void wakeScreen();
+static void notePoke();
+
+// EVERY button event funnels through here, and there are three things in front
+// of the daemon now.
+//
+// 1. If the screen is hibernating, the press only wakes it and is SWALLOWED.
+//    This is the phone convention, and the reason is specific rather than
+//    conventional: GO raises a terminal window. A press aimed at a dark screen
+//    is a press aimed at whatever tab happened to be selected, so obeying it
+//    would occasionally yank you to the wrong session -- the exact thing this
+//    device exists to stop.
+// 2. It notes activity, which is what the hibernate timer counts from.
+// 3. In MENU or PAGE mode the event is handled locally and never emitted, so
+//    the daemon's queue cannot move while you are looking at settings.
+static void onButton(char ev) {
+  if (!screenOn) { wakeScreen(); return; }
+  notePoke();
+  if (uiMode == UI_CONDUCTOR) { emitBtn(ev); return; }
+  menuButton(ev);
+  blipUntil = millis() + BLIP_MS;
+  requestRender();
+}
+
 static void pollNavBtn(Btn &b, char ev) {
   bool raw = (digitalRead(b.pin) == LOW);   // pull-up: LOW = pressed
   unsigned long now = millis();
@@ -970,13 +1331,13 @@ static void pollNavBtn(Btn &b, char ev) {
     if (raw) {
       b.pressMs  = now;
       b.repeatMs = now;
-      emitBtn(ev);
+      onButton(ev);
     }
   }
   if (b.pressed && (now - b.pressMs) >= REPEAT_DELAY_MS &&
       (now - b.repeatMs) >= REPEAT_MS) {
     b.repeatMs = now;
-    emitBtn(ev);
+    onButton(ev);
   }
 }
 
@@ -990,11 +1351,11 @@ static void pollGoBtn(Btn &b) {
       b.pressMs   = now;
       b.longFired = false;
     } else if (!b.longFired) {
-      emitBtn('G');                         // short press: focus + acknowledge
+      onButton('G');                        // short press: focus + acknowledge
     }
   }
   if (b.pressed && !b.longFired && (now - b.pressMs) >= LONGPRESS_MS) {
-    emitBtn('K');                           // acknowledge without focusing
+    onButton('K');                          // acknowledge without focusing
     b.longFired = true;
   }
 }
@@ -1060,19 +1421,189 @@ static void powerOff() {
   esp_deep_sleep_start();                     // never returns
 }
 
-// The 4th button: MIRROR. A plain tap, emitted on the press edge -- no repeat
-// while held (that would flap the view on and off) and no long-press meaning.
-// It is the one action that needed a button of its own: acknowledging and
-// FOLLOW were already reachable through GO's long-press and double-click,
-// whereas showing the terminal was not reachable at all.
+// -----------------------------------------------------------------------------
+// Screen sleep (hibernate)
+// -----------------------------------------------------------------------------
+
+// Does anything in the fleet want you RIGHT NOW? Answered from the frame the
+// device already has, so hibernate needs nothing from the daemon and no protocol
+// change. Three signals, and the third is the authoritative one:
 //
-// While the view is open the DAEMON reinterprets PREV/NEXT as scroll, so this
-// firmware never learns that a mode exists: it emits the same two verbs either
-// way and just draws whatever rows arrive.
-// Emitted on RELEASE rather than on the press edge, which is what makes the
-// hold possible at all: firing on press would toggle the mirror on the way to
-// powering off. Still no auto-repeat -- holding must not flap the view.
-static void pollTapBtn(Btn &b, char ev) {
+//   * the shown session's alert is unacknowledged (the name row is flashing);
+//   * ANY fleet letter is lowercase, which is how the daemon marks an
+//     unacknowledged alert on a tab you are not looking at;
+//   * the LED is playing a LOOPING pattern -- the daemon drives that from
+//     exactly "worst unacknowledged alert", so if it loops, something needs you.
+//
+// Note what is deliberately NOT here. A `working` session does not count: a
+// fleet grinding away for an hour with nothing to say is precisely the case this
+// setting exists for. Neither does NO LINK -- a dead daemon must not be able to
+// hold the backlight on until the cell is flat, which is what would happen the
+// moment you carried the device out of WiFi range.
+static bool needsAttention() {
+  if (haveFrame && !linkLost) {
+    if (frameFlash) return true;
+    for (const char *c = frameRow[3]; *c; c++)
+      if (*c >= 'a' && *c <= 'z') return true;
+  }
+  return ledActive && ledLoop;
+}
+
+static void notePoke() { lastPokeMs = millis(); }
+
+static void wakeScreen() {
+  if (screenOn) return;
+  screenOn = true;
+  analogWrite(LCD_BL, cfg.blDuty());
+  notePoke();
+  requestRender();                            // the frame may have moved on
+}
+
+static void sleepScreen() {
+  if (!screenOn) return;
+  screenOn = false;
+  analogWrite(LCD_BL, 0);
+  // If the terminal mirror was open, close it. Leaving it open would have the
+  // daemon polling a wrapper once a second to render rows onto a dark panel --
+  // the one place where hibernating saves nothing and costs the Mac work.
+  if (mirrorOn) emitBtn('M');
+}
+
+// Called every loop. Kept in one place so the two directions cannot disagree.
+static void pollHibernate() {
+  if (!cfg.hibernates()) { wakeScreen(); return; }
+  if (needsAttention()) {
+    // An alert wakes the screen AND re-arms the timer -- note the notePoke()
+    // outside wakeScreen(), which early-returns when the screen is already lit.
+    // Without it the delay would be measured from the last button press, so
+    // acknowledging a long-standing alert would blank the screen in your face.
+    wakeScreen();
+    notePoke();
+    return;
+  }
+  if (screenOn && (millis() - lastPokeMs) >= cfg.hibernateMs()) sleepScreen();
+}
+
+// -----------------------------------------------------------------------------
+// Menu input
+// -----------------------------------------------------------------------------
+// PREV/NEXT/GO while a firmware-local screen is up. Never reaches the daemon.
+static void menuButton(char ev) {
+  if (uiMode == UI_MENU) {
+    if (ev == 'P') menuIdx = (uint8_t)((menuIdx + MENU_COUNT - 1) % MENU_COUNT);
+    else if (ev == 'N') menuIdx = (uint8_t)((menuIdx + 1) % MENU_COUNT);
+    // 'K' is GO's long press. On the strip it means the same as 'G': there is no
+    // long-press gesture here, and LONGPRESS_MS is 500 ms, which is easy to
+    // overshoot -- a press that opened nothing because you held it a beat too
+    // long reads as a dead button. On the SETTINGS page 'K' keeps its own
+    // meaning (confirm), which is why this is not a blanket alias.
+    else if (ev == 'G' || ev == 'K') {
+      switch (menuIdx) {
+        case MI_CONDUCTOR: uiMode = UI_CONDUCTOR; break;
+        case MI_SETTINGS:  uiMode = UI_PAGE; pageId = PG_SETTINGS; pageIdx = 0;
+                           resetArmedMs = 0; break;
+        case MI_ABOUT:     uiMode = UI_PAGE; pageId = PG_ABOUT; break;
+        case MI_WIFI:      // The portal takes the screen over on its own, via
+                           // net.state() == SETUP in render().
+                           uiMode = UI_CONDUCTOR;
+                           net.startPortalNow();
+                           break;
+        case MI_SLEEP:     cfg.flush();      // the deferred commit will not run
+                           powerOff();       // never returns
+                           break;
+      }
+    }
+    return;
+  }
+
+  // A page. About has nothing to operate, so only the 4th button (handled by its
+  // own poller) does anything there.
+  if (pageId != PG_SETTINGS) return;
+
+  if (ev == 'P') { pageIdx = (uint8_t)((pageIdx + SR_COUNT - 1) % SR_COUNT);
+                   resetArmedMs = 0; return; }
+  if (ev == 'N') { pageIdx = (uint8_t)((pageIdx + 1) % SR_COUNT);
+                   resetArmedMs = 0; return; }
+
+  if (ev == 'G') {                            // short press: change the value
+    switch (pageIdx) {
+      case SR_SLEEP:  cfg.cycleHib(); break;
+      case SR_BRIGHT: cfg.cycleBl();
+                      analogWrite(LCD_BL, cfg.blDuty());   // apply immediately;
+                      break;                               // a preview you can
+                                                           // see is the point
+      case SR_LED:    cfg.cycleLed();
+                      // Re-arm whatever is playing so the new cap takes effect
+                      // now rather than at the next alert.
+                      if (ledKindCode) {
+                        char k[2] = {ledKindCode, 0};
+                        ledForKind(k);
+                      } else {
+                        rgbLedWrite(PIN_RGB, 0, 0, 0);
+                      }
+                      break;
+      case SR_FLIP:   cfg.toggleFlip();
+                      flipNeedsRestart = (cfg.flipped() != flipAtBoot);
+                      break;
+      case SR_RESET:  resetArmedMs = millis() | 1UL; break;
+    }
+    return;
+  }
+
+  if (ev == 'K') {                            // long press: confirm / commit
+    if (pageIdx == SR_RESET && resetArmedMs) {
+      cfg.factoryResetAll();
+      ESP.restart();                          // never returns
+    }
+    if (pageIdx == SR_FLIP && flipNeedsRestart) {
+      cfg.flush();
+      ESP.restart();                          // never returns
+    }
+  }
+}
+
+// The 4th button. Three gestures on one switch, and the ordering of the checks
+// is what keeps them from colliding:
+//
+//   tap          in CONDUCTOR -> toggle the terminal mirror (what it always did)
+//                in MENU/PAGE -> back out one level
+//   double-tap   anywhere     -> open the menu
+//   hold 2 s     anywhere     -> long sleep (deep sleep; a tap wakes the board)
+//
+// The tap is DEFERRED by DBLCLICK_MS, because a first tap is not yet knowably a
+// single one. That is the cost of putting three gestures here, and it is paid by
+// the least latency-sensitive of the three: the mirror already waits a daemon
+// round-trip, so 300 ms vanishes into it. The alternative -- acting immediately
+// and undoing it on the second tap -- would emit B|M twice and have the daemon
+// open and close a terminal view nobody asked for.
+//
+// Nothing is emitted on the press edge, which is what makes the hold possible at
+// all: firing on press would toggle the mirror on the way to powering off.
+// Still no auto-repeat -- holding must not flap the view.
+static bool          clickPending = false;
+static unsigned long clickMs      = 0;
+
+static void fourthTap() {
+  if (uiMode == UI_MENU)      { uiMode = UI_CONDUCTOR; requestRender(); return; }
+  if (uiMode == UI_PAGE)      { uiMode = UI_MENU; resetArmedMs = 0;
+                                requestRender(); return; }
+  onButton('M');                              // CONDUCTOR: toggle the mirror
+}
+
+static void fourthDoubleTap() {
+  // NOT over the WiFi setup portal. That screen shows an AP name and a password
+  // that is regenerated on every portal start, and the glass is the only place
+  // either can be read -- covering it with a menu would strand you mid-setup
+  // with no way back to the credentials.
+  if (net.state() == MateNet::SETUP) return;
+  if (mirrorOn) emitBtn('M');                 // close it; the menu owns the
+                                              // screen from here
+  uiMode  = UI_MENU;
+  menuIdx = MI_CONDUCTOR;                     // always land on the way back out
+  requestRender();
+}
+
+static void pollTapBtn(Btn &b) {
   bool raw = (digitalRead(b.pin) == LOW);
   unsigned long now = millis();
   if (raw != b.pressed && (now - b.changeMs) >= DEBOUNCE_MS) {
@@ -1082,22 +1613,46 @@ static void pollTapBtn(Btn &b, char ev) {
       b.pressMs   = now;
       b.longFired = false;
     } else if (!b.longFired) {
-      emitBtn(ev);
+      // A dark screen: the tap only wakes, and must not also arm a click --
+      // otherwise waking the device would open the mirror or the menu.
+      if (!screenOn) { wakeScreen(); return; }
+      notePoke();
+      if (clickPending && (now - clickMs) <= DBLCLICK_MS) {
+        clickPending = false;
+        fourthDoubleTap();
+      } else {
+        clickPending = true;
+        clickMs      = now;
+      }
     }
   }
+  // The hold works whatever the screen is doing: reaching for the device in the
+  // dark to switch it off should not need two goes.
   if (b.pressed && !b.longFired && (now - b.pressMs) >= POWEROFF_HOLD_MS) {
-    b.longFired = true;                       // swallow the release
+    b.longFired  = true;                      // swallow the release
+    clickPending = false;                     // ...and the pending single tap
+    cfg.flush();                              // deferred commit will not run
     powerOff();                               // never returns
   }
+}
+
+// The deferred single tap fires from the loop once the double-click window has
+// closed with no second tap.
+static void pollPendingClick() {
+  if (!clickPending) return;
+  if ((millis() - clickMs) <= DBLCLICK_MS) return;
+  clickPending = false;
+  fourthTap();
 }
 
 static void pollButtons() {
   pollNavBtn(prevBtn, 'P');
   pollGoBtn(goBtn);
   pollNavBtn(nextBtn, 'N');
-  pollTapBtn(mirrorBtn, 'M');
+  pollTapBtn(mirrorBtn);
   pollGoBtn(bootBtn);                       // BOOT is a second GO, so a board
                                             // with nothing soldered still works
+  pollPendingClick();
 }
 
 // -----------------------------------------------------------------------------
@@ -1123,14 +1678,21 @@ void setup() {
   pinMode(PIN_BTN_MIRROR, INPUT_PULLUP);
   pinMode(PIN_BTN_BOOT, INPUT_PULLUP);
   rgbLedWrite(PIN_RGB, 0, 0, 0);            // LED dark at boot
-  lastRxMs = millis();                      // seed the liveness watchdog
+  lastRxMs   = millis();                    // seed the liveness watchdog
+  lastPokeMs = millis();                    // ...and the hibernate timer, so a
+                                            // fresh boot gets its full delay
 
   Serial.begin(SERIAL_BAUD);
+
+  // Settings before anything reads them: the backlight duty, the LED cap and the
+  // rotation all come out of NVS.
+  cfg.begin();
+  flipAtBoot = cfg.flipped();
 
   // Backlight on a PWM channel so it can be dimmed (and so a battery build can
   // trade brightness for runtime).
   pinMode(LCD_BL, OUTPUT);
-  analogWrite(LCD_BL, BL_BRIGHTNESS);
+  analogWrite(LCD_BL, cfg.blDuty());
 
   // Try the buffered canvas first; fall back to drawing straight at the panel
   // if the framebuffer will not fit. Slight flicker beats a blank screen.
@@ -1142,6 +1704,15 @@ void setup() {
     gfx = panel;
     buffered = false;
   }
+  // Rotation is applied AFTER begin(), which is the only order that works:
+  // Arduino_TFT::begin() ends by applying the rotation the constructor was
+  // given, so setting it earlier would be overwritten. Done here, once, before
+  // a single pixel is drawn -- never on a live display, because a half-rotated
+  // panel is the failure this file already warns about twice.
+  // 1 and 3 are the two landscape orientations; the driver holds a column
+  // offset for each pair, so the 34-px offset this 172x320 panel needs follows
+  // the flip on its own.
+  panel->setRotation(cfg.flipped() ? 3 : LCD_ROTATION);
   gfx->setTextWrap(false);                  // clip at the edge; never reflow a
                                             // row onto the next one
   gfx->fillScreen(C_BG);
@@ -1170,8 +1741,18 @@ void loop() {
   pollButtons();
   pollLed();
   pollBattery();
+  pollHibernate();
+  cfg.commit();                             // deferred flash write, if any
 
   unsigned long now = millis();
+
+  // The factory-reset confirmation disarms itself. An armed wipe left sitting on
+  // the glass is a trap for the next person who picks the device up looking for
+  // the battery percentage.
+  if (resetArmedMs && (now - resetArmedMs) >= RESET_ARM_MS) {
+    resetArmedMs = 0;
+    requestRender();
+  }
 
   // A freshly authenticated link needs the same kick a Nano's reset gives: H
   // makes the daemon resend the frame AND re-arm the LED loop, so an alert that
@@ -1212,7 +1793,11 @@ void loop() {
   // Redraw once the incoming burst has drained (>= 8 ms of quiet), or after
   // 60 ms regardless so a continuous stream cannot starve the display. Ticking
   // times mean roughly one redraw a second in practice.
-  if (needRender) {
+  //
+  // Not while the screen is dark: a full flush is ~28 ms of SPI at 40 MHz and
+  // there is nothing to see. needRender stays SET, so wakeScreen() shows the
+  // current frame rather than the one from when the screen went out.
+  if (needRender && screenOn) {
     bool quiet = (Serial.available() == 0) && (now - lastRxMs) >= 8;
     if (quiet || (now - dirtyMs) >= 60) {
       needRender = false;
