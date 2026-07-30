@@ -523,12 +523,15 @@ More build photos are in [`assets/photos/`](assets/photos/).
    ```sh
    python3 daemon/claude_mate_daemon.py --mock
    ```
-   For a **wireless** device, opt into the TCP listener — it needs a shared
-   token and **fails closed** without one, falling back to USB serial only:
+   For a **wireless** device, opt into the TCP listener. It generates a shared
+   token on first run and prints it — type that into the device's setup portal:
    ```sh
-   mkdir -p ~/.config/claude-mate && openssl rand -hex 32 > ~/.config/claude-mate/token
    python3 daemon/claude_mate_daemon.py --tcp        # port 8787, advertised over mDNS
    ```
+   Add `--sound` to also play a macOS alert sound when the worst unacknowledged
+   alert class changes. The device has no speaker of its own — the ESP32-S3 has
+   no DAC and the board's rail is a linear LDO, so there is no switching node a
+   firmware trick could make audible.
 3. **Feed it.** Pick either (or both):
    - **Hooks:** install the Claude Code hooks so session events reach the daemon.
    - **PTY wrapper:** `pip install pyte`, then run Claude through the wrapper:
@@ -560,7 +563,8 @@ Step-by-step guides:
 | `CLAUDE_MATE_TCP`   | off              | `1` also serves the protocol over TCP for wireless devices (same as `--tcp`) |
 | `CLAUDE_MATE_TCP_PORT` | `8787`        | TCP listener port                         |
 | `CLAUDE_MATE_TCP_BIND` | `0.0.0.0`     | Bind address — a remote device needs a routable one; `127.0.0.1` keeps it on this machine |
-| `CLAUDE_MATE_TOKEN` / `_TOKEN_FILE` | `~/.config/claude-mate/token` | Shared secret wireless devices authenticate with. **Required** for `--tcp`; without it the listener does not start |
+| `CLAUDE_MATE_TOKEN` / `_TOKEN_FILE` | `~/.config/claude-mate/token` | Shared secret wireless devices authenticate with. `--tcp` **generates one** (0600) and prints it if none exists — type that into the device's setup portal. The listener still refuses to start if a token can neither be read nor created |
+| `CLAUDE_MATE_SOUND`  | off              | `1` plays a macOS alert sound when the worst unacknowledged alert class changes (same as `--sound`) |
 
 The listener is advertised as `_claudemate._tcp` over mDNS, so a device with no
 host configured finds the daemon on its own.

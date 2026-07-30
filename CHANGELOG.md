@@ -12,6 +12,35 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
+### 2026-07-30 — Wi-Fi setup stops being a dead end, and the Mac can beep
+
+- **Fixed: an empty token box erased the stored token.** The setup portal wrote
+  it unconditionally, so the obvious thing to do on a return visit — fill in the
+  Wi-Fi password and nothing else — silently wiped the shared secret, after
+  which the device could never complete the handshake and reported only that it
+  was not connected. Empty now means **keep**; clearing is a deliberate
+  checkbox, or `X|WIPE`. The old docs warned "re-enter it every time", which was
+  an admission the behaviour was wrong rather than a fix.
+- **Fixed: every connection failure looked identical.** `drop(why)` discarded
+  its reason (`(void)why;`), so a wrong token, a missing token, a daemon that
+  is not listening and a lost network all presented as the device quietly
+  cycling back to `dialing…`. The reason now shows on the bottom line for 20 s.
+- **Changed: `--tcp` generates a token instead of refusing.** Failing closed was
+  aimed at the right danger — an *unauthenticated* listener — but caught the
+  wrong thing: the portal asks for a token, and the only way to have one was to
+  already know to create the file by hand. It now writes a 32-byte secret to
+  `~/.config/claude-mate/token` (0600, create-exclusive, never overwriting an
+  existing file) and prints it for typing into the portal. It still refuses when
+  a token can neither be read nor created, which is the real fail-closed case,
+  and `test_net_link` pins both halves (23 → 28 checks).
+- **Added: `--sound`** (off by default). Plays a macOS alert sound on the same
+  transition that drives the LED — one truth, now three renderings: rhythm,
+  colour, sound. One-shot, never looping: light is ignorable and a beep is not,
+  and an alert that repeated until acknowledged would be a smoke alarm. The
+  device itself stays silent — the ESP32-S3 has no DAC, and the board's 3.3 V
+  rail is a linear LDO with the backlight on a resistor-limited MOSFET, so there
+  is no switching node any firmware trick could make audible.
+
 ### 2026-07-30 — A menu on the 4th button, and a screen that turns itself off
 
 **ESP32-S3 only, and nothing outside its firmware changed** — no protocol

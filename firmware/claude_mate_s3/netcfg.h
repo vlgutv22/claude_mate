@@ -126,8 +126,19 @@ class MateNet {
 
   // ---- what the screen shows about us --------------------------------------
 
+  // How long a failure reason stays on the glass before the state text takes
+  // over again. Long enough to walk back to the device and read it, short
+  // enough that a stale message never masks a link that has since recovered.
+  static const unsigned long DROP_SHOW_MS = 20000UL;
+
   // One short line for the bottom of the display: honest about where we are.
   const char *statusText() {
+    // A recent failure outranks the state, because "authenticating..." on a
+    // loop tells you nothing and "no token configured" tells you everything.
+    if (_dropAt && (millis() - _dropAt) < DROP_SHOW_MS && _state != LINKED) {
+      snprintf(_status, sizeof(_status), "x %s", _dropWhy);
+      return _status;
+    }
     switch (_state) {
       case OFF:         return "wifi off - usb only";
       case SETUP:       return "setup: join the AP shown";
@@ -233,6 +244,8 @@ class MateNet {
   unsigned long _stateSince = 0;
   unsigned long _lastTry = 0;
   char          _status[64] = {0};
+  char          _dropWhy[48] = {0};   // why the last connection attempt failed
+  unsigned long _dropAt = 0;          // ...and when (0 = nothing has failed)
   char          _line[192];        // handshake line assembly
   uint8_t       _lineLen = 0;
 
@@ -372,7 +385,21 @@ class MateNet {
   }
 
   void drop(const char *why) {
-    (void)why;
+    // Keep the reason. It used to be discarded, which meant every failure --
+    // wrong token, no token, daemon not listening, wifi gone -- presented
+    // identically as the device quietly cycling back to DIALING. From the far
+    // side of the room that reads as "it just doesn't work", and the one thing
+    // the user needed to know (which of four things is wrong) was the thing
+    // being thrown away.
+    if (why) {
+      snprintf(_dropWhy, sizeof(_dropWhy), "%s", why);
+      // 0 is the "no error" sentinel, so a stamp of 0 must become something
+      // else -- but NOT `millis() | 1`, which rounds UP on any even millis()
+      // and makes the unsigned age comparison underflow to ~4.29e9. That exact
+      // trick has already been fixed twice in this firmware.
+      unsigned long t = millis();
+      _dropAt = t ? t : 1UL;
+    }
     _client.stop();
     _lineLen = 0;
     _lastTry = millis();            // honour the backoff before redialling
@@ -461,9 +488,26 @@ class MateNet {
     html += opts;
     html += F("</select>"
               "<label>Password</label><input name=pass type=password autocomplete=off>"
-              "<label>Shared token</label><input name=token autocomplete=off>"
-              "<small>Must match the daemon's CLAUDE_MATE_TOKEN.</small>"
-              "<label>Daemon host <em>(optional)</em></label><input name=host placeholder='found automatically'>"
+              "<label>Shared token</label><input name=token autocomplete=off ");
+    // Tell the user what state the token is in and what to type. "Must match
+    // the daemon's CLAUDE_MATE_TOKEN" is only useful advice if you already know
+    // you were supposed to have one -- and the commonest way to arrive here is
+    // not knowing that at all.
+    if (hasToken()) {
+      html += F("placeholder='already set - leave blank to keep it'>"
+                "<small>A token is stored. Leave this blank unless you are "
+                "changing it.</small>"
+                "<label style='display:flex;gap:8px;align-items:center;margin-top:10px'>"
+                "<input type=checkbox name=cleartoken value=1 style='width:auto'>"
+                "Erase the stored token</label>");
+    } else {
+      html += F("placeholder='paste it from the Mac'>"
+                "<small><b>No token stored yet.</b> On the Mac, run the daemon "
+                "with <code>--tcp</code> once: it creates one and prints it. "
+                "Or read it with<br><code>cat ~/.config/claude-mate/token</code>"
+                "</small>");
+    }
+    html += F("<label>Daemon host <em>(optional)</em></label><input name=host placeholder='found automatically'>"
               "<small>Leave empty to discover it over mDNS.</small>"
               "<label>Port</label><input name=port value='8787'>"
               "<button type=submit>Save &amp; connect</button></form>");
@@ -478,7 +522,20 @@ class MateNet {
     uint16_t port = (uint16_t)_web->arg("port").toInt();
     if (ssid.isEmpty()) { _web->send(400, "text/plain", "network required"); return; }
     setWifi(ssid, pass);
-    setToken(token);
+    // AN EMPTY TOKEN BOX MEANS "KEEP THE ONE I HAVE", NOT "ERASE IT".
+    //
+    // This used to write unconditionally, and it was the single worst bug in
+    // the setup flow: the obvious thing to do when you come back to the portal
+    // to change networks is to fill in the wifi password and nothing else --
+    // which silently wiped the token, after which the device could never
+    // complete the handshake and simply said it was not connected. The
+    // documentation warned about it ("re-enter it every time"), which is an
+    // admission that the behaviour was wrong, not a fix for it.
+    //
+    // Clearing a token is still possible, deliberately and explicitly, via the
+    // checkbox or `X|WIPE` over serial.
+    if (_web->arg("cleartoken") == "1") setToken("");
+    else if (!token.isEmpty())          setToken(token);
     setDaemon(host, port);
     _web->send(200, "text/html",
                F("<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"

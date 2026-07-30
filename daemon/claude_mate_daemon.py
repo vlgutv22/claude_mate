@@ -192,6 +192,29 @@ ALERT_KIND = {"error": "ERROR", "waiting": "INPUT", "done": "DONE"}
 # when the last unacknowledged member of the class is acknowledged/cleared).
 LOOP_KIND = {"error": "ERROR", "waiting": "INPUT", "done": "DONE"}
 
+# ---- Alert sounds (macOS, opt-in) ------------------------------------------ #
+# The device itself cannot make a sound: the ESP32-S3 has no DAC, and the
+# Waveshare board's 3.3 V rail is a linear LDO with the backlight on a plain
+# resistor-limited MOSFET -- there is no switching node whose current the
+# firmware could modulate into anything audible. So until a piezo is soldered
+# on, the Mac is the only speaker in the system.
+#
+# That is not purely a workaround. When you are AT the Mac it is the better
+# channel: real speakers, distinguishable sounds, and it follows the system
+# volume. It stops being enough exactly when the device is across the room on
+# battery -- which is the case the piezo will eventually cover.
+#
+# Off by default. An audible alert on every state change is far more intrusive
+# than a colour change, and that has to be opted into rather than inherited.
+SOUND_DIR = "/System/Library/Sounds"
+ALERT_SOUNDS = {
+    "ERROR": "Basso.aiff",     # descending, unmistakably "something went wrong"
+    "INPUT": "Glass.aiff",     # bright and short: a question, not a failure
+    "DONE":  "Hero.aiff",      # rising, resolved
+    "START": "Pop.aiff",       # a tick; only fires when nothing else is pending
+}
+SOUND_MIN_GAP_S = 2.0          # floor between sounds, whatever the state does
+
 # Sentinel for "we have not told the firmware a loop state yet", so the first
 # resolve always emits (V|OFF) and clears any stale loop left by a prior daemon.
 _LOOP_UNSET = "\x00unset"
@@ -524,6 +547,52 @@ def load_token(explicit: Optional[str]) -> Optional[str]:
             return fh.read().strip() or None
     except OSError:
         return None
+
+
+def ensure_token(explicit: Optional[str]) -> Optional[str]:
+    """load_token(), but MAKE one rather than refusing if there is none.
+
+    --tcp used to fail closed on a missing token and fall back to USB-only,
+    which was the right instinct aimed at the wrong problem. The danger being
+    guarded against is an UNAUTHENTICATED listener; a freshly generated 32-byte
+    secret is not that. What the old behaviour actually produced was a dead end:
+    the device's setup portal asks for a token, and the only way to have one was
+    to have already known to create the file by hand. Generating it here closes
+    that loop -- run the daemon once, read the token off the terminal, type it
+    into the portal.
+
+    Written 0600, and only ever created; an existing file is never rewritten, so
+    this cannot silently invalidate a device that is already provisioned.
+    """
+    tok = load_token(explicit)
+    if tok:
+        return tok
+    if explicit:                       # they passed one and it was blank
+        return None
+    path = os.path.expanduser(os.environ.get("CLAUDE_MATE_TOKEN_FILE",
+                                             DEFAULT_TOKEN_FILE))
+    tok = secrets.token_hex(32)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # Create-exclusive: if another daemon raced us to it, read theirs rather
+        # than clobbering a token a device may already be provisioned with.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(tok + "\n")
+    except FileExistsError:
+        return load_token(None)
+    except OSError as exc:
+        log(f"ERROR: could not create a token at {path}: {exc}")
+        return None
+    log("")
+    log("  no shared token existed, so one was generated:")
+    log("")
+    log(f"      {tok}")
+    log("")
+    log(f"  saved to {path} (mode 0600).")
+    log("  Type it into the device's wifi setup portal, in 'Shared token'.")
+    log("")
+    return tok
 
 
 class NetLink:
@@ -938,7 +1007,8 @@ class Screen:
     """Owns everything the device shows: the selection, the pre-rendered frame,
     and the LED loop tracker."""
 
-    def __init__(self, link: Link, registry: Registry) -> None:
+    def __init__(self, link: Link, registry: Registry,
+                 sound: bool = False) -> None:
         self._link = link
         self._reg = registry
         self._lock = threading.Lock()
@@ -960,6 +1030,11 @@ class Screen:
         # LED loop tracker: what continuous loop the firmware is playing
         # ("ERROR"/"INPUT"/"DONE"/None); V| is (re)sent only when it changes.
         self._loop_kind: Optional[str] = _LOOP_UNSET
+        # Alert sound (macOS). Rides the SAME transition as the LED rather than
+        # having a policy of its own -- one truth, three renderings (rhythm,
+        # colour, sound), which is the rule the S3's colour LED already follows.
+        self._sound = sound
+        self._last_sound_at = 0.0
 
     # ---- selection -------------------------------------------------------- #
 
@@ -1167,11 +1242,54 @@ class Screen:
             self._loop_kind = kind
             if kind:
                 log(f"LED: loop {kind} until acknowledged")
+            self._play_alert(kind)
+
+    def _play_alert(self, kind: Optional[str]) -> None:
+        """Play one sound for an alert-class transition. Never blocks, never
+        raises, and never becomes load-bearing.
+
+        Deliberately ONE-SHOT, where the LED loops until acknowledged. Light is
+        ignorable and a beep is not: a sound that repeated until you dealt with
+        it would be a smoke alarm, and would get the whole feature switched off
+        within a day. The LED carries the persistent state; sound only marks the
+        moment it changed.
+
+        Called with self._lock held, so it must not do anything that can wait --
+        Popen returns as soon as the child is spawned, and the child is fully
+        detached (nothing ever reaps it, so stdio goes to /dev/null and we let
+        it exit on its own)."""
+        if not (self._sound and kind):
+            return
+        if sys.platform != "darwin":
+            return
+        now = time.time()
+        # A session flapping error -> waiting -> error would otherwise stack up
+        # overlapping afplay processes. The LED's dedup does not cover this: the
+        # kind genuinely changes each time, so the transition is real.
+        if now - self._last_sound_at < SOUND_MIN_GAP_S:
+            return
+        name = ALERT_SOUNDS.get(kind)
+        if not name:
+            return
+        path = os.path.join(SOUND_DIR, name)
+        try:
+            subprocess.Popen(["afplay", path],
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+            self._last_sound_at = now
+        except Exception as exc:
+            # A missing afplay or a renamed system sound must never take the
+            # daemon down or stall the alert path -- it is decoration.
+            log(f"sound: {exc}")
+            self._sound = False        # one complaint, then stop trying
 
     def start_tick(self) -> None:
         """One-shot START blink (a job (re)started). The caller fires this only
         when nothing needs the human, so it never interrupts an alert loop."""
         self._link.write_line("V|START")
+        with self._lock:
+            self._play_alert("START")
 
     # ---- lifecycle ------------------------------------------------------------ #
 
@@ -2025,6 +2143,13 @@ def main(argv: Optional[List[str]] = None) -> int:
              "keep it on this machine)",
     )
     parser.add_argument(
+        "--sound",
+        action="store_true",
+        default=os.environ.get("CLAUDE_MATE_SOUND", "") == "1",
+        help="play a macOS alert sound when the worst unacknowledged alert "
+             "class changes (off by default; the device itself has no speaker)",
+    )
+    parser.add_argument(
         "--token",
         default=os.environ.get("CLAUDE_MATE_TOKEN") or None,
         help=f"shared secret wireless devices authenticate with (default: read "
@@ -2048,11 +2173,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     # would let anyone on the network read session names and raise windows, so a
     # missing token disables it rather than weakening it.
     if args.tcp:
-        token = load_token(args.token)
+        token = ensure_token(args.token)
         if not token:
-            log("ERROR: --tcp needs a shared token. Set CLAUDE_MATE_TOKEN, pass "
-                f"--token, or write one to {DEFAULT_TOKEN_FILE}. "
-                "Continuing with USB serial only.")
+            log("ERROR: --tcp needs a shared token and one could not be created. "
+                f"Set CLAUDE_MATE_TOKEN, pass --token, or write one to "
+                f"{DEFAULT_TOKEN_FILE}. Continuing with USB serial only.")
         else:
             rx: "queue.Queue[str]" = queue.Queue()
             candidate = NetLink(args.tcp_bind, args.tcp_port, token, rx)
@@ -2064,7 +2189,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         log(f"  tcp    : {args.tcp_bind}:{args.tcp_port} "
             f"({'on' if net else 'DISABLED'})")
 
-    screen = Screen(link, registry)
+    screen = Screen(link, registry, sound=bool(args.sound))
+    log(f"  sound  : {'on' if args.sound else 'off'}")
 
     def on_update() -> None:
         screen.notify_change()

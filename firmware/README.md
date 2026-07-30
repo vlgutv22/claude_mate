@@ -155,8 +155,23 @@ portal start. Join it from a phone, open `http://192.168.4.1`, and fill in the
 network, password, **shared token**, and port (8787); leave the host blank to
 discover the daemon over mDNS.
 
-> The token box is written unconditionally — submitting the form with it **empty
-> erases a token already stored**. Re-enter it every time you use the portal.
+**Where the token comes from.** Run the daemon with `--tcp` once and it creates
+one, prints it, and saves it to `~/.config/claude-mate/token` (mode 0600). Copy
+that string into the portal's **Shared token** box. It used to refuse to start
+without one, which left you having to know to create the file by hand before the
+portal would ever be satisfiable.
+
+> **An empty token box means "keep the one I have".** It used to write
+> unconditionally, so coming back to the portal to change networks — filling in
+> the Wi-Fi password and nothing else — silently erased the token, after which
+> the device could never finish the handshake and just said it was not
+> connected. To clear a token deliberately, tick **Erase the stored token**, or
+> send `X|WIPE` over serial.
+
+If a connection attempt fails, the reason now shows on the device's bottom line
+for 20 seconds (`x no token configured`, `x wifi lost`, …) instead of the device
+silently cycling back through `dialing…` — every failure used to look identical
+from across the room.
 
 Or provision over USB serial:
 
