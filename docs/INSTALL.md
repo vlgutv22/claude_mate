@@ -23,14 +23,17 @@ Put the project wherever you like — this guide refers to its root as `$REPO`
    "ATmega328P (Old Bootloader)" if uploads fail).
 3. **Tools → Port →** select the Nano's port (a `/dev/cu.usbserial*` or
    `/dev/cu.usbmodem*` device).
-4. Install the **required libraries** via **Sketch → Include Library → Manage
-   Libraries…** (the OLED is the only thing that needs a library — there is no
-   stepper/AccelStepper dependency anymore):
-   - **Adafruit SSD1306** (the OLED driver) — or **Adafruit SH1106 / U8g2** if
-     you have a **1.3"** SH1106 panel (see the SSD1306-vs-SH1106 note in
-     [WIRING.md](WIRING.md)).
-   - **Adafruit GFX Library** (graphics primitives Adafruit SSD1306 depends on).
-   - **Adafruit BusIO** (I2C/SPI helper pulled in by the above).
+4. Install the **one required library** via **Sketch → Include Library → Manage
+   Libraries…**:
+   - **Adafruit GFX Library** — graphics primitives, and the only external
+     dependency. The panel itself is driven by the bundled
+     [`softssd1306.h`](../firmware/claude_mate/softssd1306.h), a software-I2C
+     `Adafruit_GFX` subclass that puts SCL on **A3** (hardware SCL A5 was
+     damaged) and leaves SDA on A4. **Adafruit SSD1306 and Adafruit BusIO are
+     not needed** — CI compiles this sketch with Adafruit GFX alone.
+   - If you have a **1.3" SH1106** panel instead, you will need its own driver
+     (**Adafruit SH1106 / U8g2**) and a matching edit to the sketch — see the
+     SSD1306-vs-SH1106 note in [WIRING.md](WIRING.md).
 5. Confirm the I2C address in the sketch is **0x3C** (change to **0x3D** if your
    panel uses the alternate address).
 6. **Upload**. After upload, the board resets and emits `H` on boot.

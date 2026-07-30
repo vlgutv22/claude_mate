@@ -42,19 +42,41 @@ knocked out — so you can see at a glance which tab is on screen. Any tab with
 an **unacknowledged alert** has its letter **blinking** in the strip, so you can
 tell acked from unacked without hunting.
 
-The three buttons mean the same thing at all times:
+The buttons mean the same thing at all times. The Nano build has **three**; the
+ESP32-S3 build adds a fourth, and the first three are identical on both:
 
 | Button (left→right) | Short press | Held / double |
 |---|---|---|
 | **PREV** | selection one step **up** the queue | auto-repeats (400 ms, then 5/s) |
 | **GO**   | single: **RAISE** the terminal of the session **shown on the glass** (acknowledging its alert) | **double-click** (≤ 300 ms apart): toggle **FOLLOW** mode. Held ≥ 500 ms: acknowledge **without** raising. |
 | **NEXT** | selection one step **down** the queue | auto-repeats (400 ms, then 5/s) |
+| **MIRROR** *(4-button devices only)* | open/close a live view of that session's **actual terminal** | — (tap only) |
 
-**FOLLOW mode** (toggled by double-clicking GO; shown by a small ► marker by
-the state row): while on, PREV/NEXT additionally **raise** the selected
-session's terminal, ~250 ms after the selection settles (so holding to scroll
-never raises the windows it passes over). Raise ONLY — never ack (ack stays on
-GO long-press), never collapse.
+The 4th button is spent on the one thing three buttons could not do. Acknowledging
+and FOLLOW were already reachable through GO's long-press and double-click, so
+putting either on a switch would have bought a shortcut; showing the terminal was
+not reachable at all. A 3-button device loses nothing — GO keeps all three
+gestures — it simply cannot mirror.
+
+**MIRROR mode.** While the view is open the daemon pulls the rendered TUI from
+that session's PTY wrapper about once a second and pushes it as `M|` rows, and
+**PREV/NEXT scroll the view instead of moving the selection**. That
+reinterpretation happens in the DAEMON: the firmware emits the same `B|P`/`B|N`
+either way and never learns a mode exists. GO closes the view and raises the real
+window — looking at a copy is superseded by having the original. Polling stops
+completely when the view closes, so an unwatched fleet costs nothing.
+
+Only **wrapped** sessions can be mirrored: a hook-only session has no PTY for the
+daemon to read, and says so rather than showing a blank screen that would look
+like an idle session. Rows are **clipped, not reflowed** — a TUI's box drawing and
+alignment carry meaning, and rewrapping turns it into noise.
+
+**FOLLOW mode** (toggled by double-clicking GO, or by holding ACK on a
+4-button device; shown by a small ► marker by the state row): while on,
+PREV/NEXT additionally **raise** the selected session's terminal, ~250 ms after
+the selection settles (so holding to scroll never raises the windows it passes
+over). Raise ONLY — never ack (ack stays on GO long-press and the ACK button),
+never collapse.
 
 **Window contract:** navigation touches macOS windows ONLY in FOLLOW mode, and
 then only to **raise/activate** the selected terminal — the daemon never
@@ -146,11 +168,12 @@ transfer is open.
 
 ### 1b. Arduino → Daemon
 
-The three buttons are, left→right, **PREV | GO | NEXT**. Debounce is ~40 ms
-immediate-fire (an edge is accepted and emitted the same tick). PREV/NEXT emit
-on the **press** edge and auto-repeat while held (400 ms to start, then one
-event per 200 ms). GO distinguishes a short press (emit on release) from a long
-press (emit once at 500 ms; the release is then swallowed).
+The buttons are, left→right, **PREV | GO | NEXT** (plus **ACK** on the
+ESP32-S3's 4-button layout). Debounce is ~40 ms immediate-fire (an edge is
+accepted and emitted the same tick). PREV/NEXT emit on the **press** edge and
+auto-repeat while held (400 ms to start, then one event per 200 ms). GO and ACK
+distinguish a short press (emit on release) from a long press (emit once at
+500 ms; the release is then swallowed).
 
 | Line  | Meaning |
 |-------|---------|
@@ -159,7 +182,29 @@ press (emit once at 500 ms; the release is then swallowed).
 | `B\|P` | **PREV** pressed (D4) — selection one step up the queue. Repeats while held. |
 | `B\|N` | **NEXT** pressed (D3) — selection one step down the queue. Repeats while held. |
 | `B\|G` | **GO** short press (D2). The firmware just emits `B\|G` on each short press; the **daemon** disambiguates a single press (after ~300 ms) from a double-click. A single press raises the terminal of the session **shown on the glass** (raise only), acknowledging its alert. A **double-click** (two `B\|G` within ~300 ms) toggles **FOLLOW** mode. |
-| `B\|K` | **GO** long press (D2, held ≥ ~500 ms) — acknowledge the shown session's alert WITHOUT raising anything. No-op when nothing is unacknowledged. |
+| `B\|K` | **GO** long press (D2, held ≥ ~500 ms) — acknowledge the shown session's alert WITHOUT raising anything. No-op when nothing is unacknowledged. Also sent by a **short press of the ACK button** on a 4-button device: same verb, same effect, no daemon-side distinction. |
+| `B\|F` | Toggle **FOLLOW** mode directly. Identical in effect to a GO double-click, but unambiguous: no 300 ms window to race. Turning it ON raises the shown terminal immediately, exactly as the double-click does. No stock firmware emits this today (the 4th button became MIRROR); it is kept because the daemon accepting it costs nothing and a device with a fifth switch would want it. |
+| `B\|M` | **MIRROR** button tapped — open/close the terminal view for the session on the glass. |
+
+### 1c. Daemon → Arduino: the MIRROR view
+
+Sent only while the view is open. Rows are pre-rendered and clipped to
+**52 columns**, `17` rows, exactly like `F|` — the firmware never decides what
+fits.
+
+| Line | Meaning |
+|------|---------|
+| `M\|T\|<title>` | Header: the mirrored session's name and state. |
+| `M\|<n>\|<text>` | Row `n` (0-based, `n < 17`). Text is the rest of the line VERBATIM; tabs are expanded, control bytes become spaces, and any literal `\|` is replaced with `¦` so it cannot be mistaken for a field separator. |
+| `M\|END` | The full set has landed — draw it. Buffering until `END` means the view updates in ONE flush and never tears mid-refresh. |
+| `M\|OFF` | Close the view; the daemon then re-sends the normal `F\|` frame. |
+
+The daemon fetches the rows by sending `screen` to the session's PTY-wrapper
+control socket (the same socket used for `focus`). The wrapper replies
+length-prefixed — `SCREEN <n>`, then `n` rows, then `ok` — rather than using a
+sentinel, because terminal output can contain any line, **including one that is
+exactly `ok`**, which would truncate the mirror at an arbitrary point. A wrapper
+predating the command answers a bare `ok`, which reads as "no preview".
 
 **Reset note:** opening the USB serial port resets the Nano (~1.5 s). The `H`
 handshake plus the daemon re-sending state on `H` is exactly what makes the

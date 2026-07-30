@@ -7,9 +7,14 @@ The "brain" of the Claude Mate USB hardware companion. It:
 
   1. Listens on a Unix-domain socket (CLAUDE_MATE_SOCK) for status lines emitted
      by Claude Code hooks / the PTY wrapper: "<state>|<session_id>|<name>[|...]".
-  2. Manages a single, continuously-open USB serial connection to the Arduino
-     Nano. It auto-detects the port (/dev/cu.usbserial* then /dev/cu.usbmodem*),
-     opens it once, keeps it open, and auto-reconnects if it disappears.
+  2. Manages the device link(s). By default that is a single, continuously-open
+     USB serial connection to the Arduino Nano: it auto-detects the port
+     (/dev/cu.usbserial* then /dev/cu.usbmodem*), opens it once, keeps it open,
+     and auto-reconnects if it disappears. With --tcp it ALSO serves the exact
+     same line protocol over TCP, so a wireless companion (the ESP32-S3 build)
+     can drive the fleet from across the room. Frames fan out to every connected
+     device; button events from any of them are merged into one stream, so a USB
+     Nano and a WiFi device can be used side by side.
   3. Keeps ONE urgency-sorted triage queue of sessions
      (error > waiting > done > working > idle; unacknowledged before
      acknowledged inside a class; oldest event first) and renders ONE screen --
@@ -57,13 +62,21 @@ Config via environment variables:
     CLAUDE_MATE_PORT   serial device (default: autodetect)
     CLAUDE_MATE_SOCK   socket path   (default: /tmp/claude-mate.sock)
     CLAUDE_MATE_BAUD   serial baud   (default: 115200)
+    CLAUDE_MATE_TCP    set to 1 to also serve the protocol over TCP
+    CLAUDE_MATE_TCP_PORT / _TCP_BIND   listener port / bind address
+    CLAUDE_MATE_TOKEN / _TOKEN_FILE    shared secret for TCP devices (required
+                       for --tcp; the token itself never crosses the wire, see
+                       the NetLink handshake)
 """
 
 from __future__ import annotations
 
 import argparse
 import glob
+import hmac
 import os
+import queue
+import secrets
 import signal
 import socket
 import subprocess
@@ -72,7 +85,7 @@ import threading
 import time
 import urllib.parse
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 try:
     import serial  # pyserial
@@ -97,10 +110,35 @@ DEFAULT_BAUD = 115200
 # Serial port autodetect order (globs).
 PORT_GLOBS = ("/dev/cu.usbserial*", "/dev/cu.usbmodem*")
 
+# --- Wireless (TCP) transport ---------------------------------------------- #
+# Opt-in (--tcp / CLAUDE_MATE_TCP=1). The device dials US: the daemon's address
+# is stable, a DHCP device's is not.
+DEFAULT_TCP_PORT = 8787
+DEFAULT_TCP_BIND = "0.0.0.0"    # a remote device needs a routable address; the
+                                # listener is token-gated (see NetLink)
+DEFAULT_TOKEN_FILE = "~/.config/claude-mate/token"
+NET_AUTH_TIMEOUT_S = 5.0    # a client must finish the handshake this fast
+NET_MAX_LINE = 512          # drop over-long lines (the longest real one is ~94B)
+NET_MAX_CLIENTS = 4         # bound the fan-out (a Nano + a few wireless devices)
+MDNS_SERVICE = "_claudemate._tcp"   # advertised via macOS dns-sd so the device
+MDNS_NAME = "Claude Mate"           # finds the daemon with zero configuration
+
 # Timings (seconds).
 DOUBLE_CLICK_S = 0.30        # two GO short-presses within this window = a
                              # double-click (toggles FOLLOW mode). A single GO
                              # is deferred this long to disambiguate.
+# ---- MIRROR (the device's terminal view) ---------------------------------- #
+# The colour screen fits 53x21 characters at size 1; the status bar takes the
+# top band, leaving MIRROR_ROWS for content. Claude's TUI is 80-120 columns
+# wide, so rows are CLIPPED, not reflowed -- wrapping a TUI whose box drawing
+# and alignment carry meaning turns it into noise, and a clipped-but-truthful
+# view is easier to read than a rewrapped one.
+MIRROR_COLS = 52
+MIRROR_ROWS = 17
+MIRROR_POLL_S = 1.0          # refresh cadence while the view is open; polling
+                             # stops entirely when it is closed, so an unwatched
+                             # fleet costs nothing
+
 FOLLOW_SETTLE_S = 0.25       # in FOLLOW mode, PREV/NEXT raise the selected
                              # terminal only after the selection settles this
                              # long -- so holding to scroll doesn't raise every
@@ -381,6 +419,14 @@ class SerialLink:
     def is_open(self) -> bool:
         return self._ser is not None and self._ser.is_open
 
+    # Same names LinkHub exposes, so the maintainer can drive either link type
+    # without caring which transport it got.
+    def serial_is_open(self) -> bool:
+        return self.is_open()
+
+    def ensure_serial_open(self) -> bool:
+        return self.ensure_open()
+
     def ensure_open(self) -> bool:
         """Try to (re)open the port. Returns True if open afterwards."""
         with self._lock:
@@ -458,6 +504,366 @@ class SerialLink:
 
 
 # --------------------------------------------------------------------------- #
+# Wireless link: the same line protocol over TCP (opt-in).
+# --------------------------------------------------------------------------- #
+
+
+def load_token(explicit: Optional[str]) -> Optional[str]:
+    """Resolve the shared secret: --token/env first, then the token file.
+
+    A file keeps the secret out of the LaunchAgent plist (which is readable by
+    every process on the machine); we require it to be non-empty but do not
+    enforce permissions, since the user may deliberately share it.
+    """
+    if explicit:
+        return explicit.strip() or None
+    path = os.path.expanduser(os.environ.get("CLAUDE_MATE_TOKEN_FILE",
+                                             DEFAULT_TOKEN_FILE))
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+
+
+class NetLink:
+    """Serves the daemon<->device line protocol to token-authenticated TCP peers.
+
+    The device is the CLIENT: the daemon's address is stable and discoverable
+    (mDNS), a DHCP device's is not, and dialling out means the device needs no
+    inbound reachability at all.
+
+    HANDSHAKE (the token never crosses the wire, so sniffing one session cannot
+    reveal it and a captured handshake cannot be replayed against a later one):
+
+        daemon -> device   C|<nonce>          32 hex chars, fresh per connection
+        device -> daemon   A|<mac>            hex HMAC-SHA256(token, nonce)
+        daemon -> device   A|OK               ...or A|NO and the socket closes
+
+    After A|OK the socket carries exactly the bytes the serial link would: F|/V|/P
+    down, H/K/B| up. The device sends H, which makes the daemon resend full state
+    -- the same recovery path a Nano replug uses.
+
+    Writes fan out to every authenticated client and reads from all of them merge
+    into one queue, so a USB Nano and a wireless device work side by side. A
+    device that vanishes without a FIN (walked out of WiFi range) is reaped the
+    first time a frame or ping fails to send.
+
+    THREAT MODEL: the payload itself is plaintext. Anyone who can sniff your LAN
+    can read session names, models and states, and an on-path attacker could
+    inject button events into an established connection. Use it on a network you
+    trust; it is off unless you ask for it.
+    """
+
+    def __init__(self, bind: str, port: int, token: str,
+                 rx: "queue.Queue[str]") -> None:
+        self._bind = bind
+        self._port = port
+        self._token = token.encode("utf-8")
+        self._rx = rx
+        self._srv: Optional[socket.socket] = None
+        self._lock = threading.Lock()           # guards _clients
+        self._clients: List[socket.socket] = []
+        self._stop_evt = threading.Event()
+        self._threads: List[threading.Thread] = []
+
+    # ---- lifecycle -------------------------------------------------------- #
+
+    def start(self) -> bool:
+        """Bind + listen and start accepting. False if the port is unusable."""
+        try:
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind((self._bind, self._port))
+            srv.listen(NET_MAX_CLIENTS)
+            srv.settimeout(0.5)                 # so the accept loop can stop
+        except OSError as exc:
+            log(f"TCP listen failed on {self._bind}:{self._port}: {exc}")
+            return False
+        self._srv = srv
+        t = threading.Thread(target=self._accept_loop, name="net-accept",
+                             daemon=True)
+        t.start()
+        self._threads.append(t)
+        log(f"TCP listening on {self._bind}:{self._port} (token required)")
+        return True
+
+    def stop(self) -> None:
+        self._stop_evt.set()
+        if self._srv is not None:
+            try:
+                self._srv.close()
+            except OSError:
+                pass
+            self._srv = None
+        with self._lock:
+            clients, self._clients = self._clients, []
+        for c in clients:
+            self._shutdown(c)
+
+    @staticmethod
+    def _shutdown(sock: socket.socket) -> None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    # ---- accept + authenticate -------------------------------------------- #
+
+    def _accept_loop(self) -> None:
+        while not self._stop_evt.is_set():
+            srv = self._srv
+            if srv is None:
+                return
+            try:
+                conn, addr = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return                          # listener closed: we are done
+            with self._lock:
+                too_many = len(self._clients) >= NET_MAX_CLIENTS
+            if too_many:
+                log(f"TCP refused {addr[0]}: already serving {NET_MAX_CLIENTS}")
+                self._shutdown(conn)
+                continue
+            t = threading.Thread(target=self._serve, args=(conn, addr),
+                                 name="net-client", daemon=True)
+            t.start()
+            self._threads.append(t)
+
+    def _authenticate(self, conn: socket.socket, peer: str) -> bool:
+        """Nonce challenge / HMAC response. False = reject (caller closes)."""
+        nonce = secrets.token_hex(16)
+        expect = hmac.new(self._token, nonce.encode("ascii"),
+                          "sha256").hexdigest()
+        try:
+            conn.settimeout(NET_AUTH_TIMEOUT_S)
+            conn.sendall(f"C|{nonce}\n".encode("ascii"))
+            reply = self._read_line_blocking(conn)
+        except (OSError, socket.timeout):
+            log(f"TCP {peer}: handshake timed out")
+            return False
+        if reply is None or not reply.startswith("A|"):
+            log(f"TCP {peer}: bad handshake {reply!r}")
+            return False
+        # compare_digest keeps the comparison time independent of how much of
+        # the MAC an attacker guessed right.
+        if not hmac.compare_digest(reply[2:].strip().lower(), expect):
+            log(f"TCP {peer}: token rejected")
+            try:
+                conn.sendall(b"A|NO\n")
+            except OSError:
+                pass
+            time.sleep(0.5)                     # take the shine off brute force
+            return False
+        try:
+            conn.sendall(b"A|OK\n")
+        except OSError:
+            return False
+        return True
+
+    @staticmethod
+    def _read_line_blocking(conn: socket.socket) -> Optional[str]:
+        """One newline-terminated line, bounded by NET_MAX_LINE. None on EOF."""
+        buf = bytearray()
+        while len(buf) < NET_MAX_LINE:
+            chunk = conn.recv(1)
+            if not chunk:
+                return None
+            if chunk in (b"\n", b"\r"):
+                if not buf:
+                    continue                    # tolerate CRLF / blank lines
+                break
+            buf += chunk
+        return buf.decode("ascii", errors="replace").strip()
+
+    def _serve(self, conn: socket.socket, addr) -> None:
+        peer = f"{addr[0]}:{addr[1]}"
+        if not self._authenticate(conn, peer):
+            self._shutdown(conn)
+            return
+        try:
+            # Keepalives so a device that drops off WiFi without a FIN is
+            # eventually reaped even if we happen never to write to it.
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            conn.settimeout(None)               # blocking reads from here on
+        except OSError:
+            pass
+        with self._lock:
+            self._clients.append(conn)
+        log(f"TCP device connected: {peer}")
+        try:
+            while not self._stop_evt.is_set():
+                try:
+                    line = self._read_line_blocking(conn)
+                except (OSError, socket.timeout):
+                    break
+                if line is None:
+                    break                       # clean EOF
+                if line:
+                    self._rx.put(line)
+        finally:
+            with self._lock:
+                if conn in self._clients:
+                    self._clients.remove(conn)
+            self._shutdown(conn)
+            log(f"TCP device disconnected: {peer}")
+
+    # ---- the link surface ------------------------------------------------- #
+
+    def has_clients(self) -> bool:
+        with self._lock:
+            return bool(self._clients)
+
+    def write_line(self, line: str) -> bool:
+        """Fan out to every client. True if at least one took the bytes."""
+        data = (line.rstrip("\n") + "\n").encode("ascii", errors="replace")
+        with self._lock:
+            targets = list(self._clients)
+        if not targets:
+            return False
+        dead: List[socket.socket] = []
+        ok = False
+        for c in targets:
+            try:
+                c.sendall(data)
+                ok = True
+            except OSError:
+                dead.append(c)
+        if dead:
+            with self._lock:
+                for c in dead:
+                    if c in self._clients:
+                        self._clients.remove(c)
+            for c in dead:
+                self._shutdown(c)               # its reader thread unblocks
+        return ok
+
+
+class LinkHub:
+    """One device link made of a USB serial port plus a TCP listener.
+
+    Presents exactly the surface the rest of the daemon already used on
+    SerialLink (is_open / ensure_open / write_line / read_line / close), so
+    Screen, ButtonReader and SerialMaintainer are untouched.
+
+    Frames go to BOTH transports; incoming lines from either arrive on one
+    queue. A dedicated pump moves serial input onto that queue so a wireless
+    button press is never stuck behind a blocking serial read.
+    """
+
+    def __init__(self, serial_link: SerialLink, net: NetLink,
+                 rx: "queue.Queue[str]") -> None:
+        self._serial = serial_link
+        self._net = net
+        self._rx = rx
+        self._stop_evt = threading.Event()
+        self._pump = threading.Thread(target=self._pump_serial,
+                                      name="serial-rx-pump", daemon=True)
+        self._pump.start()
+
+    def _pump_serial(self) -> None:
+        while not self._stop_evt.is_set():
+            if not self._serial.is_open():
+                self._stop_evt.wait(0.2)        # nothing to read; don't spin
+                continue
+            line = self._serial.read_line()     # bounded by the read timeout
+            if line:
+                self._rx.put(line)
+
+    # ---- the link surface ------------------------------------------------- #
+
+    def is_open(self) -> bool:
+        """Is ANY device reachable? A wireless client counts."""
+        return self._serial.is_open() or self._net.has_clients()
+
+    def ensure_open(self) -> bool:
+        """Try to (re)open serial; a connected wireless device also counts as
+        up, so startup does not report "no device" when only WiFi is in use."""
+        opened = self._serial.ensure_open()
+        return opened or self._net.has_clients()
+
+    # The USB port, asked about on its OWN terms. is_open()/ensure_open() above
+    # answer "is anything reachable", which is right for startup but WRONG for
+    # the maintainer: with a wireless device connected they return True while
+    # the serial port is shut, so a Nano that drops -- or is plugged in later --
+    # would never be reopened and would sit on NO LINK forever.
+    def serial_is_open(self) -> bool:
+        return self._serial.is_open()
+
+    def ensure_serial_open(self) -> bool:
+        return self._serial.ensure_open()
+
+    def write_line(self, line: str) -> bool:
+        # Deliberately not short-circuiting: every connected device must get
+        # every frame, so both writes always run.
+        wired = self._serial.write_line(line)
+        wireless = self._net.write_line(line)
+        return wired or wireless
+
+    def read_line(self) -> Optional[str]:
+        try:
+            return self._rx.get(timeout=0.5)
+        except queue.Empty:
+            return None
+
+    def close(self) -> None:
+        self._stop_evt.set()
+        self._net.stop()
+        self._serial.close()
+
+
+# Anything the rest of the daemon needs from a device link.
+Link = Union[SerialLink, LinkHub]
+
+
+class MdnsAdvertiser:
+    """Advertises the TCP listener as _claudemate._tcp via macOS `dns-sd`.
+
+    Uses the system tool rather than a Bonjour library so the daemon keeps its
+    single third-party dependency (pyserial). Best-effort: no dns-sd, no
+    advertisement -- the device can still be pointed at a host by hand.
+    """
+
+    def __init__(self, port: int) -> None:
+        self._port = port
+        self._proc: Optional[subprocess.Popen] = None
+
+    def start(self) -> None:
+        if not _which("dns-sd"):
+            log("dns-sd not found; skipping mDNS advertisement")
+            return
+        try:
+            self._proc = subprocess.Popen(
+                ["dns-sd", "-R", MDNS_NAME, MDNS_SERVICE, "local",
+                 str(self._port)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+            )
+            log(f"advertising {MDNS_NAME} {MDNS_SERVICE} on port {self._port}")
+        except OSError as exc:
+            log(f"mDNS advertisement failed: {exc}")
+
+    def stop(self) -> None:
+        proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=1.0)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+# --------------------------------------------------------------------------- #
 # Screen: composes the single frame and owns selection + LED state.
 # --------------------------------------------------------------------------- #
 
@@ -532,7 +938,7 @@ class Screen:
     """Owns everything the device shows: the selection, the pre-rendered frame,
     and the LED loop tracker."""
 
-    def __init__(self, link: SerialLink, registry: Registry) -> None:
+    def __init__(self, link: Link, registry: Registry) -> None:
         self._link = link
         self._reg = registry
         self._lock = threading.Lock()
@@ -595,7 +1001,8 @@ class Screen:
         self.refresh()
 
     def toggle_follow(self) -> bool:
-        """Double-click GO: flip FOLLOW mode. Returns the new state."""
+        """Flip FOLLOW mode. Returns the new state. Reached by a GO
+        double-click, or by holding the 4-button device's ACK button."""
         with self._lock:
             self._follow = not self._follow
             state = self._follow
@@ -831,6 +1238,50 @@ def wrapper_ctrl_send(ctrl: str, cmd: str) -> bool:
         return False
 
 
+def wrapper_ctrl_screen(ctrl: str) -> Optional[List[str]]:
+    """Ask a PTY wrapper for its rendered TUI, for the device's mirror view.
+
+    Length-prefixed ("SCREEN <n>", then n rows, then "ok") rather than read
+    until a sentinel: terminal output can contain ANY line, including one that
+    is exactly "ok", which would truncate the mirror at an arbitrary point.
+    The wrapper closes the connection when done, so this reads to EOF.
+
+    Returns the rows, or None when there is nothing to show -- no wrapper (a
+    hook-only session), a dead one, or one predating the mirror command, which
+    answers a bare "ok". None is rendered as "no preview", never as a blank
+    screen that would look like a session sitting idle.
+    """
+    if not ctrl or not os.path.exists(ctrl):
+        return None
+    buf = b""
+    try:
+        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        c.settimeout(WRAPPER_LIVE_TIMEOUT_S)
+        c.connect(ctrl)
+        c.sendall(b"screen\n")
+        deadline = time.monotonic() + WRAPPER_ACK_TIMEOUT_S
+        while True:
+            chunk = c.recv(8192)
+            if not chunk:                      # EOF: the wrapper is done
+                break
+            buf += chunk
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            c.settimeout(remaining)
+        c.close()
+    except OSError:
+        return None
+    lines = buf.decode("utf-8", "replace").split("\n")
+    if not lines or not lines[0].startswith("SCREEN "):
+        return None                            # pre-mirror wrapper
+    try:
+        n = int(lines[0].split()[1])
+    except (IndexError, ValueError):
+        return None
+    return lines[1:1 + n]
+
+
 def focus_session(sess: Optional[Session]) -> None:
     """
     Raise the terminal/editor window of the given session. RAISE ONLY.
@@ -1045,7 +1496,7 @@ class SocketServer(threading.Thread):
 class ButtonReader(threading.Thread):
     """Reads serial input and dispatches H / B|<x> events."""
 
-    def __init__(self, link: SerialLink, screen: Screen) -> None:
+    def __init__(self, link: Link, screen: Screen) -> None:
         super().__init__(name="button-reader", daemon=True)
         self._link = link
         self._screen = screen
@@ -1070,6 +1521,15 @@ class ButtonReader(threading.Thread):
         self._follow_lock = threading.Lock()
         self._follow_timer: Optional[threading.Timer] = None
         self._follow_gen = 0
+        # MIRROR: while open, a repeating timer pulls the shown session's
+        # rendered TUI from its wrapper and pushes it to the device. Keyed by
+        # session so the view follows one session even if the selection is
+        # nudged, and torn down completely when closed -- no timer, no polling.
+        self._mirror_lock = threading.Lock()
+        self._mirror_key: Optional[str] = None
+        self._mirror_scroll = 0
+        self._mirror_timer: Optional[threading.Timer] = None
+        self._mirror_warned = False   # log the "no screen" reason once per open
 
     def run(self) -> None:
         while not self._stop_evt.is_set():
@@ -1090,14 +1550,30 @@ class ButtonReader(threading.Thread):
             return
         if line.startswith("B|") and len(line) >= 3:
             ev = line[2]
-            if ev == "P":                        # PREV: selection up the queue
-                self._nav(-1)
-            elif ev == "N":                      # NEXT: selection down the queue
-                self._nav(+1)
+            # While the terminal view is open PREV/NEXT scroll it instead of
+            # moving the selection. Reinterpreting here keeps the firmware a
+            # dumb renderer -- it emits the same two verbs either way and never
+            # has to know a mode exists.
+            if ev == "P":                        # PREV: selection up / scroll up
+                if self.mirror_open():
+                    self._mirror_scroll_by(+1)   # +1 = further back in history
+                else:
+                    self._nav(-1)
+            elif ev == "N":                      # NEXT: selection down / scroll
+                if self.mirror_open():
+                    self._mirror_scroll_by(-1)
+                else:
+                    self._nav(+1)
+            elif ev == "M":                      # MIRROR button: toggle the view
+                self._mirror_pressed()
             elif ev == "G":                      # GO short: focus / (dbl) follow
+                # Raising the real window supersedes looking at a copy of it.
+                self.mirror_close()
                 self._go_pressed()
-            elif ev == "K":                      # GO long: acknowledge only
+            elif ev == "K":                      # GO long / ACK button: ack only
                 self._ack_only()
+            elif ev == "F":                      # ACK button held: toggle FOLLOW
+                self._follow_pressed()
             else:
                 log(f"unknown button event: {line!r}")
             return
@@ -1168,6 +1644,160 @@ class ButtonReader(threading.Thread):
             self._go_timer = None
         self._go()
 
+    # ---- MIRROR: the device's terminal view ------------------------------ #
+
+    def mirror_open(self) -> bool:
+        with self._mirror_lock:
+            return self._mirror_key is not None
+
+    def _mirror_pressed(self) -> None:
+        """B|M -- toggle the terminal view for the session on the glass."""
+        sess = self._screen.current_shown()
+        with self._mirror_lock:
+            if self._mirror_key is not None:      # open -> close
+                self._mirror_close_locked()
+                log("MIRROR off")
+                return
+            if sess is None:
+                return
+            self._mirror_key = sess.key
+            self._mirror_scroll = 0
+            self._mirror_warned = False
+            # The ctrl socket is the whole story when a mirror comes up empty:
+            # sessions are keyed by session id, so a restarted terminal is a
+            # NEW session that merely shares a display name with the old one.
+            # Logging which socket was chosen distinguishes "wrong session" from
+            # "wrapper too old" without guesswork.
+            log(f"MIRROR on -> {sess.name} sid={sess.sid[:8]} "
+                f"ctrl={sess.focus_ctrl or '(none)'}")
+        self._mirror_tick()                       # paint immediately, do not
+                                                  # wait out the first interval
+
+    def _mirror_close_locked(self) -> None:
+        """Tear down the view. Caller holds _mirror_lock."""
+        self._mirror_key = None
+        self._mirror_scroll = 0
+        if self._mirror_timer is not None:
+            self._mirror_timer.cancel()
+            self._mirror_timer = None
+        self._link.write_line("M|OFF")            # hand the glass back to the
+        self._screen.resend_full_state()          # normal frame
+
+    def mirror_close(self) -> None:
+        with self._mirror_lock:
+            if self._mirror_key is not None:
+                self._mirror_close_locked()
+
+    def _mirror_scroll_by(self, delta: int) -> None:
+        """PREV/NEXT scroll the view instead of moving the selection."""
+        with self._mirror_lock:
+            if self._mirror_key is None:
+                return
+            self._mirror_scroll = max(0, self._mirror_scroll + delta)
+        self._mirror_tick()
+
+    def _mirror_tick(self) -> None:
+        """Fetch the wrapper's screen, push it, and re-arm."""
+        with self._mirror_lock:
+            key = self._mirror_key
+            scroll = self._mirror_scroll
+        if key is None:
+            return
+        # PREV/NEXT scroll rather than navigate while the view is open, so the
+        # shown session cannot move under us; a mismatch means it ended or was
+        # pruned, and the view has nothing left to show.
+        sess = self._screen.current_shown()
+        if sess is None or sess.key != key:
+            self.mirror_close()
+            return
+
+        rows = wrapper_ctrl_screen(sess.focus_ctrl or "")
+        if rows is None and not self._mirror_warned:
+            log(f"MIRROR: no screen from {sess.name} "
+                f"(ctrl={sess.focus_ctrl or '(none)'}) -- hook-only session, or "
+                f"a wrapper started before the mirror command existed")
+        if rows is None:
+            body = ["", "  no preview for this session.", "",
+                    "  only wrapped sessions mirror their",
+                    "  terminal -- a hook-only session has",
+                    "  no PTY for the daemon to read."]
+        else:
+            # COLLAPSE runs of blank rows to a single spacer before windowing.
+            # A TUI is not a scrolling log: Claude's screen puts the banner and
+            # conversation at the top, a wide blank gap in the middle, and the
+            # input box at the bottom. Taking the last 17 of 30 raw rows lands
+            # almost entirely in that gap -- observed as a mirror showing one
+            # line of footer and nothing else. Interior whitespace is padding
+            # for an 80x30 terminal and is pure waste on a 17-row window, so one
+            # blank row is kept as a separator and the rest dropped. Single
+            # blanks survive, so paragraph structure still reads.
+            compact: List[str] = []
+            blank_run = 0
+            for r in rows:
+                if r.strip():
+                    blank_run = 0
+                    compact.append(r)
+                else:
+                    blank_run += 1
+                    if blank_run == 1:
+                        compact.append("")
+            while compact and not compact[-1].strip():
+                compact.pop()
+            while compact and not compact[0].strip():
+                compact.pop(0)
+            # Show the TAIL: on a conversation the newest exchange is what you
+            # glanced at the device to see. Scroll walks back from there.
+            first = max(0, len(compact) - MIRROR_ROWS)
+            start = max(0, first - scroll)
+            body = compact[start:start + MIRROR_ROWS]
+
+        title = f"{sess.name} {sess.state}"[:MIRROR_COLS]
+        if not self._mirror_warned:
+            self._mirror_warned = True
+            log(f"MIRROR: sending {len(body)} rows for {sess.name} "
+                f"(fetched {'-' if rows is None else len(rows)})")
+        self._link.write_line(f"M|T|{title}")
+        for i in range(MIRROR_ROWS):
+            text = body[i] if i < len(body) else ""
+            # Tabs and control bytes would desync the fixed-width layout, and
+            # '|' is the wire's field separator.
+            text = text.expandtabs(8).replace("|", "¦")
+            text = "".join(ch if 32 <= ord(ch) < 127 else " " for ch in text)
+            self._link.write_line(f"M|{i}|{text[:MIRROR_COLS]}")
+        self._link.write_line("M|END")
+
+        with self._mirror_lock:
+            if self._mirror_key is None:          # closed while we were fetching
+                return
+            if self._mirror_timer is not None:
+                self._mirror_timer.cancel()
+            t = threading.Timer(MIRROR_POLL_S, self._mirror_tick)
+            t.daemon = True
+            self._mirror_timer = t
+            t.start()
+
+    def _follow_pressed(self) -> None:
+        """B|F -- the 4-button device's dedicated FOLLOW toggle.
+
+        Same effect as a GO double-click, without the guesswork: there is no
+        DOUBLE_CLICK_S window to race, so a deliberate toggle can never be
+        misread as two hurried raises (nor two hurried raises as a toggle).
+        Held under _go_lock because that is the lock the double-click path
+        toggles under -- otherwise a physical double-click and an F arriving
+        together could interleave and land on the wrong final state.
+
+        A GO press still waiting out its window is deliberately left alone: it
+        was a separate intent and its raise is harmless here (raises serialize
+        last-wins, and turning FOLLOW on raises the same session anyway).
+        """
+        with self._go_lock:
+            on = self._screen.toggle_follow()
+            log(f"FOLLOW button -> {'ON' if on else 'OFF'}")
+            if on:                               # turning it on raises now,
+                sess = self._screen.current_shown()   # same as the dbl-click
+                if sess is not None:
+                    self._raise(sess)
+
     def _raise(self, sess: Optional[Session]) -> None:
         """Raise a session's window on a serialized side thread (raise ONLY).
         Press order == raise order; a press still queued when a newer one
@@ -1220,7 +1850,7 @@ class ButtonReader(threading.Thread):
 class SerialMaintainer(threading.Thread):
     """Keeps the serial port open; reconnects when it drops; sends pings."""
 
-    def __init__(self, link: SerialLink, screen: Screen) -> None:
+    def __init__(self, link: Link, screen: Screen) -> None:
         super().__init__(name="serial-maintainer", daemon=True)
         self._link = link
         self._screen = screen
@@ -1229,21 +1859,29 @@ class SerialMaintainer(threading.Thread):
 
     def run(self) -> None:
         was_open = False
+        last_try = 0.0
         while not self._stop_evt.is_set():
-            if not self._link.is_open():
+            # Ask about the USB port SPECIFICALLY, never "is any device up".
+            # With a wireless device connected the latter is True while serial
+            # is shut, so a Nano that drops -- or is plugged in after the ESP32
+            # linked -- would never be reopened and would sit on NO LINK.
+            if not self._link.serial_is_open():
                 if was_open:
                     log("serial disconnected; will reconnect")
                     was_open = False
-                if self._link.ensure_open():
-                    was_open = True
-                    # Give the Nano time to reset; it will send H which triggers
-                    # a full resend. We also push state proactively as a safety net.
-                    time.sleep(2.0)
-                    self._screen.resend_full_state()
-                else:
-                    self._stop_evt.wait(RECONNECT_DELAY)
-                    continue
-            # Periodic keepalive ping.
+                if time.time() - last_try >= RECONNECT_DELAY:
+                    last_try = time.time()
+                    if self._link.ensure_serial_open():
+                        was_open = True
+                        # Give the Nano time to reset; it will send H which
+                        # triggers a full resend. We also push state proactively
+                        # as a safety net.
+                        time.sleep(2.0)
+                        self._screen.resend_full_state()
+            # Ping REGARDLESS of the USB port. Retrying serial used to `continue`
+            # past this, which would have silenced keepalives for a wireless-only
+            # setup -- the very thing the old "any device is up" check was
+            # papering over.
             now = time.time()
             if now - self._last_ping >= PING_PERIOD:
                 self._link.write_line("P")
@@ -1343,7 +1981,8 @@ class MockInjector(threading.Thread):
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Claude Mate daemon: bridges Claude Code hooks to the "
-                    "Arduino triage-queue companion over USB serial.",
+                    "triage-queue companion over USB serial and, with --tcp, "
+                    "over the network.",
     )
     parser.add_argument(
         "--mock",
@@ -1366,6 +2005,31 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=int(os.environ.get("CLAUDE_MATE_BAUD", DEFAULT_BAUD)),
         help=f"serial baud rate (default: {DEFAULT_BAUD})",
     )
+    parser.add_argument(
+        "--tcp",
+        action="store_true",
+        default=os.environ.get("CLAUDE_MATE_TCP", "") == "1",
+        help="also serve the protocol over TCP for wireless devices "
+             "(requires a shared token; off by default)",
+    )
+    parser.add_argument(
+        "--tcp-port",
+        type=int,
+        default=int(os.environ.get("CLAUDE_MATE_TCP_PORT", DEFAULT_TCP_PORT)),
+        help=f"TCP listener port (default: {DEFAULT_TCP_PORT})",
+    )
+    parser.add_argument(
+        "--tcp-bind",
+        default=os.environ.get("CLAUDE_MATE_TCP_BIND", DEFAULT_TCP_BIND),
+        help=f"TCP bind address (default: {DEFAULT_TCP_BIND}; use 127.0.0.1 to "
+             "keep it on this machine)",
+    )
+    parser.add_argument(
+        "--token",
+        default=os.environ.get("CLAUDE_MATE_TOKEN") or None,
+        help=f"shared secret wireless devices authenticate with (default: read "
+             f"from {DEFAULT_TOKEN_FILE})",
+    )
     args = parser.parse_args(argv)
 
     log("starting Claude Mate daemon")
@@ -1375,7 +2039,31 @@ def main(argv: Optional[List[str]] = None) -> int:
     log(f"  mock   : {args.mock}")
 
     registry = Registry()
-    link = SerialLink(args.port, args.baud)
+    serial_link = SerialLink(args.port, args.baud)
+    link: Link = serial_link
+    net: Optional[NetLink] = None
+    mdns: Optional[MdnsAdvertiser] = None
+
+    # Wireless transport is opt-in AND fails closed: an unauthenticated listener
+    # would let anyone on the network read session names and raise windows, so a
+    # missing token disables it rather than weakening it.
+    if args.tcp:
+        token = load_token(args.token)
+        if not token:
+            log("ERROR: --tcp needs a shared token. Set CLAUDE_MATE_TOKEN, pass "
+                f"--token, or write one to {DEFAULT_TOKEN_FILE}. "
+                "Continuing with USB serial only.")
+        else:
+            rx: "queue.Queue[str]" = queue.Queue()
+            candidate = NetLink(args.tcp_bind, args.tcp_port, token, rx)
+            if candidate.start():
+                net = candidate
+                link = LinkHub(serial_link, net, rx)
+                mdns = MdnsAdvertiser(args.tcp_port)
+                mdns.start()
+        log(f"  tcp    : {args.tcp_bind}:{args.tcp_port} "
+            f"({'on' if net else 'DISABLED'})")
+
     screen = Screen(link, registry)
 
     def on_update() -> None:
@@ -1438,12 +2126,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         for t in threads:
             t.join(timeout=1.5)
         # Best-effort: silence the LED and leave an honest frame on the way out.
+        # This reaches wireless devices too, so a battery companion shows
+        # "daemon stopped" instead of a frozen frame until its own watchdog trips.
         try:
             link.write_line("V|OFF")
             link.write_line("F|0|-1|MATE|daemon stopped||")
         except Exception:
             pass
-        link.close()
+        if mdns is not None:
+            mdns.stop()
+        link.close()      # LinkHub.close() also stops the TCP listener
     return 0
 
 

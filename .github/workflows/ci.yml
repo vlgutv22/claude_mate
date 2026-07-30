@@ -66,3 +66,31 @@ jobs:
         run: |
           arduino-cli compile --fqbn arduino:avr:nano firmware/claude_mate
           arduino-cli compile --fqbn arduino:avr:nano firmware/selftest
+
+  firmware-build-s3:
+    name: Firmware compile (ESP32-S3)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 core + Arduino_GFX
+        run: |
+          arduino-cli core update-index \
+            --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core install esp32:esp32 \
+            --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli lib install "GFX Library for Arduino"
+
+      # The board options are NOT all defaults and the sketch does not work
+      # without them: CDCOnBoot=cdc or Serial lands on UART0 instead of USB and
+      # the config commands are unreachable, and the 3 MB app partition because
+      # WiFi + display does not fit the default 1.2 MB. Compiling with the same
+      # options flash_s3.sh uses keeps CI honest about what actually ships.
+      - name: Compile ESP32-S3 sketch
+        run: |
+          arduino-cli compile \
+            --fqbn 'esp32:esp32:waveshare_esp32_s3_lcd_147:CDCOnBoot=cdc,USBMode=hwcdc,PartitionScheme=app3M_fat9M_16MB' \
+            firmware/claude_mate_s3

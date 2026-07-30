@@ -144,6 +144,21 @@ def mark():
 ctrl_ops = []                     # (cmd, arrival time) in arrival order
 ctrl_lock = threading.Lock()
 
+# What a fake wrapper hands back for the mirror ("screen") command, keyed by
+# session name. More rows than the device shows, so the daemon's tail-and-clip
+# is exercised rather than assumed: only the LAST MIRROR_ROWS should appear,
+# and PREV must scroll further back to reveal MIRROR-TOP.
+# Shaped like a real TUI, NOT a scrolling log: content at the top, a wide blank
+# GAP, then a footer pinned at the bottom. That shape broke the first version --
+# a naive tail of the last 17 raw rows landed inside the gap and mirrored one
+# line of footer and nothing else. The gap is what makes this a regression test.
+FAKE_SCREEN = {
+    "folA": (["MIRROR-TOP line %02d" % i for i in range(20)]
+             + ["$ pytest -q", "47 passed in 3.2s", "MIRROR-BOTTOM"]
+             + [""] * 12
+             + ["  footer: bypass permissions on"]),
+}
+
 def fake_ctrl(name):
     path = os.path.join(binhome, f"ctrl-{name}.sock")
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -157,11 +172,20 @@ def fake_ctrl(name):
                 break
             try:
                 data = conn.recv(64).decode(errors="ignore").strip()
-                if data:
-                    with ctrl_lock:
-                        ctrl_ops.append((data, time.monotonic()))
-                conn.sendall(b"go\n")
-                conn.sendall(b"ok\n")
+                if data.startswith("screen"):
+                    # The mirror read is NOT a window op, so it is deliberately
+                    # kept out of ctrl_ops -- that list exists to prove the
+                    # daemon never touches windows while navigating, and
+                    # recording reads there would break the invariant it backs.
+                    rows = FAKE_SCREEN.get(name, [])
+                    conn.sendall(("\n".join(["SCREEN %d" % len(rows)] + rows
+                                            + ["ok"]) + "\n").encode())
+                else:
+                    if data:
+                        with ctrl_lock:
+                            ctrl_ops.append((data, time.monotonic()))
+                    conn.sendall(b"go\n")
+                    conn.sendall(b"ok\n")
             except OSError:
                 pass
             finally:
@@ -394,6 +418,85 @@ with ctrl_lock:
     off_nav_ops = ctrl_ops[ops_before_offnav:]
 follow_off_no_raise = (len(off_nav_ops) == 0)
 
+print("\n-- phase 12b: B|F (ACK held) toggles FOLLOW with no click window --")
+# The 4-button device toggles FOLLOW with a single unambiguous verb instead of
+# a double-click. FOLLOW is OFF here (the second double-click above turned it
+# off), so ONE B|F must turn it on AND raise the shown terminal -- exactly what
+# the double-click does -- and a second B|F must turn it back off. Sending one
+# press rather than two also proves the daemon is not just counting B|G pairs.
+idx_fb = mark()
+with ctrl_lock:
+    ops_before_fb = len(ctrl_ops)
+arduino_send("B|F"); time.sleep(1.0)
+with display_lock:
+    fb_on_frame = any(frame_follow(l) for l in display[idx_fb:]
+                      if l.startswith("F|"))
+with ctrl_lock:
+    fb_raised = ctrl_ops[ops_before_fb:]
+idx_fb_off = mark()
+arduino_send("B|F"); time.sleep(1.0)
+with display_lock:
+    fb_off_frames = [l for l in display[idx_fb_off:] if l.startswith("F|")]
+fb_off_frame = bool(fb_off_frames) and not frame_follow(fb_off_frames[-1])
+
+print("\n-- phase 12c: MIRROR (B|M) shows the session's real terminal --")
+# Park on folA, the only fake wrapper carrying screen content, so these
+# assertions are about the mirror and not about which session happens to be
+# selected. FOLLOW is off here, so navigating raises nothing.
+def shown_subject():
+    with display_lock:
+        frames = [l for l in display if l.startswith("F|")]
+    return frame_subject(frames[-1]) if frames else None
+
+def nav_to(subject, max_presses=8):
+    """PREV until `subject` is on the glass. Navigation WRAPS, so a fixed press
+    count lands somewhere that depends on where the previous phase left off."""
+    for _ in range(max_presses):
+        if shown_subject() == subject:
+            return True
+        arduino_send("B|P"); time.sleep(0.5)
+    return shown_subject() == subject
+
+parked_on_folA = nav_to("folA")
+with ctrl_lock:
+    ops_before_mirror = len(ctrl_ops)
+idx_m = mark()
+arduino_send("B|M"); time.sleep(1.5)
+with display_lock:
+    m_lines = [l for l in display[idx_m:] if l.startswith("M|")]
+mirror_titled = any(l.startswith("M|T|") for l in m_lines)
+mirror_ended = any(l == "M|END" for l in m_lines)
+# The fake screen is 35 rows for a 17-row view, so the daemon must show the
+# TAIL: the newest output is what matters when you glance at a session.
+mirror_tail = any("MIRROR-BOTTOM" in l for l in m_lines)
+# The blank gap must be COLLAPSED, not windowed into: a naive tail of the raw
+# rows shows the footer and nothing else, which is what shipped first.
+mirror_gap_collapsed = (any("MIRROR-BOTTOM" in l for l in m_lines)
+                        and any("footer:" in l for l in m_lines))
+mirror_clipped = not any("MIRROR-TOP line 00" in l for l in m_lines)
+
+# PREV must scroll the view, NOT move the selection.
+idx_ms = mark()
+for _ in range(8):
+    arduino_send("B|P"); time.sleep(0.3)
+time.sleep(1.2)
+with display_lock:
+    scroll_lines = [l for l in display[idx_ms:] if l.startswith("M|")]
+mirror_scrolled = any("MIRROR-TOP" in l for l in scroll_lines)
+
+idx_moff = mark()
+arduino_send("B|M"); time.sleep(1.5)
+with display_lock:
+    off_lines = [l for l in display[idx_moff:] if l.startswith("M|")]
+    after_off = [l for l in display[idx_moff:] if l.startswith("F|")]
+mirror_closed = any(l == "M|OFF" for l in off_lines)
+# Eight PREVs while mirroring must have scrolled, not navigated: the frame that
+# comes back has to be the SAME session the view was opened on.
+mirror_kept_subject = bool(after_off) and frame_subject(after_off[-1]) == "folA"
+with ctrl_lock:
+    mirror_ops = ctrl_ops[ops_before_mirror:]
+mirror_no_window_ops = (len(mirror_ops) == 0)
+
 print("\n-- phase 13: tab ORDER is stable (alphabetical), never urgency-shuffled --")
 # Clean slate, then two sessions whose alphabetical order (apple < zebra) is the
 # OPPOSITE of their urgency once zebra errors. The strip must keep apple first.
@@ -537,6 +640,34 @@ check("double-click GO again turns FOLLOW OFF",
       follow_off_frame)
 check("with FOLLOW off, navigation raises NOTHING",
       follow_off_no_raise)
+
+# ---- FOLLOW mode via the 4-button device's dedicated verb (B|F) -----------------
+check("B|F (ACK held) turns FOLLOW ON from a SINGLE press -- no click window",
+      fb_on_frame)
+check("B|F turning FOLLOW on raises the shown terminal, like the double-click",
+      any(c == "focus" for (c, t) in fb_raised))
+check("a second B|F turns FOLLOW OFF again",
+      fb_off_frame)
+
+# ---- MIRROR: the terminal view -------------------------------------------------
+check("the mirror phase actually parked on folA (nav wraps, so this is "
+      "asserted rather than assumed)", parked_on_folA)
+check("B|M opens the mirror (title row + M|END terminator)",
+      mirror_titled and mirror_ended)
+check("the mirror shows the TAIL of a screen taller than the view "
+      "(newest output visible)", mirror_tail)
+check("...and clips the rest rather than sending every row",
+      mirror_clipped)
+check("a blank GAP between content and footer is collapsed, not windowed into "
+      "(a raw tail would mirror the footer and nothing else)",
+      mirror_gap_collapsed)
+check("PREV scrolls the mirror back into history (reveals MIRROR-TOP)",
+      mirror_scrolled)
+check("B|M again closes it (M|OFF)", mirror_closed)
+check("scrolling the mirror did NOT move the selection (still folA)",
+      mirror_kept_subject)
+check("looking at a terminal NEVER raises it (zero window ops while mirrored)",
+      mirror_no_window_ops)
 
 # ---- stable tab order ----------------------------------------------------------
 check("tab order is stable/alphabetical -- an error does NOT shuffle it to front",

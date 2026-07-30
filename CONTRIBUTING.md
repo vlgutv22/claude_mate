@@ -18,10 +18,18 @@ By participating you agree to abide by our
 ## Project layout
 
 - `daemon/` — the Python daemon (`claude_mate_daemon.py`).
-- `firmware/claude_mate/` — the Arduino Nano sketch.
+- `firmware/claude_mate/` — the Arduino Nano sketch (iteration 1).
+- `firmware/claude_mate_s3/` — the ESP32-S3 Wi-Fi sketch (iteration 2).
+- `firmware/flash_s3.sh` — build + flash for the S3; `arduino-cli upload`
+  cannot flash that board. See [`firmware/README.md`](firmware/README.md).
 - `hooks/claude-status.sh` — the Claude Code hook, installed to
   `~/.claude/hooks/`.
 - `docs/` — install, wiring, protocol, and testing guides.
+
+Both devices speak the **same protocol** and may be connected simultaneously, so
+a change to the daemon or the wrapper has to keep working for the Nano. Anything
+the Nano cannot do (colour, the terminal mirror) belongs behind a verb it simply
+never sends.
 
 ---
 
@@ -134,15 +142,21 @@ Validate changes from the bottom up, the same ladder used in
 1. **Daemon in `--mock` mode** — exercises the triage-queue, screen-rendering,
    and LED-policy logic with fake sessions and no hardware or Claude.
 2. **Serial loopback / protocol** — verify the `|`-delimited lines the daemon
-   emits (`F|…`, `V|…`, `P`) and the `H` / `B|P` / `B|N` / `B|G` / `B|K` lines it
-   consumes (see
+   emits (`F|…`, `V|…`, `M|…`, `P`) and the `H` / `B|P` / `B|N` / `B|G` /
+   `B|K` / `B|M` lines it consumes (see
    [docs/PROTOCOL.md](docs/PROTOCOL.md)).
-3. **Firmware on the bench** — flash the Nano, confirm the OLED renders the
+3. **Firmware on the bench** — flash the device, confirm the display renders the
    frame the daemon sends, the indication LED plays the alert patterns
-   (START / INPUT / DONE / ERROR), and all three buttons (**PREV / GO / NEXT**)
-   respond.
+   (START / INPUT / DONE / ERROR), and every button responds: **PREV / GO /
+   NEXT** on the Nano, plus **MIRROR** on the ESP32-S3.
 4. **End-to-end** — run the daemon against real hardware, install the hooks, and
    drive real Claude Code sessions through `working → waiting → error → done`.
+
+`tools/test_e2e.py` drives rungs 1–2 over a **serial** PTY. The ESP32-S3's
+**TCP** transport is not covered by it, so changes to anything the wireless path
+touches want a check against real hardware — or a throwaway client that performs
+the nonce/HMAC handshake and speaks the protocol directly. A bug that only
+showed up over TCP is exactly how the terminal mirror shipped broken once.
 
 Please describe which rungs you tested in your pull request.
 

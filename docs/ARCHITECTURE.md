@@ -1,7 +1,23 @@
 # Claude Mate — Architecture
 
-Claude Mate is a USB hardware companion for Claude Code. It is an Arduino Nano
-driving a small I2C OLED, three buttons, and an **indication LED**. The daemon
+Claude Mate is a hardware companion for Claude Code. Two devices speak the
+identical protocol and may be connected at once:
+
+- **Arduino Nano over USB** (iteration 1) — an I2C OLED, three buttons, and an
+  **indication LED**. Everything below describes this device unless stated
+  otherwise; it is the reference implementation of the protocol.
+- **ESP32-S3 over Wi-Fi** (iteration 2) — a 172×320 colour LCD, four buttons, a
+  WS2812, and a Li-ion cell. It reaches the daemon over TCP (mDNS-discovered,
+  HMAC-authenticated) instead of a cable. It renders the *same* pre-rendered
+  frame; the extra pixels buy typography and colour, never a different
+  information model. Its one extra capability is the
+  [terminal mirror](#the-terminal-mirror-esp32-s3-only). See
+  [`firmware/README.md`](../firmware/README.md).
+
+The daemon is written so that anything the Nano cannot do sits behind a verb the
+Nano never sends, which is why iteration 2 required no change to iteration 1.
+
+The Nano drives a small I2C OLED, three buttons, and an **indication LED**. The daemon
 keeps ONE **stable, alphabetically-ordered** **triage queue** of sessions (tabs
 never shuffle as their states change) and the OLED shows ONE screen — the
 *selected* session (the selection is **sticky**: only PREV/NEXT/GO ever move
@@ -240,6 +256,53 @@ it was last told to show via an `F|<flags>|<sel>|<r0>|<r1>|<r2>|<r3>` line.
 Long sibling names that collide at the row width are disambiguated with a
 middle squeeze (first 9 + `~` + last 10, e.g. `webapp-ba~ervice-one`). The
 exact line format is in [PROTOCOL.md](PROTOCOL.md).
+
+---
+
+## The terminal mirror (ESP32-S3 only)
+
+Tapping the S3's fourth button opens a live view of the selected session's
+**actual terminal** on the device, refreshed about once a second. It is the one
+capability the three-button build could not have: acknowledging and FOLLOW were
+already reachable through GO's long-press and double-click, so a switch spent on
+either would have bought a shortcut.
+
+It reuses plumbing that already existed rather than adding a channel:
+
+1. The PTY wrapper already mirrors the full TUI into a headless terminal
+   emulator (**pyte**) — it was only mined for state and model/effort. It now
+   also publishes that rendered text and serves it on the command `screen`.
+2. The daemon already holds a **per-session control socket** to every wrapper
+   (used for `focus`). The mirror is a request/response on that same socket, so
+   there is no new socket, no streaming, and **zero cost when nobody is
+   looking** — polling runs only while the view is open.
+3. The daemon clips rows to the device's geometry and pushes them as `M|` lines,
+   exactly as it pre-renders `F|` frames. The firmware stays a dumb renderer.
+
+Three details are load-bearing:
+
+- **The wrapper's reply is length-prefixed** (`SCREEN <n>`, then `n` rows, then
+  `ok`) rather than sentinel-terminated. Terminal output can contain any line,
+  *including one that is exactly `ok`*, which would truncate the mirror at an
+  arbitrary point.
+- **Blank runs are collapsed** before the tail is taken. A TUI is not a
+  scrolling log: Claude's screen puts the banner and conversation at the top, a
+  wide gap in the middle, and the input box pinned at the bottom, so a naive
+  tail of the last rows mirrors the gap and shows nothing.
+- **Rows are clipped, never reflowed.** A TUI's box drawing and alignment carry
+  meaning; rewrapping turns it into noise.
+
+While the view is open the **daemon** reinterprets PREV/NEXT as scroll, so the
+firmware never learns a mode exists — it emits the same verbs either way. GO
+closes the view and raises the real window: looking at a copy is superseded by
+having the original. Only **wrapped** sessions can be mirrored; a hook-only
+session has no PTY and says so, rather than showing a blank screen that would
+read as an idle session.
+
+**Privacy.** Terminal contents cross the network on the same token-authenticated
+but **plaintext** TCP link as everything else. Sending `WAIT` and `Opus 4.8` is a
+very different exposure from sending raw output, which can include keys and file
+contents. Keep it to networks you trust.
 
 ---
 

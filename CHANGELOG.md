@@ -12,6 +12,63 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
+### 2026-07-28 — Iteration 2: a cordless ESP32-S3 companion with a colour screen
+
+**The Arduino Nano build is unchanged and still supported.** Both devices speak
+the identical protocol and can be connected at the same time; everything new
+sits behind verbs the Nano never sends.
+
+- **Added: an ESP32-S3 Wi-Fi companion** (Waveshare ESP32-S3-LCD-1.47B) —
+  172×320 colour LCD, four buttons, a WS2812 whose colour *and* rhythm encode
+  the alert class, and Li-ion operation with an on-screen battery gauge. It
+  reaches the daemon over TCP, discovered by mDNS and authenticated with a
+  nonce/HMAC handshake in which the token never crosses the wire. Config lives
+  in NVS and survives a reflash; an unprovisioned board raises a Wi-Fi setup
+  portal. See [`firmware/README.md`](firmware/README.md).
+- **Added: a live terminal mirror.** The fourth button opens the selected
+  session's *actual terminal* on the device, refreshed ~1×/s, with PREV/NEXT
+  scrolling it. It reuses the PTY wrapper's existing pyte mirror and the
+  per-session control socket the daemon already used for `focus`, so there is no
+  new channel and no cost when the view is closed. Wrapped sessions only — a
+  hook-only session has no PTY and says so. Terminal contents cross the same
+  **plaintext** TCP link as everything else, which is a materially larger
+  exposure than a status string.
+- **Added: `firmware/flash_s3.sh`.** `arduino-cli upload` cannot flash this
+  board: its download mode ignores the DTR/RTS straps, the USB link stalls
+  partway through any large transfer, and a hard reset lands back in the
+  bootloader looking exactly like a dead board. The script works around all
+  three and verifies every piece with a device-side hash.
+- **Added: `firmware/README.md`**, which the S3 sketch had been citing while it
+  did not exist. Covers both builds, board options, wiring, flashing and
+  provisioning.
+- **Added: power off.** Holding MIRROR for 2 s puts the device into deep sleep;
+  a tap wakes it. "Off" is deep sleep rather than zero — the WS2812 has no
+  shutdown pin and idles ~1 mA whenever the rail is up, which dwarfs the ~8 µA
+  the S3 draws asleep, so expect roughly a month of standby on a 14500 and use a
+  switch in the battery lead if you need true zero. Waking reboots; NVS config
+  survives, and `?` reports which kind of boot it was.
+- **Protocol:** new `M|` lines (daemon → device) carry the mirror; new `B|M`
+  (mirror button) and `B|F` (direct FOLLOW toggle) are accepted from devices
+  that have the buttons for them. Additive in a dispatch that already ignores
+  unknown verbs, so old firmware and this daemon interoperate in both
+  directions.
+- **Fixed: a wireless device starved a USB one.** `LinkHub.is_open()` answers
+  *"is any device reachable"*, and `SerialMaintainer` gated reconnection on
+  exactly that — so once an ESP32 linked, a Nano that dropped (or was plugged in
+  afterwards) was never reopened and sat on `NO LINK`. Fixing the gate alone
+  would have broken the other case, because the retry path `continue`d past the
+  keepalive ping; both are fixed, and `test_net_link` grew a phase pinning the
+  invariant (20 → 23 checks).
+- **Added: the printed enclosure for the S3** —
+  [`assets/3d-model/claude_mate_s3.stl`](assets/3d-model/claude_mate_s3.stl),
+  ≈ 55 × 43 × 23 mm, cut for the 1.47" LCD on a raised shelf, four **Kailh Choc
+  low-profile (1350)** switches, USB-C, and a tube on the back that takes the
+  14500 cell behind a two-screw base plate. New build photos in
+  [`assets/photos/`](assets/photos/).
+- **Docs:** the README opens on both devices and now carries a per-build bill of
+  materials, an S3 pinout, the S3 screen sketch, the wireless-handshake flow and
+  the terminal-mirror section; the landing page was rebuilt around iteration 2.
+
 ### 2026-07-26 — …and it leaves WIP again once that work is actually done
 
 - **Fixed: the device stayed on WIP forever after the task finished.** The
