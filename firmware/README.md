@@ -8,9 +8,9 @@ apart, and **both can be connected at once**.
 | Board | Arduino Nano | Waveshare ESP32-S3-LCD-1.47**B** |
 | Display | 128×32 mono OLED (SSD1306) | 172×320 colour IPS (ST7789) |
 | Transport | USB serial | **Wi-Fi (TCP)**, USB as fallback |
-| Buttons | 3 — PREV / GO / NEXT | 4 — PREV / GO / NEXT / **MIRROR** |
+| Buttons | 3 — PREV / GO / NEXT | 4 — PREV / GO / NEXT / **MIRROR**, Kailh Choc (1350) |
 | Alert LED | one LED, rhythm only | WS2812, rhythm **+ colour** |
-| Power | USB | USB or Li-ion cell, with a battery gauge |
+| Power | USB | USB or a 14500 Li-ion cell, with a battery gauge |
 | Flash with | `arduino-cli upload` | **`./flash_s3.sh`** (see below) |
 
 The Nano build is **unchanged** by the S3 work and remains fully supported. The
@@ -77,15 +77,30 @@ The bare board has only BOOT and RESET. Add four momentary switches, each
 PREV → GPIO 3     GO → GPIO 4     NEXT → GPIO 5     MIRROR → GPIO 6
 ```
 
+The reference build uses **Kailh Choc low-profile (1350) switches** with Choc
+keycaps, which is what the printed enclosure
+([`assets/3d-model/claude_mate_s3.stl`](../assets/3d-model/claude_mate_s3.stl))
+is cut for — three across the bottom, one above them at the left, with the LCD
+on a raised shelf to their right. Tactile or linear is taste; the firmware
+debounces either. Any momentary switch works if you print your own plate.
+
 GPIO 3 is a strapping pin but an inert one: it selects the JTAG source and is
 only sampled when `STRAP_JTAG_SEL` is burned, which is not the factory default.
 Boot mode is decided by GPIO 0 and GPIO 46, neither of which is wired to a
 button, so no button held through a reset can strand the board in download mode.
 Verify with `espefuse summary` if in doubt.
 
-**Battery:** nothing to solder. Plug a Li-ion cell into the onboard battery
-header; the charger and the sense divider are on-board, landing on GPIO 1. Do
-not connect anything to GPIO 1 yourself.
+**Battery:** nothing to solder. Plug a **14500 Li-ion cell (AA-sized, 3.7 V,
+~800 mAh)** into the onboard battery header; the charger and the sense divider
+are on-board, landing on GPIO 1. Do not connect anything to GPIO 1 yourself.
+
+The chemistry is not interchangeable. The board's charger is a **4.2 V Li-ion**
+charger, and `board_s3.h` calibrates both the percent curve and the
+charge-trend detection for that (`CHARGE_FULL_MV 4150`, `BATT_MIN_MV 3000`). A
+3.2 V LiFePO4 cell of the same physical size would be over-charged by the board
+*and* read as permanently flat. A larger Li-ion cell (an 18650) is electrically
+fine but creeps too slowly for the trend fallback — see the note at the
+constants.
 
 **Board revisions differ in exactly one pin:** the backlight is **GPIO 46** on
 the ‑1.47B and GPIO 48 on the original ‑1.47. The wrong value fails in a

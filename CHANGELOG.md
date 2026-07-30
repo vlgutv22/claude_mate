@@ -52,6 +52,22 @@ sits behind verbs the Nano never sends.
   that have the buttons for them. Additive in a dispatch that already ignores
   unknown verbs, so old firmware and this daemon interoperate in both
   directions.
+- **Fixed: a wireless device starved a USB one.** `LinkHub.is_open()` answers
+  *"is any device reachable"*, and `SerialMaintainer` gated reconnection on
+  exactly that — so once an ESP32 linked, a Nano that dropped (or was plugged in
+  afterwards) was never reopened and sat on `NO LINK`. Fixing the gate alone
+  would have broken the other case, because the retry path `continue`d past the
+  keepalive ping; both are fixed, and `test_net_link` grew a phase pinning the
+  invariant (20 → 23 checks).
+- **Added: the printed enclosure for the S3** —
+  [`assets/3d-model/claude_mate_s3.stl`](assets/3d-model/claude_mate_s3.stl),
+  ≈ 55 × 43 × 23 mm, cut for the 1.47" LCD on a raised shelf, four **Kailh Choc
+  low-profile (1350)** switches, USB-C, and a tube on the back that takes the
+  14500 cell behind a two-screw base plate. New build photos in
+  [`assets/photos/`](assets/photos/).
+- **Docs:** the README opens on both devices and now carries a per-build bill of
+  materials, an S3 pinout, the S3 screen sketch, the wireless-handshake flow and
+  the terminal-mirror section; the landing page was rebuilt around iteration 2.
 
 ### 2026-07-26 — …and it leaves WIP again once that work is actually done
 

@@ -4,9 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Claude Mate — an ambient companion for your Claude Code agents</title>
-<meta name="description" content="A tiny USB desk device that cuts the cognitive overload of orchestrating many Claude Code agent sessions — it shows which session needs you and jumps you to it. Open, non-commercial, Arduino + macOS today, ESP32 Wi-Fi next.">
+<meta name="description" content="A tiny desk device that cuts the cognitive overload of orchestrating many Claude Code agent sessions — it shows which session needs you and jumps you to it. Two builds, one protocol: a USB Arduino Nano and a cordless ESP32-S3 with a colour screen, a battery and a live terminal mirror.">
 <meta property="og:title" content="Claude Mate">
-<meta property="og:description" content="An ambient desk companion that tells you which Claude Code agent needs you — and takes you there with one button.">
+<meta property="og:description" content="An ambient desk companion that tells you which Claude Code agent needs you — and takes you there with one button. Now cordless, with a colour screen and a live terminal mirror.">
 <meta property="og:type" content="website">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='4' y='7' width='24' height='18' rx='4' fill='%23d97757'/%3E%3Crect x='8' y='11' width='16' height='7' rx='1.5' fill='%230b0b0b'/%3E%3Ccircle cx='10' cy='21' r='1.5' fill='%230b0b0b'/%3E%3Ccircle cx='16' cy='21' r='1.5' fill='%230b0b0b'/%3E%3Ccircle cx='22' cy='21' r='1.5' fill='%230b0b0b'/%3E%3C/svg%3E">
 <style>
@@ -88,6 +88,36 @@
   @media(max-width:560px){.legend{grid-template-columns:1fr}}
   .legend b{color:#dfeff0; font-weight:600}
 
+  /* the S3's colour screen, drawn with the firmware's own palette */
+  .s3{--c-text:#e8eaed; --c-dim:#6b7280; --c-err:#ff4d4d; --c-wait:#ffb020;
+      --c-work:#35c4f0; --c-done:#34d399;
+      background:#0b0d10; border-radius:10px; padding:14px 16px 0; margin:0 0 2px}
+  .s3 .bar{display:flex; justify-content:space-between; align-items:center;
+           font-size:11px; letter-spacing:.08em; color:var(--c-dim);
+           border-bottom:1px solid #23262c; padding-bottom:8px}
+  .s3 .bar .ok{color:var(--c-done)}
+  .s3 .bar .sig{display:inline-flex; align-items:flex-end; gap:1.5px; height:9px; margin-right:6px; vertical-align:-1px}
+  .s3 .bar .sig i{display:block; width:2px; background:var(--c-done); border-radius:1px}
+  .s3 .bar .sig i:nth-child(1){height:3px}.s3 .bar .sig i:nth-child(2){height:6px}.s3 .bar .sig i:nth-child(3){height:9px}
+  .s3 .bar .btry{display:inline-flex; align-items:center; gap:6px; color:var(--c-text)}
+  .s3 .bar .btry u{display:block; width:22px; height:10px; border:1px solid var(--c-dim); border-radius:2px; padding:1.5px; position:relative}
+  .s3 .bar .btry u::after{content:""; position:absolute; right:-3px; top:3px; width:2px; height:4px; background:var(--c-dim); border-radius:0 1px 1px 0}
+  .s3 .bar .btry u b{display:block; height:100%; background:var(--c-done); border-radius:1px}
+  .s3 .rows{white-space:pre; margin:12px 0 0; font-size:clamp(12px,2.5vw,15px); line-height:1.55; color:var(--c-text); overflow-x:auto}
+  .s3 .name{font-size:1.5em; letter-spacing:.02em}
+  .s3 .dim{color:var(--c-dim)}
+  .s3 .e{color:var(--c-err)}.s3 .b{color:var(--c-wait)}.s3 .w{color:var(--c-work)}
+  .s3 .d{color:var(--c-done)}.s3 .i{color:var(--c-dim)}
+  .s3 .sel{background:var(--c-text); color:#0b0d10; padding:0 3px; border-radius:2px}
+  .s3 .accent{height:8px; border-radius:2px; background:var(--c-wait); margin:12px 0 14px}
+  .devgrid{display:grid; grid-template-columns:1fr 1fr; gap:16px; align-items:start}
+  @media(max-width:760px){.devgrid{grid-template-columns:1fr}}
+  .mir{white-space:pre; margin:0; font-size:clamp(10.5px,1.9vw,13px); line-height:1.45;
+       color:#c9ced6; overflow-x:auto}
+  .mir .hl{color:var(--accent)}
+  .mir .g{color:#34d399}
+  .mir .t{color:#6b7280}
+
   /* parts */
   .parts{list-style:none; margin:0; padding:0; display:grid; grid-template-columns:1fr 1fr; gap:0 34px}
   @media(max-width:640px){.parts{grid-template-columns:1fr}}
@@ -110,6 +140,7 @@
   .tag{display:inline-block; font:600 11px ui-monospace,Menlo,monospace; letter-spacing:.04em; text-transform:uppercase; padding:3px 9px; border-radius:20px; margin-bottom:10px}
   .tag.now{background:var(--accent); color:#fff}
   .tag.next{background:transparent; color:var(--accent-deep); border:1px solid var(--accent)}
+  .tag.done{background:transparent; color:var(--muted); border:1px solid var(--line)}
 
   footer{border-top:1px solid var(--line); padding:40px 0 60px; color:var(--muted); font-size:14.5px}
   footer .flinks{display:flex; gap:20px; flex-wrap:wrap; margin-bottom:16px}
@@ -126,6 +157,7 @@
   <nav>
     <a href="#why">Why</a>
     <a href="#glass">The device</a>
+    <a href="#mirror">Mirror</a>
     <a href="#parts">Parts</a>
     <a href="#build">Build</a>
     <a href="#roadmap">Roadmap</a>
@@ -138,7 +170,7 @@
   <section class="hero" style="border-top:none">
     <div class="kicker">▸ an ambient companion for claude code</div>
     <h1>Know which agent needs you.</h1>
-    <p class="lede">Claude Mate is a tiny USB desk device that cuts the <b>cognitive overload of
+    <p class="lede">Claude Mate is a tiny desk device that cuts the <b>cognitive overload of
       orchestrating many Claude&nbsp;Code sessions at once</b> — across different accounts and
       projects. One glance tells you which session finished, is blocked, or errored; one button
       takes you straight to it.</p>
@@ -147,8 +179,8 @@
       <a class="btn ghost" href="https://github.com/vlgutv22/claude_mate/blob/main/docs/INSTALL.md">Build &amp; install →</a>
     </div>
     <div class="hero-img">
-      <img src="assets/photos/IMG_4912.jpg" alt="The assembled Claude Mate device — a felt-and-terracotta enclosure with an OLED showing a live Claude Code session and three buttons.">
-      <div class="cap">Iteration one: Arduino&nbsp;Nano&nbsp;+&nbsp;OLED, USB to a Mac. <span class="pill">ESP32 Wi-Fi next</span></div>
+      <img src="assets/photos/v2-on-desk.jpg" alt="The cordless ESP32-S3 Claude Mate resting on a laptop keyboard — four low-profile keys and a colour screen showing a live Claude Code session, its battery gauge and its Wi-Fi address.">
+      <div class="cap">Iteration two: cordless ESP32-S3, colour screen, on a battery. <span class="pill">shipped</span></div>
     </div>
   </section>
 </div>
@@ -176,38 +208,112 @@
 <div class="wrap">
   <section id="glass">
     <h2>What's on the glass</h2>
-    <p class="sub">A 0.91″ OLED renders one pre-composed screen — the selected session over a
-      whole-fleet strip. Three buttons, one meaning, always: <b>PREV · GO · NEXT</b>.</p>
+    <p class="sub">One pre-composed screen — the selected session over a whole-fleet strip. The
+      daemon renders the <em>same</em> four rows for both devices; each just draws what it was
+      sent. Buttons never change meaning: <b>PREV · GO · NEXT</b>, plus <b>MIRROR</b> on the S3.</p>
+
     <div class="term">
-      <div class="tt"><i></i><i></i><i></i><span>claude-mate · 128×32 OLED</span></div>
+      <div class="tt"><i></i><i></i><i></i><span>claude-mate-s3 · 172×320 colour IPS · Wi-Fi</span></div>
+      <div class="screen">
+        <div class="s3">
+          <div class="bar">
+            <span><span class="sig"><i></i><i></i><i></i></span>CLAUDE MATE</span>
+            <span class="btry"><u><b style="width:64%"></b></u>64%</span>
+          </div>
+<pre class="rows"><span class="name b">api-server</span>
+WAIT   0:42                   work
+Opus 5 xhigh                 5h82%
+2/6  <span class="e">E</span>  <span class="sel">B</span>  <span class="w">W</span>  <span class="d">D</span>  <span class="i">I</span>
+<span class="dim">wifi 192.168.1.42</span></pre>
+          <div class="accent"></div>
+        </div>
+        <div class="legend">
+          <div><b>status bar</b> — Wi-Fi link · battery, with charging</div>
+          <div><b>row 0</b> — session name, in the state's colour</div>
+          <div><b>row 1</b> — state · time-in-state · account</div>
+          <div><b>row 2</b> — model · effort · remaining plan limit</div>
+          <div><b>row 3</b> — queue position · fleet strip, letter-coloured</div>
+          <div><b>accent bar</b> — the selected session's state, across the full width</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="term" style="margin-top:16px">
+      <div class="tt"><i></i><i></i><i></i><span>claude-mate · 128×32 OLED · USB</span></div>
       <div class="screen">
 <pre class="oled">api-server
 WAIT  0:42        work
-Opus 4.8 xhigh   5h82%
+Opus 5 xhigh     5h82%
 2/6  E B W D I</pre>
         <div class="legend">
-          <div><b>row 0</b> — session name (flashes while unacked)</div>
-          <div><b>row 1</b> — state · time-in-state · account</div>
-          <div><b>row 2</b> — model · effort · remaining plan limit</div>
-          <div><b>row 3</b> — queue position · whole-fleet letter strip</div>
           <div><b>strip</b> — <span style="color:var(--oled)">E</span>rror · <span style="color:var(--oled)">B</span> waiting · <span style="color:var(--oled)">W</span>orking · <span style="color:var(--oled)">D</span>one · <span style="color:var(--oled)">I</span>dle</div>
           <div><b>LED</b> — START · INPUT · DONE · ERROR, looping until you ack</div>
         </div>
       </div>
     </div>
-    <p class="cap" style="text-align:center">Fed by the Claude&nbsp;Code <a href="https://github.com/vlgutv22/claude_mate/tree/main/hooks">hooks</a>
+
+    <p class="cap" style="text-align:center">The rhythm is the primary channel and is identical on
+      both devices — colour is redundant reinforcement on the S3, never the only thing carrying the
+      message. Fed by the Claude&nbsp;Code <a href="https://github.com/vlgutv22/claude_mate/tree/main/hooks">hooks</a>
       or the <a href="https://github.com/vlgutv22/claude_mate/blob/main/bin/claude-mate-wrap">PTY&nbsp;wrapper</a>,
       which reads live TUI state and raises the exact terminal on GO.</p>
   </section>
 </div>
 
 <div class="wrap">
+  <section id="mirror">
+    <h2>See the terminal, not just the status</h2>
+    <p class="sub">The fourth key on the S3 opens a live view of the selected session’s
+      <em>actual</em> terminal — 52×17 characters, refreshed about once a second. PREV/NEXT scroll
+      it; GO closes it and raises the real window. This is the one thing three buttons could not do.</p>
+    <div class="term">
+      <div class="tt"><i></i><i></i><i></i><span>MIRROR · api-server WAIT</span></div>
+      <div class="screen">
+<pre class="mir"><span class="t">⏺</span> Read <span class="hl">daemon/claude_mate_daemon.py</span> (2114 lines)
+<span class="t">⏺</span> Edit <span class="hl">daemon/claude_mate_daemon.py</span>
+   <span class="g">+  # the mirror is a request/response on the socket we</span>
+   <span class="g">+  # already hold open for focus — no new channel</span>
+<span class="t">✻</span> Waiting for 1 dynamic workflow to finish…
+<span class="t">╭──────────────────────────────────────────────╮</span>
+<span class="t">│</span> Do you want to make this edit?               <span class="t">│</span>
+<span class="t">│</span>  <span class="hl">❯ 1. Yes</span>    2. No, tell Claude what to do   <span class="t">│</span>
+<span class="t">╰──────────────────────────────────────────────╯</span></pre>
+        <div class="legend">
+          <div><b>no new channel</b> — the wrapper already mirrored the TUI into pyte</div>
+          <div><b>no idle cost</b> — polling runs only while the view is open</div>
+          <div><b>wrapped sessions only</b> — a hook-only session has no PTY, and says so</div>
+          <div><b>plaintext TCP</b> — authenticated, not encrypted. Trusted networks only</div>
+        </div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<div class="wrap">
   <section id="parts">
     <h2>Parts</h2>
-    <p class="sub">A handful of common components. Full pinout and notes in
-      <a href="https://github.com/vlgutv22/claude_mate/blob/main/docs/WIRING.md">docs/WIRING.md</a>;
+    <p class="sub">Two builds, one protocol — the daemon cannot tell them apart, and both can be
+      connected at the same time. Full pinouts in
+      <a href="https://github.com/vlgutv22/claude_mate/blob/main/firmware/README.md">firmware/README.md</a>
+      and <a href="https://github.com/vlgutv22/claude_mate/blob/main/docs/WIRING.md">docs/WIRING.md</a>;
       the bill of materials lives in the
       <a href="https://github.com/vlgutv22/claude_mate/blob/main/README.md#bill-of-materials">README</a>.</p>
+
+    <h3 style="font-size:19px;margin:0 0 4px">Iteration 2 — ESP32-S3, cordless</h3>
+    <ul class="parts">
+      <li><span class="q">1×</span><span><span class="n">Waveshare ESP32-S3-LCD-1.47<b>B</b></span> <span class="d">— 172×320 IPS, 8&nbsp;MB PSRAM, 16&nbsp;MB flash, USB-C. Carries the WS2812, the charger and the battery divider</span></span></li>
+      <li><span class="q">4×</span><span><span class="n">Kailh Choc low-profile (1350) switches</span> <span class="d">— PREV · GO · NEXT · MIRROR, on GPIO 3–6</span></span></li>
+      <li><span class="q">4×</span><span><span class="n">Choc keycaps</span> <span class="d">— any low-profile cap that fits Choc stems</span></span></li>
+      <li><span class="q">1×</span><span><span class="n">14500 Li-ion cell, ~800&nbsp;mAh</span> <span class="d">— AA-sized 3.7&nbsp;V, straight into the board’s header</span></span></li>
+      <li><span class="q">2×</span><span><span class="n">M2 screws</span> <span class="d">— close the printed enclosure</span></span></li>
+      <li><span class="q">1×</span><span><span class="n">USB-C cable</span> <span class="d">— flashing and charging</span></span></li>
+    </ul>
+    <p class="cap">No resistors, no debounce caps, nothing to solder on the board side — the
+      firmware debounces in software and the four switches share one ground.
+      <b>The cell must be 3.7&nbsp;V Li-ion:</b> the onboard charger and the gauge curve are
+      calibrated for that chemistry.</p>
+
+    <h3 style="font-size:19px;margin:26px 0 4px">Iteration 1 — Arduino Nano, USB</h3>
     <ul class="parts">
       <li><span class="q">1×</span><span><span class="n"><a href="https://store.arduino.cc/products/arduino-nano">Arduino Nano</a></span> (ATmega328P) <span class="d">— any USB-serial clone works</span></span></li>
       <li><span class="q">1×</span><span><span class="n">SSD1306 0.91″ 128×32 OLED</span>, I²C <span class="d">— addr 0x3C; 0.96″ 128×64 also works</span></span></li>
@@ -216,27 +322,33 @@ Opus 4.8 xhigh   5h82%
       <li><span class="q">1×</span><span><span class="n">USB cable</span> <span class="d">— data-capable, to the Mac</span></span></li>
       <li><span class="q">—</span><span><span class="n">3D-printed enclosure</span> <span class="d">— printable model below</span></span></li>
     </ul>
-    <p class="cap">Software: a Python daemon (<code>pyserial</code>) on macOS + the firmware’s only
-      library dependency, <a href="https://github.com/adafruit/Adafruit-GFX-Library">Adafruit&nbsp;GFX</a>
-      (the SSD1306 is driven by a bundled software-I²C driver).</p>
+    <p class="cap">Software: a Python daemon (<code>pyserial</code>) on macOS. Firmware libraries:
+      <a href="https://github.com/adafruit/Adafruit-GFX-Library">Adafruit&nbsp;GFX</a> for the Nano
+      (the SSD1306 is driven by a bundled software-I²C driver), and
+      <a href="https://github.com/moononournation/Arduino_GFX">Arduino_GFX</a> for the S3.</p>
   </section>
 </div>
 
 <div class="wrap">
   <section id="build">
     <h2>Build it &amp; make it yours</h2>
-    <p class="sub">Print the enclosure, wire the parts, flash the firmware, run the daemon.
-      Photos and the printable model are in the repo’s
-      <a href="https://github.com/vlgutv22/claude_mate/tree/main/assets">assets</a>.</p>
+    <p class="sub">Print the enclosure, wire the switches, flash the firmware, run the daemon.
+      Photos and both printable models are in the repo’s
+      <a href="https://github.com/vlgutv22/claude_mate/tree/main/assets">assets</a>. The S3 needs
+      <code>./firmware/flash_s3.sh</code> — <code>arduino-cli upload</code> genuinely cannot flash
+      that board, and the
+      <a href="https://github.com/vlgutv22/claude_mate/blob/main/firmware/README.md">firmware README</a>
+      explains the three reasons why.</p>
     <div class="cta" style="justify-content:flex-start;margin-top:0 0 22px">
-      <a class="btn primary" href="assets/3d-model/claude_mate_v2.3mf" download>⬇ Download the enclosure (.3mf)</a>
+      <a class="btn primary" href="assets/3d-model/claude_mate_s3.stl" download>⬇ ESP32-S3 enclosure (.stl)</a>
+      <a class="btn ghost" href="assets/3d-model/claude_mate_v2.3mf" download>⬇ Nano enclosure (.3mf)</a>
       <a class="btn ghost" href="https://github.com/vlgutv22/claude_mate/tree/main/assets/photos">All photos →</a>
     </div>
     <div class="gal" style="margin-top:22px">
-      <a href="assets/photos/IMG_4911.jpg"><img src="assets/photos/IMG_4911.jpg" alt="Claude Mate on a desk in front of the monitor"></a>
-      <a href="assets/photos/IMG_4896.jpg"><img src="assets/photos/IMG_4896.jpg" alt="The 3D-printed enclosure parts"></a>
-      <a href="assets/photos/IMG_4899.jpg"><img src="assets/photos/IMG_4899.jpg" alt="The lit OLED and buttons, enclosure open"></a>
-      <a href="assets/photos/IMG_4900.jpg"><img src="assets/photos/IMG_4900.jpg" alt="The wired PCB going into the enclosure"></a>
+      <a href="assets/photos/v2-device.jpg"><img src="assets/photos/v2-device.jpg" alt="The assembled ESP32-S3 device in a hand — four Kailh Choc keycaps and the lit colour screen"></a>
+      <a href="assets/photos/v2-and-v1.jpg"><img src="assets/photos/v2-and-v1.jpg" alt="Both builds side by side — the ESP32-S3 keypad assembled and opened, next to the Arduino Nano box"></a>
+      <a href="assets/photos/v2-enclosure.jpg"><img src="assets/photos/v2-enclosure.jpg" alt="The back of the printed S3 enclosure — a tube for the 14500 cell and a screwed-on base plate"></a>
+      <a href="assets/photos/IMG_4896.jpg"><img src="assets/photos/IMG_4896.jpg" alt="The 3D-printed Nano enclosure parts"></a>
     </div>
   </section>
 </div>
@@ -247,15 +359,21 @@ Opus 4.8 xhigh   5h82%
     <p class="sub">Built in iterations, each removing more friction than the last. The goal never
       changes — one calm surface that tells you which agent needs you.</p>
     <div class="road">
-      <div class="card"><span class="tag now">Iteration 1 · now</span>
+      <div class="card"><span class="tag done">Iteration 1 · shipped</span>
         <h3>Arduino + macOS</h3>
         <p>An Arduino Nano drives the OLED, buttons, and LED over USB serial; a Python daemon on
-          the Mac keeps the queue, renders the screen, and raises windows.</p></div>
-      <div class="card"><span class="tag next">Iteration 2 · next</span>
-        <h3>ESP32 Wi-Fi remote</h3>
-        <p>Move to an ESP32 so the device talks to the daemon over Wi-Fi instead of USB — a truly
-          wireless desk remote you can place anywhere, no cable to the Mac.</p></div>
+          the Mac keeps the queue, renders the screen, and raises windows. <b>Unchanged and still
+          supported</b> — and it can be plugged in alongside the S3.</p></div>
+      <div class="card"><span class="tag now">Iteration 2 · now</span>
+        <h3>ESP32-S3 Wi-Fi remote</h3>
+        <p>The device reaches the daemon over Wi-Fi instead of USB — a genuinely wireless desk
+          remote you can put anywhere, on a 14500 cell with a battery gauge and a deep-sleep
+          power-off. The colour LCD brought colour-coded alerts and a fourth key: the live
+          terminal mirror.</p></div>
     </div>
+    <p class="cap" style="margin-top:18px">The goal stays fixed across every iteration:
+      <b>one calm surface that tells you which agent needs you</b>, so running many of them in
+      parallel stops taxing your attention.</p>
   </section>
 </div>
 
@@ -264,6 +382,7 @@ Opus 4.8 xhigh   5h82%
     <div class="flinks">
       <a href="https://github.com/vlgutv22/claude_mate">Repository</a>
       <a href="https://github.com/vlgutv22/claude_mate/blob/main/docs/INSTALL.md">Install</a>
+      <a href="https://github.com/vlgutv22/claude_mate/blob/main/firmware/README.md">Firmware</a>
       <a href="https://github.com/vlgutv22/claude_mate/blob/main/docs/WIRING.md">Wiring</a>
       <a href="https://github.com/vlgutv22/claude_mate/blob/main/docs/PROTOCOL.md">Protocol</a>
       <a href="https://github.com/vlgutv22/claude_mate/blob/main/CONTRIBUTING.md">Contribute</a>

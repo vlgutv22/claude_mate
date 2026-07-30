@@ -6,11 +6,16 @@
 [![Platform: macOS](https://img.shields.io/badge/platform-macOS-000000?logo=apple&logoColor=white)](docs/INSTALL.md)
 [![Daemon: Python 3.9+](https://img.shields.io/badge/daemon-Python%203.9%2B-3776AB?logo=python&logoColor=white)](daemon/claude_mate_daemon.py)
 [![Firmware: Arduino Nano](https://img.shields.io/badge/firmware-Arduino%20Nano-00979D?logo=arduino&logoColor=white)](firmware/claude_mate)
+[![Firmware: ESP32-S3](https://img.shields.io/badge/firmware-ESP32--S3-E7352C?logo=espressif&logoColor=white)](firmware/claude_mate_s3)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
 <p align="center">
-  <img src="assets/photos/IMG_4912.jpg" alt="Claude Mate — the assembled device on a desk, its OLED showing a live Claude Code session" width="640">
+  <img src="assets/photos/v2-and-v1.jpg" alt="Both Claude Mate builds on a desk — the cordless ESP32-S3 keypad with its colour screen, the same keypad opened up around its cell, and the original Arduino Nano box with its OLED" width="760">
 </p>
+
+<p align="center"><sub><b>Two devices, one protocol.</b> Left and centre: iteration 2, the
+cordless ESP32-S3 keypad (assembled, and opened around its cell). Right: iteration 1, the
+USB Arduino Nano box.</sub></p>
 
 **Claude Mate exists to cut the cognitive overload of orchestrating many
 AI-agent sessions at once** — a wall of Claude Code tabs spread across different
@@ -19,20 +24,43 @@ schedule. Instead of scanning every terminal to find the one that stalled, you
 glance at a small desk device: one screen and an indication LED tell you *which*
 session needs you *right now*, and a single button jumps you straight to it.
 
-There are two devices, speaking one protocol: the original **Arduino Nano** over
-USB, and a cordless **ESP32-S3** with a colour screen that reaches the daemon
-over Wi-Fi and runs on a battery. Either works on its own, or both at once (see
-[Roadmap](#roadmap) and [`firmware/README.md`](firmware/README.md)).
+**There are two devices, speaking one protocol, byte for byte.** The original
+**Arduino Nano** over USB, and a cordless **ESP32-S3** with a 172×320 colour
+screen that reaches the daemon over Wi-Fi, runs on a 14500 cell, and can open a
+**live mirror of a session's actual terminal**. The daemon cannot tell them
+apart: either works on its own, or **both at once** (see
+[Bill of Materials](#bill-of-materials), [Roadmap](#roadmap) and
+[`firmware/README.md`](firmware/README.md)).
 
 You feed it from the Claude Code **hooks** or the **PTY wrapper**
 (`claude-mate-wrap`); it becomes an ambient, always-on triage pane for every
 session you have open — in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
 
+**Iteration 2 — ESP32-S3, 172×320 colour IPS, cordless:**
+
+```
+        ┌──────────────────────────────────────┐
+        │ ıl CLAUDE MATE                ▰ 64%  │  ← status bar: Wi-Fi link · battery (with charging)
+        ├──────────────────────────────────────┤
+        │ api-server                           │  ← r0: session name, in the state's colour
+        │ WAIT   0:42                   work   │  ← r1: state · time-in-state · account
+        │ Opus 5 xhigh                 5h82%   │  ← r2: model · effort · remaining limit
+        │ 2/6  E  B  W  D  I                   │  ← r3: queue position · fleet strip, letter-coloured
+        │ wifi 192.168.1.42                    │  ← link detail (firmware-local, never from the daemon)
+        │══════════════════════════════════════│  ← accent bar in the selected session's state colour
+        └──────────────────────────────────────┘
+                  (•) WS2812 — rhythm AND colour
+        [ PREV ]  [ GO ]  [ NEXT ]  [ MIRROR ]     ← a fourth button opens the live terminal view
+   MIRROR: tap = mirror the selected session's real terminal · hold 2 s = power off (tap wakes)
+```
+
+**Iteration 1 — Arduino Nano, 128×32 mono OLED, USB:**
+
 ```
         ┌───────────────────────┐
         │ api-server            │   ← r0: session name (flashes while its alert
         │ WAIT  0:42       work │   ← r1: state · time-in-state · account   is unacknowledged)
-        │ Opus 4.8 xhigh  5h82% │   ← r2: model · effort · remaining limit
+        │ Opus 5 xhigh    5h82% │   ← r2: model · effort · remaining limit
         │ 2/6 E B W D I         │   ← r3: queue position · whole-fleet letter strip
         └───────────────────────┘       (the active tab's letter sits in a wide centred filled rectangle)
               (•) indication LED               ← blinks per alert class, until you ack
@@ -54,11 +82,12 @@ session you have open — in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
 ## Contents
 
 - [What it is](#what-it-is)
+- [The terminal mirror (ESP32-S3)](#the-terminal-mirror-esp32-s3)
 - [Two ways to feed it](#two-ways-to-feed-it)
 - [Features](#features)
 - [Architecture](#architecture)
 - [LED alerts & the acknowledge model](#led-alerts--the-acknowledge-model)
-- [Bill of Materials](#bill-of-materials) · [Enclosure & 3D model](#enclosure--3d-model)
+- [Bill of Materials](#bill-of-materials) · [Enclosures & 3D models](#enclosures--3d-models)
 - [Quick start](#quick-start) · [Configuration](#configuration)
 - [How the status maps to your sessions](#how-the-status-maps-to-your-sessions)
 - [Roadmap](#roadmap)
@@ -71,8 +100,18 @@ session you have open — in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
 
 ## What it is
 
-**Claude Mate** is an Arduino Nano + 0.91" I2C OLED + 3 buttons + an
-**indication LED**, paired with a lightweight Python daemon on your Mac.
+**Claude Mate** is a small desk companion paired with a lightweight Python
+daemon on your Mac. Build it either way — or both, at the same time:
+
+| | **Iteration 1** — `claude_mate/` | **Iteration 2** — `claude_mate_s3/` |
+|---|---|---|
+| Board | Arduino Nano (ATmega328P) | Waveshare ESP32-S3-LCD-1.47**B** |
+| Display | 0.91" 128×32 mono OLED (SSD1306) | 1.47" 172×320 colour IPS (ST7789) |
+| Transport | USB serial | **Wi-Fi (TCP)**, USB as fallback |
+| Buttons | 3 — PREV / GO / NEXT | 4 — + **MIRROR** (Kailh Choc low-profile) |
+| Alert light | one LED, rhythm only | WS2812, rhythm **+ colour** |
+| Power | USB | USB **or** a 14500 cell, with a gauge |
+| Extra | — | a **live mirror** of a session's terminal |
 
 The daemon keeps ONE **stable, alphabetically-ordered** **triage queue** of every
 Claude Code session (tabs never shuffle as their states change) and renders ONE
@@ -81,8 +120,8 @@ tracked **separately** — it drives the LED and the blinking fleet letters,
 never the tab order or which tab is shown. The LED blinks a status-distinct pattern for the worst
 *unacknowledged* alert — so a single tab finishing, blocking, or erroring is
 *seen* even while the rest of your fleet keeps working. It keeps blinking until
-you deal with it. There are **no UI modes**: the three buttons — **PREV · GO ·
-NEXT** — mean the same thing at all times.
+you deal with it. There are **no UI modes**: the buttons — **PREV · GO · NEXT**,
+and **MIRROR** on the S3 — mean the same thing at all times.
 
 The single must-have action is **GO**: press it and the window for the
 displayed session is raised so you can deal with it — the integrated VS Code
@@ -90,6 +129,33 @@ panel *or* the actual terminal that session is running in (matched by TTY).
 Raise **only**: nothing in the system ever collapses or resizes a window.
 Retrying or resubmitting a turn is intentionally **out of scope** (see
 [Limitations](#limitations)).
+
+The extra pixels on the S3 buy **typography, colour and the terminal mirror** —
+never a different information model. The daemon pre-renders the same four rows
+of at most 21 characters for both devices; each just draws what it was sent.
+
+---
+
+## The terminal mirror (ESP32-S3)
+
+Tapping **MIRROR** opens a live view of the selected session's *actual
+terminal* on the device — 52×17 characters, refreshed about once a second.
+**PREV/NEXT** then scroll it instead of moving the selection, and **GO** closes
+it and raises the real window. Only **wrapped** sessions can be mirrored: a
+hook-only session has no PTY for the daemon to read, and the device says so.
+
+It adds no new channel. The PTY wrapper already mirrored the full TUI into
+[pyte](https://github.com/selectel/pyte) (it was only being mined for state and
+the model/effort strings), and the daemon already held a per-session control
+socket to every wrapper for `focus`. The mirror is one more request/response on
+that socket — so polling runs **only while the view is open**, and an unwatched
+fleet costs nothing.
+
+> ⚠️ **The mirror puts raw terminal output on the network.** The handshake is
+> authenticated, but the session itself is **plaintext TCP** — and terminal
+> contents can include keys, tokens and file contents, which is a materially
+> larger exposure than shipping `WAIT` and a model name. Keep it to networks you
+> trust. `--tcp` is opt-in and fails closed without a token.
 
 ---
 
@@ -116,12 +182,12 @@ hooks are the zero-dependency feed. Use whichever fits each session.
   first) and drives only the LED and the blinking fleet letters — never the
   tab order. **PREV** / **NEXT** step the order manually (hold to auto-repeat,
   wrapping at the ends); the screen **never changes subject on its own**.
-- **No UI modes** — the three buttons mean the same thing at all times:
-  **PREV · GO · NEXT**. A short **GO** acknowledges the shown alert **and
-  raises its window**; a **long-press of GO** (~0.5 s) acknowledges it
-  **without** touching any window. Buttons fire instantly (edge-accepted
-  ~40 ms debounce), and every accepted press inverts the whole panel for
-  ~80 ms — instant "the device heard you" feedback.
+- **No UI modes** — the buttons mean the same thing at all times:
+  **PREV · GO · NEXT** (plus **MIRROR** on the S3). A short **GO** acknowledges
+  the shown alert **and raises its window**; a **long-press of GO** (~0.5 s)
+  acknowledges it **without** touching any window. Buttons fire instantly
+  (edge-accepted ~40 ms debounce), and every accepted press inverts the whole
+  panel for ~80 ms — instant "the device heard you" feedback.
 - **No auto-switch, ever** — the selection is **sticky**: only PREV/NEXT/GO
   move it, and a GO/ACK stays on the tab it acted on. An alert on another tab
   announces itself through the LED and its **blinking fleet letter**; the view
@@ -177,6 +243,26 @@ hooks are the zero-dependency feed. Use whichever fits each session.
 - **`--mock` demo mode** — run the whole display with fake sessions cycling
   through every state, no Claude and no hardware required.
 
+**On the ESP32-S3, additionally:**
+
+- **Cordless, on a cell** — Wi-Fi (TCP) instead of USB, discovered over mDNS
+  and authenticated with a nonce/HMAC handshake in which the token never
+  crosses the wire. Wi-Fi credentials, daemon address and token live in **NVS**,
+  a separate partition, so they **survive a reflash**; an unprovisioned board
+  raises a setup portal you join from a phone.
+- **Colour as a second channel** — the WS2812 plays the same rhythm *and* the
+  alert class's colour, and every fleet letter is drawn in its own state colour.
+  The colours differ in **brightness** as well as hue, so they stay distinct for
+  a red/green-colourblind reader and in direct sunlight.
+- **A battery gauge that doesn't lie** — median-of-15 spaced samples plus an EMA
+  across polls, because the board's sense divider is unfiltered and Wi-Fi TX
+  bursts dip the rail. Charging is inferred in tiers from the cell's own
+  voltage; the board exposes no charge-status line.
+- **A live terminal mirror** — see [above](#the-terminal-mirror-esp32-s3).
+- **Power off** — hold **MIRROR** for 2 s for deep sleep, tap to wake. Roughly a
+  month of standby on a 14500; the WS2812 has no shutdown pin, so a switch in
+  the battery lead is the only true zero.
+
 ---
 
 ## Architecture
@@ -201,18 +287,28 @@ hooks are the zero-dependency feed. Use whichever fits each session.
    │   • LED policy  V|<START/INPUT/DONE/ERR/OFF> │   worst unacked class, loops until ack
    │   • GO: raise the session's window — RAISE   │
    │     ONLY (wrapper ctrl-sock → VS Code link)  │
+   │   • MIRROR: pull the session's live screen   │
+   │     from its wrapper → M| lines (S3 only)    │
    └──────────────────────────────────────────────┘
-                            │  USB serial 115200 8N1, "|"-delimited ASCII
-                            ▼
-   ┌──────────────────────────────────────────────┐
-   │   Arduino Nano (ATmega328P)                  │
-   │   • SSD1306 128x32 OLED — draws the one      │
-   │     frame it was last sent (dumb renderer)   │
-   │   • indication LED (D8) plays V|<KIND>       │
-   │   • PREV/GO/NEXT buttons → B|P B|N B|G B|K   │
-   └──────────────────────────────────────────────┘
-                            │  H (hello on boot), B|<x> (buttons)
-                            └──────────────► back to the daemon
+             │                              │
+   USB serial 115200 8N1        TCP :8787 (opt-in --tcp), mDNS-discovered,
+   "|"-delimited ASCII          nonce/HMAC handshake — the token never
+             │                  crosses the wire · SAME "|" lines
+             ▼                              ▼
+   ┌────────────────────────────┐  ┌──────────────────────────────────┐
+   │  Arduino Nano (ATmega328P) │  │  ESP32-S3 (Waveshare -LCD-1.47B) │
+   │  • SSD1306 128x32 OLED —   │  │  • ST7789 172x320 colour IPS —   │
+   │    draws the one frame it  │  │    same four rows, + status bar  │
+   │    was last sent (dumb)    │  │    and the M| terminal mirror    │
+   │  • LED (D8) plays V|<KIND> │  │  • WS2812 plays V|<KIND> in the  │
+   │  • PREV/GO/NEXT buttons    │  │    alert class's colour          │
+   │    → B|P B|N B|G B|K       │  │  • + MIRROR button → B|M / B|F   │
+   └────────────────────────────┘  │  • battery gauge, Wi-Fi config   │
+             │                     │    in NVS, deep-sleep power-off  │
+             │                     └──────────────────────────────────┘
+             │  H (hello on boot), B|<x> (buttons)        │
+             └───────────────► back to the daemon ◄───────┘
+                    (both may be connected at the same time)
 ```
 
 Two control flows worth calling out:
@@ -228,31 +324,41 @@ Two control flows worth calling out:
 - **Reset recovery.** Opening the USB serial port resets the Nano (~1.5 s). On
   boot the Arduino emits `H`; the daemon responds by re-sending the full current
   state (the current frame + re-arming the LED loop), so the display recovers
-  cleanly after any reconnect.
+  cleanly after any reconnect. A wireless device gets the same treatment when it
+  (re)connects.
+- **The wireless handshake.** The device dials the daemon, not the other way
+  round — so it works from any address the Mac never has to know. It finds the
+  listener via the `_claudemate._tcp` mDNS advertisement, then proves it knows
+  the shared token against a server-issued nonce: the **token itself never
+  crosses the wire**. `--tcp` is off unless asked for, and refuses to start
+  without a token rather than serving an unauthenticated listener.
 
 > The **triage queue** is a **stable, alphabetically-ordered** list of sessions —
 > tabs never reorder as their states change. **Urgency** (worst unacknowledged
 > **error > waiting > done**, oldest first) is tracked **separately** and drives
 > only the LED and the blinking fleet letters, never the tab order or the shown
-> tab (the selection is sticky). The OLED's top row is the selected session's
-> **name**; its state (`ERR`/`WAIT`/`DONE`/`WORK`/`IDLE`) leads the second row.
+> tab (the selection is sticky). The top row is the selected session's **name**;
+> its state (`ERR`/`WAIT`/`DONE`/`WORK`/`IDLE`) leads the second row.
 
 ---
 
 ## LED alerts & the acknowledge model
 
 The LED is driven **entirely by the daemon** via `V|<KIND>` lines — the
-firmware just plays the pattern on D8; the screen never blinks the LED on its
-own. The pattern is always the class of the **worst unacknowledged alert**
-across all sessions (`ERROR` > `INPUT` > `DONE`), so the LED loops exactly
-while something needs you:
+firmware just plays the pattern (on D8 on the Nano, on the WS2812 on the S3);
+the screen never blinks the LED on its own. The pattern is always the class of
+the **worst unacknowledged alert** across all sessions (`ERROR` > `INPUT` >
+`DONE`), so the LED loops exactly while something needs you:
 
-| Event | `V|` kind | LED pattern | Repeat until acked |
-|-------|-----------|-------------|--------------------|
-| Job (re)started (nothing else pending) | `START` | one long 1 s blink, then dark | — (one-shot) |
-| Waiting on you      | `INPUT`   | aggressive even blink (~2.8 Hz) | **loops** continuously |
-| Turn finished       | `DONE`    | cascade — 4 quick blinks, then a pause | **loops** continuously |
-| Error / retry       | `ERROR`   | super-aggressive fast strobe (~7 Hz) | **loops** continuously |
+| Event | `V|` kind | LED pattern | S3 colour | Repeat until acked |
+|-------|-----------|-------------|-----------|--------------------|
+| Job (re)started (nothing else pending) | `START` | one long 1 s blink, then dark | white | — (one-shot) |
+| Waiting on you      | `INPUT`   | aggressive even blink (~2.8 Hz) | amber | **loops** continuously |
+| Turn finished       | `DONE`    | cascade — 4 quick blinks, then a pause | green | **loops** continuously |
+| Error / retry       | `ERROR`   | super-aggressive fast strobe (~7 Hz) | red | **loops** continuously |
+
+The **rhythm is the primary channel** and is identical on both devices — colour
+is redundant reinforcement on the S3, never the only thing carrying the message.
 
 The loops run in the firmware until the daemon sends `V|OFF`. A turn ending
 becomes **done** and keeps looping until you acknowledge the session — raising
@@ -271,6 +377,38 @@ firmware stops the loop on its own after ~30 s of serial silence and shows the
 ---
 
 ## Bill of Materials
+
+### Iteration 2 — ESP32-S3, cordless
+
+| Qty | Part                                    | Notes                                  |
+|-----|-----------------------------------------|----------------------------------------|
+| 1   | **Waveshare ESP32-S3-LCD-1.47B** dev board | 1.47" 172×320 IPS (ST7789), dual-core ESP32-S3, 8 MB PSRAM, 16 MB flash, USB-C. Carries the WS2812, the Li-ion charger and the battery sense divider — so there is nothing else to solder on the board side |
+| 4   | **Kailh Choc low-profile (1350) switches** | PREV · GO · NEXT · **MIRROR**. Tactile ("Chocolate"/brown) or linear, whichever you prefer — the firmware debounces in software either way |
+| 4   | Choc keycaps (1350 footprint)           | Any low-profile cap that fits Choc stems |
+| 1   | **14500 Li-ion cell, ~800 mAh**          | AA-sized 3.7 V. Plugs straight into the board's battery header — **do not** wire anything to GPIO 1 yourself, the sense divider is already there |
+| 2   | M2 screws                               | Close the printed enclosure             |
+| —   | Thin hook-up wire                       | Four switches to GPIO 3–6, one shared GND — no resistors, no debounce caps |
+| 1   | USB-C cable                             | Flashing and charging                   |
+
+> ⚠️ **The cell must be 3.7 V Li-ion.** The board's onboard charger is a 4.2 V
+> Li-ion charger and the firmware's gauge curve and charge detection are
+> calibrated for that chemistry (`CHARGE_FULL_MV 4150`, `BATT_MIN_MV 3000` in
+> [`board_s3.h`](firmware/claude_mate_s3/board_s3.h)). A 3.2 V LiFePO4 cell would
+> be over-charged by it *and* read as flat.
+
+Pinout summary (full details in [`firmware/README.md`](firmware/README.md)):
+
+| Signal               | GPIO      | Notes                                  |
+|----------------------|-----------|----------------------------------------|
+| PREV button          | 3         | `INPUT_PULLUP`, emits `B|P`. A strapping pin, but an inert one — `STRAP_JTAG_SEL` is unburned by default |
+| GO button            | 4         | `INPUT_PULLUP`, emits `B|G` / `B|K` — same meanings as on the Nano |
+| NEXT button          | 5         | `INPUT_PULLUP`, emits `B|N`            |
+| **MIRROR** button    | 6         | `INPUT_PULLUP`, emits `B|M` (tap) / `B|F`; **hold 2 s = power off**, tap wakes |
+| Backlight            | 46        | **On-board.** GPIO 46 on the ‑1.47**B**, 48 on the original ‑1.47 — the only pin that differs between revisions, and the wrong one leaves the panel dark while the ST7789 is driven perfectly |
+| WS2812 alert LED     | 38        | On-board. Plays `V|<kind>` in the alert class's colour |
+| Battery sense        | 1         | On-board 3:1 divider. Nothing to wire   |
+
+### Iteration 1 — Arduino Nano, USB
 
 | Qty | Part                                    | Notes                                  |
 |-----|-----------------------------------------|----------------------------------------|
@@ -296,19 +434,36 @@ Pinout summary (full details in [docs/WIRING.md](docs/WIRING.md)):
 | PREV button          | D4        | `INPUT_PULLUP`, emits `B|P` (selection up; auto-repeats while held) |
 | Indication LED       | D8        | LED + series resistor to GND; plays the `V|<kind>` alert pattern |
 
-The three buttons use `INPUT_PULLUP` (other leg to GND; pressed = LOW), laid
-out left→right as **PREV | GO | NEXT**.
+Buttons on both builds use `INPUT_PULLUP` (other leg to GND; pressed = LOW),
+laid out left→right as **PREV | GO | NEXT**.
 
 ---
 
-## Enclosure & 3D model
+## Enclosures & 3D models
 
-The device lives in a two-part 3D-printed enclosure — a terracotta body with a
-felt-textured faceplate, with cut-outs for the 0.91" OLED and the three
-buttons. The printable model is
-[`assets/3d-model/claude_mate_v2.3mf`](assets/3d-model/claude_mate_v2.3mf) (3MF —
-open it in Bambu Studio, PrusaSlicer, or Cura). Print one for **personal use**
-under the project's non-commercial license.
+Both devices are 3D-printed in the same two-material look — a terracotta body
+with a felt-textured faceplate. Print either for **personal use** under the
+project's non-commercial license.
+
+| | Iteration 2 — ESP32-S3 | Iteration 1 — Arduino Nano |
+|---|---|---|
+| Model | [`claude_mate_s3.stl`](assets/3d-model/claude_mate_s3.stl) | [`claude_mate_v2.3mf`](assets/3d-model/claude_mate_v2.3mf) |
+| Format | STL — body, faceplate and the small parts, positioned as they assemble | 3MF |
+| Body size | ≈ 55 × 43 × 23 mm | — |
+| Cut-outs | 1.47" LCD on a raised angled shelf, four Choc switches, USB-C | 0.91" OLED, three round buttons, USB |
+| Holds | a 14500 cell in a tube on the back, closed by two M2 screws | the Nano and the perfboard |
+
+Open either in Bambu Studio, PrusaSlicer, or Cura. The felt look is the 1 mm
+faceplate printed in a second filament; print it in one colour and it still
+assembles the same.
+
+**Iteration 2:**
+
+| On the keyboard | Assembled | Back, with the cell tube |
+|:---:|:---:|:---:|
+| [<img src="assets/photos/v2-on-desk.jpg" width="250" alt="The ESP32-S3 Claude Mate sitting on a laptop keyboard, its colour screen showing a live session">](assets/photos/v2-on-desk.jpg) | [<img src="assets/photos/v2-device.jpg" width="250" alt="The assembled ESP32-S3 device held in a hand, four Kailh Choc keycaps and the colour screen lit">](assets/photos/v2-device.jpg) | [<img src="assets/photos/v2-enclosure.jpg" width="250" alt="The back of the printed enclosure — a cylindrical tube for the 14500 cell and a screwed-on base plate">](assets/photos/v2-enclosure.jpg) |
+
+**Iteration 1:**
 
 | On the desk | Printed enclosure | Inside |
 |:---:|:---:|:---:|
@@ -320,10 +475,25 @@ More build photos are in [`assets/photos/`](assets/photos/).
 
 ## Quick start
 
-1. **Build & flash the firmware** (`firmware/claude_mate/claude_mate.ino`) onto
-   the Arduino Nano. Install **Adafruit GFX** via the Arduino Library Manager —
-   it is the only external library needed (the SSD1306 itself is driven by the
-   bundled `softssd1306.h`, a software-I2C `Adafruit_GFX` subclass).
+1. **Build & flash the firmware** — pick your device (or do both; they coexist):
+
+   - **Arduino Nano** (`firmware/claude_mate/claude_mate.ino`). Install
+     **Adafruit GFX** via the Arduino Library Manager — it is the only external
+     library needed (the SSD1306 itself is driven by the bundled
+     `softssd1306.h`, a software-I2C `Adafruit_GFX` subclass).
+     ```sh
+     arduino-cli upload -b arduino:avr:nano:cpu=atmega328 -p /dev/cu.usbserial-XXXX \
+                        firmware/claude_mate
+     ```
+   - **ESP32-S3** (`firmware/claude_mate_s3/`). Install *GFX Library for
+     Arduino* (Arduino_GFX), then use the bundled script — **`arduino-cli
+     upload` cannot flash this board**, and `firmware/README.md` explains the
+     three reasons why:
+     ```sh
+     ./firmware/flash_s3.sh
+     ```
+     On first boot an unprovisioned board raises a Wi-Fi setup portal
+     (`Claude-Mate-XXXX`); join it from a phone and point it at your Mac.
 2. **Run the daemon** on your Mac:
    ```sh
    python3 daemon/claude_mate_daemon.py
@@ -331,6 +501,12 @@ More build photos are in [`assets/photos/`](assets/photos/).
    Try it with no hardware/Claude first:
    ```sh
    python3 daemon/claude_mate_daemon.py --mock
+   ```
+   For a **wireless** device, opt into the TCP listener — it needs a shared
+   token and **fails closed** without one, falling back to USB serial only:
+   ```sh
+   mkdir -p ~/.config/claude-mate && openssl rand -hex 32 > ~/.config/claude-mate/token
+   python3 daemon/claude_mate_daemon.py --tcp        # port 8787, advertised over mDNS
    ```
 3. **Feed it.** Pick either (or both):
    - **Hooks:** install the Claude Code hooks so session events reach the daemon.
@@ -346,8 +522,9 @@ More build photos are in [`assets/photos/`](assets/photos/).
 Step-by-step guides:
 
 - 📦 **Install** — [docs/INSTALL.md](docs/INSTALL.md)
-- 🔌 **Wiring** — [docs/WIRING.md](docs/WIRING.md)
-- 📡 **Serial protocol** — [docs/PROTOCOL.md](docs/PROTOCOL.md)
+- 🔌 **Wiring (Nano)** — [docs/WIRING.md](docs/WIRING.md)
+- 📶 **Both firmwares, flashing & provisioning** — [firmware/README.md](firmware/README.md)
+- 📡 **Line protocol** — [docs/PROTOCOL.md](docs/PROTOCOL.md)
 - ✅ **Testing** — [docs/TESTING.md](docs/TESTING.md)
 
 ### Configuration
@@ -359,6 +536,13 @@ Step-by-step guides:
 | `CLAUDE_MATE_PORT`  | autodetect       | Serial device. Autodetects `/dev/cu.usbserial*` then `/dev/cu.usbmodem*` |
 | `CLAUDE_MATE_SOCK`  | `/tmp/claude-mate.sock` | Unix socket the hooks/wrapper write to |
 | `CLAUDE_MATE_BAUD`  | `115200`         | Serial baud rate                          |
+| `CLAUDE_MATE_TCP`   | off              | `1` also serves the protocol over TCP for wireless devices (same as `--tcp`) |
+| `CLAUDE_MATE_TCP_PORT` | `8787`        | TCP listener port                         |
+| `CLAUDE_MATE_TCP_BIND` | `0.0.0.0`     | Bind address — a remote device needs a routable one; `127.0.0.1` keeps it on this machine |
+| `CLAUDE_MATE_TOKEN` / `_TOKEN_FILE` | `~/.config/claude-mate/token` | Shared secret wireless devices authenticate with. **Required** for `--tcp`; without it the listener does not start |
+
+The listener is advertised as `_claudemate._tcp` over mDNS, so a device with no
+host configured finds the daemon on its own.
 
 **PTY wrapper** environment variables:
 
@@ -476,7 +660,7 @@ the screen never switches on its own — you navigate with PREV/NEXT. The LED
 pattern is always the class of the worst *unacknowledged* alert (`ERROR` >
 `INPUT` > `DONE`), dropping to `V|OFF` when nothing needs you. GO/ACK act on the
 session **currently shown** (WYSIWYG) and never move the tab order. With zero
-sessions the OLED shows `MATE / no sessions`.
+sessions the device shows `MATE / no sessions`.
 
 ---
 
@@ -488,15 +672,16 @@ Claude Mate is built in iterations, each removing more friction than the last.
   OLED, the three buttons, and the indication LED over **USB serial**; a Python
   daemon on the Mac keeps the triage queue, renders the screen, and raises
   windows. Tethered by USB to the machine it watches.
-- **Iteration 2 — ESP32-S3 Wi-Fi remote (here).** A Waveshare
+- **Iteration 2 — ESP32-S3 Wi-Fi remote (here, shipped).** A Waveshare
   ESP32-S3-LCD-1.47B talks to the daemon **over Wi-Fi** instead of USB — a
-  genuinely wireless desk remote you can put anywhere, running on a Li-ion cell
-  with an on-screen battery gauge. Same triage model, same line protocol; the
-  transport became the network. The colour LCD adds a fourth button that opens
-  a **live mirror of a session's actual terminal**, and the follow-ons that
-  iteration 1 could only hint at — colour-coded alerts, on-battery operation —
-  are in. Iteration 1 is **unchanged and still supported**: both devices speak
-  the identical protocol and can be connected at the same time. See
+  genuinely wireless desk remote you can put anywhere, running on a 14500
+  Li-ion cell with an on-screen battery gauge and a deep-sleep power-off. Same
+  triage model, same line protocol; the transport became the network. The
+  172×320 colour LCD adds a fourth **Kailh Choc** key that opens a **live
+  mirror of a session's actual terminal**, and the follow-ons that iteration 1
+  could only hint at — colour-coded alerts, on-battery operation — are in.
+  Iteration 1 is **unchanged and still supported**: both devices speak the
+  identical protocol and can be connected at the same time. See
   [`firmware/README.md`](firmware/README.md).
 
 The goal stays fixed across every iteration: **one calm surface that tells you
@@ -512,13 +697,16 @@ claude_mate/
 ├── README.md
 ├── LICENSE · CONTRIBUTING.md · CODE_OF_CONDUCT.md · SECURITY.md
 ├── patterns.json                  # hot-reloadable state-detection tuning
-├── assets/                       # device photos + printable 3D enclosure (.3mf)
+├── assets/                       # device photos + printable 3D enclosures (.3mf, .stl)
 ├── bin/
 │   └── claude-mate-wrap           # PTY wrapper: live state + terminal FOCUS (pyte)
 ├── daemon/
-│   └── claude_mate_daemon.py      # Python daemon (pyserial only)
+│   └── claude_mate_daemon.py      # Python daemon (pyserial; --tcp adds the wireless link)
 ├── firmware/
+│   ├── README.md                  # both builds: options, wiring, flashing, provisioning
 │   ├── claude_mate/               # Arduino sketch (one-frame OLED renderer + LED)
+│   ├── claude_mate_s3/            # ESP32-S3 sketch (colour UI, Wi-Fi, mirror, battery)
+│   ├── flash_s3.sh                # the only way to flash the S3 board
 │   └── selftest/                  # hardware self-test sketch
 ├── hooks/
 │   ├── claude-status.sh           # installed to ~/.claude/hooks/
@@ -559,6 +747,22 @@ claude_mate/
   rendered TUI using `patterns.json`. It is scoped to the live status region to
   avoid false positives, but unusual terminal themes/locales may need a pattern
   tweak — which you can do live, no restart.
+- **The wireless link is authenticated, not encrypted.** The handshake is
+  nonce/HMAC and the token never crosses the wire, but the session itself is
+  **plaintext TCP** — so session names, states and, with the mirror open, raw
+  terminal contents are readable by anyone on the same network. `--tcp` is
+  opt-in and refuses to start without a token; treat it as a trusted-LAN
+  feature.
+- **`arduino-cli upload` cannot flash the ESP32-S3 board.** Its download mode
+  ignores the DTR/RTS straps, the USB link stalls partway through any large
+  transfer, and `--after hard-reset` lands back in the bootloader looking
+  exactly like a bricked board. Use `firmware/flash_s3.sh`, which works around
+  all three and verifies every 32 KB piece with a device-side hash.
+- **The S3's charge detection is inferred, not read.** The board exposes no
+  charge-status line, so charging is deduced from the cell's own voltage —
+  which is calibrated for a 14500-class Li-ion cell. A much larger cell creeps
+  too slowly for the trend fallback; the "at the regulation point" tier still
+  catches it.
 - **macOS-focused.** The daemon and wrapper target a Mac (serial device naming,
   `open`, AppleScript focus). Other platforms would need port/focus adjustments.
 
@@ -575,8 +779,8 @@ chip, and the move to a fully sticky selection.
 ## License
 
 **Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0)** —
-see [LICENSE](LICENSE). This covers the whole repo: the software, the Arduino
-firmware, the hardware design, the 3D-printable enclosure, the photos, and the
+see [LICENSE](LICENSE). This covers the whole repo: the software, both
+firmwares, the hardware design, the 3D-printable enclosures, the photos, and the
 documentation.
 
 - ✅ **Personal, non-commercial use** — build one for yourself, modify it, share
