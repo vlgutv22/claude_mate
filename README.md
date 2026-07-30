@@ -186,8 +186,10 @@ hooks are the zero-dependency feed. Use whichever fits each session.
   **PREV · GO · NEXT** (plus **MIRROR** on the S3). A short **GO** acknowledges
   the shown alert **and raises its window**; a **long-press of GO** (~0.5 s)
   acknowledges it **without** touching any window. Buttons fire instantly
-  (edge-accepted ~40 ms debounce), and every accepted press inverts the whole
-  panel for ~80 ms — instant "the device heard you" feedback.
+  (edge-accepted ~40 ms debounce), and every accepted press flashes the device
+  for ~80 ms — the Nano inverts the whole panel, the S3 turns its accent bar
+  white — instant "the device heard you" feedback, well before the daemon
+  round-trips a new frame.
 - **No auto-switch, ever** — the selection is **sticky**: only PREV/NEXT/GO
   move it, and a GO/ACK stays on the tab it acted on. An alert on another tab
   announces itself through the LED and its **blinking fleet letter**; the view
@@ -302,7 +304,7 @@ hooks are the zero-dependency feed. Use whichever fits each session.
    │    was last sent (dumb)    │  │    and the M| terminal mirror    │
    │  • LED (D8) plays V|<KIND> │  │  • WS2812 plays V|<KIND> in the  │
    │  • PREV/GO/NEXT buttons    │  │    alert class's colour          │
-   │    → B|P B|N B|G B|K       │  │  • + MIRROR button → B|M / B|F   │
+   │    → B|P B|N B|G B|K       │  │  • + MIRROR button → B|M         │
    └────────────────────────────┘  │  • battery gauge, Wi-Fi config   │
              │                     │    in NVS, deep-sleep power-off  │
              │                     └──────────────────────────────────┘
@@ -403,7 +405,7 @@ Pinout summary (full details in [`firmware/README.md`](firmware/README.md)):
 | PREV button          | 3         | `INPUT_PULLUP`, emits `B|P`. A strapping pin, but an inert one — `STRAP_JTAG_SEL` is unburned by default |
 | GO button            | 4         | `INPUT_PULLUP`, emits `B|G` / `B|K` — same meanings as on the Nano |
 | NEXT button          | 5         | `INPUT_PULLUP`, emits `B|N`            |
-| **MIRROR** button    | 6         | `INPUT_PULLUP`, emits `B|M` (tap) / `B|F`; **hold 2 s = power off**, tap wakes |
+| **MIRROR** button    | 6         | `INPUT_PULLUP`, emits `B|M` on tap; **hold 2 s = power off**, tap wakes. The hold emits nothing — it sleeps |
 | Backlight            | 46        | **On-board.** GPIO 46 on the ‑1.47**B**, 48 on the original ‑1.47 — the only pin that differs between revisions, and the wrong one leaves the panel dark while the ST7789 is driven perfectly |
 | WS2812 alert LED     | 38        | On-board. Plays `V|<kind>` in the alert class's colour |
 | Battery sense        | 1         | On-board 3:1 divider. Nothing to wire   |
@@ -448,9 +450,9 @@ project's non-commercial license.
 | | Iteration 2 — ESP32-S3 | Iteration 1 — Arduino Nano |
 |---|---|---|
 | Model | [`claude_mate_s3.stl`](assets/3d-model/claude_mate_s3.stl) | [`claude_mate_v2.3mf`](assets/3d-model/claude_mate_v2.3mf) |
-| Format | STL — body, faceplate and the small parts, positioned as they assemble | 3MF |
+| Format | STL — body, 1 mm faceplate, LCD shelf and rim in assembled position; three small parts laid out separately | 3MF |
 | Body size | ≈ 55 × 43 × 23 mm | — |
-| Cut-outs | 1.47" LCD on a raised angled shelf, four Choc switches, USB-C | 0.91" OLED, three round buttons, USB |
+| Cut-outs | 1.47" LCD on a raised shelf, four Choc switches, USB-C | 0.91" OLED, three round buttons, USB |
 | Holds | a 14500 cell in a tube on the back, closed by two M2 screws | the Nano and the perfboard |
 
 Open either in Bambu Studio, PrusaSlicer, or Cura. The felt look is the 1 mm

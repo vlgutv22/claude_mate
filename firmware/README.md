@@ -30,8 +30,11 @@ arduino-cli upload  -b arduino:avr:nano:cpu=atmega328 -p /dev/cu.usbserial-XXXX 
 ```
 
 Boards shipping the **new** bootloader need `cpu=atmega328` (as above) at
-115200; older ones want `cpu=atmega328old`. Libraries: Adafruit SSD1306 and
-Adafruit GFX.
+115200; older ones want `cpu=atmega328old`. Library: **Adafruit GFX**, and only
+that one — the SSD1306 is driven by the bundled `softssd1306.h`, a software-I2C
+`Adafruit_GFX` subclass that puts SCL on A3 (hardware SCL A5 was damaged) and
+leaves SDA on A4. Adafruit SSD1306 is *not* needed; CI compiles this sketch with
+Adafruit GFX alone.
 
 `selftest/` is a standalone sketch that exercises the OLED, buttons and LED with
 no daemon attached — flash it first when bringing up new hardware.
