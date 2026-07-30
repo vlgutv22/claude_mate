@@ -61,6 +61,14 @@
 #define NET_RETRY_MS      2000UL    // between dial / discovery attempts
 #define NET_AUTH_TIMEOUT  5000UL    // the daemon allows 5 s; so do we
 #define NET_DISCOVER_MS   4000UL    // between mDNS browses
+// An UNFINISHED portal gives up after this and goes back to joining -- but ONLY
+// on a device that already has credentials to go back to. Opening the portal is
+// now one menu item away, so opening it by accident, or changing your mind, is
+// easy; without a timeout that strands a cordless device in SETUP with no
+// daemon link and no button that exits, recoverable only by a power cycle. An
+// UNPROVISIONED device keeps the portal up indefinitely, because for it there
+// is nothing to fall back to and the portal is the entire point.
+#define NET_PORTAL_TIMEOUT 300000UL  // 5 minutes
 #define NET_AP_PREFIX     "Claude-Mate-"
 
 class MateNet {
@@ -294,6 +302,7 @@ class MateNet {
   char          _status[64] = {0};
   char          _dropWhy[48] = {0};   // why the last connection attempt failed
   unsigned long _dropAt = 0;          // ...and when (0 = nothing has failed)
+  unsigned long _portalTouched = 0;   // last portal page load, for the timeout
   char          _line[192];        // handshake line assembly
   uint8_t       _lineLen = 0;
 
@@ -544,6 +553,7 @@ class MateNet {
     _web->on("/save", HTTP_POST, [this]() { serveSave(); });
     _web->onNotFound([this]() { serveForm(); });   // any URL opens the portal
     _web->begin();
+    _portalTouched = millis();
     go(SETUP);
   }
 
@@ -556,9 +566,20 @@ class MateNet {
   void pollPortal() {
     if (_dns) _dns->processNextRequest();
     if (_web) _web->handleClient();
+    // Self-heal an abandoned portal. Only when there is something to go back
+    // to: an unprovisioned device must keep it up, since the portal is the only
+    // way it will ever be configured. The clock is reset by every page load, so
+    // a user who is mid-setup with the form open is never timed out from under
+    // them -- only a portal nobody is looking at expires.
+    if (configured() && (millis() - _portalTouched) > NET_PORTAL_TIMEOUT) {
+      note("setup timed out - rejoining");
+      stopPortal();
+      startJoin();
+    }
   }
 
   void serveForm() {
+    _portalTouched = millis();          // someone is here; do not time out
     // Scanning blocks for a couple of seconds, which is fine: in SETUP there is
     // no link to keep alive and the user is waiting on this page anyway.
     // cleanScan(), not a bare scanNetworks(): see the note there. An empty
@@ -630,6 +651,7 @@ class MateNet {
   }
 
   void serveSave() {
+    _portalTouched = millis();
     String ssid  = _web->arg("ssid");
     String pass  = _web->arg("pass");
     String token = _web->arg("token");
