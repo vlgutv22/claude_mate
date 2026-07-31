@@ -55,11 +55,13 @@
   <button class="set" id="snd" aria-pressed="true"><span class="dot"></span>MAC SOUND</button>
   <span>Arrow keys or A / W / D</span>
 </div>
-<p class="legend">Level 1 as the firmware header carries it. <b>Ledges now have steps</b> —
-  the vertical budget is one row per jump (35.3 px of apex against 32 px for two rows), which
-  is why nothing above the ground line was reachable before. Every PR is <b>+1 day</b>, a
-  stomped bug <b>+½</b>, a bug that reaches you <b>−1</b>, a priority change <b>−2</b> and it
-  can't be stomped. You start with 10 days and the level costs about 14.</p>
+<p class="legend">Level 1 as the firmware header carries it. <b>The clock is the level.</b>
+  A straight run is 1159 steps, so each tier sets what that walk should cost in days and the
+  drain is derived from it — on <b>SPRINT</b> the walk costs 5 of your 7 days, on
+  <b>HOTFIX FRIDAY</b> it costs 9 against a budget of 3, and the missing 6 have to be merged
+  out of the map. PRs pay <b>+1 day</b> falling to <b>+½</b> at the top tier, a stomped bug
+  pays <b>+½</b>, and you can never bank more days than the sprint started with. A priority
+  change costs <b>−2</b> to <b>−3</b> and cannot be stomped.</p>
 
 <script>
 (() => {
@@ -115,16 +117,48 @@ const SFX={jump:()=>beep([520,760],.055),stomp:()=>beep([300,150],.05),
   merge:()=>beep([660,880,1320],.065,"square",.055),hit:()=>beep([180,120],.09,"sawtooth",.05),
   fall:()=>beep([400,260,160],.06,"sawtooth"),ship:()=>beep([523,659,784,1047,1319],.11,"square",.06)};
 
-// DIFFICULTY changes the two numbers that actually decide a run: how much
-// schedule you start with, and how fast the things that eat it move. It does
-// NOT change the level -- the same 108 columns, so a hard run is the same route
-// under more pressure rather than a different game.
+// DIFFICULTY. The old table was three tiers that moved two numbers, and the top
+// of it was cleared first try -- because the clock was never a constraint. The
+// level is 105 tiles; at 1.45 px/step that is 1159 steps, and the drain was a
+// flat 1/420 per step, so WALKING THE WHOLE LEVEL COST 2.76 DAYS. Against a
+// 7-day budget you had two and a half times the clock you needed before merging
+// a single PR. The design doc's "the level costs ~14 days, so it cannot be
+// walked" was never true of the code; 1/420 was a guess that was never checked.
+//
+// So `walk` is now the design input and the drain is derived from it: `walk` is
+// what a perfect straight run costs, in days, and `drain` is the steps per day
+// that produces it. Beating a tier means beating that number.
+//
+//   days > walk   slack; PRs are a bonus
+//   days = walk   a perfect run exactly ties; any mistake needs a PR
+//   days < walk   the deficit IS the level -- you must merge your way across
+//
+// Higher tiers spend more axes than the clock, because "same run, less time" is
+// only one kind of harder: enemies get faster, PRs pay less, hits cost more.
+const CROSS=1159;                          // steps for a straight run, measured
+const D=w=>Math.round(CROSS/w);            // steps per day for a given walk cost
 const DIFFS=[
-  {name:"PADDED",    days:14, spd:0.32, sub:"a sprint with slack in it"},
-  {name:"COMMITTED", days:10, spd:0.42, sub:"the date is the date"},
-  {name:"CRUNCH",    days: 7, spd:0.58, sub:"someone promised a demo"},
+  {name:"SPRINT",        days:7, walk:5, spd:0.58, pr:1,    stomp:.5, bug:1,   prio:2,
+   sub:"the plan, as written"},
+  {name:"CRUNCH",        days:6, walk:6, spd:0.72, pr:1,    stomp:.5, bug:1,   prio:2,
+   sub:"someone promised a demo"},
+  {name:"CODE FREEZE",   days:5, walk:7, spd:0.88, pr:1,    stomp:.5, bug:1.5, prio:2.5,
+   sub:"the branch is cut and the date is not moving"},
+  {name:"DEATH MARCH",   days:4, walk:8, spd:1.05, pr:0.75, stomp:.5, bug:1.5, prio:3,
+   sub:"every day of slack was spent last week"},
+  {name:"HOTFIX FRIDAY", days:3, walk:9, spd:1.25, pr:0.5,  stomp:.5, bug:2,   prio:3,
+   sub:"it is already broken in production"},
 ];
-let diff=1, tutorial=true, menuRow=0;
+for(const d of DIFFS) d.drain=D(d.walk);
+let diff=0, tutorial=true, menuRow=0;
+
+// Days are written as halves and quarters all over the HUD, and "0.75 days"
+// reads like a spreadsheet rather than a schedule.
+const FRAC={".25":"¼",".5":"½",".75":"¾"};
+function dstr(n){const s=n<0?"-":"",a=Math.abs(n),w=Math.floor(a),
+  f=FRAC[String(+(a-w).toFixed(2)).replace("0","")]||"";
+  return s+((w||!f)?w:"")+f;}
+function dlabel(n){return dstr(n)+" day"+(Math.abs(n)>1?"s":"");}
 
 let S;
 function reset(){S={x:T,y:4*T,vx:0,vy:0,onGround:false,face:1,days:DIFFS[diff].days,cam:0,
@@ -140,13 +174,21 @@ function hits(px,py){const x0=Math.floor((px+1)/T),x1=Math.floor((px+12)/T),
   y0=Math.floor(py/T),y1=Math.floor((py+11)/T);
   for(let c=x0;c<=x1;c++)for(let r=y0;r<=y1;r++)if(solid(c,r))return true;return false;}
 function toast(m,c){S.msg=m;S.msgCol=c||"#e6edf3";S.flash=52;}
+// You cannot bank more schedule than the sprint was given -- merging work early
+// does not move the date, it only stops you losing it. The cap used to be a flat
+// 20 days, which on a 3-day sprint was no cap at all. When it does bite, say so:
+// a reward that silently does nothing teaches the player the wrong rule.
+function gain(v,label,col){const cap=DIFFS[diff].days;
+  if(S.days>=cap){toast(label+"  ·  already at cap","#8b949e");return;}
+  const got=Math.min(v,cap-S.days);S.days+=got;
+  toast(label+"  +"+dlabel(got),col);}
 
 function step(){
   S.t++;
   if(S.state==="ship"){S.shipT++;for(const p of S.conf){p.y+=p.vy;p.x+=p.vx;if(p.y>H)p.y=-8;}return;}
   if(S.state==="slip"||S.state==="card"||S.state==="menu")return;
   if(!S.started||document.hidden)return;
-  S.days-=1/420;
+  S.days-=1/DIFFS[diff].drain;
   if(S.days<=0){S.days=0;S.state="slip";toast("MILESTONE SLIPPED","#c4302b");SFX.fall();return;}
   S.vx=(keys.right?WALK:0)-(keys.left?WALK:0); if(S.vx)S.face=S.vx>0?1:-1;
   if(S.onGround)S.coyote=6; else if(S.coyote>0)S.coyote--;
@@ -158,6 +200,21 @@ function step(){
   const ny=S.y+S.vy;
   if(!hits(S.x,ny)){S.y=ny;S.onGround=false;}
   else{ if(S.vy>0){S.y=Math.floor((ny+11)/T)*T-12;S.onGround=true;} else S.y=Math.floor(ny/T)*T+T; S.vy=0;}
+  // RESTING CONTACT. Without this, standing still is not a state -- it is a
+  // three-frame cycle. Gravity is applied every step, so from a clean landing
+  // the character falls 0.3 px (no overlap yet, so onGround goes false), then
+  // 0.6, then on the third step it finally overlaps the floor and is snapped
+  // back out. Sampled while walking on flat ground:
+  //
+  //     y=68.0 onGround  ->  68.3  ->  68.9  ->  y=68.0 onGround  ->  ...
+  //     drawn: 68            68         69         68
+  //
+  // a 1 px vertical vibration at 20 Hz that reads as the sprite shaking, and
+  // onGround true on only a third of frames -- so coyote time, which is the
+  // thing that makes the jumps land, was being refreshed off a flickering
+  // signal. Probing one pixel down and re-seating cures both. Guarded on
+  // vy>=0 so it can never cancel the first frame of a jump.
+  if(S.vy>=0&&hits(S.x,S.y+1)){S.y=Math.floor((S.y+12)/T)*T-12;S.vy=0;S.onGround=true;}
   S.x=Math.max(0,Math.min(S.x,(COLS-1)*T));
   if(S.y>ROWS*T+40){S.days-=1;toast("-1 day · fell","#f0883e");SFX.fall();
     let c=Math.floor(S.x/T);while(c>0&&!solid(c,5)&&!solid(c,6))c--;
@@ -168,19 +225,20 @@ function step(){
     const bx=b.c,by=b.r*T+6;
     if(Math.abs(bx-S.x)<12&&Math.abs(by-S.y)<12){
       if(S.vy>.6&&S.y<by-2){b.dead=true;S.vy=-3.2;S.squashT=18;
-        S.days=Math.min(20,S.days+.5);toast("FIXED  +½ day","#40c463");SFX.stomp();}
-      else if(S.inv<=0){S.days-=1;toast("-1 day · bug","#c4302b");SFX.hit();
+        gain(DIFFS[diff].stomp,"FIXED","#40c463");SFX.stomp();}
+      else if(S.inv<=0){const c=DIFFS[diff].bug;S.days-=c;
+        toast("-"+dlabel(c)+" · bug","#c4302b");SFX.hit();
         S.x-=S.face*15;S.vy=-2.5;S.inv=75;}}}
   if(S.inv>0)S.inv--;
   for(const p of S.prios){ if(p.dead)continue;
     p.y+=p.dir*(DIFFS[diff].spd*1.3); if(p.y<=p.top||p.y>=p.bot)p.dir*=-1;
     if(Math.abs(p.c-S.x)<13&&Math.abs(p.y-S.y)<13&&S.inv<=0){
-      S.days-=2;toast("RE-SCOPED  -2 days","#d29922");SFX.hit();
+      const c=DIFFS[diff].prio;S.days-=c;
+      toast("RE-SCOPED  -"+dlabel(c),"#d29922");SFX.hit();
       S.x=Math.max(0,S.x-46);S.vy=-2.2;S.inv=80;}}
   for(const p of S.prs){ if(p.got)continue;
     if(Math.abs(p.c*T-S.x)<14&&Math.abs(p.r*T-S.y)<14){
-      p.got=true;S.merged++;S.days=Math.min(20,S.days+1);
-      toast("PR MERGED  +1 day","#a371f7");SFX.merge();}}
+      p.got=true;S.merged++;gain(DIFFS[diff].pr,"PR MERGED","#a371f7");SFX.merge();}}
   if(S.flash>0)S.flash--; if(S.squashT>0)S.squashT--;
   const right=S.cam+W;
   if(!S.seen.bug&&S.bugs.some(b=>!b.dead&&b.c>S.cam+40&&b.c<right-24))
@@ -209,7 +267,8 @@ function drawMenu(){
     ["DIFFICULTY", DIFFS[diff].name, DIFFS[diff].sub],
     ["TUTORIAL",   tutorial?"ON":"OFF",
      tutorial?"freeze and explain each new enemy":"no cards, straight in"],
-    ["START SPRINT", "", DIFFS[diff].days+" days \u00b7 15 pull requests \u00b7 108 columns"],
+    ["START SPRINT", "", DIFFS[diff].days+" days \u00b7 the walk alone costs "
+     +DIFFS[diff].walk+" \u00b7 15 PRs on the map"],
   ];
   let y=76;
   for(let i=0;i<rows.length;i++){
@@ -240,7 +299,8 @@ function draw(){
   g.fillStyle="#a371f7";g.fillText(S.merged+"/"+PRS.length,142,15);
   const d=Math.max(0,S.days),bw=78,fw=Math.round(bw*Math.min(d,DIFFS[diff].days)/DIFFS[diff].days);
   g.fillStyle="#21262d";g.fillRect(W-6-bw-32,6,bw,9);
-  g.fillStyle=d>5?"#40c463":d>2.5?"#d29922":"#c4302b";g.fillRect(W-6-bw-32,6,fw,9);
+  const fr=d/DIFFS[diff].days;
+  g.fillStyle=fr>.5?"#40c463":fr>.25?"#d29922":"#c4302b";g.fillRect(W-6-bw-32,6,fw,9);
   g.fillStyle="#e6edf3";g.fillText(Math.ceil(d)+"d",W-26,15);
   g.fillStyle="#21262d";g.fillRect(0,HUD,W,1);
   g.save();g.translate(-Math.round(S.cam),PLAY_Y);
@@ -343,8 +403,9 @@ sb.addEventListener("click",()=>{soundOn=!soundOn;
 // Everything above is in an IIFE, so a harness has no way in. This is the door:
 // it reads state, never writes it, so it cannot become a cheat by accident.
 window.__shipit=()=>({state:S&&S.state,menuRow,tutorial,
-  diff:DIFFS[diff].name,days:S&&Math.ceil(S.days),
-  spd:DIFFS[diff].spd,prs:S&&S.prs.filter(p=>p.got).length});
+  diff:DIFFS[diff].name,days:S&&S.days,spd:DIFFS[diff].spd,
+  x:S&&S.x,y:S&&S.y,vy:S&&S.vy,onGround:S&&S.onGround,t:S&&S.t,
+  merged:S&&S.merged,col:S&&Math.floor(S.x/T)});
 })();
 </script>
 </body>

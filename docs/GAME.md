@@ -53,14 +53,20 @@ bug never kills you, it eats your schedule.
 It also removes a whole UI: no lives counter, no separate timer. One number in
 the corner, counting down, and everything in the world is a claim on it.
 
-| Event | Cost / gain |
+| Event | Cost / gain (at SPRINT — the harder tiers move these) |
 |---|---|
+| Every step you take | the drain, set per tier so a straight walk costs a known number of days |
 | A bug reaches you | **−1 day**, knockback, brief invulnerability |
 | Fall in a hole | **−1 day**, respawn at the last tile you stood on |
 | Stomp a bug | **+½ day** — fixing things buys schedule |
 | A **priority change** reaches you | **−2 days** and shoved four tiles back; cannot be stomped |
 | Merge a pull request | **+1 day**, and the screen says `PR MERGED` |
-| Reach the milestone flag | level complete; unused days carry over |
+| Reach the milestone | level complete; unused days carry over |
+
+The first row is the one that was missing, and its absence made everything below
+it decorative — see the difficulty table in §3, where the walk itself is finally
+priced. **You can never hold more days than the sprint started with**: merging
+early does not move the date, it only stops you losing it.
 
 **The vertical budget is ONE ROW per jump** — and missing this shipped a broken
 level. The apex of a full jump is 35.3 px. Standing on row R and landing on row
@@ -154,23 +160,56 @@ the value — so nothing new has to be learned to start.
 
 | Row | Values | What it changes |
 |---|---|---|
-| **DIFFICULTY** | PADDED · COMMITTED · CRUNCH | starting days *and* enemy speed |
+| **DIFFICULTY** | five tiers, below | the whole economy, not just the clock |
 | **TUTORIAL** | ON · OFF | whether a new enemy freezes the game to introduce itself |
 | **START SPRINT** | — | GO begins the run |
 
-The three tiers are one axis, not two, because the level costs about 14 days to
-walk and the whole design is that you cannot walk it:
+#### The clock was never a constraint, and that is why the top tier fell first try
 
-| Tier | Days | Enemy speed | Reads as |
-|---|---|---|---|
-| **PADDED** | 14 | 0.32 px/f | a sprint with slack in it — the level is walkable, PRs are a bonus |
-| **COMMITTED** | 10 | 0.42 px/f | the date is the date — ~4 days short, so some PRs are compulsory |
-| **CRUNCH** | 7 | 0.58 px/f | someone promised a demo — nearly every PR is compulsory |
+The first version of this table was three tiers moving two numbers, and its
+hardest setting was cleared on a first attempt. The reason was not the tuning of
+the tiers — it was that **§2's central claim was false of the code**.
 
-PADDED is not "easy mode with the same route". At 14 days the optional layer
-becomes genuinely optional, which is the only version of this level a first-time
-player can finish while still learning the jump. CRUNCH does not add enemies —
-it takes away the slack, which is the same pressure the theme is about.
+This document said the level costs about 14 days to walk. Measured, it cost
+**2.76**. The level is 105 tiles, walk speed is 1.45 px/step, so a straight run
+is 1159 steps; the drain was a flat `1/420` per step, which over 1159 steps is
+2.76 days. Against the hardest budget of 7 days that is two and a half times more
+clock than the level needs, before merging a single PR. `1/420` was a guess that
+was never checked against the map, so the deadline — the thing the whole design
+rests on — was decorative.
+
+So the drain is no longer a constant. **`walk` is the design input**: what a
+perfect straight run should cost in days. The drain is derived from it as
+`1159 / walk` steps per day, and the tier is defined by the gap between that and
+what you are given:
+
+| Tier | Days | Walk costs | Deficit | Enemy | PR | Bug hit | Priority change |
+|---|---|---|---|---|---|---|---|
+| **SPRINT** | 7 | 5 | −2 (slack) | 0.58 | +1 | −1 | −2 |
+| **CRUNCH** | 6 | 6 | 0 | 0.72 | +1 | −1 | −2 |
+| **CODE FREEZE** | 5 | 7 | +2 | 0.88 | +1 | −1½ | −2½ |
+| **DEATH MARCH** | 4 | 8 | +4 | 1.05 | +¾ | −1½ | −3 |
+| **HOTFIX FRIDAY** | 3 | 9 | +6 | 1.25 | +½ | −2 | −3 |
+
+All five are measured, not asserted — a scripted walk on each tier returns the
+`Walk costs` column to within 0.02 of a day.
+
+The deficit *is* the level. At SPRINT you can walk it and PRs are a bonus, which
+is the version someone can finish while still learning the jump. At CRUNCH a
+perfect run exactly ties, so any mistake has to be merged back. Above that the
+map has to be mined: HOTFIX FRIDAY needs 6 days out of a possible 13 (15 PRs at
++½, 11 stomps at +½), and the enemies that guard them move at 1.25 px/step
+against your 1.45.
+
+Higher tiers spend more than the clock, because "same run, less time" is only one
+kind of harder. Enemies close faster, PRs pay less, and hits cost more — so at
+the top a single bug undoes four merged PRs.
+
+**You can never bank more days than the sprint started with.** The cap used to be
+a flat 20 days, which on a 3-day sprint was no cap at all. Now it is the tier's
+own budget: merging work early does not move the date, it only stops you losing
+it. When the cap does bite, the toast says `already at cap` rather than silently
+eating the reward — a reward that does nothing teaches the wrong rule.
 
 **TUTORIAL OFF skips the enemy codex**, the freeze-and-explain card that fires
 the first time each enemy type appears. It is on by default and worth leaving on
@@ -321,6 +360,24 @@ ownable; the specific work is.
   `python3 -m http.server 8931` in that directory. It exists to be played, which
   is how the vertical budget, the launch window and the character's animation
   were all found to be wrong.
+
+**Standing still must be a state, not a three-frame cycle.** Reported from play
+as the character shaking while every other animation looked fine. Gravity was
+applied every step with no resting-contact check, so from a clean landing the
+character fell 0.3 px (no overlap yet, so `onGround` went false), then 0.6, then
+on the third step finally overlapped the floor and was snapped back out:
+
+```
+y=68.0 onGround  →  68.3  →  68.9  →  y=68.0 onGround  →  …
+drawn: 68            68        69        68
+```
+
+A 1 px vertical vibration at 20 Hz, and `onGround` true on **30 %** of frames —
+so coyote time, the thing that makes the jumps land at all, was being refreshed
+off a flickering signal. Probing one pixel down each step and re-seating fixes
+both: `y` is now constant while grounded, `onGround` is true 91 % of frames, and
+the drawn pixel row never changes while standing. Guard the probe on `vy >= 0` or
+it cancels the first frame of every jump.
 
 **Sprites are three fixed poses, never a scaled one.** The squash-and-stretch on
 the character was first done with `ctx.scale(1, sy)` over a sprite drawn as 1×1

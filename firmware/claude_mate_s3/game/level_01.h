@@ -125,8 +125,11 @@ static const GameSpawn LVL1_PRIOS[] = {
 #define LVL1_PRIO_COUNT (sizeof(LVL1_PRIOS) / sizeof(LVL1_PRIOS[0]))
 
 // PULL REQUESTS -- the time economy, and the reason this is a route and not a
-// walk. The level costs ~14 days to cross and you start with 10, so some of
-// these are not optional. Every one sits OFF the safe walking line.
+// walk. What crossing COSTS is set by the difficulty tier, not by this file:
+// a straight run is 1159 steps, and each tier picks what that walk should cost
+// in days (5 at SPRINT up to 9 at HOTFIX FRIDAY) with the drain derived from it.
+// Above SPRINT the walk costs more than the budget, so some of these are not
+// optional. Every one sits OFF the safe walking line.
 static const GameSpawn LVL1_PRS[] = {
   { 14, 2, 0, 0 }, { 15, 2, 0, 0 }, { 30, 1, 0, 0 }, { 31, 1, 0, 0 },
   { 52, 2, 0, 0 }, { 53, 2, 0, 0 }, { 65, 1, 0, 0 }, { 66, 1, 0, 0 },
@@ -137,9 +140,9 @@ static const GameSpawn LVL1_PRS[] = {
 #define LVL1_START_COL   1
 #define LVL1_START_ROW   5
 #define LVL1_FLAG_COL  107
-#define LVL1_DEADLINE_DAYS 10      // NOT generous: the level costs ~14 days to
-                                   // walk, so it cannot be walked. You have to
-                                   // merge your way through it.
+// The starting budget is per-tier (7/6/5/4/3); this is the default the engine
+// uses if no tier was chosen. It is deliberately equal to the SPRINT tier.
+#define LVL1_DEADLINE_DAYS 7
 #define LVL1_NAME  "M1 \xB7 KICKOFF"
 
 // ---- palette (RGB565) -------------------------------------------------------
