@@ -1,8 +1,11 @@
 # SHIP IT — a game on the glass
 
-> **Status: design proposal.** Nothing here is implemented. This document plus
-> [`level_01.h`](../firmware/claude_mate_s3/game/level_01.h) exist so the concept
-> can be judged before an engine is written.
+> **Status: level 1 ships.** The engine, the start screen, the enemy codex, the
+> sound and the saved record all run on the device — see
+> [`ship_it.h`](../firmware/claude_mate_s3/game/ship_it.h). Levels 2–12 are
+> designed here and not built. The browser prototype in
+> [`game/proto`](../firmware/claude_mate_s3/game/proto) stays the place the feel
+> is worked out, and is kept local.
 
 A side-scroller for the ESP32-S3 companion. You are **Claude Mate**. Twelve
 levels are twelve months of a project. You walk your own contribution graph from
@@ -336,18 +339,67 @@ milestone can play through the Mac's speakers while you play on the device. That
 is a genuinely nice property of a game on a networked device, and it costs one
 new key on a verb that already ships.
 
-## 9. Two things to decide before code
+## 9. Provenance of every asset
 
-**The mascot is Anthropic's mark.** The pixel creature is the Claude Code logo.
-This repo is CC BY-NC and already says "not affiliated with Anthropic", which
-covers *reference* but is a weaker position for shipping it as a game character.
-The safe alternative reads better anyway: a sprite of **the device itself** — a
-little screen with legs, four key-caps for a face — which is unambiguously this
-project's own and is funnier. Worth a decision before art is drawn twice.
+Written down because "is any of this someone else's?" is a question that gets
+harder to answer the more art exists, and because an earlier draft of this
+section asserted an infringement that turned out not to be true.
 
-**No Mario anything.** No Nintendo music, sprites, level layouts or names. Every
-asset here is either original or GitHub's public colour ramp. The genre is not
-ownable; the specific work is.
+**The character is original.** An earlier version of this document said "the
+pixel creature is the Claude Code logo". It is not, and never was in the shipped
+sprite: `MATE_BITS` is a 14×12 rounded body with two knocked-out eye slots,
+stubby arms and two legs, drawn for this project. Anthropic's mark is a
+radiating starburst and shares no geometry with it. The claim was wrong, and
+left in the repo it read as a written admission of copying something that was
+not copied.
+
+**The terrain palette is a set of hex values.** `#9BE9A8 / #40C463 / #30A14E /
+#216E39` on `#0D1117` are GitHub's contribution ramp. Colour values are facts,
+not authorship, and a calendar heat-map is an idea rather than an expression.
+What *would* be a problem is passing the result off as a GitHub product, which
+nothing here does.
+
+**The pull-request glyph is a redrawing, not a copy.** `PR_BITS` is an 11×11
+original tracing of the shape GitHub's `git-pull-request` Octicon uses — two
+nodes, a branch line, a merge arrow. Octicons is MIT-licensed, so even a direct
+copy would be permitted with the notice retained; this is a hand-drawn
+reinterpretation at a size where almost no expressive detail survives. Credited
+here because it is derived from a recognisable design, not because it has to be.
+
+**The sound is synthesised, not sampled.** The daemon renders square and
+sawtooth waves from frequency tables at runtime (`SFX_RECIPES`). It ships no
+audio files. The *alert* path is a separate thing and does play macOS system
+sounds — but by invoking `afplay` on files already on the user's own machine,
+which is what those files are for, and it redistributes nothing.
+
+**No Mario anything.** No Nintendo music, sprites, level layouts, character or
+names. This matters less than it sounds: game *rules and mechanics are not
+copyrightable* — running, jumping and stomping an enemy are systems, and systems
+are excluded from copyright. What is protectable is the specific expression, and
+none of it is borrowed.
+
+**Everything else is written for this repo:** the level map, the enemy and
+priority-change sprites, the twelve-milestone structure, the day economy, and
+this document.
+
+### What can and cannot be owned here
+
+Worth stating plainly, because it is the most commonly misunderstood part of
+open-sourcing a game.
+
+**Ownable:** the source, the sprite art, the specific level layout, the text of
+this document, and the name — the last through trademark rather than copyright.
+
+**Not ownable:** the *idea*. "A platformer where the terrain is a contribution
+graph and the deadline is your health" is a rule set and a concept, and neither
+is protectable in any jurisdiction. Someone can read this document, build their
+own, and owe nothing. What they cannot do is take this code, this art, or this
+prose.
+
+The practical protection is therefore not the licence alone but the
+**contributor agreement** — see [`CLA.md`](../CLA.md). Without one, every
+contributor holds copyright in their own patch, and the project cannot be
+relicensed or commercialised later without going back to every one of them.
 
 ## 10. What exists so far
 

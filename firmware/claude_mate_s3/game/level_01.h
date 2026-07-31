@@ -262,9 +262,12 @@ static const char *const PRIO_BITS[PRIO_H] = {
   "000001100000",
 };
 
-// A pull request: GitHub's own glyph -- a branch line with a node at each end
-// and an arrow merging back in. Outline squares said "collectible"; this says
-// what the collectible IS.
+// A pull request. An 11x11 REDRAWING of the shape GitHub's git-pull-request
+// Octicon uses -- a branch line with a node at each end and an arrow merging
+// back in -- not a copy of it. Octicons is MIT-licensed, so a direct copy would
+// be fine with the notice kept; credited here because the design is
+// recognisable, not because it has to be. Outline squares said "collectible";
+// this says what the collectible IS.
 #define PR_W 11
 #define PR_H 11
 static const char *const PR_BITS[PR_H] = {

@@ -9,9 +9,20 @@ By participating you agree to abide by our
 
 > **License of contributions.** Claude Mate is licensed **CC BY-NC 4.0**
 > (Creative Commons Attribution-NonCommercial — see [LICENSE](LICENSE)).
-> Contributions are welcome for **personal, non-commercial** use; by submitting a
-> change you agree it is offered under that same non-commercial license.
+> Contributions are welcome for **personal, non-commercial** use.
 > **Commercial use of the project is not permitted.**
+>
+> **Contributors must also agree to the [CLA](CLA.md)** — one sentence in your
+> first pull request covers everything you contribute afterwards. You keep the
+> copyright in your own work; the agreement grants the project a licence broad
+> enough that it can be relicensed later.
+>
+> That last part is the reason it exists. Saying only "contributions are offered
+> under the same licence" leaves every contributor owning their patch under
+> CC BY-NC, which means the project could **never** change licence or be
+> published commercially without tracking down every person who ever landed a
+> line — including the ones who have changed address or moved on. It is a
+> one-way door, and it closes silently on the first merged pull request.
 
 ---
 
