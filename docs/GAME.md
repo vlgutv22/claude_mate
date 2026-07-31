@@ -62,7 +62,29 @@ the corner, counting down, and everything in the world is a claim on it.
 | Merge a pull request | **+1 day**, and the screen says `PR MERGED` |
 | Reach the milestone flag | level complete; unused days carry over |
 
-**The jump budget is two tiles, measured not chosen.** Walk 1.45 px/frame, jump
+**The vertical budget is ONE ROW per jump** — and missing this shipped a broken
+level. The apex of a full jump is 35.3 px. Standing on row R and landing on row
+R−k needs a rise of k×16:
+
+| Climb | Need | Margin | |
+|---|---|---|---|
+| 1 row | 16 px | **+19.3 px** | comfortable |
+| 2 rows | 32 px | **+3.3 px** | pixel-perfect — unreachable in practice |
+| 3 rows | 48 px | −12.7 px | impossible |
+
+Every raised ledge therefore needs **one step per row it rises**. Without those
+steps a breadth-first search over standing positions found **all seventeen pull
+requests unreachable** — the entire optional layer of the level was decoration.
+Reported from play as *"why can't I jump so high?"*, which is exactly what a
+3.3 px margin feels like.
+
+The lesson generalises past this level: horizontal reach was computed carefully
+from the start and vertical reach was never computed at all. Any level tool must
+check both, and the reachability test has to be a real search from the spawn
+point rather than a per-tile sanity check — a ledge always looks fine when you
+only compare it to its own neighbours.
+
+**The horizontal budget is two tiles, measured not chosen.** Walk 1.45 px/frame, jump
 −4.75, gravity 0.30: a full jump is airborne 31 frames and covers 45 px, i.e.
 **2.81 tiles**. A 1-tile gap clears with 29 px to spare, a 2-tile gap with 13 —
 and a **3-tile gap is impossible by 3 px**, which is worse than obviously

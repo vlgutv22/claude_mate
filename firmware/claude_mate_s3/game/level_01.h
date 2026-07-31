@@ -36,6 +36,20 @@
  *      3-tile gap (48 px)   IMPOSSIBLE -- 3 px short, which is worse than
  *                           obviously impossible because it looks reachable
  *
+ * THE VERTICAL BUDGET IS ONE ROW PER JUMP, and this one was missed the first
+ * time round -- the horizontal reach was computed carefully and the vertical
+ * never was. Apex is 35.3 px. Standing on row R and landing on row R-k needs a
+ * rise of k*16:
+ *
+ *      1 row (16 px)   +19.3 px of margin   comfortable
+ *      2 rows (32 px)   +3.3 px of margin   PIXEL-PERFECT, i.e. unreachable
+ *      3 rows (48 px)  -12.7 px             impossible
+ *
+ * Every raised ledge therefore needs ONE STEP PER ROW it rises. Without them a
+ * BFS over standing positions found ALL SEVENTEEN pull requests unreachable --
+ * the entire optional layer of the level was decoration. Reported from play as
+ * "why can't I jump so high".
+ *
  * Level 1's gaps are 1, 2, 2, 2. Later levels do NOT get a bigger jump to buy
  * wider gaps -- they get a platform in the middle. Raising the jump to clear
  * three tiles costs 2.7 tiles of height on a 7-row playfield, which makes the
@@ -53,10 +67,10 @@
 //             012345678901234567890123456789012345678901234567890123456789
 static const char LVL1_MAP[LVL1_ROWS][LVL1_COLS + 1] = {
   /*Mon*/ "............................................................................................................",
-  /*Tue*/ "..................................................................444......................................4",
-  /*Wed*/ "............................222...............................333.........................444..............4",
-  /*Thu*/ "............222.............111..........2222.....222..................222...........222...........222.....4",
-  /*Fri*/ "........................22.............333333..........................222.333.............................4",
+  /*Tue*/ "...........................................................................................................4",
+  /*Wed*/ ".............................222................................333........................444.............4",
+  /*Thu*/ ".............222............2............2222......222.........3........22............222.4.........222....4",
+  /*Fri*/ "............2...........22.2...........333333.....2...........3........222.333.......2...4.........2.......4",
   /*Sat*/ "2222222222.222222222..333333333333..333333333..333333333333..22222222..3333333333..333333333333..33333333334",
   /*Sun*/ "3333333333.333333333..444444444444..444444444..444444444444..33333333..4444444444..444444444444..44444444444",
 };
@@ -92,9 +106,9 @@ static const char LVL1_MAP[LVL1_ROWS][LVL1_COLS + 1] = {
 struct GameSpawn { uint8_t col, row, from, to; };
 
 static const GameSpawn LVL1_BUGS[] = {
-  { 15, 4, 11, 19 }, { 42, 2, 41, 44 }, { 50, 4, 47, 58 }, { 55, 4, 47, 58 },
-  { 64, 4, 61, 68 }, { 72, 2, 71, 73 }, { 76, 3, 75, 77 }, { 86, 2, 85, 87 },
-  { 91, 1, 90, 92 }, { 99, 2, 99,101 }, {103, 4, 97,106 },
+  {  13, 2,  13, 15 }, {  18, 4,  16, 19 }, {  37, 4,  36, 38 }, {  43, 2,  41, 44 },
+  {  51, 2,  51, 53 }, {  56, 4,  54, 58 }, {  64, 1,  64, 66 }, {  79, 4,  78, 80 },
+  {  86, 2,  86, 88 }, { 100, 2, 100,102 }, { 105, 4, 103,106 },
 };
 #define LVL1_BUG_COUNT (sizeof(LVL1_BUGS) / sizeof(LVL1_BUGS[0]))
 
@@ -114,11 +128,10 @@ static const GameSpawn LVL1_PRIOS[] = {
 // walk. The level costs ~14 days to cross and you start with 10, so some of
 // these are not optional. Every one sits OFF the safe walking line.
 static const GameSpawn LVL1_PRS[] = {
-  { 12, 2, 0, 0 }, { 13, 2, 0, 0 }, { 28, 1, 0, 0 }, { 29, 1, 0, 0 },
-  { 50, 2, 0, 0 }, { 51, 2, 0, 0 }, { 62, 1, 0, 0 }, { 63, 1, 0, 0 },
-  { 66, 0, 0, 0 }, { 67, 0, 0, 0 }, { 71, 2, 0, 0 }, { 76, 3, 0, 0 },
-  { 85, 2, 0, 0 }, { 90, 1, 0, 0 }, { 91, 1, 0, 0 }, { 99, 2, 0, 0 },
-  {100, 2, 0, 0 },
+  { 14, 2, 0, 0 }, { 15, 2, 0, 0 }, { 30, 1, 0, 0 }, { 31, 1, 0, 0 },
+  { 52, 2, 0, 0 }, { 53, 2, 0, 0 }, { 65, 1, 0, 0 }, { 66, 1, 0, 0 },
+  { 72, 2, 0, 0 }, { 76, 3, 0, 0 }, { 87, 2, 0, 0 }, { 92, 1, 0, 0 },
+  { 93, 1, 0, 0 }, {101, 2, 0, 0 }, {102, 2, 0, 0 },
 };
 #define LVL1_PR_COUNT (sizeof(LVL1_PRS) / sizeof(LVL1_PRS[0]))
 #define LVL1_START_COL   1
