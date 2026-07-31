@@ -26,6 +26,24 @@ By participating you agree to abide by our
 
 ---
 
+## Naming
+
+**Do not introduce new identifiers containing "claude" or "anthropic".** New
+environment variables, NVS keys, socket paths, launchd labels, package ids,
+domains and handles must be mark-free. Existing ones stay as they are, for
+compatibility.
+
+Referring to Claude Code in prose, docs and comments is fine and expected — that
+is nominative use, and it is what the project *does*. The rule is about
+**identity**, not description: the mark must not end up inside something this
+project calls itself.
+
+Do not add Anthropic logos, wordmarks, brand assets, or Anthropic's brand colours
+to new art, icons, or firmware screens. The device glyph and the game sprites are
+original to this project and must stay that way. See [TRADEMARKS.md](TRADEMARKS.md).
+
+---
+
 ## Project layout
 
 - `daemon/` — the Python daemon (`claude_mate_daemon.py`).

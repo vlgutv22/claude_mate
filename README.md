@@ -1,13 +1,17 @@
 # Claude Mate
 
 [![CI](https://github.com/vlgutv22/claude_mate/actions/workflows/ci.yml/badge.svg)](https://github.com/vlgutv22/claude_mate/actions/workflows/ci.yml)
-[![Made for Claude Code](https://img.shields.io/badge/made%20for-Claude%20Code-D97757)](https://claude.com/claude-code)
+[![Works with Claude Code](https://img.shields.io/badge/works%20with-Claude%20Code-555555)](https://claude.com/claude-code)
 [![License: CC BY-NC 4.0](https://img.shields.io/badge/license-CC%20BY--NC%204.0-lightgrey.svg)](LICENSE)
 [![Platform: macOS](https://img.shields.io/badge/platform-macOS-000000?logo=apple&logoColor=white)](docs/INSTALL.md)
 [![Daemon: Python 3.9+](https://img.shields.io/badge/daemon-Python%203.9%2B-3776AB?logo=python&logoColor=white)](daemon/claude_mate_daemon.py)
 [![Firmware: Arduino Nano](https://img.shields.io/badge/firmware-Arduino%20Nano-00979D?logo=arduino&logoColor=white)](firmware/claude_mate)
 [![Firmware: ESP32-S3](https://img.shields.io/badge/firmware-ESP32--S3-E7352C?logo=espressif&logoColor=white)](firmware/claude_mate_s3)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+
+> **Not affiliated with Anthropic.** Claude and Claude Code are trademarks of
+> Anthropic, PBC. This is an independent, non-commercial project — see
+> [TRADEMARKS.md](TRADEMARKS.md).
 
 <p align="center">
   <img src="assets/photos/v2-and-v1.jpg" alt="Both Claude Mate builds on a desk — the cordless ESP32-S3 keypad with its colour screen, the same keypad opened up around its cell, and the original Arduino Nano box with its OLED" width="760">

@@ -899,13 +899,22 @@ def real_claude():
         rp = os.path.realpath(cand)
         if rp == me or rp == wrapper:
             continue
-        # Skip our own shim (a tiny script that calls claude-mate-wrap) so a
-        # `claude` shim earlier on PATH can't cause infinite double-wrapping.
+        # Skip our own shim (a tiny script that calls this wrapper) so a `claude`
+        # shim earlier on PATH can't cause infinite double-wrapping.
+        #
+        # Match ANY name this wrapper has ever shipped under, not just the
+        # current one. The check greps the candidate for the wrapper's own
+        # filename, which quietly makes the detection depend on the wrapper
+        # never being renamed: rename it, and a user whose old shim is still on
+        # PATH gets an infinite re-exec with no output and nothing to go on.
+        # Cheap to make rename-proof now, and a trap to leave in place.
+        LEGACY_NAMES = (b"claude-mate-wrap",)
         try:
             if os.path.getsize(cand) < 8192:
                 with open(cand, "rb") as fh:
-                    if b"claude-mate-wrap" in fh.read():
-                        continue
+                    blob = fh.read()
+                if any(n in blob for n in LEGACY_NAMES):
+                    continue
         except OSError:
             pass
         return cand
