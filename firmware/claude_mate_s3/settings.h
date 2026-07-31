@@ -133,6 +133,12 @@ class MateSettings {
     Preferences p;
     if (p.begin(UI_NS, false))  { p.clear(); p.end(); }
     if (p.begin(NET_NS, false)) { p.clear(); p.end(); }
+    // ...and the game record. A "factory reset" that left a high score behind
+    // would be a lie in the same way one that left the WiFi credentials is.
+    // Named literally rather than via GAME_NS: settings.h is included BEFORE
+    // the game header, and a reset that silently skipped a namespace because
+    // of include order is exactly the bug this comment exists to prevent.
+    if (p.begin("mate-game", false)) { p.clear(); p.end(); }
   }
 
  private:

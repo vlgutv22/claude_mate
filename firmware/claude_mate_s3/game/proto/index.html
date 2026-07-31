@@ -152,6 +152,28 @@ const DIFFS=[
 for(const d of DIFFS) d.drain=D(d.walk);
 let diff=0, tutorial=true, menuRow=0;
 
+// PROGRESS. localStorage here, NVS on the device (see ShipProgress in
+// game/ship_it.h) -- same rules either side so the two agree about what a
+// record IS. A harder tier wins outright and RESETS the numbers rather than
+// keeping the old ones: 12 PRs on SPRINT and 12 on HOTFIX FRIDAY are not the
+// same achievement. An easier tier still marks the level cleared but never
+// downgrades the record.
+const LEVELS=12, PKEY="shipit.progress.v1";
+let prog={done:0,tier:-1,prs:0,days:0};
+try{ const raw=localStorage.getItem(PKEY); if(raw)prog=JSON.parse(raw); }catch(e){}
+const progCount=()=>{let n=0;for(let i=0;i<LEVELS;i++)if(prog.done&(1<<i))n++;return n;};
+function progRecord(lvl,tier,prs,days){
+  const done=prog.done|(1<<lvl);
+  let best=false;
+  if(prog.tier<0||tier>prog.tier) best=true;
+  else if(tier===prog.tier) best=(prs>prog.prs)||(prs===prog.prs&&days>prog.days);
+  if(!best&&done===prog.done) return false;
+  if(best){prog.tier=tier;prog.prs=prs;prog.days=days;}
+  prog.done=done;
+  try{ localStorage.setItem(PKEY,JSON.stringify(prog)); }catch(e){}
+  return best;
+}
+
 // Days are written as halves and quarters all over the HUD, and "0.75 days"
 // reads like a spreadsheet rather than a schedule.
 const FRAC={".25":"¼",".5":"½",".75":"¾"};
@@ -246,6 +268,9 @@ function step(){
   else if(!S.seen.prio&&S.prios.some(p=>!p.dead&&p.c>S.cam+40&&p.c<right-24))
     {S.seen.prio=true;S.card="prio";S.state="card";SFX.hit();}
   if(Math.floor(S.x/T)>=COLS-2){S.state="ship";S.shipT=0;SFX.ship();
+    // Written the moment the level is cleared, not when the screen is
+    // dismissed: the run is over either way.
+    S.newBest=progRecord(0,diff,S.merged,Math.max(0,S.days));
     for(let i=0;i<44;i++)S.conf.push({x:Math.random()*W,y:-Math.random()*90,
       vy:.7+Math.random()*1.9,vx:(Math.random()-.5)*.7,
       c:["#9be9a8","#40c463","#30a14e","#a371f7","#d97757"][(Math.random()*5)|0]});}
@@ -270,7 +295,9 @@ function drawMenu(){
     ["START SPRINT", "", DIFFS[diff].days+" days \u00b7 the walk alone costs "
      +DIFFS[diff].walk+" \u00b7 15 PRs on the map"],
   ];
-  let y=76;
+  // 72 with a 28 pitch, not 76/30: the third row's sub-line sat at 146 and the
+  // record line lands at 150, so they overlapped by four pixels.
+  let y=72;
   for(let i=0;i<rows.length;i++){
     const sel=i===menuRow;
     if(sel){ g.fillStyle="#161b22"; g.fillRect(10,y-11,W-20,22); 
@@ -283,9 +310,18 @@ function drawMenu(){
     }
     g.font="9px ui-monospace,Menlo,monospace"; g.fillStyle="#6e7681";
     g.fillText(rows[i][2],20,y+10);
-    y+=30;
+    y+=28;
   }
-  g.font="9px ui-monospace,Menlo,monospace"; g.fillStyle="#6e7681";
+  // The record, where you CHOOSE the run rather than only where you end one.
+  g.font="9px ui-monospace,Menlo,monospace";
+  let rec="no milestone shipped yet", rcol="#484f58";
+  if(prog.tier>=0){
+    rec="best: "+DIFFS[prog.tier].name+"   "+prog.prs+"/"+PRS.length+" PRs   "
+        +dstr(prog.days)+"d left";
+    rcol="#a371f7";
+  }
+  g.fillStyle=rcol; g.fillText(rec,W/2-g.measureText(rec).width/2,H-22);
+  g.fillStyle="#6e7681";
   const t="PREV / NEXT  move    GO  change or start";
   g.fillText(t,W/2-g.measureText(t).width/2,H-9);
 }
@@ -325,14 +361,21 @@ function draw(){
   g.restore();
   if(S.state==="ship"){
     for(const p of S.conf){g.fillStyle=p.c;g.fillRect(p.x|0,p.y|0,3,3);}
-    if(S.shipT>26){g.fillStyle="rgba(13,17,23,.9)";g.fillRect(0,58,W,56);
-      g.fillStyle="#40c463";g.fillRect(0,58,W,1);g.fillRect(0,113,W,1);
-      g.font="bold 16px ui-monospace,Menlo,monospace";
-      const a="MILESTONE SHIPPED";g.fillStyle="#9be9a8";
-      g.fillText(a,W/2-g.measureText(a).width/2,80);
-      g.font="10px ui-monospace,Menlo,monospace";
-      const b="v0.1.0  ·  "+S.merged+"/"+PRS.length+" merged  ·  "+Math.ceil(Math.max(0,S.days))+"d carried over";
-      g.fillStyle="#e6edf3";g.fillText(b,W/2-g.measureText(b).width/2,98);}}
+    if(S.shipT>26){
+      g.fillStyle="rgba(13,17,23,.94)";g.fillRect(0,40,W,110);
+      g.fillStyle="#40c463";g.fillRect(0,40,W,1);g.fillRect(0,149,W,1);
+      const ctr=(txt,y,col,size,bold)=>{
+        g.font=(bold?"bold ":"")+size+"px ui-monospace,Menlo,monospace";
+        g.fillStyle=col; g.fillText(txt,W/2-g.measureText(txt).width/2,y);};
+      ctr("MILESTONE SHIPPED",62,"#9be9a8",16,true);
+      ctr("M1 KICKOFF PASSED",80,"#e6edf3",10);
+      ctr(S.merged+"/"+PRS.length+" merged   "+dstr(Math.max(0,S.days))
+          +"d left   "+DIFFS[diff].name,94,"#8b949e",10);
+      ctr(S.newBest?"NEW BEST - PROGRESS SAVED":"PROGRESS SAVED",112,
+          S.newBest?"#a371f7":"#8b949e",10);
+      ctr("milestone "+progCount()+" of "+LEVELS+" - the next "
+          +(LEVELS-progCount())+" are coming soon",132,"#8b949e",10);
+      ctr("any button to go back",142,"#484f58",10);}}
   if(S.state==="card"){
     const D=S.card==="bug"
       ?{name:"BUG",col:"#c4302b",bits:BUG,lines:[["Patrols a commit. Turns at every edge.",""],["Stomp it from above","+½ day"],["Let it reach you","-1 day"]]}
@@ -402,6 +445,19 @@ sb.addEventListener("click",()=>{soundOn=!soundOn;
 
 // Everything above is in an IIFE, so a harness has no way in. This is the door:
 // it reads state, never writes it, so it cannot become a cheat by accident.
+// A test hook, and unlike __shipit it WRITES: reaching the finish screen by
+// playing takes twenty seconds of correct jumps, which is not a thing a
+// harness can do reliably, and the screen is what needs checking. Named so it
+// is obvious in a stack trace that a human did not get here by playing.
+window.__finish=(prs,days)=>{
+  S.merged=prs; S.days=days; S.state="ship"; S.shipT=40;
+  S.newBest=progRecord(0,diff,prs,days);
+  return {newBest:S.newBest,prog:{...prog}};
+};
+window.__wipeProgress=()=>{ prog={done:0,tier:-1,prs:0,days:0};
+  try{localStorage.removeItem(PKEY);}catch(e){} return {...prog}; };
+window.__progress=()=>({...prog, count:progCount()});
+window.__setTier=(t)=>{ diff=t; return DIFFS[diff].name; };
 window.__shipit=()=>({state:S&&S.state,menuRow,tutorial,
   diff:DIFFS[diff].name,days:S&&S.days,spd:DIFFS[diff].spd,
   x:S&&S.x,y:S&&S.y,vy:S&&S.vy,onGround:S&&S.onGround,t:S&&S.t,

@@ -32,7 +32,83 @@
  *   silent, and nothing in this file can change that.
  */
 
+#include <Preferences.h>
 #include "level_01.h"
+
+// Progress lives in its OWN NVS namespace, not in the settings one. A game
+// record is not a device setting: it is written on a completely different
+// schedule (once per cleared level, versus on every menu fiddle), and keeping
+// them apart means a corrupt or version-bumped settings blob cannot take your
+// record with it. factoryResetAll() clears this too -- a "factory reset" that
+// left a high score behind would be a lie in the other direction.
+#define GAME_NS "mate-game"
+
+// Twelve milestones are designed (see docs/GAME.md); one is built. The bitmask
+// is sized for all twelve now so that clearing level 2 later does not need a
+// migration of the saved blob.
+#define SHIP_LEVELS 12
+
+class ShipProgress {
+ public:
+  void begin() {
+    Preferences p;
+    if (p.begin(GAME_NS, true)) {
+      _done    = p.getUShort("done", 0);
+      _hardest = p.getUChar("tier", 0xFF);
+      _prs     = p.getUChar("prs", 0);
+      _dx10    = p.getUChar("dx10", 0);
+      p.end();
+    }
+  }
+
+  bool    cleared(uint8_t lvl) const { return _done & (1u << lvl); }
+  bool    any()     const { return _done != 0; }
+  uint8_t hardest() const { return _hardest; }      // 0xFF = never cleared
+  uint8_t bestPrs() const { return _prs; }
+  float   bestDays() const { return _dx10 / 10.0f; }
+  uint8_t count() const {
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < SHIP_LEVELS; i++) if (_done & (1u << i)) n++;
+    return n;
+  }
+
+  // Record a cleared level. Returns true if this run BEAT the stored record,
+  // which the finish screen says out loud -- silently overwriting a record is
+  // the same bug as silently discarding one.
+  //
+  // A harder tier always wins outright and RESETS the numbers rather than
+  // keeping the old ones: 12 PRs on SPRINT and 12 on HOTFIX FRIDAY are not the
+  // same achievement, so carrying the count across tiers would flatter it. An
+  // easier tier still marks the level cleared but never downgrades the record.
+  bool record(uint8_t lvl, uint8_t tier, uint8_t prs, float days) {
+    uint16_t done = _done | (1u << lvl);
+    uint8_t  dx10 = (uint8_t)(days * 10.0f + 0.5f);
+    bool     best = false;
+    if (_hardest == 0xFF || tier > _hardest) {
+      best = true;
+    } else if (tier == _hardest) {
+      best = (prs > _prs) || (prs == _prs && dx10 > _dx10);
+    }
+    if (!best && done == _done) return false;      // nothing new to write
+    if (best) { _hardest = tier; _prs = prs; _dx10 = dx10; }
+    _done = done;
+    Preferences p;
+    if (p.begin(GAME_NS, false)) {
+      p.putUShort("done", _done);
+      p.putUChar("tier", _hardest);
+      p.putUChar("prs",  _prs);
+      p.putUChar("dx10", _dx10);
+      p.end();
+    }
+    return best;
+  }
+
+ private:
+  uint16_t _done    = 0;
+  uint8_t  _hardest = 0xFF;
+  uint8_t  _prs     = 0;
+  uint8_t  _dx10    = 0;
+};
 
 // Measured, not chosen. Walk 1.45, jump -4.75, gravity 0.30 puts the apex at
 // 35.3 px and a full jump 45 px downrange: two tiles across with 13 px to spare,
@@ -70,7 +146,7 @@ public:
 
   // Called from the menu. Always lands on the start screen rather than resuming:
   // a half-finished sprint you cannot see the state of is worse than a new one.
-  void open() { begin(); _lastMs = 0; _acc = 0; }
+  void open() { begin(); _lastMs = 0; _acc = 0; prog.begin(); }
 
   Result tick();
   void   draw(Arduino_GFX *g);
@@ -86,6 +162,8 @@ public:
   // hard-references the daemon protocol stops being portable to the bench.
   // Left null, the game is simply silent.
   void (*sfx)(char) = nullptr;
+
+  ShipProgress prog;
 
   // The 4th button, forwarded from the .ino. Returns true if the game is done
   // with the screen and the caller should go back to the menu.
@@ -126,6 +204,7 @@ private:
   uint8_t  _merged = 0;
   bool     _seenBug = false, _seenPrio = false;
   uint8_t  _card    = 0;                     // 1 = bug, 2 = priority change
+  bool     _newBest = false;
   char     _msg[26] = {0};
   uint16_t _msgCol  = GH_TEXT;
 
@@ -156,6 +235,13 @@ private:
   void drawStart(Arduino_GFX *g);
   void drawPlay(Arduino_GFX *g);
   void drawCard(Arduino_GFX *g);
+  void centre(Arduino_GFX *g, uint8_t size, int16_t y, const char *t,
+              uint16_t col) {
+    g->setTextSize(size);
+    g->setTextColor(col);
+    g->setCursor(SCREEN_W / 2 - (int16_t)strlen(t) * GLYPH_W * size / 2, y);
+    g->print(t);
+  }
   void blit(Arduino_GFX *g, const char *const *b, uint8_t h, uint8_t w,
             int16_t x, int16_t y, uint16_t col, bool flip);
   void dayStr(char *out, float v) const;
@@ -434,7 +520,13 @@ inline void ShipIt::step() {
       }
   }
 
-  if ((int)(_x / T) >= COLS - 2) { _state = SHIPPED; _shipT = 0; beep('W'); }
+  if ((int)(_x / T) >= COLS - 2) {
+    _state = SHIPPED; _shipT = 0; beep('W');
+    // Written the moment the level is cleared, not when the finish screen is
+    // dismissed: the run is over either way, and a flat battery between the two
+    // must not cost you the record.
+    _newBest = prog.record(0, _tier, _merged, _days);
+  }
 
   _cam = _x - SCREEN_W / 2 + 7;
   if (_cam < 0) _cam = 0;
@@ -487,7 +579,10 @@ inline void ShipIt::drawStart(Arduino_GFX *g) {
   const char *labels[3] = {"DIFFICULTY", "TUTORIAL", "START SPRINT"};
   char sub[52], val[16];
   for (uint8_t i = 0; i < 3; i++) {
-    int16_t y = 58 + i * 34;
+    // 54 with a 32 pitch, not 58/34. The third row's sub-line ran 144..152
+    // and the record line below it starts at 150 -- eight pixels of overlap,
+    // and GFX text is TOP-left so it stacks downward into it.
+    int16_t y = 54 + i * 32;
     if (i == _row) {
       g->fillRect(0, y - 4, SCREEN_W, 30, RGB565(22, 27, 34));
       g->fillRect(0, y - 4, 3, 30, GH_MATE);
@@ -512,7 +607,19 @@ inline void ShipIt::drawStart(Arduino_GFX *g) {
     g->setTextSize(1); g->setTextColor(C_DIM);
     g->setCursor(10, y + 18); g->print(sub);
   }
-  g->setTextSize(1); g->setTextColor(C_DIMMER);
+  // The record, where you choose the run rather than only where you end one.
+  char rec[52];
+  if (!prog.any()) {
+    snprintf(rec, sizeof(rec), "no milestone shipped yet");
+  } else {
+    char ds[8]; dayStr(ds, prog.bestDays());
+    snprintf(rec, sizeof(rec), "best: %s  %d/%d PRs  %sd left",
+             SHIP_TIERS[prog.hardest() < TIERS ? prog.hardest() : 0].name,
+             prog.bestPrs(), (int)LVL1_PR_COUNT, ds);
+  }
+  g->setTextSize(1); g->setTextColor(prog.any() ? GH_PR : C_DIMMER);
+  g->setCursor(10, 150); g->print(rec);
+  g->setTextColor(C_DIMMER);
   g->setCursor(10, 162); g->print("PREV/NEXT move   GO change or start   4th exit");
 }
 
@@ -524,7 +631,11 @@ inline void ShipIt::drawPlay(Arduino_GFX *g) {
   g->setTextSize(1); g->setTextColor(GH_TEXT);
   g->setCursor(6, 8); g->print(LVL1_NAME);
   blit(g, PR_BITS, PR_H, PR_W, 128, 4, GH_PR, false);
-  char buf[24];
+  // 64, not 24. The HUD's "12/15" fits in a handful of bytes, but the finish
+  // screen's "milestone 1 of 12 - the next 11 are coming soon" is 47, and
+  // snprintf would have truncated it to "milestone 1 of 12 - the" without
+  // saying a word -- a silent wrong answer rather than a crash.
+  char buf[64];
   sprintf(buf, "%d/%d", _merged, (int)LVL1_PR_COUNT);
   g->setTextColor(GH_PR); g->setCursor(143, 8); g->print(buf);
 
@@ -588,21 +699,40 @@ inline void ShipIt::drawPlay(Arduino_GFX *g) {
 
   // ---- footer ----
   if (_state == SLIP) {
-    g->fillRect(0, 60, SCREEN_W, 50, RGB565(13, 17, 23));
-    g->setTextSize(2); g->setTextColor(GH_BUG);
-    g->setCursor(40, 72); g->print("MILESTONE SLIPPED");
-    g->setTextSize(1); g->setTextColor(C_DIM);
-    g->setCursor(78, 94); g->print("any button to go back");
+    g->fillRect(0, 56, SCREEN_W, 58, RGB565(13, 17, 23));
+    g->fillRect(0, 56, SCREEN_W, 1, GH_BUG);
+    g->fillRect(0, 113, SCREEN_W, 1, GH_BUG);
+    centre(g, 2, 66, "MILESTONE SLIPPED", GH_BUG);
+    snprintf(buf, sizeof(buf), "%d/%d merged - ran out of days",
+             _merged, (int)LVL1_PR_COUNT);
+    centre(g, 1, 90, buf, C_DIM);
+    centre(g, 1, 102, "any button to go back", C_DIMMER);
   } else if (_state == SHIPPED) {
-    g->fillRect(0, 58, SCREEN_W, 56, RGB565(13, 17, 23));
-    g->fillRect(0, 58, SCREEN_W, 1, GH_L2);
-    g->fillRect(0, 113, SCREEN_W, 1, GH_L2);
-    g->setTextSize(2); g->setTextColor(GH_L1);
-    g->setCursor(44, 72); g->print("MILESTONE SHIPPED");
-    g->setTextSize(1); g->setTextColor(C_DIM);
-    sprintf(buf, "%d/%d merged - %dd left", _merged, (int)LVL1_PR_COUNT,
-            (int)ceilf(_days));
-    g->setCursor(88, 96); g->print(buf);
+    // The whole panel, not a strip. Finishing a level is the one moment the
+    // game has earned the screen, and the terrain keeps flashing green behind
+    // the edges while this is up.
+    g->fillRect(0, 40, SCREEN_W, 110, RGB565(13, 17, 23));
+    g->fillRect(0, 40, SCREEN_W, 1, GH_L2);
+    g->fillRect(0, 149, SCREEN_W, 1, GH_L2);
+
+    centre(g, 2, 50, "MILESTONE SHIPPED", GH_L1);
+    snprintf(buf, sizeof(buf), "%s PASSED", LVL1_NAME);
+    centre(g, 1, 72, buf, GH_TEXT);
+
+    char ds[8]; dayStr(ds, _days);
+    snprintf(buf, sizeof(buf), "%d/%d merged  %sd left  %s",
+             _merged, (int)LVL1_PR_COUNT, ds, d.name);
+    centre(g, 1, 86, buf, C_DIM);
+
+    // Say which of the two happened. A record silently overwritten and a record
+    // silently discarded look identical from here, and both are worth knowing.
+    centre(g, 1, 104, _newBest ? "NEW BEST - PROGRESS SAVED" : "PROGRESS SAVED",
+           _newBest ? GH_PR : C_DIM);
+
+    snprintf(buf, sizeof(buf), "milestone %d of %d - the next %d are coming soon",
+             prog.count(), SHIP_LEVELS, SHIP_LEVELS - prog.count());
+    centre(g, 1, 124, buf, C_DIM);
+    centre(g, 1, 138, "any button to go back", C_DIMMER);
   } else if (_flash && _msg[0]) {
     g->setTextSize(1); g->setTextColor(_msgCol);
     int16_t w = (int16_t)strlen(_msg) * GLYPH_W;
