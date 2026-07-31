@@ -45,20 +45,20 @@
 #include <stdint.h>
 
 #define LVL1_ROWS 7
-#define LVL1_COLS 60
+#define LVL1_COLS 108
 #define LVL1_TILE 16          // px; 7 rows x 16 = 112 px of playfield
 
 // ---- the sprint -------------------------------------------------------------
 // col:        0         1         2         3         4         5
 //             012345678901234567890123456789012345678901234567890123456789
 static const char LVL1_MAP[LVL1_ROWS][LVL1_COLS + 1] = {
-  /*Mon*/     "............................................................",
-  /*Tue*/     "...........................................................4",
-  /*Wed*/     "............................222............................4",
-  /*Thu*/     "............222.............111..........2222.....222......4",
-  /*Fri*/     "........................22.............333333..............4",
-  /*Sat*/     "2222222222.222222222..333333333333..333333333..3333333333334",
-  /*Sun*/     "3333333333.333333333..444444444444..444444444..4444444444444",
+  /*Mon*/ "............................................................................................................",
+  /*Tue*/ "..................................................................444......................................4",
+  /*Wed*/ "............................222...............................333.........................444..............4",
+  /*Thu*/ "............222.............111..........2222.....222..................222...........222...........222.....4",
+  /*Fri*/ "........................22.............333333..........................222.333.............................4",
+  /*Sat*/ "2222222222.222222222..333333333333..333333333..333333333333..22222222..3333333333..333333333333..33333333334",
+  /*Sun*/ "3333333333.333333333..444444444444..444444444..444444444444..33333333..4444444444..444444444444..44444444444",
 };
 //             ^beat1    ^2 ^beat3   ^4  ^beat5     ^6 ^beat7   ^beat8   ^flag
 //
@@ -92,28 +92,41 @@ static const char LVL1_MAP[LVL1_ROWS][LVL1_COLS + 1] = {
 struct GameSpawn { uint8_t col, row, from, to; };
 
 static const GameSpawn LVL1_BUGS[] = {
-  { 15, 4, 11, 19 },      // beat 3: alone on flat ground, long patrol, easy read
-  { 42, 2, 41, 44 },      // beat 7: up on the steps, so it is met mid-climb
-  { 50, 4, 47, 58 },      // beat 8: a long patrol...
-  { 55, 4, 47, 58 },      // ...and a second one sharing it, out of phase
+  { 15, 4, 11, 19 }, { 42, 2, 41, 44 }, { 50, 4, 47, 58 }, { 55, 4, 47, 58 },
+  { 64, 4, 61, 68 }, { 72, 2, 71, 73 }, { 76, 3, 75, 77 }, { 86, 2, 85, 87 },
+  { 91, 1, 90, 92 }, { 99, 2, 99,101 }, {103, 4, 97,106 },
 };
 #define LVL1_BUG_COUNT (sizeof(LVL1_BUGS) / sizeof(LVL1_BUGS[0]))
 
-// Optional pickups: a green cell is half a day back on the deadline. All of
-// these sit ABOVE the walking line, so collecting them is always a choice to
-// leave safe ground -- which is the entire risk/reward vocabulary of the game,
-// introduced here in its gentlest possible form.
-static const GameSpawn LVL1_CELLS[] = {
-  { 12, 2, 0, 0 }, { 13, 2, 0, 0 },        // above the first ledge
-  { 28, 1, 0, 0 }, { 29, 1, 0, 0 },        // above the high ledge at beat 5
-  { 50, 2, 0, 0 }, { 51, 2, 0, 0 },        // above the two-bug stretch
+// PRIORITY CHANGES. Rare -- three, against eleven bugs -- and a different
+// PROBLEM rather than a harder one. They drift vertically between `from` and
+// `to` (rows, not columns), denying a whole lane instead of a tile, and they
+// CANNOT be stomped: you do not fix a re-prioritisation by jumping on it. -2
+// days and shoved four tiles back, which is rework, which is the point.
+static const GameSpawn LVL1_PRIOS[] = {
+  { 31, 1, 1, 4 },        // over the beat-5 climb, guarding the high PRs
+  { 67, 0, 0, 3 },        // on the high road, where the richest PRs are
+  { 93, 1, 1, 4 },        // the crunch stretch
 };
-#define LVL1_CELL_COUNT (sizeof(LVL1_CELLS) / sizeof(LVL1_CELLS[0]))
+#define LVL1_PRIO_COUNT (sizeof(LVL1_PRIOS) / sizeof(LVL1_PRIOS[0]))
 
+// PULL REQUESTS -- the time economy, and the reason this is a route and not a
+// walk. The level costs ~14 days to cross and you start with 10, so some of
+// these are not optional. Every one sits OFF the safe walking line.
+static const GameSpawn LVL1_PRS[] = {
+  { 12, 2, 0, 0 }, { 13, 2, 0, 0 }, { 28, 1, 0, 0 }, { 29, 1, 0, 0 },
+  { 50, 2, 0, 0 }, { 51, 2, 0, 0 }, { 62, 1, 0, 0 }, { 63, 1, 0, 0 },
+  { 66, 0, 0, 0 }, { 67, 0, 0, 0 }, { 71, 2, 0, 0 }, { 76, 3, 0, 0 },
+  { 85, 2, 0, 0 }, { 90, 1, 0, 0 }, { 91, 1, 0, 0 }, { 99, 2, 0, 0 },
+  {100, 2, 0, 0 },
+};
+#define LVL1_PR_COUNT (sizeof(LVL1_PRS) / sizeof(LVL1_PRS[0]))
 #define LVL1_START_COL   1
 #define LVL1_START_ROW   5
-#define LVL1_FLAG_COL   59
-#define LVL1_DEADLINE_DAYS 14      // generous; level 10 gets 6
+#define LVL1_FLAG_COL  107
+#define LVL1_DEADLINE_DAYS 10      // NOT generous: the level costs ~14 days to
+                                   // walk, so it cannot be walked. You have to
+                                   // merge your way through it.
 #define LVL1_NAME  "M1 \xB7 KICKOFF"
 
 // ---- palette (RGB565) -------------------------------------------------------

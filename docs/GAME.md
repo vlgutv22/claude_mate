@@ -55,10 +55,11 @@ the corner, counting down, and everything in the world is a claim on it.
 
 | Event | Cost / gain |
 |---|---|
-| Touch a bug from the side | **−2 days** and a knockback |
+| A bug reaches you | **−1 day**, knockback, brief invulnerability |
 | Fall in a hole | **−1 day**, respawn at the last tile you stood on |
-| Squash a bug (land on it) | free, and it is gone |
-| Collect a green cell | **+½ day** — doing the work buys the schedule |
+| Stomp a bug | **+½ day** — fixing things buys schedule |
+| A **priority change** reaches you | **−2 days** and shoved four tiles back; cannot be stomped |
+| Merge a pull request | **+1 day**, and the screen says `PR MERGED` |
 | Reach the milestone flag | level complete; unused days carry over |
 
 **The jump budget is two tiles, measured not chosen.** Walk 1.45 px/frame, jump
@@ -155,13 +156,21 @@ that happens to a sprint.
 
 | Enemy | Behaviour | Ships in |
 |---|---|---|
-| **Bug** | patrols a platform, turns at edges. Squashable | L1 |
+| **Bug** | patrols a platform, turns at edges. Stompable, and stomping pays | L1 |
+| **Priority change** | drifts vertically, denying a whole lane. **Cannot be stomped** — you do not fix a re-prioritisation by jumping on it. Rare: three, against eleven bugs | L1 |
 | **Flaky test** | blinks in and out on a fixed cycle; harmless while absent | L7 |
 | **Regression** | squashing it works — then it comes back once, angrier | L9 |
 | **Merge conflict** | static, blocks a corridor; cannot be squashed, must be routed around | L8 |
 
-Level 1 has exactly one enemy type and four instances of it. A tutorial's job
-is to teach one verb.
+**Every enemy type introduces itself.** The first time one comes on screen the
+game freezes and shows a card: the sprite at 3×, its name, and exactly what a
+collision costs. A player should never learn a rule by losing a day to it, and on
+a device with no manual, no tooltips and no mouse-over, the card is the only
+place that rule can live. Once per type, per run.
+
+Stomping paying **+½ day** is what stops the safe line being the right line. Bugs
+sit on the route you want, so "jump everything, touch nothing" is now worse than
+engaging — the same claim the PR economy makes, one verb down.
 
 ## 6. What it looks like
 
