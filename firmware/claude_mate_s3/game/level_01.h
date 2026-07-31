@@ -26,6 +26,20 @@
  * marked below. Nothing here is decorative: every gap is a jump the player has
  * already been taught, and the first of each kind is deliberately more forgiving
  * than it will ever be again.
+ *
+ * THE JUMP BUDGET IS TWO TILES, and it is a measurement rather than a choice.
+ * With walk 1.45 px/frame, jump -4.75 and gravity 0.30, a full jump is airborne
+ * 31 frames and covers 45 px -- 2.81 tiles. So:
+ *
+ *      1-tile gap (16 px)   clears with 29 px to spare
+ *      2-tile gap (32 px)   clears with 13 px to spare
+ *      3-tile gap (48 px)   IMPOSSIBLE -- 3 px short, which is worse than
+ *                           obviously impossible because it looks reachable
+ *
+ * Level 1's gaps are 1, 2, 2, 2. Later levels do NOT get a bigger jump to buy
+ * wider gaps -- they get a platform in the middle. Raising the jump to clear
+ * three tiles costs 2.7 tiles of height on a 7-row playfield, which makes the
+ * character floaty and the ceilings meaningless.
  */
 
 #include <stdint.h>
@@ -49,8 +63,11 @@ static const char LVL1_MAP[LVL1_ROWS][LVL1_COLS + 1] = {
 //             ^beat1    ^2 ^beat3   ^4  ^beat5     ^6 ^beat7   ^beat8   ^flag
 //
 // beat 1  cols  0-9   flat ground. Walk right. Nothing can hurt you.
-// beat 2  col   10    a ONE-tile gap. The first jump, and the widest margin
-//                     for error in the game: a standing jump clears it.
+// beat 2  col   10    a ONE-tile gap. The first jump, and the widest margin for
+//                     error in the game -- but you must be MOVING: a standing
+//                     jump has no horizontal speed and drops straight in.
+//                     Deliberate, and the cheapest possible way to teach that
+//                     jumping and running are one motion here.
 // beat 3  cols 11-19  flat, one bug patrolling. The first squash.
 // beat 4  cols 20-21  a TWO-tile gap. Needs a walking start, not a standing one.
 // beat 5  cols 22-33  the first climb: a step at cols 24-25 and a high ledge at

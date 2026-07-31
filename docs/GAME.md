@@ -61,6 +61,15 @@ the corner, counting down, and everything in the world is a claim on it.
 | Collect a green cell | **+½ day** — doing the work buys the schedule |
 | Reach the milestone flag | level complete; unused days carry over |
 
+**The jump budget is two tiles, measured not chosen.** Walk 1.45 px/frame, jump
+−4.75, gravity 0.30: a full jump is airborne 31 frames and covers 45 px, i.e.
+**2.81 tiles**. A 1-tile gap clears with 29 px to spare, a 2-tile gap with 13 —
+and a **3-tile gap is impossible by 3 px**, which is worse than obviously
+impossible, because it looks reachable. Later levels buy wider crossings with a
+platform in the middle, never with a bigger jump: clearing three tiles would
+need 2.7 tiles of height on a 7-row playfield, which makes the character floaty
+and every ceiling meaningless.
+
 Carrying days over is what turns twelve levels into one arc rather than twelve
 separate scores: a sloppy sprint 3 is still hurting you in sprint 9.
 
@@ -94,6 +103,25 @@ specific:
 
 And, as with MENU and SETTINGS, **game mode swallows its buttons**: none of them
 may reach the daemon, or every jump raises a terminal on the Mac.
+
+### Coyote time and jump buffering are not polish — they are required
+
+Found by playing the prototype, not by reading it. With a fixed jump arc and no
+air control, the launch window for every gap in level 1 is about **13 px, roughly
+eight frames**: jump one tile early and you land *in* the hole. Sweeping launch
+positions, only one of five timings cleared the first gap, and the level's own
+tutorial gap was the harshest jump in it.
+
+The level data was fine. The *feel* was wrong, and the fix is the standard pair
+rather than a bigger jump:
+
+- **Coyote time** — you may still jump for ~6 frames after walking off an edge.
+- **Jump buffering** — a jump pressed up to ~6 frames early fires the moment you
+  land.
+
+Twelve lines, and the same sweep then cleared **four of five** timings. Both must
+be in the firmware engine from the first commit; retrofitting them means
+re-tuning every level built without them.
 
 ## 4. The twelve levels
 
@@ -132,7 +160,7 @@ that happens to a sprint.
 | **Regression** | squashing it works — then it comes back once, angrier | L9 |
 | **Merge conflict** | static, blocks a corridor; cannot be squashed, must be routed around | L8 |
 
-Level 1 has exactly one enemy type and three instances of it. A tutorial's job
+Level 1 has exactly one enemy type and four instances of it. A tutorial's job
 is to teach one verb.
 
 ## 6. What it looks like
