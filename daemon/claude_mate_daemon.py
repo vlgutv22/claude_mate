@@ -79,11 +79,13 @@ import queue
 import secrets
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import threading
 import time
 import urllib.parse
+import wave
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -219,25 +221,49 @@ SOUND_MIN_GAP_S = 2.0          # floor between sounds, whatever the state does
 # speaker and a backlight circuit with no inductor to abuse, so if the game is to
 # make a noise at all it has to be this machine making it.
 #
-# These are the system alert sounds, chosen for LENGTH first: a jump fires
-# several times a second and anything with a tail turns into mud. Tink is 0.2 s
-# and Pop is shorter still, while Hero and Funk are only ever reached once per
-# run, at the end, where a tail is the point.
-GAME_SOUNDS = {
-    "J": "Tink.aiff",       # jump      -- the frequent one, so the shortest one
-    "S": "Pop.aiff",        # stomped a bug
-    "M": "Glass.aiff",      # merged a PR
-    "H": "Basso.aiff",      # a bug reached you
-    "R": "Sosumi.aiff",     # re-scoped by a priority change
-    "F": "Bottle.aiff",     # fell out of the world
-    "W": "Hero.aiff",       # milestone shipped
-    "X": "Funk.aiff",       # milestone slipped
+# These were macOS system alert sounds for one version, and that was wrong in a
+# way that only shows up when you play: Basso and Glass are the vocabulary of an
+# OS telling you something, not of a game. The browser prototype uses WebAudio
+# square and sawtooth oscillators, and THAT is the sound the device should make
+# -- so the recipes below are the prototype's literals, and the daemon renders
+# them to WAV once at startup rather than reaching for a file someone at Apple
+# designed for a different purpose.
+#
+#   (frequencies Hz), note seconds, waveform, peak gain
+#
+# A recipe of several frequencies is played as a SEQUENCE, one note per entry,
+# each `dur` long -- that is what makes the merge an arpeggio and the ship a
+# fanfare rather than a chord.
+SFX_RECIPES = {
+    "J": ((520, 760),                  0.055, "square",   0.050),  # jump
+    "S": ((300, 150),                  0.050, "square",   0.050),  # stomped a bug
+    "M": ((660, 880, 1320),            0.065, "square",   0.055),  # merged a PR
+    "H": ((180, 120),                  0.090, "sawtooth", 0.050),  # a bug got you
+    "R": ((180, 120),                  0.090, "sawtooth", 0.050),  # re-scoped
+    "F": ((400, 260, 160),             0.060, "sawtooth", 0.050),  # fell
+    "X": ((400, 260, 160),             0.060, "sawtooth", 0.050),  # slipped
+    "W": ((523, 659, 784, 1047, 1319), 0.110, "square",   0.060),  # shipped
 }
-# A SEPARATE floor from SOUND_MIN_GAP_S, and much smaller, because the two are
-# solving opposite problems. The alert floor exists to stop a flapping session
-# stacking overlapping afplays; 2 s here would swallow all but one jump in a
-# level. 60 ms is above the spawn cost of afplay and below any rhythm a player
-# can produce with a thumb.
+# R and X are not distinct sounds, and that is the prototype's choice rather
+# than an oversight here: a priority change reads as a hit and a slipped
+# milestone reads as a fall, which is what they are.
+
+# The prototype's gains are WebAudio linear gain into a browser, and the same
+# numbers rendered to a file and pushed through afplay land far below the system
+# alerts they sit beside -- quiet enough to miss over a fan. Everything is scaled
+# by this one factor, so the sounds keep their RELATIVE levels (the ship fanfare
+# stays the loudest) while landing somewhere a person can hear.
+SFX_GAIN     = 5.0
+SFX_RATE     = 44100
+SFX_ATTACK_S = 0.008           # the prototype's linear attack, then exp decay
+SFX_FLOOR    = 0.0008          # ...to here, which is where its ramp ends
+
+# Rendered WAVs live here. The version in the name is load-bearing: change a
+# recipe without changing it and every machine keeps playing the old sound from
+# cache forever.
+SFX_CACHE_DIR = os.path.join(
+    os.path.expanduser("~/Library/Caches/claude-mate"), "sfx-v1")
+
 GAME_SOUND_MIN_GAP_S = 0.06
 
 # A device with no token redials every couple of seconds; say what to do about
@@ -247,6 +273,69 @@ NO_TOKEN_LOG_GAP_S = 60.0
 # Sentinel for "we have not told the firmware a loop state yet", so the first
 # resolve always emits (V|OFF) and clears any stale loop left by a prior daemon.
 _LOOP_UNSET = "\x00unset"
+
+
+def _sfx_render(freqs, dur: float, wave: str, vol: float) -> bytes:
+    """One recipe -> 16-bit mono PCM, reproducing WebAudio's envelope exactly.
+
+    The prototype gives each note its own oscillator and gain node, ramps the
+    gain linearly 0 -> vol over 8 ms, then EXPONENTIALLY down to 0.0008 by the
+    note's end. The exponential matters: a linear fade of a square wave at these
+    durations sounds like a click with a tail, and the whole character of the
+    thing is in that decay curve. WebAudio's exponentialRampToValueAtTime is
+    v0 * (v1/v0)^(progress), which is what the pow() below is.
+
+    Naive (non-band-limited) square and sawtooth, deliberately. WebAudio uses
+    band-limited wavetables, so this aliases slightly where that does not -- at
+    these frequencies the difference is inaudible, and the alternative is a
+    Fourier synthesis nobody can check against the prototype by ear."""
+    frames = bytearray()
+    span   = max(dur - SFX_ATTACK_S, 1e-6)
+    ratio  = SFX_FLOOR / vol
+    peak   = min(vol * SFX_GAIN, 0.85)         # headroom against clipping
+    for f in freqs:
+        n = int(SFX_RATE * dur)
+        for i in range(n):
+            t = i / SFX_RATE
+            if t < SFX_ATTACK_S:
+                env = t / SFX_ATTACK_S
+            else:
+                env = pow(ratio, (t - SFX_ATTACK_S) / span)
+            # Phase restarts per note, as it must: the prototype creates a new
+            # oscillator for each one.
+            ph = (f * t) % 1.0
+            sample = (2.0 * ph - 1.0) if wave == "sawtooth" else (1.0 if ph < 0.5 else -1.0)
+            v = int(max(-1.0, min(1.0, peak * env * sample)) * 32767)
+            frames += struct.pack("<h", v)
+    return bytes(frames)
+
+
+def sfx_build_cache() -> dict:
+    """Render every recipe to a WAV once and return {code: path}.
+
+    Returns {} on any failure -- a game with no sound is a working game, and a
+    daemon that will not start because it could not write a beep is not."""
+    out = {}
+    try:
+        os.makedirs(SFX_CACHE_DIR, exist_ok=True)
+        for code, (freqs, dur, wave_t, vol) in SFX_RECIPES.items():
+            path = os.path.join(SFX_CACHE_DIR, f"{code}.wav")
+            if not os.path.exists(path):
+                pcm = _sfx_render(freqs, dur, wave_t, vol)
+                # Written to a temp name and renamed, so a daemon killed
+                # mid-render cannot leave a truncated WAV cached forever.
+                tmp = path + ".part"
+                with wave.open(tmp, "wb") as w:
+                    w.setnchannels(1)
+                    w.setsampwidth(2)
+                    w.setframerate(SFX_RATE)
+                    w.writeframes(pcm)
+                os.replace(tmp, path)
+            out[code] = path
+    except Exception as exc:
+        log(f"game sound: could not build the cache ({exc}); game is silent")
+        return {}
+    return out
 
 
 def log(msg: str) -> None:
@@ -1096,6 +1185,10 @@ class Screen:
         self._sound = sound
         self._last_sound_at = 0.0
         self._last_sfx_at   = 0.0
+        # Rendered lazily-but-once at construction: eight short WAVs, well
+        # under a tenth of a second of work, and doing it here means the
+        # first jump of the first run is not the one that pays for it.
+        self._sfx = sfx_build_cache() if sys.platform == "darwin" else {}
 
     # ---- selection -------------------------------------------------------- #
 
@@ -1366,14 +1459,14 @@ class Screen:
             on = self._sound
         if not on or sys.platform != "darwin":
             return
-        name = GAME_SOUNDS.get(code)
-        if not name:
+        path = self._sfx.get(code)
+        if not path:
             return
         now = time.time()
         if now - self._last_sfx_at < GAME_SOUND_MIN_GAP_S:
             return
         try:
-            subprocess.Popen(["afplay", os.path.join(SOUND_DIR, name)],
+            subprocess.Popen(["afplay", path],
                              stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL,
                              start_new_session=True)
