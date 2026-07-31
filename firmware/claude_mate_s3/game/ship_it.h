@@ -25,9 +25,11 @@
  *   step". So the nav buttons are read here, raw, with their own short debounce,
  *   and claude_mate_s3.ino suppresses its own handling while UI_GAME is up.
  *
- * - THERE IS NO SOUND. Not an omission: this board has no DAC, no speaker, and
- *   a backlight circuit with no inductor to abuse. Sound belongs to the daemon,
- *   over the link, and is not wired here yet.
+ * - THE MAC IS THE SPEAKER. This board has no DAC, no speaker and a backlight
+ *   circuit with no inductor to abuse, so a noise can only be made at the other
+ *   end of the link: the game emits `O|SFX|<code>` and the daemon plays a system
+ *   sound. The honest consequence is that a run played with the daemon down is
+ *   silent, and nothing in this file can change that.
  */
 
 #include "level_01.h"
@@ -72,6 +74,13 @@ public:
 
   Result tick();
   void   draw(Arduino_GFX *g);
+
+  // Set by the sketch to the function that puts `O|SFX|<code>` on the link. A
+  // function pointer rather than a call to the sketch directly, because this
+  // header is included BEFORE the emit path exists -- and because a game that
+  // hard-references the daemon protocol stops being portable to the bench.
+  // Left null, the game is simply silent.
+  void (*sfx)(char) = nullptr;
 
   // The 4th button, forwarded from the .ino. Returns true if the game is done
   // with the screen and the caller should go back to the menu.
@@ -133,6 +142,7 @@ private:
   void startButton(uint8_t k);               // 0 = prev, 1 = go, 2 = next
   void step();
   void toast(const char *m, uint16_t col);
+  void beep(char c) { if (sfx) sfx(c); }
   void gain(float v, const char *label, uint16_t col);
   bool solid(int c, int r) const {
     return c >= 0 && c < COLS && r >= 0 && r < ROWS && LVL1_MAP[r][c] != '.';
@@ -303,7 +313,7 @@ inline void ShipIt::step() {
   const Tier &d = SHIP_TIERS[_tier];
   _days -= d.walk / SHIP_CROSS;
   if (_days <= 0) {
-    _days = 0; _state = SLIP; toast("MILESTONE SLIPPED", C_ERROR); return;
+    _days = 0; _state = SLIP; toast("MILESTONE SLIPPED", C_ERROR); beep('X'); return;
   }
 
   _vx = (_right ? SHIP_WALK : 0) - (_left ? SHIP_WALK : 0);
@@ -315,7 +325,8 @@ inline void ShipIt::step() {
   // without them, four in five with.
   if (_onGround) _coyote = COYOTE; else if (_coyote) _coyote--;
   if (_jump && !_jumpWas) _buffer = BUFFER; else if (_buffer) _buffer--;
-  if (_buffer && _coyote) { _vy = SHIP_JUMP; _onGround = false; _buffer = _coyote = 0; }
+  if (_buffer && _coyote) { _vy = SHIP_JUMP; _onGround = false; _buffer = _coyote = 0;
+                            beep('J'); }
   if (!_jump && _vy < -1.8f) _vy = -1.8f;    // release to cut the jump short
   _jumpWas = _jump;
 
@@ -347,7 +358,7 @@ inline void ShipIt::step() {
 
   if (_y > ROWS * T + 40) {                  // fell out of the world
     _days -= 1;
-    toast("-1d  fell", C_WAIT);
+    toast("-1d  fell", C_WAIT); beep('F');
     int c = (int)(_x / T);
     while (c > 0 && !solid(c, 5) && !solid(c, 6)) c--;
     int r = 6; while (r > 0 && !solid(c, r)) r--;
@@ -366,11 +377,11 @@ inline void ShipIt::step() {
     if (fabsf(bx - _x) < 12 && fabsf(by - _y) < 12) {
       if (_vy > 0.6f && _y < by - 2) {
         b.dead = true; _vy = -3.2f; _squash = 18;
-        gain(0.5f, "FIXED", GH_L2);
+        gain(0.5f, "FIXED", GH_L2); beep('S');
       } else if (!_inv) {
         _days -= d.bug;
         char m[26], ds[8]; dayStr(ds, d.bug); sprintf(m, "-%sd  bug", ds);
-        toast(m, GH_BUG);
+        toast(m, GH_BUG); beep('H');
         _x -= _face * 15; _vy = -2.5f; _inv = 75;
       }
     }
@@ -385,7 +396,7 @@ inline void ShipIt::step() {
     if (fabsf(p.c - _x) < 13 && fabsf(p.y - _y) < 13 && !_inv) {
       _days -= d.prio;
       char m[26], ds[8]; dayStr(ds, d.prio); sprintf(m, "RE-SCOPED -%sd", ds);
-      toast(m, GH_PRIO);
+      toast(m, GH_PRIO); beep('R');
       _x = (_x > 46) ? _x - 46 : 0; _vy = -2.2f; _inv = 80;
     }
   }
@@ -395,7 +406,7 @@ inline void ShipIt::step() {
     if (p.got) continue;
     if (fabsf(p.c * T - _x) < 14 && fabsf(p.r * T - _y) < 14) {
       p.got = true; _merged++;
-      gain(d.pr, "PR MERGED", GH_PR);
+      gain(d.pr, "PR MERGED", GH_PR); beep('M');
     }
   }
 
@@ -418,7 +429,7 @@ inline void ShipIt::step() {
       }
   }
 
-  if ((int)(_x / T) >= COLS - 2) { _state = SHIPPED; _shipT = 0; }
+  if ((int)(_x / T) >= COLS - 2) { _state = SHIPPED; _shipT = 0; beep('W'); }
 
   _cam = _x - SCREEN_W / 2 + 7;
   if (_cam < 0) _cam = 0;

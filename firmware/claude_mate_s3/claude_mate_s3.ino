@@ -1668,6 +1668,21 @@ static void sendSoundPref() {
   emitLine(buf);
 }
 
+// The game's noises, made by the Mac. This board has no DAC, no speaker and a
+// backlight circuit with no inductor to abuse, so the link is the only speaker
+// there is -- which does mean a run played with the daemon down is silent, and
+// nothing can be done about that from here.
+//
+// Gated on the device's own SOUND setting as well as the daemon's: the daemon
+// would ignore these anyway with sound off, but a jump is several frames of
+// link traffic and there is no reason to spend it on something already muted.
+static void sendSfx(char code) {
+  if (!cfg.sound()) return;
+  char buf[10];
+  snprintf(buf, sizeof(buf), "O|SFX|%c", code);
+  emitLine(buf);
+}
+
 // PREV/NEXT/GO while a firmware-local screen is up. Never reaches the daemon.
 static void menuButton(char ev) {
   if (uiMode == UI_MENU) {
@@ -1950,6 +1965,7 @@ void setup() {
   // Emit hello once so a daemon already listening on USB sends full state. The
   // WiFi path sends its own H the moment the handshake completes (see loop()).
   if (Serial) { Serial.println("H"); sendSoundPref(); }
+  game.sfx = sendSfx;                       // the Mac is the game's only speaker
 }
 
 void loop() {

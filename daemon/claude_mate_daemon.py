@@ -215,6 +215,31 @@ ALERT_SOUNDS = {
 }
 SOUND_MIN_GAP_S = 2.0          # floor between sounds, whatever the state does
 
+# SHIP IT, the game on the device, over `O|SFX|<code>`. The board has no DAC, no
+# speaker and a backlight circuit with no inductor to abuse, so if the game is to
+# make a noise at all it has to be this machine making it.
+#
+# These are the system alert sounds, chosen for LENGTH first: a jump fires
+# several times a second and anything with a tail turns into mud. Tink is 0.2 s
+# and Pop is shorter still, while Hero and Funk are only ever reached once per
+# run, at the end, where a tail is the point.
+GAME_SOUNDS = {
+    "J": "Tink.aiff",       # jump      -- the frequent one, so the shortest one
+    "S": "Pop.aiff",        # stomped a bug
+    "M": "Glass.aiff",      # merged a PR
+    "H": "Basso.aiff",      # a bug reached you
+    "R": "Sosumi.aiff",     # re-scoped by a priority change
+    "F": "Bottle.aiff",     # fell out of the world
+    "W": "Hero.aiff",       # milestone shipped
+    "X": "Funk.aiff",       # milestone slipped
+}
+# A SEPARATE floor from SOUND_MIN_GAP_S, and much smaller, because the two are
+# solving opposite problems. The alert floor exists to stop a flapping session
+# stacking overlapping afplays; 2 s here would swallow all but one jump in a
+# level. 60 ms is above the spawn cost of afplay and below any rhythm a player
+# can produce with a thumb.
+GAME_SOUND_MIN_GAP_S = 0.06
+
 # A device with no token redials every couple of seconds; say what to do about
 # it at most this often, or the advice buries itself.
 NO_TOKEN_LOG_GAP_S = 60.0
@@ -1070,6 +1095,7 @@ class Screen:
         # colour, sound), which is the rule the S3's colour LED already follows.
         self._sound = sound
         self._last_sound_at = 0.0
+        self._last_sfx_at   = 0.0
 
     # ---- selection -------------------------------------------------------- #
 
@@ -1326,6 +1352,34 @@ class Screen:
             # daemon down or stall the alert path -- it is decoration.
             log(f"sound: {exc}")
             self._sound = False        # one complaint, then stop trying
+
+    def play_sfx(self, code: str) -> None:
+        """One game sound, from `O|SFX|<code>`. Same contract as _play_alert:
+        never blocks, never raises, never becomes load-bearing.
+
+        It keeps its OWN clock rather than sharing _last_sound_at. Sharing would
+        break both directions -- the 2 s alert floor would swallow a level's
+        worth of jumps, and a run of jumps would suppress a genuine ERROR alert
+        that arrived mid-game, which is exactly the alert you would want to hear.
+        """
+        with self._lock:
+            on = self._sound
+        if not on or sys.platform != "darwin":
+            return
+        name = GAME_SOUNDS.get(code)
+        if not name:
+            return
+        now = time.time()
+        if now - self._last_sfx_at < GAME_SOUND_MIN_GAP_S:
+            return
+        try:
+            subprocess.Popen(["afplay", os.path.join(SOUND_DIR, name)],
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+            self._last_sfx_at = now
+        except Exception as exc:
+            log(f"game sound: {exc}")
 
     def start_tick(self) -> None:
         """One-shot START blink (a job (re)started). The caller fires this only
@@ -2011,6 +2065,10 @@ class ButtonReader(threading.Thread):
         key, val = parts[0].strip().upper(), parts[1].strip()
         if key == "SND":
             self._screen.set_sound(val == "1")
+        elif key == "SFX":
+            # Deliberately NOT logged: a level fires hundreds of these and the
+            # log is something a person reads.
+            self._screen.play_sfx(val[:1].upper())
         else:
             log(f"unknown device option {key!r} (ignored)")
 
