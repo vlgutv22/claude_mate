@@ -146,6 +146,37 @@ Twelve lines, and the same sweep then cleared **four of five** timings. Both mus
 be in the firmware engine from the first commit; retrofitting them means
 re-tuning every level built without them.
 
+### The start screen sets the sprint, not the "difficulty"
+
+A run begins on a menu rather than in level 1, and it is driven by the same
+convention as the device SETTINGS page — PREV/NEXT move between rows, GO changes
+the value — so nothing new has to be learned to start.
+
+| Row | Values | What it changes |
+|---|---|---|
+| **DIFFICULTY** | PADDED · COMMITTED · CRUNCH | starting days *and* enemy speed |
+| **TUTORIAL** | ON · OFF | whether a new enemy freezes the game to introduce itself |
+| **START SPRINT** | — | GO begins the run |
+
+The three tiers are one axis, not two, because the level costs about 14 days to
+walk and the whole design is that you cannot walk it:
+
+| Tier | Days | Enemy speed | Reads as |
+|---|---|---|---|
+| **PADDED** | 14 | 0.32 px/f | a sprint with slack in it — the level is walkable, PRs are a bonus |
+| **COMMITTED** | 10 | 0.42 px/f | the date is the date — ~4 days short, so some PRs are compulsory |
+| **CRUNCH** | 7 | 0.58 px/f | someone promised a demo — nearly every PR is compulsory |
+
+PADDED is not "easy mode with the same route". At 14 days the optional layer
+becomes genuinely optional, which is the only version of this level a first-time
+player can finish while still learning the jump. CRUNCH does not add enemies —
+it takes away the slack, which is the same pressure the theme is about.
+
+**TUTORIAL OFF skips the enemy codex**, the freeze-and-explain card that fires
+the first time each enemy type appears. It is on by default and worth leaving on
+for one run; on a replay it is an interruption. It is a display toggle only —
+turning it off never changes what the enemies do.
+
 ## 4. The twelve levels
 
 Twelve months of a release. Difficulty is not just "more bugs" — each level
@@ -285,6 +316,21 @@ ownable; the specific work is.
 - [`firmware/claude_mate_s3/game/level_01.h`](../firmware/claude_mate_s3/game/level_01.h)
   — level 1 as data, in the format an engine would consume, with the sprites and
   the palette.
+- [`firmware/claude_mate_s3/game/proto/index.html`](../firmware/claude_mate_s3/game/proto/index.html)
+  — a playable prototype at the device's exact 320×172, kept **local only**. Run
+  `python3 -m http.server 8931` in that directory. It exists to be played, which
+  is how the vertical budget, the launch window and the character's animation
+  were all found to be wrong.
+
+**Sprites are three fixed poses, never a scaled one.** The squash-and-stretch on
+the character was first done with `ctx.scale(1, sy)` over a sprite drawn as 1×1
+rectangles. That puts fractional rectangles on the canvas, the canvas antialiases
+them, and the result read as a glitch — the character shimmered while every other
+animation looked fine, because nothing else was scaled. It is now three discrete
+bitmaps (14×12 neutral, 14×8 landing, 14×14 rising) bottom-aligned to the same
+baseline. Measured over 30 frames: zero partially-transparent pixels. The device
+has no antialiasing at all, so any effect that depends on sub-pixel coverage is
+a prototype-only illusion and must not be built on.
 
 Nothing is wired into the firmware. The next step, if the concept survives
 review, is the engine described in §7 — playfield band, tile-aligned camera,

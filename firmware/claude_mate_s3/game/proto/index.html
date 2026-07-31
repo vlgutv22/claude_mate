@@ -72,7 +72,22 @@ const ROWS=7,COLS=108,T=16,W=320,H=172,HUD=24,PLAY_Y=HUD+12;
 const RAMP={"1":"#9be9a8","2":"#40c463","3":"#30a14e","4":"#216e39"};
 const solid=(c,r)=>c>=0&&c<COLS&&r>=0&&r<ROWS&&MAP[r][c]!==".";
 
-const MATE=["01111111111100","01111111111100","01101111110110","01101111110110","01111111111100","11111111111110","11111111111110","01111111111100","01111111111100","01111111111100","00110000011000","00110000011000"];
+// THREE POSES, not one sprite scaled. g.scale(1,0.72) on a bitmap drawn as 1x1
+// fillRects turns every pixel into a FRACTIONAL rect, which the canvas
+// antialiases -- that is the shimmer that read as a glitch, and it only hit the
+// character because nothing else is ever scaled. Discrete poses are also what
+// the firmware would ship: three bitmaps, integer blits, no float anywhere.
+const MATE=["01111111111100","01111111111100","01101111110110","01101111110110",
+            "01111111111100","11111111111110","11111111111110","01111111111100",
+            "01111111111100","01111111111100","00110000011000","00110000011000"];
+// landing: flatter and wider, legs tucked
+const MATE_SQUASH=["00111111111100","01111111111110","11101111101110","11101111101110",
+                   "11111111111110","11111111111110","01111111111100","00110000011000"];
+// rising: taller and narrower, legs extended
+const MATE_STRETCH=["00011111111000","00111111111100","00110111101100","00110111101100",
+                    "00111111111100","01111111111110","01111111111110","00111111111100",
+                    "00111111111100","00111111111100","00111111111100","00011000011000",
+                    "00011000011000","00001000001000"];
 const BUG=["001000000100","000100001000","000011110000","001111111100","011110011110","111110011111","011110011110","111110011111","001111111100","010010010010"];
 const PRIO=["000001100000","000011110000","000110011000","001110011100","011110011110","111110011111","111110011111","011111111110","001110011100","000111111000","000011110000","000001100000"];
 const PR=["01110000000","11011000000","10001000000","11011001110","01110011011","00100010001","00100011011","00100001110","01110000000","11011000000","01110000000"];
@@ -100,12 +115,23 @@ const SFX={jump:()=>beep([520,760],.055),stomp:()=>beep([300,150],.05),
   merge:()=>beep([660,880,1320],.065,"square",.055),hit:()=>beep([180,120],.09,"sawtooth",.05),
   fall:()=>beep([400,260,160],.06,"sawtooth"),ship:()=>beep([523,659,784,1047,1319],.11,"square",.06)};
 
+// DIFFICULTY changes the two numbers that actually decide a run: how much
+// schedule you start with, and how fast the things that eat it move. It does
+// NOT change the level -- the same 108 columns, so a hard run is the same route
+// under more pressure rather than a different game.
+const DIFFS=[
+  {name:"PADDED",    days:14, spd:0.32, sub:"a sprint with slack in it"},
+  {name:"COMMITTED", days:10, spd:0.42, sub:"the date is the date"},
+  {name:"CRUNCH",    days: 7, spd:0.58, sub:"someone promised a demo"},
+];
+let diff=1, tutorial=true, menuRow=0;
+
 let S;
-function reset(){S={x:T,y:4*T,vx:0,vy:0,onGround:false,face:1,days:10,cam:0,
+function reset(){S={x:T,y:4*T,vx:0,vy:0,onGround:false,face:1,days:DIFFS[diff].days,cam:0,
   bugs:BUGS.map(b=>({c:b[0]*T,r:b[1],from:b[2],to:b[3],dir:1})),
   prs:PRS.map(p=>({c:p[0],r:p[1],got:false})),
   prios:PRIOS.map(p=>({c:p[0]*T,y:p[1]*T,top:p[1]*T,bot:p[2]*T,dir:1})),
-  seen:{bug:false,prio:false},card:null,merged:0,state:"play",flash:0,msg:"",
+  seen:{bug:!tutorial,prio:!tutorial},card:null,merged:0,state:"menu",flash:0,msg:"",
   msgCol:"#e6edf3",squashT:0,t:0,started:false,coyote:0,buffer:0,inv:0,shipT:0,conf:[]};}
 reset();
 const keys={left:false,right:false,jump:false},jw={v:false};
@@ -118,7 +144,7 @@ function toast(m,c){S.msg=m;S.msgCol=c||"#e6edf3";S.flash=52;}
 function step(){
   S.t++;
   if(S.state==="ship"){S.shipT++;for(const p of S.conf){p.y+=p.vy;p.x+=p.vx;if(p.y>H)p.y=-8;}return;}
-  if(S.state==="slip"||S.state==="card")return;
+  if(S.state==="slip"||S.state==="card"||S.state==="menu")return;
   if(!S.started||document.hidden)return;
   S.days-=1/420;
   if(S.days<=0){S.days=0;S.state="slip";toast("MILESTONE SLIPPED","#c4302b");SFX.fall();return;}
@@ -137,7 +163,7 @@ function step(){
     let c=Math.floor(S.x/T);while(c>0&&!solid(c,5)&&!solid(c,6))c--;
     let r=6;while(r>0&&!solid(c,r))r--; S.x=c*T;S.y=(r-1)*T;S.vy=0;S.inv=60;}
   for(const b of S.bugs){ if(b.dead)continue;
-    b.c+=b.dir*.42; const col=Math.floor((b.c+6)/T);
+    b.c+=b.dir*DIFFS[diff].spd; const col=Math.floor((b.c+6)/T);
     if(col<=b.from||col>=b.to||!solid(col,b.r+1))b.dir*=-1;
     const bx=b.c,by=b.r*T+6;
     if(Math.abs(bx-S.x)<12&&Math.abs(by-S.y)<12){
@@ -147,7 +173,7 @@ function step(){
         S.x-=S.face*15;S.vy=-2.5;S.inv=75;}}}
   if(S.inv>0)S.inv--;
   for(const p of S.prios){ if(p.dead)continue;
-    p.y+=p.dir*.55; if(p.y<=p.top||p.y>=p.bot)p.dir*=-1;
+    p.y+=p.dir*(DIFFS[diff].spd*1.3); if(p.y<=p.top||p.y>=p.bot)p.dir*=-1;
     if(Math.abs(p.c-S.x)<13&&Math.abs(p.y-S.y)<13&&S.inv<=0){
       S.days-=2;toast("RE-SCOPED  -2 days","#d29922");SFX.hit();
       S.x=Math.max(0,S.x-46);S.vy=-2.2;S.inv=80;}}
@@ -168,13 +194,51 @@ function step(){
   S.cam=Math.max(0,Math.min(S.x-W/2+7,COLS*T-W));
 }
 
+function drawMenu(){
+  g.fillStyle="#0d1117";g.fillRect(0,0,W,H);
+  // the title, with Mate standing on a little run of commits
+  g.font="bold 22px ui-monospace,Menlo,monospace";
+  g.fillStyle="#9be9a8"; g.fillText("SHIP IT",18,36);
+  g.font="9px ui-monospace,Menlo,monospace"; g.fillStyle="#8b949e";
+  g.fillText("walk your graph to the milestone",18,50);
+  for(let i=0;i<5;i++){ g.fillStyle=["#9be9a8","#40c463","#30a14e","#216e39","#40c463"][i];
+    g.fillRect(232+i*16,44,14,14); }
+  blit(MATE,246,30,"#d97757");
+
+  const rows=[
+    ["DIFFICULTY", DIFFS[diff].name, DIFFS[diff].sub],
+    ["TUTORIAL",   tutorial?"ON":"OFF",
+     tutorial?"freeze and explain each new enemy":"no cards, straight in"],
+    ["START SPRINT", "", DIFFS[diff].days+" days \u00b7 15 pull requests \u00b7 108 columns"],
+  ];
+  let y=76;
+  for(let i=0;i<rows.length;i++){
+    const sel=i===menuRow;
+    if(sel){ g.fillStyle="#161b22"; g.fillRect(10,y-11,W-20,22); 
+             g.fillStyle="#d97757"; g.fillRect(10,y-11,2,22); }
+    g.font="bold 11px ui-monospace,Menlo,monospace";
+    g.fillStyle=sel?"#e6edf3":"#8b949e"; g.fillText(rows[i][0],20,y);
+    if(rows[i][1]){
+      g.fillStyle=i===0?"#40c463":(tutorial?"#40c463":"#8b949e");
+      g.fillText(rows[i][1], W-24-g.measureText(rows[i][1]).width, y);
+    }
+    g.font="9px ui-monospace,Menlo,monospace"; g.fillStyle="#6e7681";
+    g.fillText(rows[i][2],20,y+10);
+    y+=30;
+  }
+  g.font="9px ui-monospace,Menlo,monospace"; g.fillStyle="#6e7681";
+  const t="PREV / NEXT  move    GO  change or start";
+  g.fillText(t,W/2-g.measureText(t).width/2,H-9);
+}
+
 function draw(){
+  if(S.state==="menu"){ drawMenu(); return; }
   g.fillStyle="#0d1117";g.fillRect(0,0,W,H);
   g.font="bold 10px ui-monospace,Menlo,monospace";
   g.fillStyle="#e6edf3";g.fillText("M1 · KICKOFF",6,15);
   blit(PR,128,5,"#a371f7");
   g.fillStyle="#a371f7";g.fillText(S.merged+"/"+PRS.length,142,15);
-  const d=Math.max(0,S.days),bw=78,fw=Math.round(bw*Math.min(d,14)/14);
+  const d=Math.max(0,S.days),bw=78,fw=Math.round(bw*Math.min(d,DIFFS[diff].days)/DIFFS[diff].days);
   g.fillStyle="#21262d";g.fillRect(W-6-bw-32,6,bw,9);
   g.fillStyle=d>5?"#40c463":d>2.5?"#d29922":"#c4302b";g.fillRect(W-6-bw-32,6,fw,9);
   g.fillStyle="#e6edf3";g.fillText(Math.ceil(d)+"d",W-26,15);
@@ -191,9 +255,13 @@ function draw(){
     const bob=Math.sin((S.t+p.c*9)/17)*1.6; blit(PR,p.c*T+3,p.r*T+3+bob,"#a371f7");}
   for(const b of S.bugs) if(!b.dead) blit(BUG,b.c,b.r*T+6,"#c4302b",b.dir<0);
   for(const p of S.prios) if(!p.dead) blit(PRIO,p.c,p.y+2,"#d29922");
-  let sy=1; if(S.squashT>0)sy=.72; else if(!S.onGround&&S.vy<-1)sy=1.12;
-  if(!(S.inv>0&&(S.t>>2)%2)){g.save();g.translate(Math.round(S.x),Math.round(S.y));
-    g.scale(1,sy);g.translate(0,(1-sy)*12);blit(MATE,0,0,"#d97757",S.face<0);g.restore();}
+  // pick a pose; never scale. Each pose is bottom-aligned to the feet so the
+  // character does not appear to sink or hop when it changes.
+  let pose=MATE, ph=12;
+  if(S.squashT>0){ pose=MATE_SQUASH; ph=8; }
+  else if(!S.onGround&&S.vy<-1){ pose=MATE_STRETCH; ph=14; }
+  if(!(S.inv>0&&(S.t>>2)%2))
+    blit(pose, Math.round(S.x), Math.round(S.y)+(12-ph), "#d97757", S.face<0);
   g.restore();
   if(S.state==="ship"){
     for(const p of S.conf){g.fillStyle=p.c;g.fillRect(p.x|0,p.y|0,3,3);}
@@ -246,7 +314,17 @@ const KM={ArrowLeft:"left",KeyA:"left",ArrowRight:"right",KeyD:"right",
   ArrowUp:"jump",KeyW:"jump",Space:"jump"};
 const btn={left:document.getElementById("kPrev"),jump:document.getElementById("kGo"),
   right:document.getElementById("kNext")};
+function menuButton(k){
+  if(k==="left")  menuRow=(menuRow+2)%3;
+  else if(k==="right") menuRow=(menuRow+1)%3;
+  else if(k==="jump"){
+    if(menuRow===0){ diff=(diff+1)%DIFFS.length; S.days=DIFFS[diff].days; SFX.jump(); }
+    else if(menuRow===1){ tutorial=!tutorial; S.seen={bug:!tutorial,prio:!tutorial}; SFX.jump(); }
+    else { S.state="play"; SFX.merge(); }
+  }
+}
 function set(k,v){ if(!(k in keys))return;
+  if(v&&S.state==="menu"){ menuButton(k); return; }
   if(v&&S.state==="card"){S.state="play";return;}
   if(v&&S.state==="play")S.started=true;
   keys[k]=v; btn[k]&&btn[k].classList.toggle("down",v);}
