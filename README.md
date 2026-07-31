@@ -40,7 +40,7 @@ session you have open — in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
 
 ```
         ┌──────────────────────────────────────┐
-        │ ▁▄█ CLAUDE MATE               ▰ 64%  │  ← status bar: Wi-Fi link · battery (with charging)
+        │ ▁▄█ CLAUDE MATE              ▮▮▮     │  ← status bar: Wi-Fi link · battery (3 segments)
         ├──────────────────────────────────────┤
         │ api-server                           │  ← r0: session name, in the state's colour
         │ WAIT   0:42                   work   │  ← r1: state · time-in-state · account
@@ -257,10 +257,14 @@ hooks are the zero-dependency feed. Use whichever fits each session.
   alert class's colour, and every fleet letter is drawn in its own state colour.
   The colours differ in **brightness** as well as hue, so they stay distinct for
   a red/green-colourblind reader and in direct sunlight.
-- **A battery gauge that doesn't lie** — median-of-15 spaced samples plus an EMA
-  across polls, because the board's sense divider is unfiltered and Wi-Fi TX
-  bursts dip the rail. Charging is inferred in tiers from the cell's own
-  voltage; the board exposes no charge-status line.
+- **A battery indicator that doesn't lie** — **three segments** (3 green, 2
+  amber, 1 red), not a percentage. Unplug a full cell and the voltage relaxes
+  from 4200 to ~3950 mV in minutes, so a percentage read 100 % then 79 % with
+  nothing wrong: 4200 mV is the *charger's* regulation point, surface charge is
+  not consumption, and at ~9 mV per percent the ADC noise is worth whole points.
+  Median-of-15 samples, an EMA, 60 mV of hysteresis and a 45-second hold sit
+  behind it. The exact number stays in the About page, where diagnosis wants it.
+  Charging is inferred in tiers; the board exposes no charge-status line.
 - **A live terminal mirror** — see [above](#the-terminal-mirror-esp32-s3).
 - **An on-device menu** — double-tap the 4th button. Settings (screen sleep,
   brightness, alert-LED level including a genuine *off*, flip, factory reset),

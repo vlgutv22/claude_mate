@@ -252,6 +252,13 @@ static bool mirrorOn = false;
 static char mirrorTitle[MIRROR_COLS + 1] = {0};
 static char mirrorRow[MIRROR_ROWS][MIRROR_COLS + 1] = {{0}};
 
+// The displayed level: 3, 2, 1, or -1 for "no cell". Deliberately separate from
+// battPercent, which stays exact for the `?` readout and the About page --
+// diagnosis wants the number, the glance wants the shape.
+static int8_t   battLevel     = -1;
+static int8_t   battLevelCand = -1;    // level the raw voltage is asking for...
+static unsigned long battLevelSince = 0;  // ...and how long it has asked
+
 static uint32_t battRawMv    = 0;      // this poll's median, before the EMA
 static uint32_t battFiltMv   = 0;      // EMA state (0 = not yet seeded)
 static bool     battCharging = false;  // inferred, not read from a status pin
@@ -452,9 +459,37 @@ static void pollBattery() {
   // Nothing wired to the divider reads as a floating near-zero: report "no
   // gauge" rather than a permanent 0% that would look like a dying cell.
   int pc = (mv < BATT_MIN_MV) ? -1 : battPercentFromMv(mv);
-  if (pc != battPercent) needRender = true;
   battMv = mv;
   battPercent = pc;
+
+  // ---- the displayed level: hysteresis, then a hold ----------------------
+  // Two independent guards, because they stop different things. Hysteresis
+  // stops a voltage sitting exactly on a threshold from flickering between two
+  // levels. The hold stops a genuine but BRIEF excursion -- a WiFi TX burst, a
+  // backlight step, the sag as the screen wakes -- from moving the display at
+  // all. Neither alone is enough: hysteresis lets a long sag through, and a
+  // hold alone would still flicker once it expired.
+  int8_t want;
+  if (pc < 0) {
+    want = -1;                                  // no cell wired
+  } else {
+    // Fall only after crossing the threshold by BATT_HYST_MV; rise on touch.
+    int8_t cur = battLevel > 0 ? battLevel : 0;
+    uint32_t l3 = BATT_L3_MV - (cur >= 3 ? BATT_HYST_MV : 0);
+    uint32_t l2 = BATT_L2_MV - (cur >= 2 ? BATT_HYST_MV : 0);
+    want = (mv >= l3) ? 3 : (mv >= l2) ? 2 : 1;
+  }
+  if (want != battLevelCand) {                  // a new candidate: restart the
+    battLevelCand  = want;                      // clock rather than accumulate
+    battLevelSince = now ? now : 1UL;
+  }
+  bool settled = battLevelSince &&
+                 (now - battLevelSince) >= BATT_LEVEL_HOLD_MS;
+  // First reading after boot shows immediately -- making someone stare at a
+  // blank corner for 45 s to prove a point would be its own kind of wrong.
+  if (battLevel < 0 || settled) {
+    if (want != battLevel) { battLevel = want; needRender = true; }
+  }
 
   // Charging: no status line exists on this board, so infer it. See the long
   // note by CHARGE_FULL_MV in board_s3.h for why this is sound rather than a
@@ -559,40 +594,40 @@ static void drawBolt(int16_t x, int16_t y, uint16_t col) {
 
 // Battery chip: outline, proportional fill, nub, percentage. Falls back to the
 // WiFi signal in dBm when no cell is wired, so the corner is never dead space.
+// Three segments, filled from the left, coloured by how many are lit: 3 green,
+// 2 amber, 1 red. No number -- see the note at BATT_L3_MV in board_s3.h for why
+// a percentage was actively misleading here.
 static void drawBatteryChip(int16_t right, int16_t y) {
-  if (battPercent < 0) {
+  if (battLevel < 0) {
     if (!net.connected()) return;
     char buf[12];
-    snprintf(buf, sizeof(buf), "%ddBm", net.rssi());
+    snprintf(buf, sizeof(buf), "%ddBm", (int)net.rssi());
     gfx->setTextSize(1);
     gfx->setTextColor(C_DIM);
     gfx->setCursor(right - (int16_t)strlen(buf) * GLYPH_W, y + 3);
     gfx->print(buf);
     return;
   }
-  char buf[8];
-  snprintf(buf, sizeof(buf), "%d%%", battPercent);
-  int16_t textW = (int16_t)strlen(buf) * GLYPH_W;
-  int16_t bodyW = 22, bodyH = 11;
-  int16_t bx = right - textW - 4 - bodyW - 2;
+  const int16_t segW = 9, segH = 12, gap = 3;
+  const int16_t totalW = segW * 3 + gap * 2;
+  int16_t bx = right - totalW;
   int16_t by = y + 2;
-  // Charging outranks the low-battery warning colours: a cell at 8% that is on
-  // the charger is good news, and colouring it red would say the opposite.
+
+  // Charging outranks the low-battery colours: a nearly flat cell that is ON
+  // the charger is good news, and painting it red would say the opposite.
   uint16_t col = battCharging ? C_OK
-                 : battPercent <= 10 ? C_ERROR
-                 : battPercent <= 25 ? C_WAIT : C_DIM;
-  gfx->drawRect(bx, by, bodyW, bodyH, col);
-  gfx->fillRect(bx + bodyW, by + 3, 2, bodyH - 6, col);           // the nub
-  int16_t fillW = (int16_t)((bodyW - 4) * battPercent / 100);
-  if (fillW > 0) gfx->fillRect(bx + 2, by + 2, fillW, bodyH - 4, col);
-  // The bolt sits ON TOP of the fill in the background colour, so it stays
-  // legible at 100% (all fill) and at 0% (no fill) alike -- a bolt drawn in the
-  // accent colour would vanish into a full bar.
-  if (battCharging) drawBolt(bx + bodyW / 2 - 2, by + 2, C_BG);
-  gfx->setTextSize(1);
-  gfx->setTextColor(col);
-  gfx->setCursor(right - textW, y + 2);
-  gfx->print(buf);
+                 : battLevel >= 3 ? C_DONE
+                 : battLevel == 2 ? C_WAIT : C_ERROR;
+
+  for (int8_t i = 0; i < 3; i++) {
+    int16_t sx = bx + i * (segW + gap);
+    if (i < battLevel) gfx->fillRect(sx, by, segW, segH, col);
+    else               gfx->drawRect(sx, by, segW, segH, C_DIMMER);
+  }
+  // The bolt sits ON the segments in the background colour, so it reads at
+  // three lit segments and at one alike -- drawn in the accent colour it would
+  // vanish into a filled block.
+  if (battCharging) drawBolt(bx + totalW / 2 - 2, by + 2, C_BG);
 }
 
 static void drawStatusBar() {
@@ -987,8 +1022,9 @@ static void drawAboutPage() {
     snprintf(battBuf, sizeof(battBuf), "no cell (%u mV raw)",
              (unsigned)battRawMv);
   else
-    snprintf(battBuf, sizeof(battBuf), "%d%%  %u mV  %s", battPercent,
-             (unsigned)battMv, battCharging ? "charging" : "on battery");
+    snprintf(battBuf, sizeof(battBuf), "%d/3  %d%%  %u mV  %s", (int)battLevel,
+             battPercent, (unsigned)battMv,
+             battCharging ? "charging" : "on battery");
 #else
   snprintf(battBuf, sizeof(battBuf), "gauge compiled out");
 #endif
@@ -1187,7 +1223,8 @@ static bool handleConfigLine(char *line) {
                       (unsigned)battMv, (unsigned)battRawMv,
                       (double)BATT_DIVIDER);
       else
-        Serial.printf("batt  : %d%% (%u mV filt, %u raw) %s\n", battPercent,
+        Serial.printf("batt  : level %d/3  %d%% (%u mV filt, %u raw) %s\n",
+                      (int)battLevel, battPercent,
                       (unsigned)battMv, (unsigned)battRawMv,
                       battCharging ? "charging" : "on battery");
 #else

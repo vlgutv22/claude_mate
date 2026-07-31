@@ -186,7 +186,37 @@ struct Btn {
 // this has to work without modifying it.
 #define BATT_SAMPLES    15    // odd, so the median is an actual sample
 #define BATT_SAMPLE_US  500   // spacing: spreads the burst over ~7 ms
-#define BATT_EMA_SHIFT  3     // weight 1/8 -> settles in ~8 polls (~40 s)
+#define BATT_EMA_SHIFT  4     // weight 1/16 -> settles in ~16 polls (~80 s).
+                              // Was 1/8. Nothing needs this to be fast: the
+                              // display is now three coarse levels, so the
+                              // filter can trade all of its speed for calm.
+
+// ---- Battery LEVEL (what the status bar actually shows) ---------------------
+// THREE SEGMENTS, NOT A PERCENTAGE, and the reason is a measured failure rather
+// than taste. Unplug a full cell and the reading falls from 4200 mV to about
+// 3950 mV within minutes -- so a percentage read 100 % and then 79 % with
+// nothing wrong. Both numbers were honest and the display was still a lie:
+//
+//   * 4200 mV is the CHARGER's constant-voltage point, not the cell's state of
+//     charge. While plugged in you are reading the charger, not the battery.
+//   * A Li-ion just off charge carries surface charge that relaxes over tens of
+//     minutes. That fall is not consumption.
+//   * The curve is steep here -- roughly 9 mV per percent -- so ordinary ADC
+//     noise on an unfiltered divider is worth whole percentage points.
+//
+// A number invites you to trust its last digit. Three segments promise only
+// what a single voltage reading through a noisy divider can actually deliver,
+// and the thresholds are placed so that a fresh cell's relaxation stays inside
+// the top segment instead of visibly draining.
+#define BATT_L3_MV      3900  // >= this: three segments (green)
+#define BATT_L2_MV      3700  // >= this: two (amber); below: one (red)
+// Asymmetric on purpose: a level must be crossed by this much to fall, but only
+// touched to rise. Charge going UP is real; going down through a threshold is
+// where noise and IR sag live.
+#define BATT_HYST_MV    60
+// ...and even then it must hold for this long. At BATT_POLL_MS that is nine
+// consecutive polls agreeing, which no WiFi burst survives.
+#define BATT_LEVEL_HOLD_MS 45000UL
 
 #define BATT_MIN_MV   3000    // below this the reading is treated as "no cell
                               // wired" and the chip is hidden entirely. NOTE:

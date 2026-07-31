@@ -188,6 +188,38 @@ Z                     start the setup portal now
 `?` also reports the link state and the battery gauge's raw millivolts, which is
 the quickest way to tell a mis-set `BATT_DIVIDER` from a genuinely flat cell.
 
+### The battery indicator is three segments, not a percentage
+
+Three green, two amber, one red. That is not a simplification for its own sake —
+a percentage was actively misleading here, and the failure is easy to reproduce:
+unplug a full cell and the reading falls from 4200 mV to about 3950 mV within
+minutes, so the display went **100 % → 79 %** with nothing wrong.
+
+Every one of those numbers was honest. The display was still a lie:
+
+- **4200 mV is the charger's constant-voltage point, not the cell's charge.**
+  While plugged in you are reading the charger, not the battery.
+- **A Li-ion just off charge carries surface charge** that relaxes over tens of
+  minutes. That fall is not consumption.
+- **The curve is steep here** — roughly 9 mV per percent — so ordinary ADC noise
+  on an unfiltered divider is worth whole percentage points.
+
+A number invites you to trust its last digit. Three segments promise only what
+one voltage reading through a noisy divider can deliver, and the thresholds
+(3900 / 3700 mV) are placed so a fresh cell's relaxation stays inside the top
+segment instead of visibly draining.
+
+Two guards sit behind it, stopping different things. **Hysteresis** (60 mV, fall
+only — rise on touch) stops a voltage sitting on a threshold flickering between
+levels. A **45-second hold** stops a genuine but brief excursion — a Wi-Fi TX
+burst, a backlight step, the sag as the screen wakes — from moving the display at
+all. Neither alone is enough: hysteresis lets a long sag through, and a hold
+alone still flickers once it expires. The EMA also slowed from 1/8 to 1/16
+(~80 s), since a three-level display has no use for speed.
+
+The exact percentage and millivolts are still in `?` and on the About page.
+Diagnosis wants the number; a glance wants the shape.
+
 The daemon side needs `--tcp` (or `CLAUDE_MATE_TCP=1`) and a token in
 `~/.config/claude-mate/token`. Config lives in NVS, a separate partition, so it
 **survives a reflash**.

@@ -12,6 +12,33 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
+### 2026-07-31 — A battery indicator that stops lying, and a menu that responds
+
+- **Changed: three segments instead of a battery percentage** (3 green, 2 amber,
+  1 red). Reported from the bench: unplug a full cell and the display falls from
+  100 % to 70–80 % within minutes. Every number was honest and the display was
+  still a lie — 4200 mV is the *charger's* constant-voltage point rather than the
+  cell's charge, a Li-ion just off charge sheds surface charge over tens of
+  minutes, and at ~9 mV per percent the ADC noise on an unfiltered divider is
+  worth whole points. A number invites you to trust its last digit. Behind the
+  segments: 60 mV of hysteresis (fall only — rise on touch), a 45-second hold so
+  no Wi-Fi burst or backlight step can move it, and the EMA slowed from 1/8 to
+  1/16. The exact percentage and millivolts stay in `?` and on the About page,
+  because diagnosis wants the number and a glance wants the shape.
+- **Fixed: the menu was close to unusable with no daemon.** `TCPClient::connect()`
+  and `MDNS.queryService()` both block, and both are called from the loop that
+  polls the buttons — in DIALING that was roughly three quarters of every second
+  with the firmware unable to read a pin, so a press *and* its release could land
+  inside one window and be dropped rather than delayed. Reconnection is now held
+  while a firmware-local screen is up, backs off 2 s → 30 s while the daemon is
+  absent, and the dial timeout dropped 1500 → 600 ms.
+- **Added: "Mac sound" in settings**, with a new `O|<KEY>|<value>` device →
+  daemon verb to carry it. The device has no speaker, so this is the one
+  preference whose effect happens on the Mac; it is re-sent on every connect
+  because the daemon keeps no per-device state. Unknown keys are ignored on both
+  sides, so old and new interoperate in either direction.
+- **The settings page scrolls**, since five rows fit and there are now six.
+
 ### 2026-07-30 — Wi-Fi setup stops being a dead end, and the Mac can beep
 
 - **Fixed: an empty token box erased the stored token.** The setup portal wrote
