@@ -1978,7 +1978,17 @@ void loop() {
   // close to unusable exactly when you most need it (no link, so you have come
   // to the menu to fix something). The link is not wanted while you are in
   // Settings anyway, and it resumes the instant you leave.
-  net.holdReconnect(uiMode != UI_CONDUCTOR);
+  // ...but the GAME's start screen is an exception to the exception. The hold
+  // exists because the mDNS browse and the TCP connect BLOCK this loop for most
+  // of a second, which made the menu near-unusable with no daemon to find. In a
+  // level that would be far worse -- a 600 ms freeze mid-jump. But the game's
+  // only speaker is the daemon, so holding unconditionally means a link that
+  // dropped before you pressed START stays dropped, and the whole run is silent
+  // with no way to fix it short of leaving. Reconnecting is therefore allowed on
+  // the start screen and the codex cards, where nothing is moving and a hitch
+  // costs nothing, and forbidden the instant a level is running.
+  net.holdReconnect(uiMode != UI_CONDUCTOR &&
+                    !(uiMode == UI_GAME && game.idle()));
   net.poll();
   net.applyPendingConfig();
   pumpUsb();

@@ -75,6 +75,11 @@ public:
   Result tick();
   void   draw(Arduino_GFX *g);
 
+  // True when the game is showing a screen rather than running a level -- the
+  // start screen, a codex card, or the end of a run. The sketch uses this to
+  // decide when it may spend 600 ms blocking on a reconnect: never mid-level.
+  bool idle() const { return _state != PLAY; }
+
   // Set by the sketch to the function that puts `O|SFX|<code>` on the link. A
   // function pointer rather than a call to the sketch directly, because this
   // header is included BEFORE the emit path exists -- and because a game that
