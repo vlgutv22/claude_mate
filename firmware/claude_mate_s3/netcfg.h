@@ -57,8 +57,20 @@
 #define NET_NS            "claudemate"   // NVS namespace
 #define NET_DEFAULT_PORT  8787
 #define NET_JOIN_TIMEOUT  20000UL   // give up on an SSID after this and retry
-#define NET_DIAL_TIMEOUT  1500      // per TCP connect attempt (ms)
-#define NET_RETRY_MS      2000UL    // between dial / discovery attempts
+// BOTH of these are time the main loop is STOPPED, not time it waits in the
+// background: TCPClient::connect() and MDNS.queryService() are blocking calls
+// made from poll(), which is called from loop(), which also polls the buttons.
+// While one is in flight the firmware cannot see a button at all -- a press and
+// release inside the window is dropped, not delayed. Keep them short.
+#define NET_DIAL_TIMEOUT  600       // per TCP connect attempt (ms). A LAN
+                                    // connect answers in single-digit ms; 1500
+                                    // only ever bought us dead air.
+#define NET_RETRY_MS      2000UL    // between dial / discovery attempts...
+// ...doubling each consecutive failure up to this. A daemon that is off stays
+// off for hours (the Mac is asleep, or you carried the device to another room),
+// and retrying every 2 s for hours means blocking the loop every 2 s for hours
+// -- sluggish to use and a pointless drain on the cell. Success resets it.
+#define NET_RETRY_MAX_MS  30000UL
 #define NET_AUTH_TIMEOUT  5000UL    // the daemon allows 5 s; so do we
 #define NET_DISCOVER_MS   4000UL    // between mDNS browses
 // An UNFINISHED portal gives up after this and goes back to joining -- but ONLY
@@ -105,12 +117,29 @@ class MateNet {
     switch (_state) {
       case SETUP:       pollPortal();     break;
       case JOINING:     pollJoin();       break;
-      case DISCOVERING: pollDiscover();   break;
-      case DIALING:     pollDial();       break;
+      // The two states that BLOCK. While the user is driving a firmware-local
+      // screen, reconnection waits: a menu that drops every other button press
+      // is worse than a link that comes back a few seconds later, and the user
+      // is right there watching, so the moment they leave the menu it resumes.
+      // Nothing else is paused -- an established link keeps flowing, a join
+      // keeps progressing, the portal keeps serving.
+      case DISCOVERING: if (!_holdReconnect) pollDiscover(); break;
+      case DIALING:     if (!_holdReconnect) pollDial();     break;
       case AUTHING:     pollAuth();       break;
       case LINKED:      pollLinked();     break;
       case OFF:         break;
     }
+  }
+
+  // Set by the sketch whenever the UI is not on the CONDUCTOR view. See poll().
+  //
+  // Leaving the menu RESETS the backoff and retries at once. Someone who has
+  // just been in Settings is standing over the device wanting it to work, and
+  // making them wait out a 30 s gap they cannot see would read as the fix not
+  // having taken.
+  void holdReconnect(bool hold) {
+    if (_holdReconnect && !hold) { _fails = 0; _lastTry = 0; }
+    _holdReconnect = hold;
   }
 
   // ---- the link surface (what the sketch uses) ------------------------------
@@ -250,7 +279,7 @@ class MateNet {
       bool ours = (!_ssid.isEmpty() && WiFi.SSID(i) == _ssid);
       sawOurs |= ours;
       out.printf("  %-32s %4d dBm  ch%-3d %s%s\n",
-                 WiFi.SSID(i).c_str(), WiFi.RSSI(i), WiFi.channel(i),
+                 WiFi.SSID(i).c_str(), (int)WiFi.RSSI(i), (int)WiFi.channel(i),
                  WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "open " : "psk  ",
                  ours ? " <- configured" : "");
     }
@@ -303,6 +332,8 @@ class MateNet {
   char          _dropWhy[48] = {0};   // why the last connection attempt failed
   unsigned long _dropAt = 0;          // ...and when (0 = nothing has failed)
   unsigned long _portalTouched = 0;   // last portal page load, for the timeout
+  uint8_t       _fails = 0;           // consecutive dial/discover failures
+  bool          _holdReconnect = false;  // UI is busy; do not block the loop
   char          _line[192];        // handshake line assembly
   uint8_t       _lineLen = 0;
 
@@ -377,14 +408,20 @@ class MateNet {
 
   void pollDiscover() {
     if (WiFi.status() != WL_CONNECTED) { startJoin(); return; }
-    if (millis() - _lastTry < NET_DISCOVER_MS && _lastTry) return;
+    if (millis() - _lastTry < retryGap(NET_DISCOVER_MS) && _lastTry) return;
     _lastTry = millis();
+    // No timeout parameter exists on this core's queryService, so this one
+    // cannot be shortened through the API -- which is exactly why the backoff
+    // and the menu hold below matter: they reduce how OFTEN we pay it.
     int n = MDNS.queryService("claudemate", "tcp");
     if (n > 0) {
+      _fails = 0;
       _foundIp   = MDNS.address(0);
       _foundPort = MDNS.port(0);
       go(DIALING);
       _lastTry = 0;
+    } else {
+      bumpFail();
     }
   }
 
@@ -392,7 +429,7 @@ class MateNet {
 
   void pollDial() {
     if (WiFi.status() != WL_CONNECTED) { startJoin(); return; }
-    if (_lastTry && millis() - _lastTry < NET_RETRY_MS) return;
+    if (_lastTry && millis() - _lastTry < retryGap(NET_RETRY_MS)) return;
     _lastTry = millis();
 
     bool ok;
@@ -403,15 +440,32 @@ class MateNet {
       ok = _client.connect(_host.c_str(), _port, NET_DIAL_TIMEOUT);
     }
     if (!ok) {
+      bumpFail();
       // A host that stops answering may have moved: re-browse rather than
       // hammering a dead address forever.
       if (_host.isEmpty()) { _foundPort = 0; go(DISCOVERING); }
       return;
     }
+    _fails = 0;                    // reaching the daemon resets the backoff
     _client.setNoDelay(true);      // button presses are tiny; never coalesce them
     _lineLen = 0;
     go(AUTHING);
   }
+
+  // Exponential backoff on consecutive failures, capped. Each attempt costs the
+  // main loop a blocking connect or mDNS query, so the gap between them is a
+  // responsiveness budget as much as a network one.
+  //
+  // The cap is applied to the RESULT, not to the shift count. Capping the shift
+  // alone would have let the discovery gap reach 4000<<4 = 64 s -- meaning up to
+  // a minute before a device noticed the daemon had come back, which is the
+  // wrong side of the trade. Both paths now top out at NET_RETRY_MAX_MS exactly,
+  // so the comment and the behaviour agree.
+  unsigned long retryGap(unsigned long base) const {
+    unsigned long g = base << (_fails > 4 ? 4 : _fails);
+    return g > NET_RETRY_MAX_MS ? NET_RETRY_MAX_MS : g;
+  }
+  void bumpFail() { if (_fails < 4) _fails++; }
 
   void pollAuth() {
     if (!_client.connected()) { drop("closed during handshake"); return; }

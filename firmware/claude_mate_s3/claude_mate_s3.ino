@@ -1825,6 +1825,14 @@ void setup() {
 void loop() {
   static MateNet::State lastNetState = MateNet::OFF;
 
+  // Hold off reconnection attempts while a firmware-local screen is up. Both
+  // the mDNS browse and the TCP connect BLOCK this loop, so with no daemon to
+  // find they stop the button poll for most of every second -- a press and its
+  // release can land entirely inside one and be dropped, which made the menu
+  // close to unusable exactly when you most need it (no link, so you have come
+  // to the menu to fix something). The link is not wanted while you are in
+  // Settings anyway, and it resumes the instant you leave.
+  net.holdReconnect(uiMode != UI_CONDUCTOR);
   net.poll();
   net.applyPendingConfig();
   pumpUsb();
