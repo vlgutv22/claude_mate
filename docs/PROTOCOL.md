@@ -185,6 +185,7 @@ distinguish a short press (emit on release) from a long press (emit once at
 | `B\|K` | **GO** long press (D2, held ≥ ~500 ms) — acknowledge the shown session's alert WITHOUT raising anything. No-op when nothing is unacknowledged. Also sent by a **short press of the ACK button** on a 4-button device: same verb, same effect, no daemon-side distinction. |
 | `B\|F` | Toggle **FOLLOW** mode directly. Identical in effect to a GO double-click, but unambiguous: no 300 ms window to race. Turning it ON raises the shown terminal immediately, exactly as the double-click does. No stock firmware emits this today (the 4th button became MIRROR); it is kept because the daemon accepting it costs nothing and a device with a fifth switch would want it. |
 | `B\|M` | **MIRROR** button tapped — open/close the terminal view for the session on the glass. |
+| `O\|<KEY>\|<value>` | A device-set **option**. Unknown keys are ignored, so an older daemon and a newer firmware interoperate in both directions — the same rule the `B\|` verbs follow. Currently only `O\|SND\|0` / `O\|SND\|1`: mute or unmute the **macOS** alert sound. It crosses the link because it is the one device setting whose effect happens on the Mac — the device has no speaker, so a mute reached for on the device has to travel. Re-sent on every connect, since the daemon keeps no per-device state to remember it in. |
 
 ### 1c. Daemon → Arduino: the MIRROR view
 
@@ -205,6 +206,29 @@ length-prefixed — `SCREEN <n>`, then `n` rows, then `ok` — rather than using
 sentinel, because terminal output can contain any line, **including one that is
 exactly `ok`**, which would truncate the mirror at an arbitrary point. A wrapper
 predating the command answers a bare `ok`, which reads as "no preview".
+
+### 1d. The wireless handshake (TCP devices only)
+
+Before any of the above flows, a TCP device proves it knows the shared token:
+
+| Direction | Line | Meaning |
+|---|---|---|
+| daemon → device | `C\|<nonce>` | 32 hex chars, fresh per connection |
+| device → daemon | `A\|<mac>` | hex HMAC-SHA256(token, nonce) |
+| device → daemon | `A\|NOTOKEN` | *"I have no token configured"* — see below |
+| daemon → device | `A\|OK` | authenticated; the protocol above begins |
+| daemon → device | `A\|NO` | rejected; the socket closes |
+
+The token never crosses the wire and the nonce is fresh per connection, so a
+sniffed handshake is worthless.
+
+`A|NOTOKEN` exists because a device with no token used to simply hang up, which
+reached the daemon as `bad handshake None` — indistinguishable from a crash, a
+truncated read or a network fault, when the device knew the exact answer all
+along. A cleared token is the commonest wireless failure there is (it is what
+the setup portal used to cause), so it gets a line of its own and a daemon
+message that says what to do about it. A daemon too old to recognise it reports
+a rejected token, which is still more use than silence.
 
 **Reset note:** opening the USB serial port resets the Nano (~1.5 s). The `H`
 handshake plus the daemon re-sending state on `H` is exactly what makes the

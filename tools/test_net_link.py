@@ -19,6 +19,7 @@ import hmac
 import os
 import pty
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -145,36 +146,80 @@ def is_frame(f):
 
 
 # --------------------------------------------------------------------------- #
-# Phase 0: --tcp with NO token must refuse to listen (fail closed)
+# Phase 0: --tcp with no token GENERATES one, and still fails closed if it
+# cannot.
+#
+# This used to assert that --tcp without a token refused to listen. That was
+# aimed at the right danger -- an UNAUTHENTICATED listener -- but it caught the
+# wrong thing, and the cost was a dead end for the user: the device's setup
+# portal asks for a token, and the only way to have one was to already know to
+# create the file by hand. A freshly generated 32-byte secret is not an
+# unauthenticated listener, so generating it closes the loop without weakening
+# anything. The property that actually matters is pinned by phase 1 (a wrong
+# token is rejected), which is unchanged.
 # --------------------------------------------------------------------------- #
-print("\n-- phase 0: --tcp without a token refuses to listen --")
+print("\n-- phase 0: --tcp with no token generates one --")
 tmp = tempfile.mkdtemp(prefix="cm-net-")
-port_noauth = free_port()
+port_gen = free_port()
+gen_token_path = os.path.join(tmp, "generated", "token")
 env = dict(os.environ)
-env["CLAUDE_MATE_SOCK"] = os.path.join(tmp, "noauth.sock")
+env["CLAUDE_MATE_SOCK"] = os.path.join(tmp, "gen.sock")
 env["CLAUDE_MATE_PORT"] = "/dev/null/nope"      # never opens; that is fine
 env["CLAUDE_MATE_TOKEN"] = ""
-env["CLAUDE_MATE_TOKEN_FILE"] = os.path.join(tmp, "does-not-exist")
+env["CLAUDE_MATE_TOKEN_FILE"] = gen_token_path
+gen = subprocess.Popen(
+    [sys.executable, DAEMON, "--tcp", "--tcp-port", str(port_gen),
+     "--tcp-bind", "127.0.0.1"],
+    env=env, stderr=subprocess.PIPE, text=True)
+gen_err = []
+threading.Thread(
+    target=lambda: [gen_err.append(l) for l in gen.stderr],
+    daemon=True).start()
+time.sleep(2.0)
+
+
+def port_open(p):
+    try:
+        socket.create_connection(("127.0.0.1", p), timeout=0.5).close()
+        return True
+    except OSError:
+        return False
+
+
+check("--tcp with no token file creates one", os.path.exists(gen_token_path))
+gen_tok = ""
+if os.path.exists(gen_token_path):
+    gen_tok = open(gen_token_path).read().strip()
+    mode = stat.S_IMODE(os.stat(gen_token_path).st_mode)
+else:
+    mode = -1
+check("...long enough to be a real secret (>= 32 chars)", len(gen_tok) >= 32)
+check("...mode 0600, not world-readable", mode == 0o600)
+check("...and the listener actually opens", port_open(port_gen))
+check("...and it is PRINTED, so it can be typed into the setup portal",
+      any(gen_tok and gen_tok in l for l in gen_err))
+gen.terminate()
+gen.wait(timeout=5)
+
+# ...but a token it cannot create still fails closed. This is the real
+# fail-closed case, and it must never regress into an open listener.
+print("\n-- phase 0b: --tcp still refuses when no token can be created --")
+port_noauth = free_port()
+env2 = dict(env)
+env2["CLAUDE_MATE_SOCK"] = os.path.join(tmp, "noauth.sock")
+env2["CLAUDE_MATE_TOKEN_FILE"] = "/dev/null/nope/token"   # unwritable by design
 noauth = subprocess.Popen(
     [sys.executable, DAEMON, "--tcp", "--tcp-port", str(port_noauth),
      "--tcp-bind", "127.0.0.1"],
-    env=env, stderr=subprocess.PIPE, text=True)
+    env=env2, stderr=subprocess.PIPE, text=True)
 noauth_err = []
 threading.Thread(
     target=lambda: [noauth_err.append(l) for l in noauth.stderr],
     daemon=True).start()
 time.sleep(2.0)
 
-
-def port_closed():
-    try:
-        socket.create_connection(("127.0.0.1", port_noauth), timeout=0.5).close()
-        return False
-    except OSError:
-        return True
-
-
-check("--tcp without a token does NOT open a listener", port_closed())
+check("--tcp with an uncreatable token does NOT open a listener",
+      not port_open(port_noauth))
 check("...and says why", any("needs a shared token" in l for l in noauth_err))
 noauth.terminate()
 noauth.wait(timeout=5)
@@ -271,6 +316,39 @@ check("a device with the WRONG token is refused", not got_in)
 check("...and is told so (A|NO) rather than left hanging", impostor.reject)
 impostor.close()
 
+# A device that knows it has NO token says so instead of hanging up silently.
+# Silence made the daemon log "bad handshake None", which reads like a crash or
+# a network fault -- and a cleared token is the commonest wireless failure there
+# is, so it earns the one message that says what to do about it.
+print("\n-- phase 1b: a device with no token at all says so --")
+notok = socket.create_connection(("127.0.0.1", tcp_port), timeout=5.0)
+notok.settimeout(5.0)
+chal = b""
+while b"\n" not in chal:
+    c = notok.recv(1024)
+    if not c:
+        break
+    chal += c
+check("...the daemon still challenges it", chal.startswith(b"C|"))
+notok.sendall(b"A|NOTOKEN\n")
+verdict = b""
+try:
+    while b"\n" not in verdict:
+        c = notok.recv(1024)
+        if not c:
+            break
+        verdict += c
+except (socket.timeout, OSError):
+    pass
+check("a device reporting A|NOTOKEN is refused with A|NO",
+      verdict.strip() == b"A|NO")
+notok.close()
+check("...and the daemon logs what to DO about it, not 'bad handshake'",
+      wait_for(lambda: any("HAS NO TOKEN" in l for l in daemon_err)))
+check("...naming the token file, so the fix is copy-pasteable",
+      any("claude-mate/token" in l or "token" in l.lower()
+          for l in daemon_err if "HAS NO TOKEN" in l or "token is in" in l))
+
 # --------------------------------------------------------------------------- #
 # Phase 2: the real device authenticates and gets the full state
 # --------------------------------------------------------------------------- #
@@ -283,6 +361,28 @@ check("the challenge nonce is a 32-char hex string",
       and all(c in "0123456789abcdef" for c in first_nonce))
 check("the token itself is NEVER sent over the wire (HMAC only)",
       TOKEN not in (first_nonce or ""))
+
+# The device owns its own hardware settings and the daemon rightly knows nothing
+# about them -- the alert SOUND is the one exception, because it plays on the
+# Mac. A mute reached for on the device therefore has to cross the link.
+print("\n-- phase 2b: a device can set the Mac's alert sound --")
+dev.send("O|SND|1")
+check("O|SND|1 turns the sound on",
+      wait_for(lambda: any("sound: on (set from the device)" in l
+                           for l in daemon_err)))
+dev.send("O|SND|0")
+check("O|SND|0 turns it off again",
+      wait_for(lambda: any("sound: off (set from the device)" in l
+                           for l in daemon_err)))
+# Forward compatibility both ways: a newer firmware must never break an older
+# daemon, so an unrecognised key is ignored rather than fatal.
+dev.send("O|NOSUCHKEY|1")
+check("an unknown option is ignored, not fatal",
+      wait_for(lambda: any("unknown device option" in l for l in daemon_err)))
+dev.send("O|malformed")
+check("a malformed option is ignored, not fatal",
+      wait_for(lambda: any("malformed device option" in l for l in daemon_err)))
+check("...and the link is still up after all of that", dev.authed)
 
 # H is what a real device sends after A|OK; the daemon answers with full state.
 dev.send("H")

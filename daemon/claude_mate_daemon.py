@@ -192,6 +192,33 @@ ALERT_KIND = {"error": "ERROR", "waiting": "INPUT", "done": "DONE"}
 # when the last unacknowledged member of the class is acknowledged/cleared).
 LOOP_KIND = {"error": "ERROR", "waiting": "INPUT", "done": "DONE"}
 
+# ---- Alert sounds (macOS, opt-in) ------------------------------------------ #
+# The device itself cannot make a sound: the ESP32-S3 has no DAC, and the
+# Waveshare board's 3.3 V rail is a linear LDO with the backlight on a plain
+# resistor-limited MOSFET -- there is no switching node whose current the
+# firmware could modulate into anything audible. So until a piezo is soldered
+# on, the Mac is the only speaker in the system.
+#
+# That is not purely a workaround. When you are AT the Mac it is the better
+# channel: real speakers, distinguishable sounds, and it follows the system
+# volume. It stops being enough exactly when the device is across the room on
+# battery -- which is the case the piezo will eventually cover.
+#
+# Off by default. An audible alert on every state change is far more intrusive
+# than a colour change, and that has to be opted into rather than inherited.
+SOUND_DIR = "/System/Library/Sounds"
+ALERT_SOUNDS = {
+    "ERROR": "Basso.aiff",     # descending, unmistakably "something went wrong"
+    "INPUT": "Glass.aiff",     # bright and short: a question, not a failure
+    "DONE":  "Hero.aiff",      # rising, resolved
+    "START": "Pop.aiff",       # a tick; only fires when nothing else is pending
+}
+SOUND_MIN_GAP_S = 2.0          # floor between sounds, whatever the state does
+
+# A device with no token redials every couple of seconds; say what to do about
+# it at most this often, or the advice buries itself.
+NO_TOKEN_LOG_GAP_S = 60.0
+
 # Sentinel for "we have not told the firmware a loop state yet", so the first
 # resolve always emits (V|OFF) and clears any stale loop left by a prior daemon.
 _LOOP_UNSET = "\x00unset"
@@ -526,6 +553,52 @@ def load_token(explicit: Optional[str]) -> Optional[str]:
         return None
 
 
+def ensure_token(explicit: Optional[str]) -> Optional[str]:
+    """load_token(), but MAKE one rather than refusing if there is none.
+
+    --tcp used to fail closed on a missing token and fall back to USB-only,
+    which was the right instinct aimed at the wrong problem. The danger being
+    guarded against is an UNAUTHENTICATED listener; a freshly generated 32-byte
+    secret is not that. What the old behaviour actually produced was a dead end:
+    the device's setup portal asks for a token, and the only way to have one was
+    to have already known to create the file by hand. Generating it here closes
+    that loop -- run the daemon once, read the token off the terminal, type it
+    into the portal.
+
+    Written 0600, and only ever created; an existing file is never rewritten, so
+    this cannot silently invalidate a device that is already provisioned.
+    """
+    tok = load_token(explicit)
+    if tok:
+        return tok
+    if explicit:                       # they passed one and it was blank
+        return None
+    path = os.path.expanduser(os.environ.get("CLAUDE_MATE_TOKEN_FILE",
+                                             DEFAULT_TOKEN_FILE))
+    tok = secrets.token_hex(32)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # Create-exclusive: if another daemon raced us to it, read theirs rather
+        # than clobbering a token a device may already be provisioned with.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(tok + "\n")
+    except FileExistsError:
+        return load_token(None)
+    except OSError as exc:
+        log(f"ERROR: could not create a token at {path}: {exc}")
+        return None
+    log("")
+    log("  no shared token existed, so one was generated:")
+    log("")
+    log(f"      {tok}")
+    log("")
+    log(f"  saved to {path} (mode 0600).")
+    log("  Type it into the device's wifi setup portal, in 'Shared token'.")
+    log("")
+    return tok
+
+
 class NetLink:
     """Serves the daemon<->device line protocol to token-authenticated TCP peers.
 
@@ -566,6 +639,7 @@ class NetLink:
         self._clients: List[socket.socket] = []
         self._stop_evt = threading.Event()
         self._threads: List[threading.Thread] = []
+        self._no_token_logged = 0.0             # throttle for _log_no_token
 
     # ---- lifecycle -------------------------------------------------------- #
 
@@ -651,6 +725,19 @@ class NetLink:
         if reply is None or not reply.startswith("A|"):
             log(f"TCP {peer}: bad handshake {reply!r}")
             return False
+        # A device that knows it has no token says so, rather than hanging up and
+        # leaving us to report "bad handshake None" -- which reads like a crash
+        # or a network fault and sends you looking in the wrong place entirely.
+        # It is the commonest wireless failure by far, because it is what a
+        # cleared token looks like, so it gets the one message that says exactly
+        # what to do about it.
+        if reply.strip().upper() == "A|NOTOKEN":
+            self._log_no_token(peer)
+            try:
+                conn.sendall(b"A|NO\n")
+            except OSError:
+                pass
+            return False
         # compare_digest keeps the comparison time independent of how much of
         # the MAC an attacker guessed right.
         if not hmac.compare_digest(reply[2:].strip().lower(), expect):
@@ -666,6 +753,23 @@ class NetLink:
         except OSError:
             return False
         return True
+
+    def _log_no_token(self, peer: str) -> None:
+        """The actionable message, throttled.
+
+        The device redials every couple of seconds, so an unthrottled message
+        would bury the log in copies of itself -- which is its own kind of
+        useless, and exactly what `bad handshake None` was already doing."""
+        now = time.time()
+        if now - self._no_token_logged < NO_TOKEN_LOG_GAP_S:
+            return
+        self._no_token_logged = now
+        path = os.path.expanduser(os.environ.get("CLAUDE_MATE_TOKEN_FILE",
+                                                 DEFAULT_TOKEN_FILE))
+        log(f"TCP {peer}: THE DEVICE HAS NO TOKEN. Open its wifi setup portal "
+            f"(4th button -> MENU -> WI-FI) and paste the token into 'Shared "
+            f"token', or send T|<token> over USB.")
+        log(f"    this daemon's token is in {path}")
 
     @staticmethod
     def _read_line_blocking(conn: socket.socket) -> Optional[str]:
@@ -938,7 +1042,8 @@ class Screen:
     """Owns everything the device shows: the selection, the pre-rendered frame,
     and the LED loop tracker."""
 
-    def __init__(self, link: Link, registry: Registry) -> None:
+    def __init__(self, link: Link, registry: Registry,
+                 sound: bool = False) -> None:
         self._link = link
         self._reg = registry
         self._lock = threading.Lock()
@@ -960,6 +1065,11 @@ class Screen:
         # LED loop tracker: what continuous loop the firmware is playing
         # ("ERROR"/"INPUT"/"DONE"/None); V| is (re)sent only when it changes.
         self._loop_kind: Optional[str] = _LOOP_UNSET
+        # Alert sound (macOS). Rides the SAME transition as the LED rather than
+        # having a policy of its own -- one truth, three renderings (rhythm,
+        # colour, sound), which is the rule the S3's colour LED already follows.
+        self._sound = sound
+        self._last_sound_at = 0.0
 
     # ---- selection -------------------------------------------------------- #
 
@@ -1167,11 +1277,62 @@ class Screen:
             self._loop_kind = kind
             if kind:
                 log(f"LED: loop {kind} until acknowledged")
+            self._play_alert(kind)
+
+    def set_sound(self, on: bool) -> None:
+        """Enable/disable the macOS alert sound. Called from the device."""
+        with self._lock:
+            if self._sound == on:
+                return
+            self._sound = on
+        log(f"sound: {'on' if on else 'off'} (set from the device)")
+
+    def _play_alert(self, kind: Optional[str]) -> None:
+        """Play one sound for an alert-class transition. Never blocks, never
+        raises, and never becomes load-bearing.
+
+        Deliberately ONE-SHOT, where the LED loops until acknowledged. Light is
+        ignorable and a beep is not: a sound that repeated until you dealt with
+        it would be a smoke alarm, and would get the whole feature switched off
+        within a day. The LED carries the persistent state; sound only marks the
+        moment it changed.
+
+        Called with self._lock held, so it must not do anything that can wait --
+        Popen returns as soon as the child is spawned, and the child is fully
+        detached (nothing ever reaps it, so stdio goes to /dev/null and we let
+        it exit on its own)."""
+        if not (self._sound and kind):
+            return
+        if sys.platform != "darwin":
+            return
+        now = time.time()
+        # A session flapping error -> waiting -> error would otherwise stack up
+        # overlapping afplay processes. The LED's dedup does not cover this: the
+        # kind genuinely changes each time, so the transition is real.
+        if now - self._last_sound_at < SOUND_MIN_GAP_S:
+            return
+        name = ALERT_SOUNDS.get(kind)
+        if not name:
+            return
+        path = os.path.join(SOUND_DIR, name)
+        try:
+            subprocess.Popen(["afplay", path],
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+            self._last_sound_at = now
+        except Exception as exc:
+            # A missing afplay or a renamed system sound must never take the
+            # daemon down or stall the alert path -- it is decoration.
+            log(f"sound: {exc}")
+            self._sound = False        # one complaint, then stop trying
 
     def start_tick(self) -> None:
         """One-shot START blink (a job (re)started). The caller fires this only
         when nothing needs the human, so it never interrupts an alert loop."""
         self._link.write_line("V|START")
+        with self._lock:
+            self._play_alert("START")
 
     # ---- lifecycle ------------------------------------------------------------ #
 
@@ -1577,6 +1738,15 @@ class ButtonReader(threading.Thread):
             else:
                 log(f"unknown button event: {line!r}")
             return
+        # O| -- a device-set OPTION. The device owns its own hardware settings
+        # (brightness, screen sleep, LED level) and the daemon rightly knows
+        # nothing about them. The alert SOUND is the exception, because it plays
+        # here: the device has no speaker, so a mute reached for on the device
+        # has to travel. The device re-sends this on every connect, since the
+        # daemon keeps no per-device state to remember it in.
+        if line.startswith("O|"):
+            self._device_option(line[2:])
+            return
         log(f"ignoring serial line from Arduino: {line!r}")
 
     # ---- navigation (+ FOLLOW-mode auto-raise) --------------------------- #
@@ -1830,6 +2000,20 @@ class ButtonReader(threading.Thread):
         self._screen.stay_on(sess)               # stay on the acted tab
         self._raise(sess)
 
+    def _device_option(self, body: str) -> None:
+        """`O|<KEY>|<value>` from a device. Unknown keys are ignored, so an
+        older daemon and a newer firmware stay interoperable in both
+        directions -- the same rule the B| verbs already follow."""
+        parts = body.split("|")
+        if len(parts) != 2:
+            log(f"malformed device option: {body!r}")
+            return
+        key, val = parts[0].strip().upper(), parts[1].strip()
+        if key == "SND":
+            self._screen.set_sound(val == "1")
+        else:
+            log(f"unknown device option {key!r} (ignored)")
+
     def _ack_only(self) -> None:
         """GO long-press: acknowledge the shown session's alert WITHOUT touching
         any window, and STAY on it (no auto-switch). A no-op when the shown
@@ -2025,6 +2209,13 @@ def main(argv: Optional[List[str]] = None) -> int:
              "keep it on this machine)",
     )
     parser.add_argument(
+        "--sound",
+        action="store_true",
+        default=os.environ.get("CLAUDE_MATE_SOUND", "") == "1",
+        help="play a macOS alert sound when the worst unacknowledged alert "
+             "class changes (off by default; the device itself has no speaker)",
+    )
+    parser.add_argument(
         "--token",
         default=os.environ.get("CLAUDE_MATE_TOKEN") or None,
         help=f"shared secret wireless devices authenticate with (default: read "
@@ -2048,11 +2239,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     # would let anyone on the network read session names and raise windows, so a
     # missing token disables it rather than weakening it.
     if args.tcp:
-        token = load_token(args.token)
+        token = ensure_token(args.token)
         if not token:
-            log("ERROR: --tcp needs a shared token. Set CLAUDE_MATE_TOKEN, pass "
-                f"--token, or write one to {DEFAULT_TOKEN_FILE}. "
-                "Continuing with USB serial only.")
+            log("ERROR: --tcp needs a shared token and one could not be created. "
+                f"Set CLAUDE_MATE_TOKEN, pass --token, or write one to "
+                f"{DEFAULT_TOKEN_FILE}. Continuing with USB serial only.")
         else:
             rx: "queue.Queue[str]" = queue.Queue()
             candidate = NetLink(args.tcp_bind, args.tcp_port, token, rx)
@@ -2064,7 +2255,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         log(f"  tcp    : {args.tcp_bind}:{args.tcp_port} "
             f"({'on' if net else 'DISABLED'})")
 
-    screen = Screen(link, registry)
+    screen = Screen(link, registry, sound=bool(args.sound))
+    log(f"  sound  : {'on' if args.sound else 'off'}")
 
     def on_update() -> None:
         screen.notify_change()

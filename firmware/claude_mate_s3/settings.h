@@ -76,6 +76,7 @@ class MateSettings {
       _bl   = clampIdx(p.getUChar("bl",   BL_DEFAULT_IDX),  BL_STEPS);
       _led  = clampIdx(p.getUChar("led",  LED_DEFAULT_IDX), LED_STEPS);
       _flip = p.getBool("flip", false);
+      _snd  = p.getBool("snd",  false);   // off by default: see LED_LEVELS
       p.end();
     }
     _dirty = 0;
@@ -94,6 +95,7 @@ class MateSettings {
   uint8_t hibIdx() const { return _hib; }
   uint8_t blIdx()  const { return _bl;  }
   uint8_t ledIdx() const { return _led; }
+  bool    sound()  const { return _snd; }
 
   const char *hibLabel() const {
     static char buf[6];
@@ -111,6 +113,7 @@ class MateSettings {
   void cycleBl()  { _bl  = (uint8_t)((_bl  + 1) % BL_STEPS);  touch(); }
   void cycleLed() { _led = (uint8_t)((_led + 1) % LED_STEPS); touch(); }
   void toggleFlip() { _flip = !_flip; touch(); }
+  void toggleSound() { _snd = !_snd; touch(); }
 
   // Called every loop. Writes only once the value has settled, so a thumb held
   // on NEXT costs one flash write rather than one per step.
@@ -155,6 +158,7 @@ class MateSettings {
     p.putUChar("bl",  _bl);
     p.putUChar("led", _led);
     p.putBool("flip", _flip);
+    p.putBool("snd",  _snd);
     p.end();
   }
 
@@ -162,5 +166,9 @@ class MateSettings {
   uint8_t       _bl   = BL_DEFAULT_IDX;
   uint8_t       _led  = LED_DEFAULT_IDX;
   bool          _flip = false;
+  // The Mac's alert sound, not the device's -- this board has no speaker. The
+  // device is simply the most convenient place to reach for a mute, so the
+  // setting lives here and is pushed to the daemon over the link.
+  bool          _snd  = false;
   unsigned long _dirty = 0;
 };

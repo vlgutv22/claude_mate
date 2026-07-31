@@ -40,7 +40,7 @@ session you have open — in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
 
 ```
         ┌──────────────────────────────────────┐
-        │ ▁▄█ CLAUDE MATE               ▰ 64%  │  ← status bar: Wi-Fi link · battery (with charging)
+        │ ▁▄█ CLAUDE MATE              ▮▮▮     │  ← status bar: Wi-Fi link · battery (3 segments)
         ├──────────────────────────────────────┤
         │ api-server                           │  ← r0: session name, in the state's colour
         │ WAIT   0:42                   work   │  ← r1: state · time-in-state · account
@@ -257,10 +257,14 @@ hooks are the zero-dependency feed. Use whichever fits each session.
   alert class's colour, and every fleet letter is drawn in its own state colour.
   The colours differ in **brightness** as well as hue, so they stay distinct for
   a red/green-colourblind reader and in direct sunlight.
-- **A battery gauge that doesn't lie** — median-of-15 spaced samples plus an EMA
-  across polls, because the board's sense divider is unfiltered and Wi-Fi TX
-  bursts dip the rail. Charging is inferred in tiers from the cell's own
-  voltage; the board exposes no charge-status line.
+- **A battery indicator that doesn't lie** — **three segments** (3 green, 2
+  amber, 1 red), not a percentage. Unplug a full cell and the voltage relaxes
+  from 4200 to ~3950 mV in minutes, so a percentage read 100 % then 79 % with
+  nothing wrong: 4200 mV is the *charger's* regulation point, surface charge is
+  not consumption, and at ~9 mV per percent the ADC noise is worth whole points.
+  Median-of-15 samples, an EMA, 60 mV of hysteresis and a 45-second hold sit
+  behind it. The exact number stays in the About page, where diagnosis wants it.
+  Charging is inferred in tiers; the board exposes no charge-status line.
 - **A live terminal mirror** — see [above](#the-terminal-mirror-esp32-s3).
 - **An on-device menu** — double-tap the 4th button. Settings (screen sleep,
   brightness, alert-LED level including a genuine *off*, flip, factory reset),
@@ -523,12 +527,15 @@ More build photos are in [`assets/photos/`](assets/photos/).
    ```sh
    python3 daemon/claude_mate_daemon.py --mock
    ```
-   For a **wireless** device, opt into the TCP listener — it needs a shared
-   token and **fails closed** without one, falling back to USB serial only:
+   For a **wireless** device, opt into the TCP listener. It generates a shared
+   token on first run and prints it — type that into the device's setup portal:
    ```sh
-   mkdir -p ~/.config/claude-mate && openssl rand -hex 32 > ~/.config/claude-mate/token
    python3 daemon/claude_mate_daemon.py --tcp        # port 8787, advertised over mDNS
    ```
+   Add `--sound` to also play a macOS alert sound when the worst unacknowledged
+   alert class changes. The device has no speaker of its own — the ESP32-S3 has
+   no DAC and the board's rail is a linear LDO, so there is no switching node a
+   firmware trick could make audible.
 3. **Feed it.** Pick either (or both):
    - **Hooks:** install the Claude Code hooks so session events reach the daemon.
    - **PTY wrapper:** `pip install pyte`, then run Claude through the wrapper:
@@ -560,7 +567,8 @@ Step-by-step guides:
 | `CLAUDE_MATE_TCP`   | off              | `1` also serves the protocol over TCP for wireless devices (same as `--tcp`) |
 | `CLAUDE_MATE_TCP_PORT` | `8787`        | TCP listener port                         |
 | `CLAUDE_MATE_TCP_BIND` | `0.0.0.0`     | Bind address — a remote device needs a routable one; `127.0.0.1` keeps it on this machine |
-| `CLAUDE_MATE_TOKEN` / `_TOKEN_FILE` | `~/.config/claude-mate/token` | Shared secret wireless devices authenticate with. **Required** for `--tcp`; without it the listener does not start |
+| `CLAUDE_MATE_TOKEN` / `_TOKEN_FILE` | `~/.config/claude-mate/token` | Shared secret wireless devices authenticate with. `--tcp` **generates one** (0600) and prints it if none exists — type that into the device's setup portal. The listener still refuses to start if a token can neither be read nor created |
+| `CLAUDE_MATE_SOUND`  | off              | `1` plays a macOS alert sound when the worst unacknowledged alert class changes (same as `--sound`) |
 
 The listener is advertised as `_claudemate._tcp` over mDNS, so a device with no
 host configured finds the daemon on its own.

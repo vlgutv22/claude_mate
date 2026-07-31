@@ -158,14 +158,20 @@ static uint8_t pageIdx = 0;          // selected row within the page
 
 // Settings rows, in screen order.
 enum SetRow : uint8_t {
-  SR_SLEEP, SR_BRIGHT, SR_LED, SR_FLIP, SR_RESET, SR_COUNT
+  SR_SLEEP, SR_BRIGHT, SR_LED, SR_SOUND, SR_FLIP, SR_RESET, SR_COUNT
 };
+// Which row is at the top of the visible window. The page scrolls now: five
+// rows fit and there are six, which is exactly the case the static_assert below
+// used to reject outright. Scrolling was named in its own comment as one of the
+// two ways out, and it is the one that keeps paying off.
+static uint8_t pageTop = 0;
 // The page does not scroll, so a sixth row would simply not be drawn -- and
 // would look like a bug in the setting rather than in the layout. Adding one
 // means either raising PAGE_ROWS_VIS (and finding the pixels) or teaching the
 // page to scroll; this makes the compiler say so instead of the screen.
-static_assert(SR_COUNT <= PAGE_ROWS_VIS,
-              "settings rows exceed what one page can show without scrolling");
+// The page scrolls, so rows may exceed PAGE_ROWS_VIS -- but the WINDOW must
+// still be at least one row, and pageTop arithmetic assumes it.
+static_assert(PAGE_ROWS_VIS >= 1, "the settings window needs at least one row");
 
 // The factory-reset row asks twice. A single GO arms it and the row says what is
 // about to be destroyed; the confirming gesture is a LONG press, which is a
@@ -245,6 +251,13 @@ static esp_sleep_wakeup_cause_t wakeCause = ESP_SLEEP_WAKEUP_UNDEFINED;
 static bool mirrorOn = false;
 static char mirrorTitle[MIRROR_COLS + 1] = {0};
 static char mirrorRow[MIRROR_ROWS][MIRROR_COLS + 1] = {{0}};
+
+// The displayed level: 3, 2, 1, or -1 for "no cell". Deliberately separate from
+// battPercent, which stays exact for the `?` readout and the About page --
+// diagnosis wants the number, the glance wants the shape.
+static int8_t   battLevel     = -1;
+static int8_t   battLevelCand = -1;    // level the raw voltage is asking for...
+static unsigned long battLevelSince = 0;  // ...and how long it has asked
 
 static uint32_t battRawMv    = 0;      // this poll's median, before the EMA
 static uint32_t battFiltMv   = 0;      // EMA state (0 = not yet seeded)
@@ -446,9 +459,37 @@ static void pollBattery() {
   // Nothing wired to the divider reads as a floating near-zero: report "no
   // gauge" rather than a permanent 0% that would look like a dying cell.
   int pc = (mv < BATT_MIN_MV) ? -1 : battPercentFromMv(mv);
-  if (pc != battPercent) needRender = true;
   battMv = mv;
   battPercent = pc;
+
+  // ---- the displayed level: hysteresis, then a hold ----------------------
+  // Two independent guards, because they stop different things. Hysteresis
+  // stops a voltage sitting exactly on a threshold from flickering between two
+  // levels. The hold stops a genuine but BRIEF excursion -- a WiFi TX burst, a
+  // backlight step, the sag as the screen wakes -- from moving the display at
+  // all. Neither alone is enough: hysteresis lets a long sag through, and a
+  // hold alone would still flicker once it expired.
+  int8_t want;
+  if (pc < 0) {
+    want = -1;                                  // no cell wired
+  } else {
+    // Fall only after crossing the threshold by BATT_HYST_MV; rise on touch.
+    int8_t cur = battLevel > 0 ? battLevel : 0;
+    uint32_t l3 = BATT_L3_MV - (cur >= 3 ? BATT_HYST_MV : 0);
+    uint32_t l2 = BATT_L2_MV - (cur >= 2 ? BATT_HYST_MV : 0);
+    want = (mv >= l3) ? 3 : (mv >= l2) ? 2 : 1;
+  }
+  if (want != battLevelCand) {                  // a new candidate: restart the
+    battLevelCand  = want;                      // clock rather than accumulate
+    battLevelSince = now ? now : 1UL;
+  }
+  bool settled = battLevelSince &&
+                 (now - battLevelSince) >= BATT_LEVEL_HOLD_MS;
+  // First reading after boot shows immediately -- making someone stare at a
+  // blank corner for 45 s to prove a point would be its own kind of wrong.
+  if (battLevel < 0 || settled) {
+    if (want != battLevel) { battLevel = want; needRender = true; }
+  }
 
   // Charging: no status line exists on this board, so infer it. See the long
   // note by CHARGE_FULL_MV in board_s3.h for why this is sound rather than a
@@ -553,40 +594,40 @@ static void drawBolt(int16_t x, int16_t y, uint16_t col) {
 
 // Battery chip: outline, proportional fill, nub, percentage. Falls back to the
 // WiFi signal in dBm when no cell is wired, so the corner is never dead space.
+// Three segments, filled from the left, coloured by how many are lit: 3 green,
+// 2 amber, 1 red. No number -- see the note at BATT_L3_MV in board_s3.h for why
+// a percentage was actively misleading here.
 static void drawBatteryChip(int16_t right, int16_t y) {
-  if (battPercent < 0) {
+  if (battLevel < 0) {
     if (!net.connected()) return;
     char buf[12];
-    snprintf(buf, sizeof(buf), "%ddBm", net.rssi());
+    snprintf(buf, sizeof(buf), "%ddBm", (int)net.rssi());
     gfx->setTextSize(1);
     gfx->setTextColor(C_DIM);
     gfx->setCursor(right - (int16_t)strlen(buf) * GLYPH_W, y + 3);
     gfx->print(buf);
     return;
   }
-  char buf[8];
-  snprintf(buf, sizeof(buf), "%d%%", battPercent);
-  int16_t textW = (int16_t)strlen(buf) * GLYPH_W;
-  int16_t bodyW = 22, bodyH = 11;
-  int16_t bx = right - textW - 4 - bodyW - 2;
+  const int16_t segW = 9, segH = 12, gap = 3;
+  const int16_t totalW = segW * 3 + gap * 2;
+  int16_t bx = right - totalW;
   int16_t by = y + 2;
-  // Charging outranks the low-battery warning colours: a cell at 8% that is on
-  // the charger is good news, and colouring it red would say the opposite.
+
+  // Charging outranks the low-battery colours: a nearly flat cell that is ON
+  // the charger is good news, and painting it red would say the opposite.
   uint16_t col = battCharging ? C_OK
-                 : battPercent <= 10 ? C_ERROR
-                 : battPercent <= 25 ? C_WAIT : C_DIM;
-  gfx->drawRect(bx, by, bodyW, bodyH, col);
-  gfx->fillRect(bx + bodyW, by + 3, 2, bodyH - 6, col);           // the nub
-  int16_t fillW = (int16_t)((bodyW - 4) * battPercent / 100);
-  if (fillW > 0) gfx->fillRect(bx + 2, by + 2, fillW, bodyH - 4, col);
-  // The bolt sits ON TOP of the fill in the background colour, so it stays
-  // legible at 100% (all fill) and at 0% (no fill) alike -- a bolt drawn in the
-  // accent colour would vanish into a full bar.
-  if (battCharging) drawBolt(bx + bodyW / 2 - 2, by + 2, C_BG);
-  gfx->setTextSize(1);
-  gfx->setTextColor(col);
-  gfx->setCursor(right - textW, y + 2);
-  gfx->print(buf);
+                 : battLevel >= 3 ? C_DONE
+                 : battLevel == 2 ? C_WAIT : C_ERROR;
+
+  for (int8_t i = 0; i < 3; i++) {
+    int16_t sx = bx + i * (segW + gap);
+    if (i < battLevel) gfx->fillRect(sx, by, segW, segH, col);
+    else               gfx->drawRect(sx, by, segW, segH, C_DIMMER);
+  }
+  // The bolt sits ON the segments in the background colour, so it reads at
+  // three lit segments and at one alike -- drawn in the accent colour it would
+  // vanish into a filled block.
+  if (battCharging) drawBolt(bx + totalW / 2 - 2, by + 2, C_BG);
 }
 
 static void drawStatusBar() {
@@ -908,6 +949,14 @@ static void drawSetRow(uint8_t row, int16_t y, bool sel) {
       value = cfg.ledLabel();
       vcol  = cfg.ledBright() ? C_WAIT : C_DIM;
       break;
+    case SR_SOUND:
+      label = "Mac sound";
+      // Named for where it happens. "Sound: on" on a device with no speaker
+      // would be a promise the hardware cannot keep, and the first thing anyone
+      // would do is turn it on and wait for a beep that never comes.
+      value = cfg.sound() ? "on" : "off";
+      vcol  = cfg.sound() ? C_DONE : C_DIM;
+      break;
     case SR_FLIP:
       label = "Flip screen";
       if (flipNeedsRestart) {
@@ -937,8 +986,20 @@ static void drawSetRow(uint8_t row, int16_t y, bool sel) {
 }
 
 static void drawSettingsPage() {
-  for (uint8_t r = 0; r < SR_COUNT && r < PAGE_ROWS_VIS; r++)
-    drawSetRow(r, PAGE_ROW_Y + r * PAGE_ROW_H, r == pageIdx);
+  for (uint8_t i = 0; i < PAGE_ROWS_VIS && (pageTop + i) < SR_COUNT; i++) {
+    uint8_t row = pageTop + i;
+    drawSetRow(row, PAGE_ROW_Y + i * PAGE_ROW_H, row == pageIdx);
+  }
+  // A scrollbar, because otherwise there is nothing at all to say that a sixth
+  // row exists -- the list simply looks complete.
+  if (SR_COUNT > PAGE_ROWS_VIS) {
+    int16_t trackY = PAGE_ROW_Y, trackH = PAGE_ROWS_VIS * PAGE_ROW_H - 2;
+    int16_t thumbH = trackH * PAGE_ROWS_VIS / SR_COUNT;
+    int16_t thumbY = trackY + (trackH - thumbH) * pageTop /
+                     (SR_COUNT - PAGE_ROWS_VIS);
+    gfx->fillRect(SCREEN_W - 3, trackY, 2, trackH, C_DIMMER);
+    gfx->fillRect(SCREEN_W - 3, thumbY, 2, thumbH, C_DIM);
+  }
   gfx->setTextSize(1);
   gfx->setTextColor(resetArmedMs ? C_ERROR : C_DIM);
   gfx->setCursor(PAD_X, MENU_HINT_Y);
@@ -961,8 +1022,9 @@ static void drawAboutPage() {
     snprintf(battBuf, sizeof(battBuf), "no cell (%u mV raw)",
              (unsigned)battRawMv);
   else
-    snprintf(battBuf, sizeof(battBuf), "%d%%  %u mV  %s", battPercent,
-             (unsigned)battMv, battCharging ? "charging" : "on battery");
+    snprintf(battBuf, sizeof(battBuf), "%d/3  %d%%  %u mV  %s", (int)battLevel,
+             battPercent, (unsigned)battMv,
+             battCharging ? "charging" : "on battery");
 #else
   snprintf(battBuf, sizeof(battBuf), "gauge compiled out");
 #endif
@@ -1161,7 +1223,8 @@ static bool handleConfigLine(char *line) {
                       (unsigned)battMv, (unsigned)battRawMv,
                       (double)BATT_DIVIDER);
       else
-        Serial.printf("batt  : %d%% (%u mV filt, %u raw) %s\n", battPercent,
+        Serial.printf("batt  : level %d/3  %d%% (%u mV filt, %u raw) %s\n",
+                      (int)battLevel, battPercent,
                       (unsigned)battMv, (unsigned)battRawMv,
                       battCharging ? "charging" : "on battery");
 #else
@@ -1233,6 +1296,16 @@ static bool handleConfigLine(char *line) {
       Serial.println("rebooting");
       delay(100);
       ESP.restart();
+      return true;
+
+    case 'Y':                              // scan and list what the RADIO sees
+      // A headless device that will not join has two very different problems --
+      // the network is not there, or the password is wrong -- and from the
+      // outside they look identical. This is the only way to tell them apart
+      // without a serial console on the router. It also catches the trap that
+      // this chip is 2.4 GHz only: an SSID the Mac joins happily can be
+      // invisible here if the router moved it to 5 GHz.
+      net.scanTo(Serial);
       return true;
 
     case 'Z':                              // start the setup portal now
@@ -1544,6 +1617,25 @@ static void pollHibernate() {
 // -----------------------------------------------------------------------------
 // Menu input
 // -----------------------------------------------------------------------------
+// Keep the selected row inside the visible window, scrolling by the minimum
+// needed. Wrapping from the last row to the first jumps the window back to the
+// top, which is what "the list wrapped" should look like.
+static void scrollToSelection() {
+  if (pageIdx < pageTop) pageTop = pageIdx;
+  else if (pageIdx >= pageTop + PAGE_ROWS_VIS)
+    pageTop = (uint8_t)(pageIdx - PAGE_ROWS_VIS + 1);
+}
+
+// The Mac's alert sound is a DAEMON setting reached from the device, so it is
+// the one preference here that has to cross the link. Sent on every change and
+// again on every (re)connect, because the daemon keeps no per-device state and
+// would otherwise forget it the moment the link dropped.
+static void sendSoundPref() {
+  char buf[12];
+  snprintf(buf, sizeof(buf), "O|SND|%d", cfg.sound() ? 1 : 0);
+  emitLine(buf);
+}
+
 // PREV/NEXT/GO while a firmware-local screen is up. Never reaches the daemon.
 static void menuButton(char ev) {
   if (uiMode == UI_MENU) {
@@ -1558,7 +1650,7 @@ static void menuButton(char ev) {
       switch (menuIdx) {
         case MI_CONDUCTOR: uiMode = UI_CONDUCTOR; break;
         case MI_SETTINGS:  uiMode = UI_PAGE; pageId = PG_SETTINGS; pageIdx = 0;
-                           resetArmedMs = 0; break;
+                           pageTop = 0; resetArmedMs = 0; break;
         case MI_ABOUT:     uiMode = UI_PAGE; pageId = PG_ABOUT; break;
         case MI_WIFI:      // The portal takes the screen over on its own, via
                            // net.state() == SETUP in render().
@@ -1578,9 +1670,9 @@ static void menuButton(char ev) {
   if (pageId != PG_SETTINGS) return;
 
   if (ev == 'P') { pageIdx = (uint8_t)((pageIdx + SR_COUNT - 1) % SR_COUNT);
-                   resetArmedMs = 0; return; }
+                   scrollToSelection(); resetArmedMs = 0; return; }
   if (ev == 'N') { pageIdx = (uint8_t)((pageIdx + 1) % SR_COUNT);
-                   resetArmedMs = 0; return; }
+                   scrollToSelection(); resetArmedMs = 0; return; }
 
   // 'K' is GO's long press. On the three rows that only cycle a value it means
   // the same as 'G': LONGPRESS_MS is 500 ms, easy to overshoot, and a press that
@@ -1601,6 +1693,12 @@ static void menuButton(char ev) {
                       // next alert -- picking "off" while a 7 Hz strobe is going
                       // is exactly when you reach for this setting.
                       ledApplyCap();
+                      break;
+      case SR_SOUND:  cfg.toggleSound();
+                      // Tell the daemon at once: the sound plays there, so a
+                      // toggle that only reached NVS would do nothing until the
+                      // next reconnect and read as a dead row.
+                      sendSoundPref();
                       break;
       case SR_FLIP:   cfg.toggleFlip();
                       flipNeedsRestart = (cfg.flipped() != flipAtBoot);
@@ -1809,12 +1907,20 @@ void setup() {
 
   // Emit hello once so a daemon already listening on USB sends full state. The
   // WiFi path sends its own H the moment the handshake completes (see loop()).
-  if (Serial) Serial.println("H");
+  if (Serial) { Serial.println("H"); sendSoundPref(); }
 }
 
 void loop() {
   static MateNet::State lastNetState = MateNet::OFF;
 
+  // Hold off reconnection attempts while a firmware-local screen is up. Both
+  // the mDNS browse and the TCP connect BLOCK this loop, so with no daemon to
+  // find they stop the button poll for most of every second -- a press and its
+  // release can land entirely inside one and be dropped, which made the menu
+  // close to unusable exactly when you most need it (no link, so you have come
+  // to the menu to fix something). The link is not wanted while you are in
+  // Settings anyway, and it resumes the instant you leave.
+  net.holdReconnect(uiMode != UI_CONDUCTOR);
   net.poll();
   net.applyPendingConfig();
   pumpUsb();
@@ -1842,6 +1948,8 @@ void loop() {
   if (ns != lastNetState) {
     if (ns == MateNet::LINKED) {
       net.write("H");
+      sendSoundPref();                      // the daemon keeps no per-device
+                                            // state; re-assert it every link
       lastRxMs = now;                       // the link is alive as of now
     }
     lastNetState = ns;

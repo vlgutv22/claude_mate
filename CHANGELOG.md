@@ -12,6 +12,62 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
+### 2026-07-31 — A battery indicator that stops lying, and a menu that responds
+
+- **Changed: three segments instead of a battery percentage** (3 green, 2 amber,
+  1 red). Reported from the bench: unplug a full cell and the display falls from
+  100 % to 70–80 % within minutes. Every number was honest and the display was
+  still a lie — 4200 mV is the *charger's* constant-voltage point rather than the
+  cell's charge, a Li-ion just off charge sheds surface charge over tens of
+  minutes, and at ~9 mV per percent the ADC noise on an unfiltered divider is
+  worth whole points. A number invites you to trust its last digit. Behind the
+  segments: 60 mV of hysteresis (fall only — rise on touch), a 45-second hold so
+  no Wi-Fi burst or backlight step can move it, and the EMA slowed from 1/8 to
+  1/16. The exact percentage and millivolts stay in `?` and on the About page,
+  because diagnosis wants the number and a glance wants the shape.
+- **Fixed: the menu was close to unusable with no daemon.** `TCPClient::connect()`
+  and `MDNS.queryService()` both block, and both are called from the loop that
+  polls the buttons — in DIALING that was roughly three quarters of every second
+  with the firmware unable to read a pin, so a press *and* its release could land
+  inside one window and be dropped rather than delayed. Reconnection is now held
+  while a firmware-local screen is up, backs off 2 s → 30 s while the daemon is
+  absent, and the dial timeout dropped 1500 → 600 ms.
+- **Added: "Mac sound" in settings**, with a new `O|<KEY>|<value>` device →
+  daemon verb to carry it. The device has no speaker, so this is the one
+  preference whose effect happens on the Mac; it is re-sent on every connect
+  because the daemon keeps no per-device state. Unknown keys are ignored on both
+  sides, so old and new interoperate in either direction.
+- **The settings page scrolls**, since five rows fit and there are now six.
+
+### 2026-07-30 — Wi-Fi setup stops being a dead end, and the Mac can beep
+
+- **Fixed: an empty token box erased the stored token.** The setup portal wrote
+  it unconditionally, so the obvious thing to do on a return visit — fill in the
+  Wi-Fi password and nothing else — silently wiped the shared secret, after
+  which the device could never complete the handshake and reported only that it
+  was not connected. Empty now means **keep**; clearing is a deliberate
+  checkbox, or `X|WIPE`. The old docs warned "re-enter it every time", which was
+  an admission the behaviour was wrong rather than a fix.
+- **Fixed: every connection failure looked identical.** `drop(why)` discarded
+  its reason (`(void)why;`), so a wrong token, a missing token, a daemon that
+  is not listening and a lost network all presented as the device quietly
+  cycling back to `dialing…`. The reason now shows on the bottom line for 20 s.
+- **Changed: `--tcp` generates a token instead of refusing.** Failing closed was
+  aimed at the right danger — an *unauthenticated* listener — but caught the
+  wrong thing: the portal asks for a token, and the only way to have one was to
+  already know to create the file by hand. It now writes a 32-byte secret to
+  `~/.config/claude-mate/token` (0600, create-exclusive, never overwriting an
+  existing file) and prints it for typing into the portal. It still refuses when
+  a token can neither be read nor created, which is the real fail-closed case,
+  and `test_net_link` pins both halves (23 → 28 checks).
+- **Added: `--sound`** (off by default). Plays a macOS alert sound on the same
+  transition that drives the LED — one truth, now three renderings: rhythm,
+  colour, sound. One-shot, never looping: light is ignorable and a beep is not,
+  and an alert that repeated until acknowledged would be a smoke alarm. The
+  device itself stays silent — the ESP32-S3 has no DAC, and the board's 3.3 V
+  rail is a linear LDO with the backlight on a resistor-limited MOSFET, so there
+  is no switching node any firmware trick could make audible.
+
 ### 2026-07-30 — A menu on the 4th button, and a screen that turns itself off
 
 **ESP32-S3 only, and nothing outside its firmware changed** — no protocol
