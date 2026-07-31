@@ -362,6 +362,28 @@ check("the challenge nonce is a 32-char hex string",
 check("the token itself is NEVER sent over the wire (HMAC only)",
       TOKEN not in (first_nonce or ""))
 
+# The device owns its own hardware settings and the daemon rightly knows nothing
+# about them -- the alert SOUND is the one exception, because it plays on the
+# Mac. A mute reached for on the device therefore has to cross the link.
+print("\n-- phase 2b: a device can set the Mac's alert sound --")
+dev.send("O|SND|1")
+check("O|SND|1 turns the sound on",
+      wait_for(lambda: any("sound: on (set from the device)" in l
+                           for l in daemon_err)))
+dev.send("O|SND|0")
+check("O|SND|0 turns it off again",
+      wait_for(lambda: any("sound: off (set from the device)" in l
+                           for l in daemon_err)))
+# Forward compatibility both ways: a newer firmware must never break an older
+# daemon, so an unrecognised key is ignored rather than fatal.
+dev.send("O|NOSUCHKEY|1")
+check("an unknown option is ignored, not fatal",
+      wait_for(lambda: any("unknown device option" in l for l in daemon_err)))
+dev.send("O|malformed")
+check("a malformed option is ignored, not fatal",
+      wait_for(lambda: any("malformed device option" in l for l in daemon_err)))
+check("...and the link is still up after all of that", dev.authed)
+
 # H is what a real device sends after A|OK; the daemon answers with full state.
 dev.send("H")
 check("H over TCP triggers a full state resend (F| frame arrives)",

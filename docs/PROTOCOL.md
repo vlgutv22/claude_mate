@@ -185,6 +185,7 @@ distinguish a short press (emit on release) from a long press (emit once at
 | `B\|K` | **GO** long press (D2, held ≥ ~500 ms) — acknowledge the shown session's alert WITHOUT raising anything. No-op when nothing is unacknowledged. Also sent by a **short press of the ACK button** on a 4-button device: same verb, same effect, no daemon-side distinction. |
 | `B\|F` | Toggle **FOLLOW** mode directly. Identical in effect to a GO double-click, but unambiguous: no 300 ms window to race. Turning it ON raises the shown terminal immediately, exactly as the double-click does. No stock firmware emits this today (the 4th button became MIRROR); it is kept because the daemon accepting it costs nothing and a device with a fifth switch would want it. |
 | `B\|M` | **MIRROR** button tapped — open/close the terminal view for the session on the glass. |
+| `O\|<KEY>\|<value>` | A device-set **option**. Unknown keys are ignored, so an older daemon and a newer firmware interoperate in both directions — the same rule the `B\|` verbs follow. Currently only `O\|SND\|0` / `O\|SND\|1`: mute or unmute the **macOS** alert sound. It crosses the link because it is the one device setting whose effect happens on the Mac — the device has no speaker, so a mute reached for on the device has to travel. Re-sent on every connect, since the daemon keeps no per-device state to remember it in. |
 
 ### 1c. Daemon → Arduino: the MIRROR view
 

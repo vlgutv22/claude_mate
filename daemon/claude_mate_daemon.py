@@ -1279,6 +1279,14 @@ class Screen:
                 log(f"LED: loop {kind} until acknowledged")
             self._play_alert(kind)
 
+    def set_sound(self, on: bool) -> None:
+        """Enable/disable the macOS alert sound. Called from the device."""
+        with self._lock:
+            if self._sound == on:
+                return
+            self._sound = on
+        log(f"sound: {'on' if on else 'off'} (set from the device)")
+
     def _play_alert(self, kind: Optional[str]) -> None:
         """Play one sound for an alert-class transition. Never blocks, never
         raises, and never becomes load-bearing.
@@ -1730,6 +1738,15 @@ class ButtonReader(threading.Thread):
             else:
                 log(f"unknown button event: {line!r}")
             return
+        # O| -- a device-set OPTION. The device owns its own hardware settings
+        # (brightness, screen sleep, LED level) and the daemon rightly knows
+        # nothing about them. The alert SOUND is the exception, because it plays
+        # here: the device has no speaker, so a mute reached for on the device
+        # has to travel. The device re-sends this on every connect, since the
+        # daemon keeps no per-device state to remember it in.
+        if line.startswith("O|"):
+            self._device_option(line[2:])
+            return
         log(f"ignoring serial line from Arduino: {line!r}")
 
     # ---- navigation (+ FOLLOW-mode auto-raise) --------------------------- #
@@ -1982,6 +1999,20 @@ class ButtonReader(threading.Thread):
             self.on_ack(sess)                    # raising the window = acknowledged
         self._screen.stay_on(sess)               # stay on the acted tab
         self._raise(sess)
+
+    def _device_option(self, body: str) -> None:
+        """`O|<KEY>|<value>` from a device. Unknown keys are ignored, so an
+        older daemon and a newer firmware stay interoperable in both
+        directions -- the same rule the B| verbs already follow."""
+        parts = body.split("|")
+        if len(parts) != 2:
+            log(f"malformed device option: {body!r}")
+            return
+        key, val = parts[0].strip().upper(), parts[1].strip()
+        if key == "SND":
+            self._screen.set_sound(val == "1")
+        else:
+            log(f"unknown device option {key!r} (ignored)")
 
     def _ack_only(self) -> None:
         """GO long-press: acknowledge the shown session's alert WITHOUT touching

@@ -158,14 +158,20 @@ static uint8_t pageIdx = 0;          // selected row within the page
 
 // Settings rows, in screen order.
 enum SetRow : uint8_t {
-  SR_SLEEP, SR_BRIGHT, SR_LED, SR_FLIP, SR_RESET, SR_COUNT
+  SR_SLEEP, SR_BRIGHT, SR_LED, SR_SOUND, SR_FLIP, SR_RESET, SR_COUNT
 };
+// Which row is at the top of the visible window. The page scrolls now: five
+// rows fit and there are six, which is exactly the case the static_assert below
+// used to reject outright. Scrolling was named in its own comment as one of the
+// two ways out, and it is the one that keeps paying off.
+static uint8_t pageTop = 0;
 // The page does not scroll, so a sixth row would simply not be drawn -- and
 // would look like a bug in the setting rather than in the layout. Adding one
 // means either raising PAGE_ROWS_VIS (and finding the pixels) or teaching the
 // page to scroll; this makes the compiler say so instead of the screen.
-static_assert(SR_COUNT <= PAGE_ROWS_VIS,
-              "settings rows exceed what one page can show without scrolling");
+// The page scrolls, so rows may exceed PAGE_ROWS_VIS -- but the WINDOW must
+// still be at least one row, and pageTop arithmetic assumes it.
+static_assert(PAGE_ROWS_VIS >= 1, "the settings window needs at least one row");
 
 // The factory-reset row asks twice. A single GO arms it and the row says what is
 // about to be destroyed; the confirming gesture is a LONG press, which is a
@@ -908,6 +914,14 @@ static void drawSetRow(uint8_t row, int16_t y, bool sel) {
       value = cfg.ledLabel();
       vcol  = cfg.ledBright() ? C_WAIT : C_DIM;
       break;
+    case SR_SOUND:
+      label = "Mac sound";
+      // Named for where it happens. "Sound: on" on a device with no speaker
+      // would be a promise the hardware cannot keep, and the first thing anyone
+      // would do is turn it on and wait for a beep that never comes.
+      value = cfg.sound() ? "on" : "off";
+      vcol  = cfg.sound() ? C_DONE : C_DIM;
+      break;
     case SR_FLIP:
       label = "Flip screen";
       if (flipNeedsRestart) {
@@ -937,8 +951,20 @@ static void drawSetRow(uint8_t row, int16_t y, bool sel) {
 }
 
 static void drawSettingsPage() {
-  for (uint8_t r = 0; r < SR_COUNT && r < PAGE_ROWS_VIS; r++)
-    drawSetRow(r, PAGE_ROW_Y + r * PAGE_ROW_H, r == pageIdx);
+  for (uint8_t i = 0; i < PAGE_ROWS_VIS && (pageTop + i) < SR_COUNT; i++) {
+    uint8_t row = pageTop + i;
+    drawSetRow(row, PAGE_ROW_Y + i * PAGE_ROW_H, row == pageIdx);
+  }
+  // A scrollbar, because otherwise there is nothing at all to say that a sixth
+  // row exists -- the list simply looks complete.
+  if (SR_COUNT > PAGE_ROWS_VIS) {
+    int16_t trackY = PAGE_ROW_Y, trackH = PAGE_ROWS_VIS * PAGE_ROW_H - 2;
+    int16_t thumbH = trackH * PAGE_ROWS_VIS / SR_COUNT;
+    int16_t thumbY = trackY + (trackH - thumbH) * pageTop /
+                     (SR_COUNT - PAGE_ROWS_VIS);
+    gfx->fillRect(SCREEN_W - 3, trackY, 2, trackH, C_DIMMER);
+    gfx->fillRect(SCREEN_W - 3, thumbY, 2, thumbH, C_DIM);
+  }
   gfx->setTextSize(1);
   gfx->setTextColor(resetArmedMs ? C_ERROR : C_DIM);
   gfx->setCursor(PAD_X, MENU_HINT_Y);
@@ -1554,6 +1580,25 @@ static void pollHibernate() {
 // -----------------------------------------------------------------------------
 // Menu input
 // -----------------------------------------------------------------------------
+// Keep the selected row inside the visible window, scrolling by the minimum
+// needed. Wrapping from the last row to the first jumps the window back to the
+// top, which is what "the list wrapped" should look like.
+static void scrollToSelection() {
+  if (pageIdx < pageTop) pageTop = pageIdx;
+  else if (pageIdx >= pageTop + PAGE_ROWS_VIS)
+    pageTop = (uint8_t)(pageIdx - PAGE_ROWS_VIS + 1);
+}
+
+// The Mac's alert sound is a DAEMON setting reached from the device, so it is
+// the one preference here that has to cross the link. Sent on every change and
+// again on every (re)connect, because the daemon keeps no per-device state and
+// would otherwise forget it the moment the link dropped.
+static void sendSoundPref() {
+  char buf[12];
+  snprintf(buf, sizeof(buf), "O|SND|%d", cfg.sound() ? 1 : 0);
+  emitLine(buf);
+}
+
 // PREV/NEXT/GO while a firmware-local screen is up. Never reaches the daemon.
 static void menuButton(char ev) {
   if (uiMode == UI_MENU) {
@@ -1568,7 +1613,7 @@ static void menuButton(char ev) {
       switch (menuIdx) {
         case MI_CONDUCTOR: uiMode = UI_CONDUCTOR; break;
         case MI_SETTINGS:  uiMode = UI_PAGE; pageId = PG_SETTINGS; pageIdx = 0;
-                           resetArmedMs = 0; break;
+                           pageTop = 0; resetArmedMs = 0; break;
         case MI_ABOUT:     uiMode = UI_PAGE; pageId = PG_ABOUT; break;
         case MI_WIFI:      // The portal takes the screen over on its own, via
                            // net.state() == SETUP in render().
@@ -1588,9 +1633,9 @@ static void menuButton(char ev) {
   if (pageId != PG_SETTINGS) return;
 
   if (ev == 'P') { pageIdx = (uint8_t)((pageIdx + SR_COUNT - 1) % SR_COUNT);
-                   resetArmedMs = 0; return; }
+                   scrollToSelection(); resetArmedMs = 0; return; }
   if (ev == 'N') { pageIdx = (uint8_t)((pageIdx + 1) % SR_COUNT);
-                   resetArmedMs = 0; return; }
+                   scrollToSelection(); resetArmedMs = 0; return; }
 
   // 'K' is GO's long press. On the three rows that only cycle a value it means
   // the same as 'G': LONGPRESS_MS is 500 ms, easy to overshoot, and a press that
@@ -1611,6 +1656,12 @@ static void menuButton(char ev) {
                       // next alert -- picking "off" while a 7 Hz strobe is going
                       // is exactly when you reach for this setting.
                       ledApplyCap();
+                      break;
+      case SR_SOUND:  cfg.toggleSound();
+                      // Tell the daemon at once: the sound plays there, so a
+                      // toggle that only reached NVS would do nothing until the
+                      // next reconnect and read as a dead row.
+                      sendSoundPref();
                       break;
       case SR_FLIP:   cfg.toggleFlip();
                       flipNeedsRestart = (cfg.flipped() != flipAtBoot);
@@ -1819,7 +1870,7 @@ void setup() {
 
   // Emit hello once so a daemon already listening on USB sends full state. The
   // WiFi path sends its own H the moment the handshake completes (see loop()).
-  if (Serial) Serial.println("H");
+  if (Serial) { Serial.println("H"); sendSoundPref(); }
 }
 
 void loop() {
@@ -1860,6 +1911,8 @@ void loop() {
   if (ns != lastNetState) {
     if (ns == MateNet::LINKED) {
       net.write("H");
+      sendSoundPref();                      // the daemon keeps no per-device
+                                            // state; re-assert it every link
       lastRxMs = now;                       // the link is alive as of now
     }
     lastNetState = ns;
