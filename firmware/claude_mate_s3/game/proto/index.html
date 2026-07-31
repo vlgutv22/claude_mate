@@ -339,6 +339,12 @@ document.getElementById("kMenu").addEventListener("click",reset);
 const sb=document.getElementById("snd");
 sb.addEventListener("click",()=>{soundOn=!soundOn;
   sb.setAttribute("aria-pressed",String(soundOn)); if(soundOn)SFX.merge();});
+
+// Everything above is in an IIFE, so a harness has no way in. This is the door:
+// it reads state, never writes it, so it cannot become a cheat by accident.
+window.__shipit=()=>({state:S&&S.state,menuRow,tutorial,
+  diff:DIFFS[diff].name,days:S&&Math.ceil(S.days),
+  spd:DIFFS[diff].spd,prs:S&&S.prs.filter(p=>p.got).length});
 })();
 </script>
 </body>
