@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SHIP IT — local prototype</title>
+<style>
+  :root{ --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+         --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+         --page:#faf7f5; --ink:#241c18; --dim:#6b5b53; --rule:#e3d8d1; --mate:#d97757; }
+  @media (prefers-color-scheme:dark){
+    :root{ --page:#17120f; --ink:#f0e7e2; --dim:#a4938a; --rule:#332721; } }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--page);color:var(--ink);font:400 15px/1.6 var(--sans);
+       display:flex;flex-direction:column;align-items:center;padding:32px 16px 60px}
+  h1{font:600 12px/1 var(--mono);letter-spacing:.2em;text-transform:uppercase;
+     color:var(--mate);margin:0 0 6px}
+  p.lede{font-size:22px;font-weight:500;letter-spacing:-.01em;margin:0 0 22px;text-align:center}
+  .device{background:linear-gradient(#c9714f,#b45f40);border-radius:18px;padding:14px 14px 0;
+          box-shadow:0 22px 44px -26px rgba(60,25,10,.6)}
+  canvas{display:block;width:640px;height:344px;border-radius:6px;background:#0d1117;
+         image-rendering:pixelated}
+  @media(max-width:700px){canvas{width:320px;height:172px}}
+  .keys{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;padding:14px 0}
+  .key{appearance:none;border:0;border-radius:7px;background:#efe9e4;color:#3a2b24;
+       font:600 11px/1.35 var(--mono);letter-spacing:.05em;padding:9px 4px;cursor:pointer;
+       text-align:center;transition:transform .05s,background .12s}
+  .key b{display:block;font-size:14px}
+  .key.down{transform:translateY(2px);background:var(--mate);color:#fff}
+  .bar{display:flex;gap:16px;align-items:center;margin-top:16px;flex-wrap:wrap;
+       justify-content:center;font:400 13px var(--mono);color:var(--dim)}
+  .set{display:flex;align-items:center;gap:9px;background:transparent;color:var(--ink);
+       border:1px solid var(--rule);border-radius:8px;padding:7px 12px;cursor:pointer;
+       font:600 11px var(--mono);letter-spacing:.07em}
+  .set .dot{width:9px;height:9px;border-radius:50%;background:#b9aca4}
+  .set[aria-pressed="true"] .dot{background:#40c463;box-shadow:0 0 0 3px rgba(64,196,99,.22)}
+  .legend{margin-top:26px;max-width:560px;color:var(--dim);font-size:13.5px}
+  .legend b{color:var(--ink)}
+</style>
+</head>
+<body>
+<h1>Claude Mate · local prototype</h1>
+<p class="lede">SHIP IT — merge pull requests or miss the milestone.</p>
+
+<div class="device">
+  <canvas id="scr" width="320" height="172"></canvas>
+  <div class="keys">
+    <button class="key" id="kPrev"><b>←</b>PREV</button>
+    <button class="key" id="kGo"><b>↑</b>GO · jump</button>
+    <button class="key" id="kNext"><b>→</b>NEXT</button>
+    <button class="key" id="kMenu"><b>⏻</b>4th · restart</button>
+  </div>
+</div>
+<div class="bar">
+  <button class="set" id="snd" aria-pressed="true"><span class="dot"></span>MAC SOUND</button>
+  <span>Arrow keys or A / W / D</span>
+</div>
+<p class="legend">Level 1 as the firmware header carries it. <b>Ledges now have steps</b> —
+  the vertical budget is one row per jump (35.3 px of apex against 32 px for two rows), which
+  is why nothing above the ground line was reachable before. Every PR is <b>+1 day</b>, a
+  stomped bug <b>+½</b>, a bug that reaches you <b>−1</b>, a priority change <b>−2</b> and it
+  can't be stomped. You start with 10 days and the level costs about 14.</p>
+
+<script>
+(() => {
+"use strict";
+const MAP=['............................................................................................................','...........................................................................................................4','.............................222................................333........................444.............4','.............222............2............2222......222.........3........22............222.4.........222....4','............2...........22.2...........333333.....2...........3........222.333.......2...4.........2.......4','2222222222.222222222..333333333333..333333333..333333333333..22222222..3333333333..333333333333..33333333334','3333333333.333333333..444444444444..444444444..444444444444..33333333..4444444444..444444444444..44444444444'];
+const BUGS=[[13,2,13,15],[18,4,16,19],[37,4,36,38],[43,2,41,44],[51,2,51,53],[56,4,54,58],[64,1,64,66],[79,4,78,80],[86,2,86,88],[100,2,100,102],[105,4,103,106]];
+const PRS=[[14,2],[15,2],[30,1],[31,1],[52,2],[53,2],[65,1],[66,1],[72,2],[76,3],[87,2],[92,1],[93,1],[101,2],[102,2]];
+const PRIOS=[[31,1,4],[67,0,3],[93,1,4]];
+const ROWS=7,COLS=108,T=16,W=320,H=172,HUD=24,PLAY_Y=HUD+12;
+const RAMP={"1":"#9be9a8","2":"#40c463","3":"#30a14e","4":"#216e39"};
+const solid=(c,r)=>c>=0&&c<COLS&&r>=0&&r<ROWS&&MAP[r][c]!==".";
+
+const MATE=["01111111111100","01111111111100","01101111110110","01101111110110","01111111111100","11111111111110","11111111111110","01111111111100","01111111111100","01111111111100","00110000011000","00110000011000"];
+const BUG=["001000000100","000100001000","000011110000","001111111100","011110011110","111110011111","011110011110","111110011111","001111111100","010010010010"];
+const PRIO=["000001100000","000011110000","000110011000","001110011100","011110011110","111110011111","111110011111","011111111110","001110011100","000111111000","000011110000","000001100000"];
+const PR=["01110000000","11011000000","10001000000","11011001110","01110011011","00100010001","00100011011","00100001110","01110000000","11011000000","01110000000"];
+
+const cv=document.getElementById("scr"),g=cv.getContext("2d");
+g.imageSmoothingEnabled=false;
+function blit(b,x,y,col,flip){g.fillStyle=col;
+  for(let r=0;r<b.length;r++){const row=b[r];
+    for(let c=0;c<row.length;c++) if(row[c]==="1"){
+      const px=flip?x+(row.length-1-c):x+c; g.fillRect(px|0,(y+r)|0,1,1);}}}
+
+let AC=null,soundOn=true;
+function beep(fs,d,type,vol){ if(!soundOn)return;
+  try{ AC=AC||new (window.AudioContext||window.webkitAudioContext)();
+    if(AC.state==="suspended")AC.resume();
+    const t0=AC.currentTime;
+    fs.forEach((f,i)=>{const o=AC.createOscillator(),gn=AC.createGain();
+      o.type=type||"square";o.frequency.setValueAtTime(f,t0+i*d);
+      gn.gain.setValueAtTime(0,t0+i*d);
+      gn.gain.linearRampToValueAtTime(vol||0.05,t0+i*d+0.008);
+      gn.gain.exponentialRampToValueAtTime(0.0008,t0+i*d+d);
+      o.connect(gn);gn.connect(AC.destination);o.start(t0+i*d);o.stop(t0+i*d+d+0.02);});
+  }catch(e){}}
+const SFX={jump:()=>beep([520,760],.055),stomp:()=>beep([300,150],.05),
+  merge:()=>beep([660,880,1320],.065,"square",.055),hit:()=>beep([180,120],.09,"sawtooth",.05),
+  fall:()=>beep([400,260,160],.06,"sawtooth"),ship:()=>beep([523,659,784,1047,1319],.11,"square",.06)};
+
+let S;
+function reset(){S={x:T,y:4*T,vx:0,vy:0,onGround:false,face:1,days:10,cam:0,
+  bugs:BUGS.map(b=>({c:b[0]*T,r:b[1],from:b[2],to:b[3],dir:1})),
+  prs:PRS.map(p=>({c:p[0],r:p[1],got:false})),
+  prios:PRIOS.map(p=>({c:p[0]*T,y:p[1]*T,top:p[1]*T,bot:p[2]*T,dir:1})),
+  seen:{bug:false,prio:false},card:null,merged:0,state:"play",flash:0,msg:"",
+  msgCol:"#e6edf3",squashT:0,t:0,started:false,coyote:0,buffer:0,inv:0,shipT:0,conf:[]};}
+reset();
+const keys={left:false,right:false,jump:false},jw={v:false};
+const GRAV=.30,WALK=1.45,JUMP=-4.75,MAXFALL=7;
+function hits(px,py){const x0=Math.floor((px+1)/T),x1=Math.floor((px+12)/T),
+  y0=Math.floor(py/T),y1=Math.floor((py+11)/T);
+  for(let c=x0;c<=x1;c++)for(let r=y0;r<=y1;r++)if(solid(c,r))return true;return false;}
+function toast(m,c){S.msg=m;S.msgCol=c||"#e6edf3";S.flash=52;}
+
+function step(){
+  S.t++;
+  if(S.state==="ship"){S.shipT++;for(const p of S.conf){p.y+=p.vy;p.x+=p.vx;if(p.y>H)p.y=-8;}return;}
+  if(S.state==="slip"||S.state==="card")return;
+  if(!S.started||document.hidden)return;
+  S.days-=1/420;
+  if(S.days<=0){S.days=0;S.state="slip";toast("MILESTONE SLIPPED","#c4302b");SFX.fall();return;}
+  S.vx=(keys.right?WALK:0)-(keys.left?WALK:0); if(S.vx)S.face=S.vx>0?1:-1;
+  if(S.onGround)S.coyote=6; else if(S.coyote>0)S.coyote--;
+  if(keys.jump&&!jw.v)S.buffer=6; else if(S.buffer>0)S.buffer--;
+  if(S.buffer>0&&S.coyote>0){S.vy=JUMP;S.onGround=false;S.buffer=0;S.coyote=0;SFX.jump();}
+  if(!keys.jump&&S.vy<-1.8)S.vy=-1.8; jw.v=keys.jump;
+  S.vy=Math.min(S.vy+GRAV,MAXFALL);
+  const nx=S.x+S.vx; if(!hits(nx,S.y))S.x=nx;
+  const ny=S.y+S.vy;
+  if(!hits(S.x,ny)){S.y=ny;S.onGround=false;}
+  else{ if(S.vy>0){S.y=Math.floor((ny+11)/T)*T-12;S.onGround=true;} else S.y=Math.floor(ny/T)*T+T; S.vy=0;}
+  S.x=Math.max(0,Math.min(S.x,(COLS-1)*T));
+  if(S.y>ROWS*T+40){S.days-=1;toast("-1 day · fell","#f0883e");SFX.fall();
+    let c=Math.floor(S.x/T);while(c>0&&!solid(c,5)&&!solid(c,6))c--;
+    let r=6;while(r>0&&!solid(c,r))r--; S.x=c*T;S.y=(r-1)*T;S.vy=0;S.inv=60;}
+  for(const b of S.bugs){ if(b.dead)continue;
+    b.c+=b.dir*.42; const col=Math.floor((b.c+6)/T);
+    if(col<=b.from||col>=b.to||!solid(col,b.r+1))b.dir*=-1;
+    const bx=b.c,by=b.r*T+6;
+    if(Math.abs(bx-S.x)<12&&Math.abs(by-S.y)<12){
+      if(S.vy>.6&&S.y<by-2){b.dead=true;S.vy=-3.2;S.squashT=18;
+        S.days=Math.min(20,S.days+.5);toast("FIXED  +½ day","#40c463");SFX.stomp();}
+      else if(S.inv<=0){S.days-=1;toast("-1 day · bug","#c4302b");SFX.hit();
+        S.x-=S.face*15;S.vy=-2.5;S.inv=75;}}}
+  if(S.inv>0)S.inv--;
+  for(const p of S.prios){ if(p.dead)continue;
+    p.y+=p.dir*.55; if(p.y<=p.top||p.y>=p.bot)p.dir*=-1;
+    if(Math.abs(p.c-S.x)<13&&Math.abs(p.y-S.y)<13&&S.inv<=0){
+      S.days-=2;toast("RE-SCOPED  -2 days","#d29922");SFX.hit();
+      S.x=Math.max(0,S.x-46);S.vy=-2.2;S.inv=80;}}
+  for(const p of S.prs){ if(p.got)continue;
+    if(Math.abs(p.c*T-S.x)<14&&Math.abs(p.r*T-S.y)<14){
+      p.got=true;S.merged++;S.days=Math.min(20,S.days+1);
+      toast("PR MERGED  +1 day","#a371f7");SFX.merge();}}
+  if(S.flash>0)S.flash--; if(S.squashT>0)S.squashT--;
+  const right=S.cam+W;
+  if(!S.seen.bug&&S.bugs.some(b=>!b.dead&&b.c>S.cam+40&&b.c<right-24))
+    {S.seen.bug=true;S.card="bug";S.state="card";SFX.hit();}
+  else if(!S.seen.prio&&S.prios.some(p=>!p.dead&&p.c>S.cam+40&&p.c<right-24))
+    {S.seen.prio=true;S.card="prio";S.state="card";SFX.hit();}
+  if(Math.floor(S.x/T)>=COLS-2){S.state="ship";S.shipT=0;SFX.ship();
+    for(let i=0;i<44;i++)S.conf.push({x:Math.random()*W,y:-Math.random()*90,
+      vy:.7+Math.random()*1.9,vx:(Math.random()-.5)*.7,
+      c:["#9be9a8","#40c463","#30a14e","#a371f7","#d97757"][(Math.random()*5)|0]});}
+  S.cam=Math.max(0,Math.min(S.x-W/2+7,COLS*T-W));
+}
+
+function draw(){
+  g.fillStyle="#0d1117";g.fillRect(0,0,W,H);
+  g.font="bold 10px ui-monospace,Menlo,monospace";
+  g.fillStyle="#e6edf3";g.fillText("M1 · KICKOFF",6,15);
+  blit(PR,128,5,"#a371f7");
+  g.fillStyle="#a371f7";g.fillText(S.merged+"/"+PRS.length,142,15);
+  const d=Math.max(0,S.days),bw=78,fw=Math.round(bw*Math.min(d,14)/14);
+  g.fillStyle="#21262d";g.fillRect(W-6-bw-32,6,bw,9);
+  g.fillStyle=d>5?"#40c463":d>2.5?"#d29922":"#c4302b";g.fillRect(W-6-bw-32,6,fw,9);
+  g.fillStyle="#e6edf3";g.fillText(Math.ceil(d)+"d",W-26,15);
+  g.fillStyle="#21262d";g.fillRect(0,HUD,W,1);
+  g.save();g.translate(-Math.round(S.cam),PLAY_Y);
+  const c0=Math.max(0,Math.floor(S.cam/T)-1),c1=Math.min(COLS-1,c0+22);
+  for(let c=c0;c<=c1;c++)for(let r=0;r<ROWS;r++){const ch=MAP[r][c];
+    if(ch==="."){g.strokeStyle="#161b22";g.lineWidth=1;g.strokeRect(c*T+1.5,r*T+1.5,T-3,T-3);}
+    else{let col=RAMP[ch]; if(S.state==="ship"&&c*3<S.shipT)col="#9be9a8";
+      g.fillStyle=col;g.fillRect(c*T+1,r*T+1,T-2,T-2);}}
+  g.fillStyle="#a371f7";g.fillRect((COLS-1)*T+2,0,3,ROWS*T);
+  g.fillStyle=S.state==="ship"?"#9be9a8":"#a371f7";g.fillRect((COLS-1)*T+5,6,10,8);
+  for(const p of S.prs){ if(p.got)continue;
+    const bob=Math.sin((S.t+p.c*9)/17)*1.6; blit(PR,p.c*T+3,p.r*T+3+bob,"#a371f7");}
+  for(const b of S.bugs) if(!b.dead) blit(BUG,b.c,b.r*T+6,"#c4302b",b.dir<0);
+  for(const p of S.prios) if(!p.dead) blit(PRIO,p.c,p.y+2,"#d29922");
+  let sy=1; if(S.squashT>0)sy=.72; else if(!S.onGround&&S.vy<-1)sy=1.12;
+  if(!(S.inv>0&&(S.t>>2)%2)){g.save();g.translate(Math.round(S.x),Math.round(S.y));
+    g.scale(1,sy);g.translate(0,(1-sy)*12);blit(MATE,0,0,"#d97757",S.face<0);g.restore();}
+  g.restore();
+  if(S.state==="ship"){
+    for(const p of S.conf){g.fillStyle=p.c;g.fillRect(p.x|0,p.y|0,3,3);}
+    if(S.shipT>26){g.fillStyle="rgba(13,17,23,.9)";g.fillRect(0,58,W,56);
+      g.fillStyle="#40c463";g.fillRect(0,58,W,1);g.fillRect(0,113,W,1);
+      g.font="bold 16px ui-monospace,Menlo,monospace";
+      const a="MILESTONE SHIPPED";g.fillStyle="#9be9a8";
+      g.fillText(a,W/2-g.measureText(a).width/2,80);
+      g.font="10px ui-monospace,Menlo,monospace";
+      const b="v0.1.0  ·  "+S.merged+"/"+PRS.length+" merged  ·  "+Math.ceil(Math.max(0,S.days))+"d carried over";
+      g.fillStyle="#e6edf3";g.fillText(b,W/2-g.measureText(b).width/2,98);}}
+  if(S.state==="card"){
+    const D=S.card==="bug"
+      ?{name:"BUG",col:"#c4302b",bits:BUG,lines:[["Patrols a commit. Turns at every edge.",""],["Stomp it from above","+½ day"],["Let it reach you","-1 day"]]}
+      :{name:"PRIORITY CHANGE",col:"#d29922",bits:PRIO,lines:[["Drifts up and down. Denies a whole lane.",""],["CANNOT be stomped","go around"],["If it reaches you","-2 days, pushed back"]]};
+    g.fillStyle="rgba(13,17,23,.94)";g.fillRect(0,0,W,H);
+    g.strokeStyle=D.col;g.lineWidth=1;g.strokeRect(18.5,26.5,W-37,H-58);
+    g.save();g.translate(34,44);g.scale(3,3);blit(D.bits,0,0,D.col);g.restore();
+    g.font="bold 13px ui-monospace,Menlo,monospace";g.fillStyle=D.col;g.fillText(D.name,86,54);
+    g.font="9px ui-monospace,Menlo,monospace";let yy=70;
+    for(const [l,r] of D.lines){g.fillStyle=r?"#e6edf3":"#8b949e";g.fillText(l,86,yy);
+      if(r){g.fillStyle=D.col;g.fillText(r,W-30-g.measureText(r).width,yy);} yy+=15;}
+    g.fillStyle="#8b949e";const t="press any button to continue";
+    g.fillText(t,W/2-g.measureText(t).width/2,H-14);}
+  if(S.state==="slip"){
+    g.fillStyle="rgba(13,17,23,.9)";g.fillRect(0,64,W,44);
+    g.fillStyle="#c4302b";g.fillRect(0,64,W,1);g.fillRect(0,107,W,1);
+    g.font="bold 15px ui-monospace,Menlo,monospace";const a="MILESTONE SLIPPED";
+    g.fillStyle="#c4302b";g.fillText(a,W/2-g.measureText(a).width/2,86);
+    g.font="9px ui-monospace,Menlo,monospace";g.fillStyle="#8b949e";
+    const b="merge more pull requests";g.fillText(b,W/2-g.measureText(b).width/2,100);}
+  if(S.msg&&S.flash>0&&S.state==="play"){
+    g.font="bold 10px ui-monospace,Menlo,monospace";const w=g.measureText(S.msg).width;
+    g.fillStyle="rgba(13,17,23,.88)";g.fillRect(W/2-w/2-8,PLAY_Y+30,w+16,17);
+    g.fillStyle=S.msgCol;g.fillText(S.msg,W/2-w/2,PLAY_Y+42);}
+  if(!S.started&&S.state==="play"){
+    g.font="9px ui-monospace,Menlo,monospace";g.fillStyle="#8b949e";
+    const t="press → to start the sprint";g.fillText(t,W/2-g.measureText(t).width/2,PLAY_Y+98);}
+  if(S.state==="ship"||S.state==="slip"){
+    g.font="9px ui-monospace,Menlo,monospace";g.fillStyle="#8b949e";
+    const t="4th button to restart";g.fillText(t,W/2-g.measureText(t).width/2,H-8);}
+}
+
+const DT=1000/60;let acc=0,last=performance.now();
+function loop(now){acc=Math.min(acc+(now-last),250);last=now;
+  while(acc>=DT){step();acc-=DT;} draw(); requestAnimationFrame(loop);}
+requestAnimationFrame(loop);
+
+const KM={ArrowLeft:"left",KeyA:"left",ArrowRight:"right",KeyD:"right",
+  ArrowUp:"jump",KeyW:"jump",Space:"jump"};
+const btn={left:document.getElementById("kPrev"),jump:document.getElementById("kGo"),
+  right:document.getElementById("kNext")};
+function set(k,v){ if(!(k in keys))return;
+  if(v&&S.state==="card"){S.state="play";return;}
+  if(v&&S.state==="play")S.started=true;
+  keys[k]=v; btn[k]&&btn[k].classList.toggle("down",v);}
+addEventListener("keydown",e=>{if(e.code==="Enter"||e.code==="KeyR"){reset();return;}
+  const k=KM[e.code];if(k){e.preventDefault();set(k,true);}});
+addEventListener("keyup",e=>{const k=KM[e.code];if(k)set(k,false);});
+for(const [k,el] of Object.entries(btn)){
+  el.addEventListener("pointerdown",e=>{e.preventDefault();set(k,true);});
+  ["pointerup","pointerleave","pointercancel"].forEach(ev=>
+    el.addEventListener(ev,e=>{e.preventDefault();set(k,false);}));}
+document.getElementById("kMenu").addEventListener("click",reset);
+const sb=document.getElementById("snd");
+sb.addEventListener("click",()=>{soundOn=!soundOn;
+  sb.setAttribute("aria-pressed",String(soundOn)); if(soundOn)SFX.merge();});
+})();
+</script>
+</body>
+</html>
