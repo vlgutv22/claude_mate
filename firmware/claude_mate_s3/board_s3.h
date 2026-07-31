@@ -292,14 +292,20 @@ struct Btn {
 // a fifth of the width and runs out of height at five rows, while a strip has
 // room to spare in the axis it actually has.
 //
-// Only the SELECTED item is labelled. Five labels at once would either be
+// Only the SELECTED item is labelled. Six labels at once would either be
 // unreadable at size 1 or collide at size 2, and the icons carry the
 // recognition once you have been here twice.
-#define MENU_COUNT      5
+//
+// SIX items, since SHIP IT joined. The pitch had to come down with it: five
+// gaps of 58 span 290 px and the selected tile is 46 wide, so slot 0's centre
+// would land at 15 and its left edge 8 px OFF the glass. At 52 the strip spans
+// 260, slot 0 centres at 30 and clears the edge by 7 px, while the selected
+// plate (54 wide) still misses its 34 px neighbour by 8.
+#define MENU_COUNT      6
 #define MENU_ICON       34    // unselected tile, px square
 #define MENU_ICON_SEL   46    // ...and the selected one
-#define MENU_PITCH      58    // centre-to-centre
-#define MENU_CX0        44    // centre of slot 0: (320 - 4*58) / 2
+#define MENU_PITCH      52    // centre-to-centre
+#define MENU_CX0        30    // centre of slot 0: (320 - 5*52) / 2
 #define MENU_CY         80    // vertical centre of the strip
 #define MENU_LABEL_Y    116   // selected item's label (size 2, centred)
 #define MENU_HINT_Y     150   // the what-the-buttons-do line (size 1, dim)
@@ -338,7 +344,7 @@ struct Btn {
 // Shown on the About page and by the serial `?`. The only place a flashed
 // device can tell you which build it is running -- which matters because the
 // flash script writes in verified pieces and a partial run is otherwise silent.
-#define FW_VERSION "s3-2.1"
+#define FW_VERSION "s3-2.2"
 
 // ---- Timing (identical semantics to the Nano build) ------------------------
 #define SERIAL_BAUD     115200

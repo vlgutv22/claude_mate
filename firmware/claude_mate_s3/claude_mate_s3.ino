@@ -107,6 +107,7 @@
 #include "board_s3.h"
 #include "netcfg.h"
 #include "settings.h"
+#include "game/ship_it.h"
 
 // ---- Display -----------------------------------------------------------------
 // Drawn into an off-screen canvas and flushed in one go: the frame is rebuilt
@@ -144,11 +145,11 @@ MateSettings cfg;
 // terminal you were not looking at. The daemon simply sees no button events,
 // needs no protocol change, and keeps its frame current the whole time, so
 // leaving the menu is instant.
-enum UiMode : uint8_t { UI_CONDUCTOR, UI_MENU, UI_PAGE };
+enum UiMode : uint8_t { UI_CONDUCTOR, UI_MENU, UI_PAGE, UI_GAME };
 static UiMode uiMode = UI_CONDUCTOR;
 
 enum MenuItem : uint8_t {
-  MI_CONDUCTOR, MI_SETTINGS, MI_ABOUT, MI_WIFI, MI_SLEEP
+  MI_CONDUCTOR, MI_SETTINGS, MI_ABOUT, MI_WIFI, MI_GAME, MI_SLEEP
 };
 static uint8_t menuIdx = MI_CONDUCTOR;
 
@@ -868,6 +869,22 @@ static void iconSleep(int16_t cx, int16_t cy, int16_t s, uint16_t col) {
   gfx->fillCircle(cx + r / 2, cy - r / 3, r * 7 / 8, C_BG);
 }
 
+static void iconGame(int16_t cx, int16_t cy, int16_t s, uint16_t col) {
+  // Mate itself, not a controller glyph: the mascot IS the character you play,
+  // and a tile that shows the thing you will be moving needs no caption. Drawn
+  // from the same parts as the sprite -- body, two eye slots, two legs -- so the
+  // tile and the game agree at a glance.
+  int16_t w = s * 3 / 4, h = s * 5 / 8;
+  int16_t x = cx - w / 2, y = cy - h / 2 - s / 8;
+  gfx->fillRoundRect(x, y, w, h, 3, col);
+  int16_t ew = w / 5, eh = h / 3;
+  gfx->fillRect(x + w / 6, y + h / 5, ew, eh, C_BG);
+  gfx->fillRect(x + w - w / 6 - ew, y + h / 5, ew, eh, C_BG);
+  int16_t lw = w / 5, lh = s / 4;
+  gfx->fillRect(x + w / 5, y + h, lw, lh, col);
+  gfx->fillRect(x + w - w / 5 - lw, y + h, lw, lh, col);
+}
+
 struct MenuDef {
   const char *label;
   void (*icon)(int16_t, int16_t, int16_t, uint16_t);
@@ -881,8 +898,11 @@ static const MenuDef MENU[MENU_COUNT] = {
   {"SETTINGS",  iconSettings,  C_TEXT},
   {"ABOUT",     iconAbout,     C_TEXT},
   {"WI-FI",     iconWifi,      C_DONE},
+  {"SHIP IT",   iconGame,      GH_MATE},
   {"SLEEP",     iconSleep,     C_IDLE},
 };
+
+ShipIt game;
 
 // Centre text of the given size at x.
 static void drawCentred(int16_t cx, int16_t y, uint8_t size, const char *s,
@@ -1075,6 +1095,10 @@ static void render() {
     gfx->print("PREV/NEXT move   GO open   4th back");
     gfx->fillRect(0, ACCENT_Y, SCREEN_W, ACCENT_H,
                   blip ? C_TEXT : MENU[menuIdx].colour);
+  } else if (uiMode == UI_GAME) {
+    // No status bar and no accent bar: the game owns all 172 px. The battery
+    // and the link are exactly the things you did not come here to look at.
+    game.draw(gfx);
   } else if (uiMode == UI_PAGE) {
     drawStatusBar();
     if (pageId == PG_SETTINGS) drawSettingsPage();
@@ -1420,6 +1444,12 @@ static void onButton(char ev) {
 static void pollNavBtn(Btn &b, char ev) {
   bool raw = (digitalRead(b.pin) == LOW);   // pull-up: LOW = pressed
   unsigned long now = millis();
+  // The game reads these three pins directly, every step, because a platformer
+  // needs "is it held down NOW" and this poller deals in events with a 400/200
+  // ms auto-repeat. Track the level so that leaving the game does not deliver
+  // the release of a press the menu never saw as an event.
+  if (uiMode == UI_GAME) { b.pressed = raw; b.changeMs = now; b.longFired = true;
+                           return; }
   if (raw != b.pressed && (now - b.changeMs) >= DEBOUNCE_MS) {
     b.pressed  = raw;
     b.changeMs = now;
@@ -1452,6 +1482,8 @@ static void pollNavBtn(Btn &b, char ev) {
 static void pollGoBtn(Btn &b) {
   bool raw = (digitalRead(b.pin) == LOW);
   unsigned long now = millis();
+  if (uiMode == UI_GAME) { b.pressed = raw; b.changeMs = now; b.longFired = true;
+                           return; }
   if (raw != b.pressed && (now - b.changeMs) >= DEBOUNCE_MS) {
     b.pressed  = raw;
     b.changeMs = now;
@@ -1652,6 +1684,7 @@ static void menuButton(char ev) {
         case MI_SETTINGS:  uiMode = UI_PAGE; pageId = PG_SETTINGS; pageIdx = 0;
                            pageTop = 0; resetArmedMs = 0; break;
         case MI_ABOUT:     uiMode = UI_PAGE; pageId = PG_ABOUT; break;
+        case MI_GAME:      uiMode = UI_GAME; game.open(); break;
         case MI_WIFI:      // The portal takes the screen over on its own, via
                            // net.state() == SETUP in render().
                            uiMode = UI_CONDUCTOR;
@@ -1748,6 +1781,11 @@ static bool          clickPending = false;
 static unsigned long clickMs      = 0;
 
 static void fourthTap() {
+  // In the game the 4th button steps OUT one level at a time -- play back to the
+  // start screen, start screen back to the menu -- so a mis-tap mid-level costs
+  // you the run but not the screen you were on.
+  if (uiMode == UI_GAME)      { if (game.fourth()) uiMode = UI_MENU;
+                                requestRender(); return; }
   if (uiMode == UI_MENU)      { uiMode = UI_CONDUCTOR; requestRender(); return; }
   if (uiMode == UI_PAGE)      { uiMode = UI_MENU; resetArmedMs = 0;
                                 requestRender(); return; }
@@ -1794,6 +1832,10 @@ static void pollTapBtn(Btn &b) {
   // dark to switch it off should not need two goes.
   if (b.pressed && !b.longFired && (now - b.pressMs) >= POWEROFF_HOLD_MS) {
     b.longFired  = true;                      // swallow the release
+    // NOT during a game. The 4th button is the only way out of a level, and a
+    // thumb that rests on it for two seconds while thinking about a jump would
+    // switch the device off mid-run. Holding it leaves the game instead.
+    if (uiMode == UI_GAME) { uiMode = UI_MENU; requestRender(); return; }
     cfg.flush();                              // deferred commit will not run
     powerOff();                               // never returns
   }
@@ -1986,6 +2028,18 @@ void loop() {
   // Not while the screen is dark: a full flush is ~28 ms of SPI at 40 MHz and
   // there is nothing to see. needRender stays SET, so wakeScreen() shows the
   // current frame rather than the one from when the screen went out.
+  // A sprint in progress renders every pass and never coalesces: the throttle
+  // below exists to stop a chatty daemon starving the display, and a game has
+  // the opposite problem. notePoke() keeps the hibernate timer from blanking
+  // the screen under someone mid-level, which idle-detection would otherwise do
+  // to a player who is holding a button but sending the daemon nothing.
+  if (uiMode == UI_GAME) {
+    game.tick();
+    notePoke();
+    if (screenOn) { needRender = false; render(); }
+    return;
+  }
+
   if (needRender && screenOn) {
     bool quiet = (Serial.available() == 0) && (now - lastRxMs) >= 8;
     if (quiet || (now - dirtyMs) >= 60) {

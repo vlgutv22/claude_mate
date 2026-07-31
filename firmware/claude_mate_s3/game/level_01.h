@@ -145,56 +145,138 @@ static const GameSpawn LVL1_PRS[] = {
 #define LVL1_DEADLINE_DAYS 7
 #define LVL1_NAME  "M1 \xB7 KICKOFF"
 
-// ---- palette (RGB565) -------------------------------------------------------
+// ---- palette ----------------------------------------------------------------
 // GitHub's own contribution ramp, so a screenshot of the game and a screenshot
-// of the graph are the same picture.
-#define GH_L1  RGB565(155, 233, 168)      // #9BE9A8
-#define GH_L2  RGB565( 64, 196,  99)      // #40C463
-#define GH_L3  RGB565( 48, 161,  78)      // #30A14E
-#define GH_L4  RGB565( 33, 110,  57)      // #216E39
-#define GH_BG  RGB565( 13,  17,  23)      // #0D1117, GitHub's own dark canvas
-#define GH_GRID RGB565(33, 38, 45)        // empty-cell outline, #21262D
+// of the graph are the same picture. RGB565() comes from board_s3.h.
+#define GH_L1   RGB565(155, 233, 168)     // #9BE9A8
+#define GH_L2   RGB565( 64, 196,  99)     // #40C463
+#define GH_L3   RGB565( 48, 161,  78)     // #30A14E
+#define GH_L4   RGB565( 33, 110,  57)     // #216E39
+#define GH_BG   RGB565( 13,  17,  23)     // #0D1117, GitHub's own dark canvas
+#define GH_GRID RGB565( 22,  27,  34)     // empty-cell outline, #161B22
+#define GH_MATE RGB565(217, 119,  87)     // #D97757, the accent used repo-wide
+#define GH_BUG  RGB565(196,  48,  43)     // a red that is NOT the alert red, so
+                                          // an enemy and an error never read as
+                                          // the same thing
+#define GH_PRIO RGB565(210, 153,  34)     // #D29922
+#define GH_PR   RGB565(163, 113, 247)     // #A371F7, GitHub's own PR purple
+#define GH_TEXT RGB565(230, 237, 243)     // #E6EDF3
 
 // ---- sprites ----------------------------------------------------------------
-// 1 bit per pixel, MSB first, padded to whole bytes per row. Drawn as filled
-// rectangles rather than blitted: at this size a run-length walk of the bitmap
-// is fewer SPI writes than a per-pixel blit, and the terrain is rectangles
-// already so the same primitive serves both.
+// One character per pixel, one string per row. That is the same literal the
+// browser prototype carries, which is the point: the prototype is where the
+// feel of this thing is worked out, and a sprite that exists twice in two
+// formats is a sprite that will drift. Drawn as runs of fillRect -- at this
+// size a run-length walk beats a per-pixel blit, and the terrain is rectangles
+// already, so one primitive serves both.
 
-// Claude Mate, 14x12. The project's mascot: a wide body, two dark eye slots,
-// stubby arms that step out at the shoulders, two legs.
+// THREE POSES, NEVER ONE SPRITE SCALED. The squash and stretch was first done
+// with a vertical scale over a bitmap drawn as 1x1 rects, which turns every
+// pixel into a FRACTIONAL rect for the canvas to antialias -- a shimmer that
+// read as a glitch, and one that could never have shipped here anyway: this
+// panel has no antialiasing at all. Discrete poses are honest on both.
 #define MATE_W 14
 #define MATE_H 12
-static const uint16_t MATE_BITS[MATE_H] = {
-  0b0111111111110000,   // .############.
-  0b0111111111110000,   // .############.
-  0b0110111111011000,   // .##.######.##.   <- eye slots knocked out
-  0b0110111111011000,   // .##.######.##.
-  0b0111111111110000,   // .############.
-  0b1111111111111000,   // ##############   <- arms
-  0b1111111111111000,   // ##############
-  0b0111111111110000,   // .############.
-  0b0111111111110000,   // .############.
-  0b0111111111110000,   // .############.
-  0b0011000001100000,   // ..##......##..   <- legs
-  0b0011000001100000,   // ..##......##..
+static const char *const MATE_BITS[MATE_H] = {
+  "01111111111100",
+  "01111111111100",
+  "01101111110110",   // eye slots knocked out
+  "01101111110110",
+  "01111111111100",
+  "11111111111110",   // arms
+  "11111111111110",
+  "01111111111100",
+  "01111111111100",
+  "01111111111100",
+  "00110000011000",   // legs
+  "00110000011000",
 };
-#define MATE_COL RGB565(217, 119, 87)     // #D97757, the accent used repo-wide
 
-// A bug, 10x8. Round-ish on purpose: it is the only non-square thing on a
-// screen made of squares, which is what makes it readable at this size.
-#define BUG_W 10
-#define BUG_H 8
-static const uint16_t BUG_BITS[BUG_H] = {
-  0b0011110000000000,   // ..####....
-  0b0111111000000000,   // .######...
-  0b1101101100000000,   // ##.##.##..   <- pale eyes knocked out
-  0b1111111100000000,   // ########..
-  0b1111111100000000,   // ########..
-  0b0111111000000000,   // .######...
-  0b1010010100000000,   // #.#..#.#..   <- legs
-  0b1000000100000000,   // #......#..
+// landing: flatter and wider, legs tucked
+#define MATE_SQUASH_H 8
+static const char *const MATE_SQUASH_BITS[MATE_SQUASH_H] = {
+  "00111111111100",
+  "01111111111110",
+  "11101111101110",
+  "11101111101110",
+  "11111111111110",
+  "11111111111110",
+  "01111111111100",
+  "00110000011000",
 };
-#define BUG_COL RGB565(196, 48, 43)       // a red that is not the ERROR red, so
-                                          // an alert and an enemy never read as
-                                          // the same thing
+
+// rising: taller and narrower, legs extended
+#define MATE_STRETCH_H 14
+static const char *const MATE_STRETCH_BITS[MATE_STRETCH_H] = {
+  "00011111111000",
+  "00111111111100",
+  "00110111101100",
+  "00110111101100",
+  "00111111111100",
+  "01111111111110",
+  "01111111111110",
+  "00111111111100",
+  "00111111111100",
+  "00111111111100",
+  "00111111111100",
+  "00011000011000",
+  "00011000011000",
+  "00001000001000",
+};
+
+// A bug: antennae, a shell with a seam down it, six legs. Round-ish on purpose,
+// because it is the only non-square thing on a screen made of squares, and that
+// is what makes it readable at 12 px.
+#define BUG_W 12
+#define BUG_H 10
+static const char *const BUG_BITS[BUG_H] = {
+  "001000000100",
+  "000100001000",
+  "000011110000",
+  "001111111100",
+  "011110011110",
+  "111110011111",
+  "011110011110",
+  "111110011111",
+  "001111111100",
+  "010010010010",
+};
+
+// A PRIORITY CHANGE: a two-headed arrow, pointing both ways at once. It drifts
+// vertically and cannot be stomped -- you do not fix a re-prioritisation by
+// jumping on it.
+#define PRIO_W 12
+#define PRIO_H 12
+static const char *const PRIO_BITS[PRIO_H] = {
+  "000001100000",
+  "000011110000",
+  "000110011000",
+  "001110011100",
+  "011110011110",
+  "111110011111",
+  "111110011111",
+  "011111111110",
+  "001110011100",
+  "000111111000",
+  "000011110000",
+  "000001100000",
+};
+
+// A pull request: GitHub's own glyph -- a branch line with a node at each end
+// and an arrow merging back in. Outline squares said "collectible"; this says
+// what the collectible IS.
+#define PR_W 11
+#define PR_H 11
+static const char *const PR_BITS[PR_H] = {
+  "01110000000",
+  "11011000000",
+  "10001000000",
+  "11011001110",
+  "01110011011",
+  "00100010001",
+  "00100011011",
+  "00100001110",
+  "01110000000",
+  "11011000000",
+  "01110000000",
+};
