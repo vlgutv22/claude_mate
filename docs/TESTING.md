@@ -81,6 +81,18 @@ python3 tools/test_detect.py          # the wrapper's screen scrape: which rende
 python3 tools/test_hook_state.py      # the hook's wire line per Stop payload —
                                       # incl. "the turn ended but work is still in
                                       # flight" reporting working instead of done
+
+python3 tools/test_controller_mode.py # what --web puts on the DEVICE link: G|1 when
+                                      # a page takes the grab, G|0 on release (incl.
+                                      # a crashed tab), and a re-assert on every
+                                      # handshake so a device that connects mid-game
+                                      # is told too. Ends with a STATIC check that
+                                      # handleLine and handleConfigLine claim
+                                      # disjoint verbs — the config console sees USB
+                                      # lines first, so a collision is silently
+                                      # unreachable over USB, which is exactly how
+                                      # the first attempt at this verb (X|, already
+                                      # X|WIPE) failed. Read it before adding one.
 ```
 
 Each prints a `PASS`/`FAIL` checklist and exits non-zero on failure, so they

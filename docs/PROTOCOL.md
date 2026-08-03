@@ -114,6 +114,18 @@ input buffer at 96 bytes and drops malformed/oversized lines).
 | `G\|1` `G\|0` | **Controller mode** on / off. Sent by the daemon when a browser page takes or releases the grab on the `--web` bridge (see `daemon/webbridge.py`). While on, the device stops acting on its own buttons, reads the four pins raw and emits press/release **edges** (`B\|+P` …), draws a gamepad face **once** instead of per frame, and drops the backlight to a fraction of its normal duty. That last part is not decoration: a full flush is 110 KB over SPI, and doing it once a second to redraw a screen nobody is looking at — on battery, while the Mac has the buttons — is the overuse the mode exists to avoid. The device leaves on `G\|0`, or on a two-second hold of the 4th button if the Mac never sends one (a crashed tab, a killed daemon). An older firmware ignores `G\|` entirely and simply keeps its menu semantics. |
 | `P` | Ping / keepalive, sent every ~15 s. The Arduino replies with `K` (NOT `H` — `H` means "I rebooted" and triggers a full resend + LED re-arm, which would restart the blink phase every ping). |
 
+> **Adding a downlink verb? These letters are already taken, and not by this
+> table.** On the S3, USB serial lines go to the **config console** first —
+> `handleConfigLine()` — and only fall through to the protocol handler if it
+> declines them. It owns `?`, `W`, `S`, `T`, `X`, `R`, `Y`, `Z`. A protocol verb
+> that collides with one of those is **silently unreachable over USB** while
+> working perfectly over TCP, so it survives every test that does not run on a
+> cabled device. This is not hypothetical: controller mode first shipped as
+> `X|1`, which the console answered with `refusing: send X|WIPE to clear
+> config` — one lax compare away from wiping the Wi-Fi credentials and the
+> token every time somebody opened the game. `tools/test_controller_mode.py`
+> asserts the two sets stay disjoint.
+
 **`F` line fields** — each row is ≤ 21 chars (size-1), drawn top to bottom:
 
 | Field   | Description |
