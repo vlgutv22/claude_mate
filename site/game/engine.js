@@ -252,7 +252,11 @@ addEventListener('keyup', e => { const k = KEYMAP[e.key]; if (k) { keys[k] = fal
 const BTN = { P: 'left', N: 'right', G: 'jump' };
 const pulseTimers = {};
 function deviceButton(code) {
-  if (code === 'M') { fourth(); return; }
+  // The 4th button arrives as +M/-M in controller mode and as a bare M
+  // otherwise. Act on the PRESS only -- acting on both edges would open the
+  // menu and immediately leave it.
+  if (code === 'M' || code === '+M') { fourth(); return; }
+  if (code === '-M') return;
   const edge = code[0] === '+' ? 1 : code[0] === '-' ? -1 : 0;
   const raw  = edge ? code.slice(1) : code;
   const k    = BTN[raw];

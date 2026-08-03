@@ -483,6 +483,7 @@ class WebBridge:
         self._device = device
         self.queue_max = max(1, int(queue_max))
         self.grab_ttl = float(grab_ttl)
+        self.on_grab = None   # callback(bool): the grab was taken/released
         self.heartbeat = float(heartbeat)
 
         self._lock = threading.Lock()          # guards _clients / _next_id
@@ -645,18 +646,43 @@ class WebBridge:
 
     def _register(self, grab: bool, peer: str) -> _Client:
         with self._lock:
+            was = any(c.grab for c in self._clients.values() if c.alive)
             self._next_id += 1
             client = _Client(self._next_id, grab, peer, self.queue_max)
             self._clients[client.cid] = client
+            now = any(c.grab for c in self._clients.values() if c.alive)
         self._log("web bridge: page connected from %s (%s)"
                   % (peer, "GRAB -- buttons drive the game" if client.grab
                      else "mirror only"))
+        if now != was:
+            self._fire_grab(now)
         return client
+
+    def _fire_grab(self, on: bool) -> None:
+        """Tell the owner the grab changed, so it can put the DEVICE into
+        controller mode -- raw edges, a gamepad face on the glass, and a dim
+        backlight instead of a screen nobody is looking at.
+
+        Fired outside the lock and swallowed whole: the callback goes on to
+        write to a socket, and a device that has wandered off must not take the
+        HTTP thread with it."""
+        cb = self.on_grab
+        if cb is None:
+            return
+        try:
+            cb(on)
+        except Exception as exc:
+            self._log("web bridge: grab callback failed: %s" % exc)
 
     def _unregister(self, client: _Client) -> None:
         client.alive = False
         with self._lock:
             existed = self._clients.pop(client.cid, None) is not None
+            still = any(c.grab for c in self._clients.values() if c.alive)
+        if existed and client.grab and not still:
+            self._fire_grab(False)
+        with self._lock:
+            pass
         if existed:
             self._log("web bridge: page disconnected from %s%s%s"
                       % (client.peer,

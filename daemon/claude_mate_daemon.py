@@ -1858,16 +1858,23 @@ class ButtonReader(threading.Thread):
         if line == "K":                          # keepalive ack to our P: no-op
             return
         if line.startswith("B|") and len(line) >= 3:
-            ev = line[2]
+            code = line[2:].strip()
+            ev = code[0]
             # Device-as-controller (--web): mirror every press to the browser,
             # and while a page holds the GRAB the buttons belong to the GAME.
             # One place covers P/N/G/K/M/F and anything added later; the return
             # is what stops a jump from also raising a terminal on the Mac.
             bridge = self.bridge
             if bridge is not None:
-                bridge.push(ev)
+                bridge.push(code)
                 if bridge.grabbed():
                     return
+            # +P / -P are press and release EDGES, which only exist while the
+            # device is in controller mode. They are meaningless to the session
+            # switcher -- acting on them would move the selection twice per
+            # press, once down and once up -- so they stop here.
+            if code[0] in "+-":
+                return
             # While the terminal view is open PREV/NEXT scroll it instead of
             # moving the selection. Reinterpreting here keeps the firmware a
             # dumb renderer -- it emits the same two verbs either way and never
@@ -2467,6 +2474,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             candidate = WebBridge(root=args.web_root, port=args.web_port,
                                   device=link.is_open, log=log)
+
+            def _controller(on: bool, _link=link) -> None:
+                # Put the DEVICE into controller mode for as long as a page is
+                # driving it. Without this the buttons keep their menu
+                # semantics -- 40 ms debounce, then 400 ms before auto-repeat,
+                # then one event every 200 ms -- which is right for a selection
+                # list and unplayable as a gamepad. In controller mode the
+                # firmware reads the pins raw and sends press/release edges.
+                try:
+                    _link.write_line("X|1" if on else "X|0")
+                except Exception as exc:
+                    log(f"controller mode: {exc}")
+                log("device controller mode: %s" % ("ON" if on else "off"))
+
+            candidate.on_grab = _controller
             if candidate.start():
                 web = candidate
         log(f"  web    : {'on' if web else 'DISABLED'}")

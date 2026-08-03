@@ -145,7 +145,29 @@ MateSettings cfg;
 // terminal you were not looking at. The daemon simply sees no button events,
 // needs no protocol change, and keeps its frame current the whole time, so
 // leaving the menu is instant.
-enum UiMode : uint8_t { UI_CONDUCTOR, UI_MENU, UI_PAGE, UI_GAME };
+enum UiMode : uint8_t { UI_CONDUCTOR, UI_MENU, UI_PAGE, UI_GAME, UI_PAD };
+
+// CONTROLLER MODE. The daemon turns this on (X|1) while a browser page is
+// driving the device's buttons, and off (X|0) when the page goes away.
+//
+// It exists because the ordinary button semantics are unplayable as a gamepad,
+// and not by a little: pollNavBtn debounces for 40 ms, then waits 400 ms before
+// auto-repeating, then emits one event every 200 ms. That is correct for a
+// selection list and it means a held direction moves you once, stalls for most
+// of a second, then stutters. Reported as "huge delay", and it was.
+//
+// Here the pins are read raw every loop and PRESS/RELEASE EDGES go up the link
+// (B|+P, B|-P, ...), so the page knows what is held down right now, which is
+// the only question a platformer asks.
+//
+// It is also the low-power screen. Nobody is looking at the glass while they
+// play on a monitor, so the pad face is drawn ONCE and the backlight drops --
+// a full flush is 110 KB over SPI, and doing that 30 times a second to render a
+// screen nobody is watching is exactly the overuse this mode avoids.
+static bool     padActive   = false;
+static bool     padDirty    = false;   // only the pad's OWN changes redraw it
+static uint8_t  padHeld     = 0;      // bitmask, for the on-glass key preview
+static UiMode   padReturnTo = UI_CONDUCTOR;
 static UiMode uiMode = UI_CONDUCTOR;
 
 enum MenuItem : uint8_t {
@@ -1078,6 +1100,37 @@ static void drawAboutPage() {
   gfx->print("4th button: back");
 }
 
+// The gamepad face. Drawn once per state change, never per frame: this screen
+// is a still image and a full flush is 110 KB of SPI.
+static void drawPad() {
+  drawCentred(SCREEN_W / 2, 16, 2, "CONTROLLER", C_TEXT);
+  gfx->setTextSize(1);
+  gfx->setTextColor(C_DIM);
+  const char *sub = "the Mac has the buttons";
+  gfx->setCursor(SCREEN_W / 2 - (int16_t)strlen(sub) * GLYPH_W / 2, 40);
+  gfx->print(sub);
+
+  // The four keys in their real physical arrangement: the 4th sits alone above
+  // the row of three, the way it does on the board.
+  struct Cap { int16_t x, y; const char *label; uint8_t bit; };
+  static const Cap CAPS[4] = {
+    { 64, 60, "4th", 3 },
+    { 64, 108, "PREV", 0 }, { 136, 108, "GO", 1 }, { 208, 108, "NEXT", 2 },
+  };
+  for (uint8_t i = 0; i < 4; i++) {
+    bool down = padHeld & (1 << CAPS[i].bit);
+    int16_t w = 60, h = 40;
+    int16_t x = CAPS[i].x, y = CAPS[i].y;
+    if (down) gfx->fillRoundRect(x, y, w, h, 7, C_WORK);
+    else      gfx->drawRoundRect(x, y, w, h, 7, C_DIMMER);
+    drawCentred(x + w / 2, y + h / 2 - 4, 1, CAPS[i].label, down ? C_BG : C_DIM);
+  }
+  gfx->setTextColor(C_DIMMER);
+  const char *out = "hold 4th to leave";
+  gfx->setCursor(SCREEN_W / 2 - (int16_t)strlen(out) * GLYPH_W / 2, 156);
+  gfx->print(out);
+}
+
 static void render() {
   gfx->fillScreen(C_BG);
   bool blip = (long)(millis() - blipUntil) < 0;
@@ -1095,6 +1148,8 @@ static void render() {
     gfx->print("PREV/NEXT move   GO open   4th back");
     gfx->fillRect(0, ACCENT_Y, SCREEN_W, ACCENT_H,
                   blip ? C_TEXT : MENU[menuIdx].colour);
+  } else if (uiMode == UI_PAD) {
+    drawPad();
   } else if (uiMode == UI_GAME) {
     // No status bar and no accent bar: the game owns all 172 px. The battery
     // and the link are exactly the things you did not come here to look at.
@@ -1179,6 +1234,27 @@ static void handleLine(char *line) {
         copyField(frameRow[r], sizeof(frameRow[r]), fields[3 + r]);
       haveFrame = true;
       requestRender();
+      break;
+    }
+
+    case 'X': {                            // X|1 / X|0 -- controller mode
+      char *bar = strchr(line, '|');
+      if (!bar) break;
+      bool on = (bar[1] == '1');
+      if (on && uiMode != UI_PAD) {
+        padReturnTo = (uiMode == UI_GAME) ? UI_CONDUCTOR : uiMode;
+        uiMode = UI_PAD;
+        padActive = true;
+        padHeld = 0;
+        padDirty = true;
+        analogWrite(LCD_BL, PAD_BL_DUTY);    // nobody is looking at this screen
+        requestRender();
+      } else if (!on && uiMode == UI_PAD) {
+        uiMode = padReturnTo;
+        padActive = false;
+        analogWrite(LCD_BL, cfg.blDuty());
+        requestRender();
+      }
       break;
     }
 
@@ -1872,7 +1948,51 @@ static void pollPendingClick() {
   fourthTap();
 }
 
+// Controller mode reads the pins itself, every loop, and sends edges. No
+// debounce beyond 8 ms, no auto-repeat, no deferred tap: the page needs to know
+// what is held down THIS frame, and every one of those mechanisms exists to
+// answer a different question.
+static void pollPadButtons() {
+  static const uint8_t PINS[4] = {PIN_BTN_PREV, PIN_BTN_GO, PIN_BTN_NEXT,
+                                  PIN_BTN_MIRROR};
+  static const char    CODE[4] = {'P', 'G', 'N', 'M'};
+  static bool          was[4]  = {false, false, false, false};
+  static unsigned long chg[4]  = {0, 0, 0, 0};
+  static unsigned long mirrorDownMs = 0;
+
+  unsigned long now = millis();
+  for (uint8_t i = 0; i < 4; i++) {
+    bool raw = (digitalRead(PINS[i]) == LOW);
+    if (raw == was[i] || (now - chg[i]) < PAD_DEBOUNCE_MS) continue;
+    was[i] = raw;
+    chg[i] = now;
+    char buf[6] = {'B', '|', raw ? '+' : '-', CODE[i], 0, 0};
+    emitLine(buf);
+    if (raw) padHeld |= (1 << i); else padHeld &= ~(1 << i);
+    padDirty = true;
+    notePoke();          // playing is not idling: do not blank mid-game
+    requestRender();                        // only on a change: the pad face is
+                                            // otherwise a still image
+    if (i == 3) mirrorDownMs = raw ? now : 0;
+  }
+  // The way OUT if the Mac never says X|0 -- a crashed tab, a daemon killed
+  // mid-game. Hold the 4th button for two seconds. It does NOT power off here:
+  // that is the same thumb-resting hazard the game has, and a controller you
+  // cannot leave is worse than one you have to hold a button to leave.
+  if (mirrorDownMs && (now - mirrorDownMs) >= POWEROFF_HOLD_MS) {
+    mirrorDownMs = 0;
+    was[3] = false;
+    emitLine("B|-M");                       // never leave the page holding it
+    uiMode = padReturnTo;
+    padActive = false;
+    padHeld = 0;
+    analogWrite(LCD_BL, cfg.blDuty());
+    requestRender();
+  }
+}
+
 static void pollButtons() {
+  if (uiMode == UI_PAD) { pollPadButtons(); return; }
   pollNavBtn(prevBtn, 'P');
   pollGoBtn(goBtn);
   pollNavBtn(nextBtn, 'N');
@@ -1987,7 +2107,11 @@ void loop() {
   // with no way to fix it short of leaving. Reconnecting is therefore allowed on
   // the start screen and the codex cards, where nothing is moving and a hitch
   // costs nothing, and forbidden the instant a level is running.
-  net.holdReconnect(uiMode != UI_CONDUCTOR &&
+  // UI_PAD is exempt for the same reason the game's start screen is: the pad is
+  // a still image, so a blocking browse costs nothing to look at -- and if the
+  // link drops while the Mac holds the grab, nothing can send X|0 to release
+  // it. Holding reconnection there would strand the device in controller mode.
+  net.holdReconnect(uiMode != UI_CONDUCTOR && uiMode != UI_PAD &&
                     !(uiMode == UI_GAME && game.idle()));
   net.poll();
   net.applyPendingConfig();
@@ -2063,6 +2187,22 @@ void loop() {
     game.tick();
     notePoke();
     if (screenOn) { needRender = false; render(); }
+    return;
+  }
+
+  // THE PAD IS A STILL IMAGE. Frames, LED updates and the blink phase all call
+  // requestRender() about once a second, and honouring that here would spend a
+  // full 110 KB flush -- ~28 ms of SPI -- redrawing a screen nobody is looking
+  // at, on battery, while the Mac has the buttons. Only the pad's own changes
+  // are worth a redraw; everything else is dropped, not queued.
+  if (uiMode == UI_PAD) {
+    if (needRender && screenOn && padDirty) {
+      needRender = false;
+      padDirty   = false;
+      render();
+    } else {
+      needRender = false;
+    }
     return;
   }
 

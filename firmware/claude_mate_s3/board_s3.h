@@ -364,6 +364,15 @@ struct Btn {
 // the thing on the single tap: it already costs a daemon round-trip, so 300 ms
 // disappears into latency that was there anyway.
 #define DBLCLICK_MS     300UL
+// Controller mode. 8 ms is well past any switch bounce this hardware shows and
+// well under one 60 Hz frame, so an edge is never missed and never doubled --
+// where the menu's 40 ms would eat a quick tap-and-release entirely.
+#define PAD_DEBOUNCE_MS  8UL
+// A dim but not dark panel: the pad face stays readable if you glance down,
+// while the backlight -- the largest draw on the board -- runs at a fraction of
+// its normal duty for as long as the page holds the grab.
+#define PAD_BL_DUTY      24
+
 #define REPEAT_DELAY_MS 400UL  // PREV/NEXT held this long -> auto-repeat
 #define REPEAT_MS       200UL  // ...then one event every 200 ms
 #define BLINK_MS        400UL  // flash / blink half-period (~2.5 Hz)
