@@ -147,8 +147,8 @@ MateSettings cfg;
 // leaving the menu is instant.
 enum UiMode : uint8_t { UI_CONDUCTOR, UI_MENU, UI_PAGE, UI_GAME, UI_PAD };
 
-// CONTROLLER MODE. The daemon turns this on (X|1) while a browser page is
-// driving the device's buttons, and off (X|0) when the page goes away.
+// CONTROLLER MODE. The daemon turns this on (G|1) while a browser page is
+// driving the device's buttons, and off (G|0) when the page goes away.
 //
 // It exists because the ordinary button semantics are unplayable as a gamepad,
 // and not by a little: pollNavBtn debounces for 40 ms, then waits 400 ms before
@@ -1982,7 +1982,7 @@ static void pollPadButtons() {
                                             // otherwise a still image
     if (i == 3) mirrorDownMs = raw ? now : 0;
   }
-  // The way OUT if the Mac never says X|0 -- a crashed tab, a daemon killed
+  // The way OUT if the Mac never says G|0 -- a crashed tab, a daemon killed
   // mid-game. Hold the 4th button for two seconds. It does NOT power off here:
   // that is the same thumb-resting hazard the game has, and a controller you
   // cannot leave is worse than one you have to hold a button to leave.
@@ -2116,7 +2116,7 @@ void loop() {
   // costs nothing, and forbidden the instant a level is running.
   // UI_PAD is exempt for the same reason the game's start screen is: the pad is
   // a still image, so a blocking browse costs nothing to look at -- and if the
-  // link drops while the Mac holds the grab, nothing can send X|0 to release
+  // link drops while the Mac holds the grab, nothing can send G|0 to release
   // it. Holding reconnection there would strand the device in controller mode.
   net.holdReconnect(uiMode != UI_CONDUCTOR && uiMode != UI_PAD &&
                     !(uiMode == UI_GAME && game.idle()));
