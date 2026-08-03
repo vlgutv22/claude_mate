@@ -39,10 +39,11 @@
 
   /* ---- the stage: full width, locked to the device's 320x172 -------------- */
   .stage{background:var(--stage); border-block:1px solid var(--line); padding:0}
-  .screen-wrap{position:relative; width:100%; max-width:1600px; margin:0 auto; line-height:0}
+  .screen-wrap{position:relative; width:100%; max-width:1600px; margin:0 auto; line-height:0;
+    display:flex; justify-content:center}
   canvas#screen{display:block; width:100%; height:auto; background:#0d1117;
     image-rendering:pixelated; image-rendering:crisp-edges}
-  .overlay{position:absolute; inset:auto 0 0 0; display:flex; gap:10px; justify-content:space-between;
+  .overlay{position:absolute; inset:auto 0 0 0; z-index:2; display:flex; gap:10px; justify-content:space-between;
     padding:10px 14px; pointer-events:none; line-height:1.4}
   .chip{pointer-events:auto; font:600 11px/1 ui-monospace,Menlo,monospace; letter-spacing:.06em;
     background:rgba(13,17,23,.72); color:#8b949e; border:1px solid #21262d; border-radius:999px;
@@ -80,7 +81,10 @@
     <canvas id="screen" width="320" height="172" aria-label="SHIP IT — a platformer played on a contribution graph"></canvas>
     <div class="overlay">
       <span class="chip" id="pad" data-live="0"><span class="dot"></span>CONTROLLER · KEYBOARD</span>
-      <button class="chip" id="snd" data-on="1" aria-label="Toggle sound"><span class="dot"></span>SOUND</button>
+      <span style="display:flex;gap:10px">
+        <button class="chip" id="one" data-on="0" aria-label="Show at the device's own 320x172"><span class="dot"></span>1:1</button>
+        <button class="chip" id="snd" data-on="1" aria-label="Toggle sound"><span class="dot"></span>SOUND</button>
+      </span>
     </div>
   </div>
 </div>

@@ -64,11 +64,31 @@ wx.imageSmoothingEnabled = false;
 
 let S = 1, DPR = 1;                       // world->screen scale, device pixels
 
+// "1:1" renders the canvas at exactly 320x172 CSS pixels -- the device's own
+// pixel count -- so the two can be compared side by side instead of argued
+// about. Off by default; the chip toggles it.
+let oneToOne = false;
+
 function resize() {
   const box = view.parentElement.getBoundingClientRect();
   DPR = Math.min(window.devicePixelRatio || 1, 3);
-  const cssW = Math.max(320, Math.floor(box.width));
-  const cssH = Math.round(cssW * H / W);
+
+  let cssW, cssH;
+  if (oneToOne) {
+    cssW = W; cssH = H;
+  } else {
+    // FIT THE VIEWPORT, not just the width. Full-width alone means that on any
+    // ordinary laptop the frame is taller than the space under the header, so
+    // the bottom of the playfield is below the fold and what you actually see
+    // is a crop -- which does not look like the device even though the canvas
+    // itself is the right shape. Fit to whichever axis runs out first and the
+    // whole 320:172 frame is always on screen.
+    const chrome = (document.querySelector('header.bar') || {}).offsetHeight || 56;
+    const maxH = Math.max(180, window.innerHeight - chrome);
+    cssW = Math.max(320, Math.floor(box.width));
+    cssH = Math.round(cssW * H / W);
+    if (cssH > maxH) { cssH = maxH; cssW = Math.round(cssH * W / H); }
+  }
   view.style.width  = cssW + 'px';
   view.style.height = cssH + 'px';
   view.width  = Math.round(cssW * DPR);
@@ -605,8 +625,12 @@ const R = (x, y, w, h, col) => { vx.fillStyle = col; vx.fillRect(x * L, y * L, w
 
 function drawHud() {
   const d = DIFFS[diff];
-  R(0, 0, UI_W, 70, 'rgba(13,17,23,0.92)');
-  R(0, 69, UI_W, 1.2, P.grid);
+  // 24/172 of the height, to the pixel -- the device's own HUD band. 70 was
+  // 22.4 device rows, which is close enough to look right on its own and
+  // wrong next to the real thing.
+  const hud = UI_H * HUD_H / H;                 // 75.07
+  R(0, 0, UI_W, hud, 'rgba(13,17,23,0.92)');
+  R(0, hud - 1.2, UI_W, 1.2, P.grid);
 
   txt(LEVEL.name, 26, 45, 25, P.text, 'left', 700);
   txt('\u21c4 ' + Sx.merged + '/' + LEVEL.prs.length, 430, 45, 25, P.pr, 'left', 700);
@@ -793,6 +817,12 @@ window.__finish = (prs, days) => {
 window.__btn = deviceButton;   // exercise the device path without a device
 window.__wipeProgress = () => { prog = { done: 0, tier: -1, prs: 0, days: 0 };
   try { localStorage.removeItem(PKEY); } catch (e) {} return { ...prog }; };
+
+document.getElementById('one')?.addEventListener('click', e => {
+  oneToOne = !oneToOne;
+  e.currentTarget.dataset.on = oneToOne ? '1' : '0';
+  resize();
+});
 
 document.getElementById('snd')?.addEventListener('click', e => {
   soundOn = !soundOn;
