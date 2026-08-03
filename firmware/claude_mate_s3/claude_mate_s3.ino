@@ -168,10 +168,11 @@ static bool     padActive   = false;
 static bool     padDirty    = false;   // only the pad's OWN changes redraw it
 static uint8_t  padHeld     = 0;      // bitmask, for the on-glass key preview
 static UiMode   padReturnTo = UI_CONDUCTOR;
+static bool     padManual   = false;  // switched on here, not by the daemon
 static UiMode uiMode = UI_CONDUCTOR;
 
 enum MenuItem : uint8_t {
-  MI_CONDUCTOR, MI_SETTINGS, MI_ABOUT, MI_WIFI, MI_GAME, MI_SLEEP
+  MI_CONDUCTOR, MI_SETTINGS, MI_GAME, MI_SLEEP
 };
 static uint8_t menuIdx = MI_CONDUCTOR;
 
@@ -179,19 +180,24 @@ enum PageId : uint8_t { PG_SETTINGS, PG_ABOUT };
 static PageId  pageId  = PG_SETTINGS;
 static uint8_t pageIdx = 0;          // selected row within the page
 
-// Settings rows, in screen order.
+// Settings rows, in screen order: the one mode switch first, then the
+// preferences, then the two rows that open something else, then the destructive
+// one last and on its own.
+//
+// SR_PAD is an ACTION, not a stored preference. Controller mode is somewhere the
+// device IS, not something it remembers -- and the daemon drives it too, so a
+// persisted "on" would fight the browser page for who decides.
 enum SetRow : uint8_t {
-  SR_SLEEP, SR_BRIGHT, SR_LED, SR_SOUND, SR_FLIP, SR_RESET, SR_COUNT
+  SR_PAD, SR_SLEEP, SR_BRIGHT, SR_LED, SR_SOUND, SR_FLIP,
+  SR_WIFI, SR_ABOUT, SR_RESET, SR_COUNT
 };
-// Which row is at the top of the visible window. The page scrolls now: five
-// rows fit and there are six, which is exactly the case the static_assert below
-// used to reject outright. Scrolling was named in its own comment as one of the
-// two ways out, and it is the one that keeps paying off.
+// Which row is at the top of the visible window. Five rows fit and there are
+// nine, so the page scrolls -- and the scrollbar in drawSettingsPage() is what
+// says the other four exist, since a cut list otherwise just looks complete.
+// Everything here is computed from SR_COUNT, so rows can be added without
+// touching the geometry; that is the whole reason absorbing ABOUT and WI-FI
+// from the top-level strip cost nothing but their two cases.
 static uint8_t pageTop = 0;
-// The page does not scroll, so a sixth row would simply not be drawn -- and
-// would look like a bug in the setting rather than in the layout. Adding one
-// means either raising PAGE_ROWS_VIS (and finding the pixels) or teaching the
-// page to scroll; this makes the compiler say so instead of the screen.
 // The page scrolls, so rows may exceed PAGE_ROWS_VIS -- but the WINDOW must
 // still be at least one row, and pageTop arithmetic assumes it.
 static_assert(PAGE_ROWS_VIS >= 1, "the settings window needs at least one row");
@@ -865,23 +871,9 @@ static void iconSettings(int16_t cx, int16_t cy, int16_t s, uint16_t col) {
   }
 }
 
-static void iconAbout(int16_t cx, int16_t cy, int16_t s, uint16_t col) {
-  int16_t r = s * 3 / 8;
-  gfx->drawCircle(cx, cy, r, col);
-  gfx->drawCircle(cx, cy, r - 1, col);
-  gfx->fillRect(cx - 1, cy - r / 2 - 1, 3, 3, col);          // the dot
-  gfx->fillRect(cx - 1, cy - r / 6,     3, r * 5 / 6, col);  // the stem
-}
-
-static void iconWifi(int16_t cx, int16_t cy, int16_t s, uint16_t col) {
-  // Ascending bars rather than arcs: the same shape the status bar already uses
-  // for signal strength, so the two are obviously about the same thing.
-  int16_t bw = s / 7, gap = s / 5, x = cx - (gap * 3) / 2, base = cy + s / 3;
-  for (int i = 0; i < 4; i++) {
-    int16_t h = (s / 5) + i * (s / 6);
-    gfx->fillRect(x + i * gap, base - h, bw, h, col);
-  }
-}
+// iconAbout and iconWifi lived here until ABOUT and WI-FI became settings rows.
+// The rows are text, so the icons had no caller left, and an unused static is
+// a warning today and a puzzle later. The status bar draws its own signal bars.
 
 static void iconSleep(int16_t cx, int16_t cy, int16_t s, uint16_t col) {
   // A crescent: a filled disc with a background-coloured disc bitten out of it.
@@ -918,11 +910,12 @@ struct MenuDef {
 static const MenuDef MENU[MENU_COUNT] = {
   {"CONDUCTOR", iconConductor, C_WORK},
   {"SETTINGS",  iconSettings,  C_TEXT},
-  {"ABOUT",     iconAbout,     C_TEXT},
-  {"WI-FI",     iconWifi,      C_DONE},
   {"SHIP IT",   iconGame,      GH_MATE},
   {"SLEEP",     iconSleep,     C_IDLE},
 };
+static_assert(sizeof(MENU) / sizeof(MENU[0]) == MENU_COUNT,
+              "MENU_COUNT and the MENU table disagree -- drawMenu() indexes "
+              "the table by MENU_COUNT and would walk off the end");
 
 ShipIt game;
 
@@ -971,6 +964,14 @@ static void drawSetRow(uint8_t row, int16_t y, bool sel) {
   uint16_t    vcol = C_TEXT;
 
   switch (row) {
+    case SR_PAD:
+      label = "Game controller";
+      // An arrow, like Factory reset: this row GOES somewhere rather than
+      // holding a value. It reads "on" nowhere, because the moment you are in
+      // controller mode you are looking at the pad face, not at this list.
+      value = "\x10";
+      vcol  = C_DIM;
+      break;
     case SR_SLEEP:
       label = "Sleep screen";
       value = cfg.hibLabel();
@@ -1009,6 +1010,26 @@ static void drawSetRow(uint8_t row, int16_t y, bool sel) {
         vcol  = cfg.flipped() ? C_DONE : C_DIM;
       }
       break;
+    case SR_WIFI: {
+      label = "Wi-Fi setup";
+      // The one row that answers before you press it. This is where you come
+      // when the device is not linked, so "joining" or "linked" settles the
+      // question you walked in with. Lowercased from stateName() rather than
+      // mapped again here: a second table would be one more thing to forget to
+      // update, and this one cannot fall out of step with the enum.
+      char *p = buf;
+      for (const char *s = net.stateName(); *s && p < buf + sizeof(buf) - 1; s++)
+        *p++ = (*s >= 'A' && *s <= 'Z') ? (char)(*s - 'A' + 'a') : *s;
+      *p = 0;
+      value = buf;
+      vcol  = net.connected() ? C_DONE : C_WAIT;
+      break;
+    }
+    case SR_ABOUT:
+      label = "About";
+      value = "\x10";
+      vcol  = C_DIM;
+      break;
     case SR_RESET:
       label = "Factory reset";
       if (resetArmedMs) { value = "HOLD GO"; vcol = C_ERROR; }
@@ -1046,7 +1067,7 @@ static void drawSettingsPage() {
   gfx->setTextColor(resetArmedMs ? C_ERROR : C_DIM);
   gfx->setCursor(PAD_X, MENU_HINT_Y);
   gfx->print(resetArmedMs ? "hold GO to wipe wifi + token + settings"
-                          : "PREV/NEXT row   GO change   4th back");
+                          : "PREV/NEXT row   GO select   4th back");
 }
 
 // About: a readout, at size 1, because these are numbers you lean in for and
@@ -1106,7 +1127,11 @@ static void drawPad() {
   drawCentred(SCREEN_W / 2, 16, 2, "CONTROLLER", C_TEXT);
   gfx->setTextSize(1);
   gfx->setTextColor(C_DIM);
-  const char *sub = "the Mac has the buttons";
+  // Say which of the two situations this actually is. Switched on from the
+  // settings row there may be no page listening yet, so the useful sentence is
+  // the address to open -- not a claim about the Mac that is not yet true.
+  const char *sub = padManual ? "open 127.0.0.1:8788 to play"
+                              : "the Mac has the buttons";
   gfx->setCursor(SCREEN_W / 2 - (int16_t)strlen(sub) * GLYPH_W / 2, 40);
   gfx->print(sub);
 
@@ -1182,6 +1207,43 @@ static void requestRender() {
   }
 }
 
+// Controller mode is entered from two directions -- the daemon's G|1 when a
+// browser page takes the grab, and the settings row when you switch it on
+// yourself -- and both have to leave the device in exactly the same state, so
+// both come through here rather than each setting five variables and hoping.
+//
+// `manual` changes nothing except what the face SAYS. Entered from the menu
+// there may be no page listening yet, and "the Mac has the buttons" would be
+// a sentence that is both untrue and unhelpful at the moment you most need to
+// know what to do next.
+static void enterPad(bool manual) {
+  if (uiMode == UI_PAD) {
+    // Already here. A page taking the grab while you sit in the manually
+    // entered pad is NOT a no-op: the face is now saying the wrong thing.
+    if (!manual && padManual) { padManual = false; padDirty = true;
+                                requestRender(); }
+    return;
+  }
+  padManual   = manual;
+  padReturnTo = (uiMode == UI_GAME) ? UI_CONDUCTOR : uiMode;
+  uiMode      = UI_PAD;
+  padActive   = true;
+  padHeld     = 0;
+  padDirty    = true;
+  analogWrite(LCD_BL, PAD_BL_DUTY);        // nobody is looking at this screen
+  requestRender();
+}
+
+static void leavePad() {
+  if (uiMode != UI_PAD) return;
+  uiMode    = padReturnTo;
+  padActive = false;
+  padManual = false;
+  padHeld   = 0;
+  analogWrite(LCD_BL, cfg.blDuty());
+  requestRender();
+}
+
 // -----------------------------------------------------------------------------
 // Protocol
 // -----------------------------------------------------------------------------
@@ -1247,21 +1309,8 @@ static void handleLine(char *line) {
                                            // the config.
       char *bar = strchr(line, '|');
       if (!bar) break;
-      bool on = (bar[1] == '1');
-      if (on && uiMode != UI_PAD) {
-        padReturnTo = (uiMode == UI_GAME) ? UI_CONDUCTOR : uiMode;
-        uiMode = UI_PAD;
-        padActive = true;
-        padHeld = 0;
-        padDirty = true;
-        analogWrite(LCD_BL, PAD_BL_DUTY);    // nobody is looking at this screen
-        requestRender();
-      } else if (!on && uiMode == UI_PAD) {
-        uiMode = padReturnTo;
-        padActive = false;
-        analogWrite(LCD_BL, cfg.blDuty());
-        requestRender();
-      }
+      if (bar[1] == '1') enterPad(false);    // false: the Mac asked, not the user
+      else               leavePad();
       break;
     }
 
@@ -1344,9 +1393,16 @@ static bool handleConfigLine(char *line) {
       // diagnosed without guessing at what someone set in the menu. `screen`
       // reporting "off" is the difference between a broken backlight and a
       // hibernate timeout doing its job.
+      // Name every mode. The ternary stopped at "page" when there were three,
+      // so UI_GAME and UI_PAD both reported as "page" -- and this line is the
+      // only way to ask a cabled device what it is doing, which makes a wrong
+      // answer here expensive exactly when you are already confused.
       Serial.printf("ui    : %s  screen %s%s  bright %u/%u  led %s  flip %s\n",
                     uiMode == UI_CONDUCTOR ? "conductor"
-                                           : uiMode == UI_MENU ? "menu" : "page",
+                    : uiMode == UI_MENU    ? "menu"
+                    : uiMode == UI_PAGE    ? (pageId == PG_ABOUT ? "about"
+                                                                 : "settings")
+                    : uiMode == UI_GAME    ? "game" : "pad",
                     cfg.hibLabel(), screenOn ? "" : " (asleep now)",
                     (unsigned)(cfg.blIdx() + 1), (unsigned)BL_STEPS,
                     cfg.ledLabel(), cfg.flipped() ? "on" : "off");
@@ -1781,13 +1837,7 @@ static void menuButton(char ev) {
         case MI_CONDUCTOR: uiMode = UI_CONDUCTOR; break;
         case MI_SETTINGS:  uiMode = UI_PAGE; pageId = PG_SETTINGS; pageIdx = 0;
                            pageTop = 0; resetArmedMs = 0; break;
-        case MI_ABOUT:     uiMode = UI_PAGE; pageId = PG_ABOUT; break;
         case MI_GAME:      uiMode = UI_GAME; game.open(); break;
-        case MI_WIFI:      // The portal takes the screen over on its own, via
-                           // net.state() == SETUP in render().
-                           uiMode = UI_CONDUCTOR;
-                           net.startPortalNow();
-                           break;
         case MI_SLEEP:     cfg.flush();      // the deferred commit will not run
                            powerOff();       // never returns
                            break;
@@ -1814,6 +1864,19 @@ static void menuButton(char ev) {
 
   if (ev == 'G') {                            // short press: change the value
     switch (pageIdx) {
+      case SR_PAD:    // Switch the device into controller mode from the device.
+                      // padReturnTo becomes UI_PAGE, so the two-second hold on
+                      // the 4th button drops you back on this row rather than
+                      // somewhere you did not come from.
+                      enterPad(true);
+                      break;
+      case SR_WIFI:   // The portal takes the screen over on its own, via
+                      // net.state() == SETUP in render(), which outranks every
+                      // firmware-local screen -- so hand the glass back first.
+                      uiMode = UI_CONDUCTOR;
+                      net.startPortalNow();
+                      break;
+      case SR_ABOUT:  pageId = PG_ABOUT; break;
       case SR_SLEEP:  cfg.cycleHib(); break;
       case SR_BRIGHT: cfg.cycleBl();
                       analogWrite(LCD_BL, cfg.blDuty());   // apply immediately;
@@ -1885,8 +1948,15 @@ static void fourthTap() {
   if (uiMode == UI_GAME)      { if (game.fourth()) uiMode = UI_MENU;
                                 requestRender(); return; }
   if (uiMode == UI_MENU)      { uiMode = UI_CONDUCTOR; requestRender(); return; }
-  if (uiMode == UI_PAGE)      { uiMode = UI_MENU; resetArmedMs = 0;
-                                requestRender(); return; }
+  if (uiMode == UI_PAGE) {
+    // One level at a time, the same rule the game follows. About is reached
+    // FROM settings now, so it backs out to the settings page -- landing on
+    // the top-level strip would skip a level and lose your place in the list.
+    if (pageId == PG_ABOUT) { pageId = PG_SETTINGS; pageIdx = SR_ABOUT;
+                              scrollToSelection(); requestRender(); return; }
+    uiMode = UI_MENU; resetArmedMs = 0;
+    requestRender(); return;
+  }
   onButton('M');                              // CONDUCTOR: toggle the mirror
 }
 
@@ -1990,11 +2060,7 @@ static void pollPadButtons() {
     mirrorDownMs = 0;
     was[3] = false;
     emitLine("B|-M");                       // never leave the page holding it
-    uiMode = padReturnTo;
-    padActive = false;
-    padHeld = 0;
-    analogWrite(LCD_BL, cfg.blDuty());
-    requestRender();
+    leavePad();
   }
 }
 

@@ -259,10 +259,10 @@ current the whole time, and needs no protocol change.
   ┌──────────────────────────────────────┐
   │ ▁▄█ CLAUDE MATE               ▰ 64%  │
   ├──────────────────────────────────────┤
-  │    ┌────────┐                        │
-  │    │  ▤▤▤   │   ⚟      ⓘ     ▟   ☾   │  ← the selected tile is enlarged
-  │    └────────┘                        │
-  │          CONDUCTOR                   │  ← only the selected item is labelled
+  │        ┌────────┐                    │
+  │        │  ▤▤▤   │   ⚟     ▦     ☾    │  ← the selected tile is enlarged
+  │        └────────┘                    │
+  │            CONDUCTOR                 │  ← only the selected item is labelled
   │  PREV/NEXT move   GO open   4th back │
   └══════════════════════════════════════┘
 ```
@@ -270,27 +270,42 @@ current the whole time, and needs no protocol change.
 A horizontal strip rather than a list, and not as a style preference: this panel
 is 320×172, so a vertical list uses a fifth of the width and runs out of height
 at five rows, while a strip has room to spare in the axis it actually has. Only
-the selected item is labelled — five labels are either unreadable at size 1 or
-collide at size 2, and the icons carry the recognition once you have been here
-twice. They are drawn from primitives: at 34–46 px a font glyph is
+the selected item is labelled — several labels at once are either unreadable at
+size 1 or collide at size 2, and the icons carry the recognition once you have
+been here twice. They are drawn from primitives: at 34–46 px a font glyph is
 unrecognisable, and a bitmap costs flash plus a second place to keep the design.
+
+**Four items, not six.** ABOUT and WI-FI used to sit here and are now rows in
+SETTINGS, because neither is a *place you go* — one is something you read and the
+other is something you set, which is what that page is for. Keeping them on the
+strip meant the top level grew every time the device learned a new trick, and
+the strip is the one screen that has to stay scannable at a glance. The pitch
+did not change; only the origin, since three gaps span 156 px instead of five
+spanning 260.
 
 | Item | What it does |
 |---|---|
 | **CONDUCTOR** | back to the triage view — the daemon's frame, unchanged since iteration 2 shipped |
-| **SETTINGS** | the five rows below |
-| **ABOUT** | link, RSSI, battery % + raw mV, boot cause, firmware version. The serial `?` output, on the glass — which is the only place it can be read on a cordless device with no console attached |
-| **WI-FI** | start the setup portal now. Previously this needed BOOT held through power-on, or `Z` over serial |
+| **SETTINGS** | the nine rows below |
+| **SHIP IT** | the platformer, played on a contribution graph. Runs on the device itself; the record survives a flat battery |
 | **SLEEP** | the same deep sleep the 2 s hold does, made discoverable |
 
 ### Settings
 
+Nine rows, five visible, so the page scrolls and draws a scrollbar — without one
+a cut list simply looks complete. Everything is computed from the row count, so
+adding a row costs nothing but the row.
+
 | Row | Values | Notes |
 |---|---|---|
+| **Game controller** | → | Switch the device into controller mode from the device, rather than waiting for a browser page to take it. An **action, not a stored preference**: controller mode is somewhere the device *is*, and a persisted "on" would fight the page over who decides. The face says `open 127.0.0.1:8788 to play` when you got here this way and `the Mac has the buttons` when a page did it — the two situations need different sentences. Leave with a 2 s hold of the 4th button, which drops you back on this row |
 | **Sleep screen** | off · 1m · 2m · 5m · 10m · 30m | One row, not a toggle plus a duration — the two can never disagree, and it costs one row on a screen that has five. Defaults to **off**: nobody's screen should start going dark because they took an update |
 | **Brightness** | 5 steps | Non-linear in duty (20/60/120/200/255). Equal duty steps feel like one enormous jump at the bottom and four identical ones at the top. Applied live, so the step you are on is the step you can see |
 | **Alert LED** | off · low · med · high | **off is genuinely dark.** A 7 Hz red strobe is the right answer to a failed turn at a desk and the wrong one in a bedroom — and the alert still arrives, through the flashing name row and fleet letter |
+| **Mac sound** | on / off | Named for **where it happens**. "Sound: on" on a device with no speaker would be a promise the hardware cannot keep. Crosses the link at once (`O\|SND\|`) — a toggle that only reached NVS would do nothing until the next reconnect and read as a dead row |
 | **Flip screen** | on / off | Applies **on restart**; the row says so and a long GO does it. Rotation is set once after `begin()`, and re-rotating a live panel is the one failure in this firmware that looks exactly like dead hardware |
+| **Wi-Fi setup** | *state* → | Starts the setup portal. The value is the live link state, lowercased from the same enum the `?` dump prints, so the row answers "am I linked?" before you press it — which is the question you walked in with. Previously this was a top-level item, and before that it needed BOOT held through power-on, or `Z` over serial |
+| **About** | → | Link, RSSI, battery % + raw mV, boot cause, firmware version. The serial `?` output, on the glass — the only place it can be read on a cordless device with no console attached. The 4th button backs out to **this page**, not to the top strip: one level at a time |
 | **Factory reset** | hold GO to confirm | Wipes Wi-Fi, token **and** settings. Asks twice, and the second gesture is a **long** press rather than another tap — you cannot double-tap your way into wiping the token. Disarms itself after 6 s |
 
 Settings live in their own NVS namespace (`mate-ui`), separate from the network

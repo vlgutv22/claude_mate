@@ -296,16 +296,17 @@ struct Btn {
 // unreadable at size 1 or collide at size 2, and the icons carry the
 // recognition once you have been here twice.
 //
-// SIX items, since SHIP IT joined. The pitch had to come down with it: five
-// gaps of 58 span 290 px and the selected tile is 46 wide, so slot 0's centre
-// would land at 15 and its left edge 8 px OFF the glass. At 52 the strip spans
-// 260, slot 0 centres at 30 and clears the edge by 7 px, while the selected
-// plate (54 wide) still misses its 34 px neighbour by 8.
-#define MENU_COUNT      6
+// FOUR items. It was six until ABOUT and WI-FI moved into the settings page,
+// where they belong: neither is a place you go, they are things you read and
+// things you set, and keeping them on the strip meant the top level grew every
+// time the device learned a new trick. The pitch stays at 52 -- it was chosen
+// so six tiles cleared the glass, and four at the same pitch simply leaves more
+// air. Only the origin moves: three gaps span 156, so slot 0 centres at 82.
+#define MENU_COUNT      4
 #define MENU_ICON       34    // unselected tile, px square
 #define MENU_ICON_SEL   46    // ...and the selected one
 #define MENU_PITCH      52    // centre-to-centre
-#define MENU_CX0        30    // centre of slot 0: (320 - 5*52) / 2
+#define MENU_CX0        82    // centre of slot 0: (320 - 3*52) / 2
 #define MENU_CY         80    // vertical centre of the strip
 #define MENU_LABEL_Y    116   // selected item's label (size 2, centred)
 #define MENU_HINT_Y     150   // the what-the-buttons-do line (size 1, dim)

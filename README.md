@@ -270,12 +270,16 @@ hooks are the zero-dependency feed. Use whichever fits each session.
   behind it. The exact number stays in the About page, where diagnosis wants it.
   Charging is inferred in tiers; the board exposes no charge-status line.
 - **A live terminal mirror** — see [above](#the-terminal-mirror-esp32-s3).
-- **An on-device menu** — double-tap the 4th button. Settings (screen sleep,
-  brightness, alert-LED level including a genuine *off*, flip, factory reset),
-  an About readout, the Wi-Fi setup portal, and long sleep. Entirely
-  **firmware-local**: while it is up PREV/GO/NEXT are handled on the device and
-  never emitted, so the queue cannot move while you are aiming at a settings row
-  — and there is **no protocol change and no daemon change** for any of it.
+- **An on-device menu** — double-tap the 4th button. Four items: the triage view,
+  SETTINGS, SHIP IT and long sleep. Settings holds the rest — a **game
+  controller** switch, screen sleep, brightness, alert-LED level including a
+  genuine *off*, Mac sound, flip, the Wi-Fi setup portal, an About readout, and
+  factory reset. About and Wi-Fi live there rather than on the top strip because
+  neither is a place you go: one is something you read, the other something you
+  set. Entirely **firmware-local**: while it is up PREV/GO/NEXT are handled on
+  the device and never emitted, so the queue cannot move while you are aiming at
+  a settings row — and there is **no protocol change and no daemon change** for
+  any of it.
 - **A screen that turns itself off** — after 1–30 minutes, and only when nothing
   is waiting on you. What counts as waiting comes from the frame the device
   already has: a flashing name row, any lowercase fleet letter, or a *looping*
