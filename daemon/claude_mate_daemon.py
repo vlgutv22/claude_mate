@@ -1185,6 +1185,7 @@ class Screen:
         self._sound = sound
         self._last_sound_at = 0.0
         self._last_sfx_at   = 0.0
+        self.on_handshake_extra = None   # re-assert edge-driven device state
         # Rendered lazily-but-once at construction: eight short WAVs, well
         # under a tenth of a second of work, and doing it here means the
         # first jump of the first run is not the one that pays for it.
@@ -1498,6 +1499,16 @@ class Screen:
             self._loop_kind = _LOOP_UNSET      # firmware was reset -> forget it
         self.refresh(force=True)
         self.sync_led()
+        # Controller mode is edge-driven -- the daemon sends G| only when the
+        # grab CHANGES -- so a device that shows up while a page is already
+        # holding it would never be told, and would sit in menu semantics
+        # wondering why the game felt laggy. Same class of bug as the sound
+        # preference, and the same fix: re-assert on every handshake.
+        if self.on_handshake_extra is not None:
+            try:
+                self.on_handshake_extra()
+            except Exception as exc:
+                log(f"handshake extra: {exc}")
 
     def notify_change(self) -> None:
         """Called on any registry change: refresh frame + LED."""
@@ -2483,12 +2494,17 @@ def main(argv: Optional[List[str]] = None) -> int:
                 # list and unplayable as a gamepad. In controller mode the
                 # firmware reads the pins raw and sends press/release edges.
                 try:
-                    _link.write_line("X|1" if on else "X|0")
+                    _link.write_line("G|1" if on else "G|0")
                 except Exception as exc:
                     log(f"controller mode: {exc}")
                 log("device controller mode: %s" % ("ON" if on else "off"))
 
             candidate.on_grab = _controller
+            # ...and re-assert it whenever a device says hello, so one that
+            # connects mid-game lands in controller mode rather than in menu
+            # semantics.
+            screen.on_handshake_extra = (
+                lambda _b=candidate: _controller(_b.grabbed()))
             if candidate.start():
                 web = candidate
         log(f"  web    : {'on' if web else 'DISABLED'}")

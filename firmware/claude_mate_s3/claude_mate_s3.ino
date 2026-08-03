@@ -1237,7 +1237,14 @@ static void handleLine(char *line) {
       break;
     }
 
-    case 'X': {                            // X|1 / X|0 -- controller mode
+    case 'G': {                            // G|1 / G|0 -- gamepad (controller)
+                                           // mode. NOT 'X': that is X|WIPE in
+                                           // handleConfigLine, which sees USB
+                                           // serial lines first and answered
+                                           // "refusing: send X|WIPE" instead --
+                                           // so the mode never engaged, and a
+                                           // sloppier value could have wiped
+                                           // the config.
       char *bar = strchr(line, '|');
       if (!bar) break;
       bool on = (bar[1] == '1');
