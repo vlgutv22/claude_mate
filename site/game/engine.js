@@ -790,6 +790,7 @@ window.__finish = (prs, days) => {
   Sx.newBest = progRecord(0, diff, prs, days);
   return { newBest: Sx.newBest, prog: { ...prog } };
 };
+window.__btn = deviceButton;   // exercise the device path without a device
 window.__wipeProgress = () => { prog = { done: 0, tier: -1, prs: 0, days: 0 };
   try { localStorage.removeItem(PKEY); } catch (e) {} return { ...prog }; };
 

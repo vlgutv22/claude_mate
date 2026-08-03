@@ -1810,6 +1810,7 @@ class ButtonReader(threading.Thread):
         self._screen = screen
         self._stop_evt = threading.Event()  # NOT `_stop`: Thread.join() calls its own _stop()
         self.on_ack = None   # callback(sess): acknowledge a session's alert
+        self.bridge = None   # optional WebBridge: device-as-controller (--web)
         # FOCUS runs on side threads (it can block for seconds on sockets /
         # subprocesses). `_focus_serial` serializes them so two quick GOs
         # can't raise windows in finish-order instead of press-order, and
@@ -1858,6 +1859,15 @@ class ButtonReader(threading.Thread):
             return
         if line.startswith("B|") and len(line) >= 3:
             ev = line[2]
+            # Device-as-controller (--web): mirror every press to the browser,
+            # and while a page holds the GRAB the buttons belong to the GAME.
+            # One place covers P/N/G/K/M/F and anything added later; the return
+            # is what stops a jump from also raising a terminal on the Mac.
+            bridge = self.bridge
+            if bridge is not None:
+                bridge.push(ev)
+                if bridge.grabbed():
+                    return
             # While the terminal view is open PREV/NEXT scroll it instead of
             # moving the selection. Reinterpreting here keeps the firmware a
             # dumb renderer -- it emits the same two verbs either way and never
@@ -2360,6 +2370,24 @@ def main(argv: Optional[List[str]] = None) -> int:
              "keep it on this machine)",
     )
     parser.add_argument(
+        "--web",
+        action="store_true",
+        default=os.environ.get("CLAUDE_MATE_WEB", "") == "1",
+        help="serve the browser game on 127.0.0.1 and let the device's buttons "
+             "drive it while the page is open (off by default)",
+    )
+    parser.add_argument(
+        "--web-port",
+        type=int,
+        default=int(os.environ.get("CLAUDE_MATE_WEB_PORT", 8788)),
+        help="loopback port for --web (default: 8788)",
+    )
+    parser.add_argument(
+        "--web-root",
+        default=os.environ.get("CLAUDE_MATE_WEB_ROOT") or None,
+        help="directory served by --web (default: <repo>/site/game)",
+    )
+    parser.add_argument(
         "--sound",
         action="store_true",
         default=os.environ.get("CLAUDE_MATE_SOUND", "") == "1",
@@ -2424,9 +2452,29 @@ def main(argv: Optional[List[str]] = None) -> int:
         if kind == "START" and registry.top_alert() is None:
             screen.start_tick()
 
+    # Device-as-controller. Loopback only, opt-in, and entirely optional: an
+    # import or bind failure costs the game, never the daemon. The import is
+    # lazy and inside the branch because tools/test_net_link.py exec_modules
+    # this file by path, where a module-level import would need daemon/ on
+    # sys.path.
+    web = None
+    if args.web:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        try:
+            from webbridge import WebBridge
+        except Exception as exc:
+            log(f"--web: cannot import webbridge.py: {exc}")
+        else:
+            candidate = WebBridge(root=args.web_root, port=args.web_port,
+                                  device=link.is_open, log=log)
+            if candidate.start():
+                web = candidate
+        log(f"  web    : {'on' if web else 'DISABLED'}")
+
     socket_server = SocketServer(args.sock, registry, on_update, on_haptic)
     button_reader = ButtonReader(link, screen)
     button_reader.on_ack = on_ack
+    button_reader.bridge = web
     maintainer = SerialMaintainer(link, screen)
     ticker = Ticker(screen, registry)
 
@@ -2476,6 +2524,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             link.write_line("F|0|-1|MATE|daemon stopped||")
         except Exception:
             pass
+        if web is not None:
+            web.stop()
         if mdns is not None:
             mdns.stop()
         link.close()      # LinkHub.close() also stops the TCP listener
