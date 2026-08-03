@@ -368,6 +368,19 @@ struct Btn {
 // Controller mode. 8 ms is well past any switch bounce this hardware shows and
 // well under one 60 Hz frame, so an edge is never missed and never doubled --
 // where the menu's 40 ms would eat a quick tap-and-release entirely.
+// THE RADIO POLICY, for BLE gamepad mode. One 2.4 GHz radio is shared between
+// BLE and Wi-Fi, so holding both up while you play costs latency on the link
+// that matters. The device cannot be TOLD whether you are mid-level -- a HID
+// gamepad is a one-way device and the browser has no way back to it -- so it
+// infers from your thumbs: presses mean playing, stillness means you stopped.
+//
+// PAD_PLAY_IDLE_MS is the "you have stopped" threshold. Long enough to survive
+// reading a codex card or lining up a jump, short enough that an alert waiting
+// on the daemon is not missed for minutes. PAD_WIFI_CHECK_MS bounds how often a
+// still pad re-checks, so a paused game does not flap the radio.
+#define PAD_PLAY_IDLE_MS    6000UL
+#define PAD_WIFI_CHECK_MS   20000UL
+
 #define PAD_DEBOUNCE_MS  8UL
 // A dim but not dark panel: the pad face stays readable if you glance down,
 // while the backlight -- the largest draw on the board -- runs at a fraction of

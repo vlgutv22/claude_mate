@@ -107,6 +107,7 @@
 #include "board_s3.h"
 #include "netcfg.h"
 #include "settings.h"
+#include "blepad.h"
 #include "game/ship_it.h"
 
 // ---- Display -----------------------------------------------------------------
@@ -169,6 +170,15 @@ static bool     padDirty    = false;   // only the pad's OWN changes redraw it
 static uint8_t  padHeld     = 0;      // bitmask, for the on-glass key preview
 static UiMode   padReturnTo = UI_CONDUCTOR;
 static bool     padManual   = false;  // switched on here, not by the daemon
+// Which way the presses leave the device. PAD_LINK is the daemon (serial or
+// TCP, whichever is up); PAD_BLE is a standard HID gamepad and needs no daemon,
+// no Wi-Fi and no loopback -- which is the only way the PUBLIC site can ever be
+// driven by this hardware, since https cannot reach http://127.0.0.1.
+enum PadVia : uint8_t { PAD_LINK, PAD_BLE };
+static PadVia   padVia      = PAD_LINK;
+static unsigned long padLastInput = 0;   // for the radio policy; see loop()
+static bool     padWifiParked = false;
+static unsigned long padWifiUpSince = 0;
 static UiMode uiMode = UI_CONDUCTOR;
 
 enum MenuItem : uint8_t {
@@ -188,7 +198,7 @@ static uint8_t pageIdx = 0;          // selected row within the page
 // device IS, not something it remembers -- and the daemon drives it too, so a
 // persisted "on" would fight the browser page for who decides.
 enum SetRow : uint8_t {
-  SR_PAD, SR_SLEEP, SR_BRIGHT, SR_LED, SR_SOUND, SR_FLIP,
+  SR_PAD, SR_BLE, SR_SLEEP, SR_BRIGHT, SR_LED, SR_SOUND, SR_FLIP,
   SR_WIFI, SR_ABOUT, SR_RESET, SR_COUNT
 };
 // Which row is at the top of the visible window. Five rows fit and there are
@@ -918,6 +928,7 @@ static_assert(sizeof(MENU) / sizeof(MENU[0]) == MENU_COUNT,
               "the table by MENU_COUNT and would walk off the end");
 
 ShipIt game;
+BlePad  blepad;
 
 // Centre text of the given size at x.
 static void drawCentred(int16_t cx, int16_t y, uint8_t size, const char *s,
@@ -969,6 +980,13 @@ static void drawSetRow(uint8_t row, int16_t y, bool sel) {
       // An arrow, like Factory reset: this row GOES somewhere rather than
       // holding a value. It reads "on" nowhere, because the moment you are in
       // controller mode you are looking at the pad face, not at this list.
+      value = "\x10";
+      vcol  = C_DIM;
+      break;
+    case SR_BLE:
+      label = "BLE gamepad";
+      // Needs no daemon, no Wi-Fi and no loopback, which is the only way the
+      // PUBLIC site can drive this hardware: https cannot reach 127.0.0.1.
       value = "\x10";
       vcol  = C_DIM;
       break;
@@ -1124,14 +1142,22 @@ static void drawAboutPage() {
 // The gamepad face. Drawn once per state change, never per frame: this screen
 // is a still image and a full flush is 110 KB of SPI.
 static void drawPad() {
-  drawCentred(SCREEN_W / 2, 16, 2, "CONTROLLER", C_TEXT);
+  drawCentred(SCREEN_W / 2, 16, 2,
+              padVia == PAD_BLE ? "BLE GAMEPAD" : "CONTROLLER", C_TEXT);
   gfx->setTextSize(1);
-  gfx->setTextColor(C_DIM);
-  // Say which of the two situations this actually is. Switched on from the
-  // settings row there may be no page listening yet, so the useful sentence is
-  // the address to open -- not a claim about the Mac that is not yet true.
-  const char *sub = padManual ? "open 127.0.0.1:8788 to play"
-                              : "the Mac has the buttons";
+  // Say which of the situations this actually is. Switched on from the settings
+  // row there may be nothing listening yet, so the useful sentence is what to
+  // do next -- not a claim about the Mac that is not yet true.
+  const char *sub;
+  uint16_t    subCol = C_DIM;
+  if (padVia == PAD_BLE) {
+    if (blepad.connected()) { sub = "paired -- any page, any origin"; subCol = C_DONE; }
+    else                    { sub = "pair \"Claude Mate\" in Bluetooth"; subCol = C_WAIT; }
+  } else {
+    sub = padManual ? "open 127.0.0.1:8788 to play"
+                    : "the Mac has the buttons";
+  }
+  gfx->setTextColor(subCol);
   gfx->setCursor(SCREEN_W / 2 - (int16_t)strlen(sub) * GLYPH_W / 2, 40);
   gfx->print(sub);
 
@@ -1216,7 +1242,7 @@ static void requestRender() {
 // there may be no page listening yet, and "the Mac has the buttons" would be
 // a sentence that is both untrue and unhelpful at the moment you most need to
 // know what to do next.
-static void enterPad(bool manual) {
+static void enterPad(bool manual, PadVia via = PAD_LINK) {
   if (uiMode == UI_PAD) {
     // Already here. A page taking the grab while you sit in the manually
     // entered pad is NOT a no-op: the face is now saying the wrong thing.
@@ -1224,18 +1250,35 @@ static void enterPad(bool manual) {
                                 requestRender(); }
     return;
   }
+  if (via == PAD_BLE && !blepad.begin("Claude Mate")) {
+    // Refuse rather than open a controller that cannot send anything. A mode
+    // that silently does nothing is worse than one that will not start.
+    return;
+  }
+  padVia      = via;
   padManual   = manual;
   padReturnTo = (uiMode == UI_GAME) ? UI_CONDUCTOR : uiMode;
   uiMode      = UI_PAD;
   padActive   = true;
   padHeld     = 0;
   padDirty    = true;
+  padLastInput  = millis();
+  padWifiParked = false;
+  // Allow the first park immediately: the modular subtract makes this "already
+  // past the check window" without special-casing a device that just booted.
+  padWifiUpSince = millis() - PAD_WIFI_CHECK_MS;
   analogWrite(LCD_BL, PAD_BL_DUTY);        // nobody is looking at this screen
   requestRender();
 }
 
 static void leavePad() {
   if (uiMode != UI_PAD) return;
+  if (padVia == PAD_BLE) {
+    blepad.end();                          // frees the controller, not just idle
+    if (padWifiParked) net.restart();      // give the radio back to the daemon
+  }
+  padVia    = PAD_LINK;
+  padWifiParked = false;
   uiMode    = padReturnTo;
   padActive = false;
   padManual = false;
@@ -1318,6 +1361,16 @@ static void handleLine(char *line) {
       char *bar = strchr(line, '|');
       if (!bar || bar[1] == 0) break;
       ledForKind(bar + 1);
+      // Playing on a BLE pad, the daemon's screen is not on the glass and the
+      // radio is parked for most of the time -- so an alert that needs a HUMAN
+      // has to take the device back rather than wait to be noticed. ERROR and
+      // INPUT are the two that mean someone is blocked; DONE and START are
+      // news, and news can wait until you stop.
+      if (uiMode == UI_PAD && padVia == PAD_BLE &&
+          (!strcmp(bar + 1, "ERROR") || !strcmp(bar + 1, "INPUT"))) {
+        padReturnTo = UI_CONDUCTOR;
+        leavePad();
+      }
       break;
     }
 
@@ -1870,6 +1923,12 @@ static void menuButton(char ev) {
                       // somewhere you did not come from.
                       enterPad(true);
                       break;
+      case SR_BLE:    // Same face, different wire: a standard HID gamepad the
+                      // Mac pairs with once. enterPad() refuses if the stack
+                      // will not start, leaving you on this row rather than in
+                      // a controller that cannot send anything.
+                      enterPad(true, PAD_BLE);
+                      break;
       case SR_WIFI:   // The portal takes the screen over on its own, via
                       // net.state() == SETUP in render(), which outranks every
                       // firmware-local screen -- so hand the glass back first.
@@ -2043,9 +2102,17 @@ static void pollPadButtons() {
     if (raw == was[i] || (now - chg[i]) < PAD_DEBOUNCE_MS) continue;
     was[i] = raw;
     chg[i] = now;
-    char buf[6] = {'B', '|', raw ? '+' : '-', CODE[i], 0, 0};
-    emitLine(buf);
     if (raw) padHeld |= (1 << i); else padHeld &= ~(1 << i);
+    // Over BLE the whole four-switch state goes as ONE HID report -- a host
+    // asks "what is held now", not "what changed" -- so there is nothing to
+    // emit per edge. Over the daemon link the edges ARE the protocol.
+    if (padVia == PAD_BLE) {
+      blepad.setButtons(padHeld);
+    } else {
+      char buf[6] = {'B', '|', raw ? '+' : '-', CODE[i], 0, 0};
+      emitLine(buf);
+    }
+    padLastInput = now;                     // drives the radio policy in loop()
     padDirty = true;
     notePoke();          // playing is not idling: do not blank mid-game
     requestRender();                        // only on a change: the pad face is
@@ -2059,8 +2126,55 @@ static void pollPadButtons() {
   if (mirrorDownMs && (now - mirrorDownMs) >= POWEROFF_HOLD_MS) {
     mirrorDownMs = 0;
     was[3] = false;
-    emitLine("B|-M");                       // never leave the page holding it
+    padHeld = 0;
+    // Never leave the other end holding the button you left with -- a stuck
+    // key is the one bug a controller cannot recover from on its own.
+    if (padVia == PAD_BLE) blepad.setButtons(0);
+    else                   emitLine("B|-M");
     leavePad();
+  }
+}
+
+// THE RADIO POLICY for BLE gamepad mode.
+//
+// One 2.4 GHz radio, shared. Holding Wi-Fi up while you play costs latency on
+// the link that actually matters, and the Wi-Fi path is the one that was
+// misbehaving in the first place. But a device that goes deaf for a whole
+// session is worse than a laggy one: the daemon is the reason this thing
+// exists, and an error you find out about an hour later is an error you found
+// out about too late.
+//
+// So the radio follows your thumbs, because nothing else can tell it. A HID
+// gamepad is one-way -- the browser has no channel back -- so "are you mid
+// level?" is answered by "did you press anything in the last few seconds?".
+// Presses mean playing and the radio is parked; stillness means you stopped to
+// read something, or paused, or wandered off, and the radio goes back up to see
+// what the daemon has. If what it has is urgent, the V| handler above takes the
+// device off the pad entirely.
+static void pollPadRadio() {
+  if (uiMode != UI_PAD || padVia != PAD_BLE) return;
+  blepad.poll();                            // re-advertise if the host went away
+
+  unsigned long now = millis();
+  bool playing = (now - padLastInput) < PAD_PLAY_IDLE_MS;
+
+  if (!playing) {
+    if (padWifiParked) {                    // you stopped -- go and look
+      net.restart();
+      padWifiParked  = false;
+      padWifiUpSince = now;
+      requestRender();
+    }
+    return;
+  }
+  // Playing. Park the radio -- but never mid-attempt. Tearing a join down
+  // before it can finish would mean the check never actually happens, and the
+  // device would spend the session neither playing cleanly nor learning
+  // anything, which is the worst of both.
+  if (!padWifiParked && (now - padWifiUpSince) >= PAD_WIFI_CHECK_MS) {
+    net.shutdown();                         // poll() no-ops in OFF: no blocking
+    padWifiParked = true;
+    requestRender();
   }
 }
 
@@ -2191,6 +2305,7 @@ void loop() {
   pumpUsb();
   pumpNet();
   pollButtons();
+  pollPadRadio();
   pollLed();
   pollBattery();
   pollHibernate();

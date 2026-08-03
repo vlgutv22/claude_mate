@@ -271,29 +271,96 @@ function deviceButton(code) {
   }
 }
 
-function connectDevice() {
+// The device as an ORDINARY BLUETOOTH GAMEPAD.
+//
+// This is the only input path that works on the public site. Everything else
+// here needs the daemon on 127.0.0.1, and a page served over https cannot reach
+// a local http server -- so on the published copy the hardware could never do
+// anything. Paired over BLE the Mac presents it as a system gamepad and the
+// Gamepad API is same-origin-free: any page, any host.
+//
+// Polled rather than evented, because that is the only thing the API offers --
+// getGamepads() returns a snapshot and there is no button event. Polling once
+// per frame is exactly the resolution the game runs at anyway.
+//
+// Button order is the firmware's report map, which is the PHYSICAL order:
+//   0 = PREV   1 = GO   2 = NEXT   3 = 4th
+const PAD_BTN = ['left', 'jump', 'right', null];
+let padPrev = [false, false, false, false];
+let padIndex = null;
+
+// Two independent sources can claim the buttons, so the badge is computed from
+// both rather than assigned by whichever fired last -- otherwise one SSE
+// hiccup would report KEYBOARD while a Bluetooth pad was happily driving.
+let sseLive = false, padLive = false;
+function refreshBadge() {
   const badge = document.getElementById('pad');
-  const set = (mode, live) => {
-    controller = mode;
-    badge.textContent = mode === 'DEVICE' ? 'CONTROLLER · CLAUDE MATE' : 'CONTROLLER · KEYBOARD';
-    badge.dataset.live = live ? '1' : '0';
-  };
-  set('KEYBOARD', false);
+  if (!badge) return;
+  const mode = padLive ? 'BLUETOOTH' : sseLive ? 'DEVICE' : 'KEYBOARD';
+  controller = mode;
+  badge.textContent =
+    mode === 'BLUETOOTH' ? 'CONTROLLER · CLAUDE MATE ᛒ' :
+    mode === 'DEVICE'    ? 'CONTROLLER · CLAUDE MATE'   :
+                           'CONTROLLER · KEYBOARD';
+  badge.dataset.live = mode === 'KEYBOARD' ? '0' : '1';
+}
+
+addEventListener('gamepadconnected', e => {
+  // Only adopt OUR pad. Someone with a DualSense already paired should not have
+  // the badge claim Claude Mate is driving the game -- but if nothing else has
+  // claimed the slot, take it, because an unrecognised id is more likely to be
+  // this device under an OS-chosen name than a competing controller.
+  if (/claude|mate/i.test(e.gamepad.id) || padIndex === null) {
+    padIndex = e.gamepad.index;
+    padLive = true;
+    refreshBadge();
+  }
+});
+addEventListener('gamepaddisconnected', e => {
+  if (padIndex === e.gamepad.index) {
+    padIndex = null;
+    padLive = false;
+    padPrev = [false, false, false, false];
+    for (const k of PAD_BTN) if (k) keys[k] = false;   // never leave one stuck
+    refreshBadge();
+  }
+});
+
+function pollGamepad() {
+  if (padIndex === null || !navigator.getGamepads) return;
+  const gp = navigator.getGamepads()[padIndex];
+  if (!gp) return;
+  for (let i = 0; i < PAD_BTN.length; i++) {
+    const b = gp.buttons[i];
+    const down = !!(b && (b.pressed || b.value > 0.5));
+    if (down === padPrev[i]) continue;
+    padPrev[i] = down;
+    if (i === 3) { if (down) fourth(); continue; }     // 4th: act on press only
+    const k = PAD_BTN[i];
+    if (!k) continue;
+    if (down && Sx.state !== 'play') nav(k);
+    keys[k] = down;                       // held state, which is what a pad is
+  }
+}
+
+function connectDevice() {
+  refreshBadge();
   // Same-origin when the daemon serves this page; otherwise try the loopback
   // port directly, which works when the page is opened from disk. A page served
   // over HTTPS cannot reach http://127.0.0.1 -- mixed content -- which is
-  // exactly why the daemon serves the game itself.
+  // exactly why the daemon serves the game itself, and why the BLE path above
+  // is the only one the published site can use.
   const base = location.protocol === 'file:' ? 'http://127.0.0.1:8788' : '';
   let es;
   try { es = new EventSource(base + '/events?grab=1'); } catch (e) { return; }
-  es.onopen = () => set('DEVICE', true);
+  es.onopen = () => { sseLive = true; refreshBadge(); };
   es.onmessage = ev => {
     try {
       const m = JSON.parse(ev.data);
       if (m.btn) deviceButton(m.btn);
     } catch (e) {}
   };
-  es.onerror = () => { set('KEYBOARD', false); };
+  es.onerror = () => { sseLive = false; refreshBadge(); };
 }
 
 // ---------------------------------------------------------------------------
@@ -788,6 +855,7 @@ function drawScreen() {
 // ---------------------------------------------------------------------------
 let acc = 0, last = 0;
 function frame(now) {
+  pollGamepad();
   if (!last) last = now;
   let dt = now - last; last = now;
   if (dt > 100) dt = 100;                   // a stalled tab must not fast-forward
