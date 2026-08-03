@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SHIP IT — Claude Mate</title>
+<meta name="description" content="A platformer where the terrain is your contribution graph and the deadline is your health. Plays in the browser; if you own the hardware, the device is the gamepad. Independent project, not affiliated with Anthropic.">
+<style>
+  :root{
+    --paper:#faf9f5; --raise:#ffffff; --ink:#26241f; --muted:#6d6b63;
+    --accent:#d97757; --accent-deep:#b8542f; --line:#e8e5dc;
+    --radius:14px; --maxw:900px;
+    --stage:#0d1117;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --paper:#211f1d; --raise:#2a2825; --ink:#efece4; --muted:#a8a49a;
+      --accent:#e08a6b; --accent-deep:#e9a488; --line:#38352f;
+    }
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; background:var(--paper); color:var(--ink);
+    font:400 17px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:var(--maxw); margin:0 auto; padding:0 22px}
+  h1,h2,h3{font-family:Georgia,"Iowan Old Style","Times New Roman",serif; font-weight:600; line-height:1.15; letter-spacing:-.01em}
+  a{color:var(--accent-deep); text-decoration:none}
+  a:hover{text-decoration:underline}
+  a:focus-visible,button:focus-visible{outline:2px solid var(--accent); outline-offset:3px; border-radius:4px}
+  .mono{font-family:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace}
+
+  header.bar{border-bottom:1px solid var(--line); position:sticky; top:0; z-index:5;
+    background:color-mix(in srgb,var(--paper) 88%, transparent); backdrop-filter:saturate(1.2) blur(8px)}
+  header.bar .wrap{display:flex; align-items:center; justify-content:space-between; height:56px}
+  header.bar strong{font-family:Georgia,serif; font-weight:600}
+
+  /* ---- the stage: full width, locked to the device's 320x172 -------------- */
+  .stage{background:var(--stage); border-block:1px solid var(--line); padding:0}
+  .screen-wrap{position:relative; width:100%; max-width:1600px; margin:0 auto; line-height:0}
+  canvas#screen{display:block; width:100%; height:auto; background:#0d1117;
+    image-rendering:pixelated; image-rendering:crisp-edges}
+  .overlay{position:absolute; inset:auto 0 0 0; display:flex; gap:10px; justify-content:space-between;
+    padding:10px 14px; pointer-events:none; line-height:1.4}
+  .chip{pointer-events:auto; font:600 11px/1 ui-monospace,Menlo,monospace; letter-spacing:.06em;
+    background:rgba(13,17,23,.72); color:#8b949e; border:1px solid #21262d; border-radius:999px;
+    padding:7px 11px; display:inline-flex; gap:7px; align-items:center; backdrop-filter:blur(6px)}
+  .chip .dot{width:7px; height:7px; border-radius:50%; background:#484f58}
+  .chip[data-live="1"]{color:#9be9a8; border-color:#2d5a3d}
+  .chip[data-live="1"] .dot{background:#40c463; box-shadow:0 0 0 3px rgba(64,196,99,.22)}
+  button.chip{cursor:pointer}
+  button.chip[data-on="1"] .dot{background:#40c463}
+
+  /* ---- the keys, laid out like the real device --------------------------- */
+  .pad{display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin:26px 0 0}
+  .cap{background:var(--raise); border:1px solid var(--line); border-radius:12px; padding:14px 10px;
+    text-align:center}
+  .cap .glyph{font:400 22px/1 ui-monospace,Menlo,monospace; color:var(--accent); display:block; margin-bottom:6px}
+  .cap b{display:block; font:600 12px/1.3 ui-monospace,Menlo,monospace; letter-spacing:.05em}
+  .cap span{display:block; font-size:13px; color:var(--muted); margin-top:2px}
+  @media(max-width:560px){ .pad{grid-template-columns:repeat(2,1fr)} }
+
+  section{padding:52px 0}
+  .lede{font-size:20px; color:var(--muted); max-width:62ch}
+  .note{font-size:14.5px; color:var(--muted); border-left:2px solid var(--line); padding-left:14px}
+  footer{border-top:1px solid var(--line); padding:30px 0; font-size:14px; color:var(--muted)}
+</style>
+</head>
+<body>
+
+<header class="bar"><div class="wrap">
+  <strong>Claude&nbsp;Mate</strong>
+  <span class="mono" style="font-size:13px;color:var(--muted)">SHIP IT · level 1</span>
+</div></header>
+
+<div class="stage">
+  <div class="screen-wrap">
+    <canvas id="screen" width="320" height="172" aria-label="SHIP IT — a platformer played on a contribution graph"></canvas>
+    <div class="overlay">
+      <span class="chip" id="pad" data-live="0"><span class="dot"></span>CONTROLLER · KEYBOARD</span>
+      <button class="chip" id="snd" data-on="1" aria-label="Toggle sound"><span class="dot"></span>SOUND</button>
+    </div>
+  </div>
+</div>
+
+<div class="wrap">
+  <section>
+    <h1 style="font-size:34px;margin:0 0 12px">The graph is the level.</h1>
+    <p class="lede">A commit is a floor tile. A day you shipped nothing is a hole. You do not
+      have three lives — you have <strong>days until the milestone</strong>, and everything in
+      the world is a claim on them. Merge pull requests to buy back schedule, or the milestone
+      slips.</p>
+
+    <div class="pad">
+      <div class="cap"><span class="glyph">□</span><b>PREV</b><span>walk left</span></div>
+      <div class="cap"><span class="glyph">○</span><b>GO</b><span>jump — hold for height</span></div>
+      <div class="cap"><span class="glyph">△</span><b>NEXT</b><span>walk right</span></div>
+      <div class="cap"><span class="glyph">✕</span><b>4th</b><span>back to the menu</span></div>
+    </div>
+
+    <p class="note" style="margin-top:26px">
+      <strong>The device is the gamepad.</strong> If your Claude Mate is linked and the daemon is
+      running with <code class="mono">--web</code>, open this page from
+      <code class="mono">http://127.0.0.1:8788</code> and the four keycaps on the hardware drive
+      the game above — the badge turns green. Everyone else plays on the keyboard:
+      <span class="mono">← →</span> to walk, <span class="mono">↑</span> to jump,
+      <span class="mono">esc</span> for the menu. Sound is synthesised in the browser; nothing is
+      downloaded.
+    </p>
+  </section>
+
+  <!-- CONTRIBUTE / BUILD sections are inserted here -->
+
+</div>
+
+<footer><div class="wrap">
+  Works with <a href="https://claude.com/claude-code">Claude&nbsp;Code</a>.
+  Claude and Claude Code are trademarks of Anthropic,&nbsp;PBC.
+  Independent project — not affiliated with, sponsored by, or endorsed by Anthropic.
+</div></footer>
+
+<script type="module" src="./engine.js"></script>
+</body>
+</html>
