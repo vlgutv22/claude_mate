@@ -1,13 +1,17 @@
 # Claude Mate
 
 [![CI](https://github.com/vlgutv22/claude_mate/actions/workflows/ci.yml/badge.svg)](https://github.com/vlgutv22/claude_mate/actions/workflows/ci.yml)
-[![Made for Claude Code](https://img.shields.io/badge/made%20for-Claude%20Code-D97757)](https://claude.com/claude-code)
+[![Works with Claude Code](https://img.shields.io/badge/works%20with-Claude%20Code-555555)](https://claude.com/claude-code)
 [![License: CC BY-NC 4.0](https://img.shields.io/badge/license-CC%20BY--NC%204.0-lightgrey.svg)](LICENSE)
 [![Platform: macOS](https://img.shields.io/badge/platform-macOS-000000?logo=apple&logoColor=white)](docs/INSTALL.md)
 [![Daemon: Python 3.9+](https://img.shields.io/badge/daemon-Python%203.9%2B-3776AB?logo=python&logoColor=white)](daemon/claude_mate_daemon.py)
 [![Firmware: Arduino Nano](https://img.shields.io/badge/firmware-Arduino%20Nano-00979D?logo=arduino&logoColor=white)](firmware/claude_mate)
 [![Firmware: ESP32-S3](https://img.shields.io/badge/firmware-ESP32--S3-E7352C?logo=espressif&logoColor=white)](firmware/claude_mate_s3)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+
+> **Not affiliated with Anthropic.** Claude and Claude Code are trademarks of
+> Anthropic, PBC. This is an independent, non-commercial project — see
+> [TRADEMARKS.md](TRADEMARKS.md).
 
 <p align="center">
   <img src="assets/photos/v2-and-v1.jpg" alt="Both Claude Mate builds on a desk — the cordless ESP32-S3 keypad with its colour screen, the same keypad opened up around its cell, and the original Arduino Nano box with its OLED" width="760">
@@ -266,12 +270,16 @@ hooks are the zero-dependency feed. Use whichever fits each session.
   behind it. The exact number stays in the About page, where diagnosis wants it.
   Charging is inferred in tiers; the board exposes no charge-status line.
 - **A live terminal mirror** — see [above](#the-terminal-mirror-esp32-s3).
-- **An on-device menu** — double-tap the 4th button. Settings (screen sleep,
-  brightness, alert-LED level including a genuine *off*, flip, factory reset),
-  an About readout, the Wi-Fi setup portal, and long sleep. Entirely
-  **firmware-local**: while it is up PREV/GO/NEXT are handled on the device and
-  never emitted, so the queue cannot move while you are aiming at a settings row
-  — and there is **no protocol change and no daemon change** for any of it.
+- **An on-device menu** — double-tap the 4th button. Four items: the triage view,
+  SETTINGS, SHIP IT and long sleep. Settings holds the rest — a **game
+  controller** switch, screen sleep, brightness, alert-LED level including a
+  genuine *off*, Mac sound, flip, the Wi-Fi setup portal, an About readout, and
+  factory reset. About and Wi-Fi live there rather than on the top strip because
+  neither is a place you go: one is something you read, the other something you
+  set. Entirely **firmware-local**: while it is up PREV/GO/NEXT are handled on
+  the device and never emitted, so the queue cannot move while you are aiming at
+  a settings row — and there is **no protocol change and no daemon change** for
+  any of it.
 - **A screen that turns itself off** — after 1–30 minutes, and only when nothing
   is waiting on you. What counts as waiting comes from the frame the device
   already has: a flashing name row, any lowercase fleet letter, or a *looping*

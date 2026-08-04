@@ -1,0 +1,550 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SHIP IT — Claude Mate</title>
+<meta name="description" content="A platformer where the terrain is your contribution graph and the deadline is your health. Plays in the browser; if you own the hardware, the device is the gamepad. Independent project, not affiliated with Anthropic.">
+<style>
+  :root{
+    --paper:#faf9f5; --raise:#ffffff; --ink:#26241f; --muted:#6d6b63;
+    --accent:#d97757; --accent-deep:#b8542f; --line:#e8e5dc;
+    --radius:14px; --maxw:900px;
+    --stage:#0d1117;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --paper:#211f1d; --raise:#2a2825; --ink:#efece4; --muted:#a8a49a;
+      --accent:#e08a6b; --accent-deep:#e9a488; --line:#38352f;
+    }
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; background:var(--paper); color:var(--ink);
+    font:400 17px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:var(--maxw); margin:0 auto; padding:0 22px}
+  h1,h2,h3{font-family:Georgia,"Iowan Old Style","Times New Roman",serif; font-weight:600; line-height:1.15; letter-spacing:-.01em}
+  a{color:var(--accent-deep); text-decoration:none}
+  a:hover{text-decoration:underline}
+  a:focus-visible,button:focus-visible{outline:2px solid var(--accent); outline-offset:3px; border-radius:4px}
+  .mono{font-family:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace}
+
+  header.bar{border-bottom:1px solid var(--line); position:sticky; top:0; z-index:5;
+    background:color-mix(in srgb,var(--paper) 88%, transparent); backdrop-filter:saturate(1.2) blur(8px)}
+  header.bar .wrap{display:flex; align-items:center; justify-content:space-between; height:56px}
+  header.bar strong{font-family:Georgia,serif; font-weight:600}
+
+  /* ---- the stage: full width, locked to the device's 320x172 -------------- */
+  .stage{background:var(--stage); border-block:1px solid var(--line); padding:0}
+  .screen-wrap{position:relative; width:100%; max-width:1600px; margin:0 auto; line-height:0;
+    display:flex; justify-content:center}
+  canvas#screen{display:block; width:100%; height:auto; background:#0d1117;
+    image-rendering:pixelated; image-rendering:crisp-edges}
+  .overlay{position:absolute; inset:auto 0 0 0; z-index:2; display:flex; gap:10px; justify-content:space-between;
+    padding:10px 14px; pointer-events:none; line-height:1.4}
+  .chip{pointer-events:auto; font:600 11px/1 ui-monospace,Menlo,monospace; letter-spacing:.06em;
+    background:rgba(13,17,23,.72); color:#8b949e; border:1px solid #21262d; border-radius:999px;
+    padding:7px 11px; display:inline-flex; gap:7px; align-items:center; backdrop-filter:blur(6px)}
+  .chip .dot{width:7px; height:7px; border-radius:50%; background:#484f58}
+  .chip[data-live="1"]{color:#9be9a8; border-color:#2d5a3d}
+  .chip[data-live="1"] .dot{background:#40c463; box-shadow:0 0 0 3px rgba(64,196,99,.22)}
+  button.chip{cursor:pointer}
+  button.chip[data-on="1"] .dot{background:#40c463}
+
+  /* ---- the keys, laid out like the real device --------------------------- */
+  .pad{display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin:26px 0 0}
+  .cap{background:var(--raise); border:1px solid var(--line); border-radius:12px; padding:14px 10px;
+    text-align:center}
+  .cap .glyph{font:400 22px/1 ui-monospace,Menlo,monospace; color:var(--accent); display:block; margin-bottom:6px}
+  .cap b{display:block; font:600 12px/1.3 ui-monospace,Menlo,monospace; letter-spacing:.05em}
+  .cap span{display:block; font-size:13px; color:var(--muted); margin-top:2px}
+  @media(max-width:560px){ .pad{grid-template-columns:repeat(2,1fr)} }
+
+  section{padding:52px 0}
+  .lede{font-size:20px; color:var(--muted); max-width:62ch}
+  .note{font-size:14.5px; color:var(--muted); border-left:2px solid var(--line); padding-left:14px}
+  footer{border-top:1px solid var(--line); padding:30px 0; font-size:14px; color:var(--muted)}
+
+  /* ---- consent notice (only ever built if analytics is configured) -------- */
+  .consent{position:fixed; left:16px; right:16px; bottom:16px; z-index:50;
+    max-width:640px; margin:0 auto; display:flex; gap:14px; align-items:center;
+    flex-wrap:wrap; justify-content:space-between;
+    background:var(--raise); border:1px solid var(--line);
+    border-radius:var(--radius); padding:14px 16px;
+    box-shadow:0 10px 30px rgba(0,0,0,.28)}
+  .consent p{margin:0; font-size:14px; color:var(--muted); flex:1 1 280px}
+  .consent .row{display:flex; gap:8px}
+  .consent button{padding:8px 14px; border-radius:8px; font-weight:600;
+    font-size:14px; cursor:pointer; border:1px solid var(--line);
+    background:var(--paper); color:var(--ink)}
+  .consent button.yes{background:var(--accent); border-color:var(--accent); color:#fff}
+</style>
+<!-- ---------------------------------------------------------------------------
+  Google Tag Manager, container GTM-5P8X3RNW.
+
+  The container is loaded UNCONDITIONALLY, but Consent Mode v2 defaults are
+  pushed to dataLayer FIRST -- before gtm.js is even requested. That ordering is
+  the whole point: a tag inside the container that respects consent (GA4 does)
+  then stays dormant until someone says yes, and starts measuring the moment
+  they do, with no reload. Push the defaults after the loader and the first hit
+  escapes ungated, which is the usual way this is got wrong.
+
+  This publishes from the EU and GA4 stores an identifier on the visitor's
+  device, which is not a thing you may do first and ask about afterwards.
+  Decline is a real answer: stored, never re-asked, nothing sent. The choice
+  lives in localStorage, exempt because it exists solely to honour the answer.
+
+  Never runs on localhost, 127.0.0.1 or file:// -- a property whose numbers
+  include your own development is one you cannot trust. That also keeps it off
+  the copy the daemon serves at 127.0.0.1:8788.
+
+  Duplicated verbatim in site/game/index.html. There is no build step and the
+  two pages are already independent documents that carry their own stylesheets,
+  so a shared file would have to be reached by a relative path -- and the daemon
+  serves site/game/ AS ITS WEB ROOT, where ../ does not exist. Change both.
+---------------------------------------------------------------------------- -->
+<script>
+(function () {
+  var GTM_ID = 'GTM-5P8X3RNW';
+  var LOCAL  = ['127.0.0.1', 'localhost', '[::1]', '::1'];
+  var KEY    = 'cm-analytics-consent';
+
+  if (location.protocol === 'file:' ||
+      LOCAL.indexOf(location.hostname) !== -1) return;
+
+  window.dataLayer = window.dataLayer || [];
+  function gtag() { dataLayer.push(arguments); }
+
+  // BEFORE the container. wait_for_update gives a stored "yes" time to land
+  // before any tag decides it has been denied.
+  gtag('consent', 'default', {
+    ad_storage: 'denied',
+    ad_user_data: 'denied',
+    ad_personalization: 'denied',
+    analytics_storage: 'denied',
+    wait_for_update: 500
+  });
+
+  var saved = null;
+  try { saved = localStorage.getItem(KEY); } catch (e) {}
+  if (saved === 'granted') gtag('consent', 'update', { analytics_storage: 'granted' });
+
+  // Google's own snippet, unmodified except for taking the id from above.
+  (function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':
+  new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],
+  j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
+  'https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);
+  })(window,document,'script','dataLayer',GTM_ID);
+
+  if (saved) return;                                       // already answered
+
+  function ask() {
+    var box = document.createElement('div');
+    box.className = 'consent';
+    box.setAttribute('role', 'dialog');
+    box.setAttribute('aria-label', 'Analytics consent');
+    box.innerHTML =
+      '<p>Anonymous page analytics, to see whether any of this is read. ' +
+      'Nothing is stored unless you say yes.</p>' +
+      '<span class="row">' +
+        '<button type="button" class="no">No thanks</button>' +
+        '<button type="button" class="yes">Allow</button>' +
+      '</span>';
+    function done(answer) {
+      try { localStorage.setItem(KEY, answer); } catch (e) {}
+      if (answer === 'granted')
+        gtag('consent', 'update', { analytics_storage: 'granted' });
+      box.remove();
+    }
+    box.querySelector('.yes').addEventListener('click', function () { done('granted'); });
+    box.querySelector('.no').addEventListener('click', function () { done('denied'); });
+    document.body.appendChild(box);
+  }
+  if (document.readyState === 'loading')
+    document.addEventListener('DOMContentLoaded', ask);
+  else ask();
+})();
+</script>
+</head>
+<body>
+<!-- Google Tag Manager (noscript) -->
+<noscript><iframe src="https://www.googletagmanager.com/ns.html?id=GTM-5P8X3RNW"
+height="0" width="0" style="display:none;visibility:hidden"></iframe></noscript>
+<!-- End Google Tag Manager (noscript) -->
+
+<header class="bar"><div class="wrap">
+  <strong>Claude&nbsp;Mate</strong>
+  <span class="mono" style="font-size:13px;color:var(--muted)">SHIP IT · level 1</span>
+</div></header>
+
+<div class="stage">
+  <div class="screen-wrap">
+    <canvas id="screen" width="320" height="172" aria-label="SHIP IT — a platformer played on a contribution graph"></canvas>
+    <div class="overlay">
+      <span class="chip" id="pad" data-live="0"><span class="dot"></span>CONTROLLER · KEYBOARD</span>
+      <span style="display:flex;gap:10px">
+        <button class="chip" id="one" data-on="0" aria-label="Show at the device's own 320x172"><span class="dot"></span>1:1</button>
+        <button class="chip" id="snd" data-on="1" aria-label="Toggle sound"><span class="dot"></span>SOUND</button>
+      </span>
+    </div>
+  </div>
+</div>
+
+<div class="wrap">
+  <section>
+    <h1 style="font-size:34px;margin:0 0 12px">The graph is the level.</h1>
+    <p class="lede">A commit is a floor tile. A day you shipped nothing is a hole. You do not
+      have three lives — you have <strong>days until the milestone</strong>, and everything in
+      the world is a claim on them. Merge pull requests to buy back schedule, or the milestone
+      slips.</p>
+
+    <div class="pad">
+      <div class="cap"><span class="glyph">□</span><b>PREV</b><span>walk left</span></div>
+      <div class="cap"><span class="glyph">○</span><b>GO</b><span>jump — hold for height</span></div>
+      <div class="cap"><span class="glyph">△</span><b>NEXT</b><span>walk right</span></div>
+      <div class="cap"><span class="glyph">✕</span><b>4th</b><span>back to the menu</span></div>
+    </div>
+
+    <p class="note" style="margin-top:26px">
+      <strong>The device is the gamepad.</strong> If your Claude Mate is linked and the daemon is
+      running with <code class="mono">--web</code>, open this page from
+      <code class="mono">http://127.0.0.1:8788</code> and the four keycaps on the hardware drive
+      the game above — the badge turns green. Everyone else plays on the keyboard:
+      <span class="mono">← →</span> to walk, <span class="mono">↑</span> to jump,
+      <span class="mono">esc</span> for the menu. Sound is synthesised in the browser; nothing is
+      downloaded.
+    </p>
+  </section>
+
+<style>
+  /* Base rules this block depends on. Written with :where() so their
+     specificity is ZERO -- pasted into site/index.html, that page's own
+     .card/.btn/.cta/.cols definitions win unchanged and nothing is restyled;
+     pasted anywhere else (the game page), these stand in. */
+  :where(.cta){display:flex; gap:12px; justify-content:center; flex-wrap:wrap; margin:26px 0 8px}
+  :where(.btn){display:inline-flex; align-items:center; gap:8px; padding:11px 20px;
+    border-radius:10px; font-weight:600; font-size:15px; border:1px solid transparent}
+  :where(.btn.primary){background:var(--accent); color:#fff}
+  :where(.btn.ghost){border-color:var(--line); color:var(--ink); background:var(--raise)}
+  :where(.cols){display:grid; grid-template-columns:repeat(3,1fr); gap:16px}
+  :where(.card){background:var(--raise); border:1px solid var(--line);
+    border-radius:var(--radius); padding:20px}
+  :where(.card h3){font-size:18px; margin:0 0 6px}
+  :where(.card p){margin:0; color:var(--muted); font-size:15px}
+  @media(max-width:760px){ :where(.cols){grid-template-columns:1fr} }
+
+  /* ---- new, additive only. Uses the page's existing custom properties. ---- */
+
+  /* a two-up card grid (the page already has 3-up .cols and 2-up .road) */
+  .two{display:grid; grid-template-columns:1fr 1fr; gap:16px}
+  @media(max-width:760px){.two{grid-template-columns:1fr}}
+
+  /* SHIP IT — the game panel, drawn in CSS with the game's own palette.
+     Always dark, like the .s3 mock: it is a screen, not page furniture. */
+  .game{background:#0d1117; border-radius:10px; padding:12px 12px 14px}
+  .game-hud{display:flex; align-items:center; justify-content:space-between; gap:12px;
+            font:400 11px/1 ui-monospace,"SF Mono",Menlo,monospace; letter-spacing:.04em;
+            color:#e6edf3; border-bottom:1px solid #21262d; padding-bottom:9px}
+  .game-hud .pr{color:#a371f7}
+  .game-hud .dl{display:inline-flex; align-items:center; gap:7px}
+  .game-hud .dl u{display:block; width:46px; height:9px; background:#21262d;
+                  border-radius:1px; text-decoration:none}
+  .game-hud .dl u b{display:block; height:100%; width:100%; background:#40c463; border-radius:1px}
+
+  /* two layers: the terrain, and the actors over it — an overlay rather than
+     more grid items, because a positioned item displaces every auto-placed one */
+  .pf{position:relative; margin-top:12px}
+  .pf-tiles,.pf-actors{display:grid; grid-template-columns:repeat(30,1fr); gap:1px}
+  .pf-actors{position:absolute; inset:0; grid-template-rows:repeat(7,1fr); pointer-events:none}
+  .pf i{border-radius:1px; display:block}
+  .pf-tiles i{aspect-ratio:1}
+  .pf-tiles i:not([class]){box-shadow:inset 0 0 0 1px #161b22}  /* a day you shipped nothing */
+  .pf .t1{background:#9be9a8} .pf .t2{background:#40c463}
+  .pf .t3{background:#30a14e} .pf .t4{background:#216e39}
+  .pf .mate{background:#d97757; border-radius:2px;
+            background-image:radial-gradient(circle at 33% 40%,#0d1117 0 13%,transparent 14%),
+                             radial-gradient(circle at 67% 40%,#0d1117 0 13%,transparent 14%)}
+  .pf .bug{background:#c4302b; border-radius:45%;
+           background-image:radial-gradient(circle at 30% 38%,#0d1117 0 12%,transparent 13%),
+                            radial-gradient(circle at 70% 38%,#0d1117 0 12%,transparent 13%)}
+  .pf .prq{background-image:radial-gradient(circle at 50% 50%,#a371f7 0 32%,transparent 33%)}
+
+  /* the four keycaps, and what they are on a keyboard */
+  .keycaps{display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin-top:16px}
+  @media(max-width:560px){.keycaps{grid-template-columns:1fr 1fr}}
+  .kc{background:var(--raise); border:1px solid var(--line); border-radius:11px;
+      padding:12px 10px; text-align:center}
+  .kc b{display:block; font-size:20px; line-height:1.1; color:var(--accent-deep)}
+  .kc em{display:block; font:600 12px ui-monospace,Menlo,monospace; letter-spacing:.05em;
+         font-style:normal; margin-top:6px}
+  .kc small{display:block; color:var(--muted); font-size:12.5px; margin-top:3px}
+
+  /* a card's link row — repo paths, in the page's mono */
+  .card p.lk, .lk{margin:12px 0 0; display:flex; flex-wrap:wrap; gap:4px 14px;
+      font:400 13px ui-monospace,"SF Mono",Menlo,monospace}
+
+  /* the build path reuses .parts, in one column */
+  .parts.steps{grid-template-columns:1fr}
+
+  /* visible keyboard focus, scoped to the two new sections */
+  #play a:focus-visible,
+  #contribute a:focus-visible{outline:2px solid var(--accent); outline-offset:3px;
+                              border-radius:6px}
+</style>
+
+
+<!-- ═══════════════════════════════ SECTION 1 ═══════════════════════════════ -->
+
+<div class="wrap">
+  <section id="play">
+    <h2>Play it</h2>
+    <p class="sub">SHIP IT is a small platformer that runs in your browser. The terrain is a
+      contribution graph — a day you shipped something is a tile you can stand on, a day you
+      shipped nothing is a hole you fall through. You get no lives. You get <b>days until the
+      milestone</b>, and every bug that reaches you eats one.</p>
+
+    <div class="term">
+      <div class="tt"><i></i><i></i><i></i><span>SHIP IT · M1 · KICKOFF · 320×172, the device's own screen</span></div>
+      <div class="screen">
+        <div class="game">
+          <div class="game-hud">
+            <span>M1 · KICKOFF</span>
+            <span class="pr">◆ 0/15 merged</span>
+            <span class="dl"><u><b></b></u>7d</span>
+          </div>
+          <div class="pf" role="img" aria-label="The first thirty columns of level 1, drawn as a GitHub contribution graph: ten solid days, a one-day gap, a longer streak, a two-day gap, then a heavier block. Claude Mate stands on the left; a bug patrols a small ledge above a purple pull request.">
+          <div class="pf-tiles">
+            <!--Mon--><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+            <!--Tue--><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+            <!--Wed--><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i class="t2"></i>
+            <!--Thu--><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i class="t2"></i><i class="t2"></i><i class="t2"></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i class="t2"></i><i></i>
+            <!--Fri--><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i class="t2"></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i class="t2"></i><i class="t2"></i><i></i><i class="t2"></i><i></i><i></i>
+            <!--Sat--><i class="t2"></i><i class="t2"></i><i class="t2"></i><i class="t2"></i><i class="t2"></i><i class="t2"></i><i class="t2"></i><i class="t2"></i><i class="t2"></i><i class="t2"></i><i></i><i class="t2"></i><i class="t2"></i><i class="t2"></i><i class="t2"></i><i class="t2"></i><i class="t2"></i><i class="t2"></i><i class="t2"></i><i class="t2"></i><i></i><i></i><i class="t3"></i><i class="t3"></i><i class="t3"></i><i class="t3"></i><i class="t3"></i><i class="t3"></i><i class="t3"></i><i class="t3"></i>
+            <!--Sun--><i class="t3"></i><i class="t3"></i><i class="t3"></i><i class="t3"></i><i class="t3"></i><i class="t3"></i><i class="t3"></i><i class="t3"></i><i class="t3"></i><i class="t3"></i><i></i><i class="t3"></i><i class="t3"></i><i class="t3"></i><i class="t3"></i><i class="t3"></i><i class="t3"></i><i class="t3"></i><i class="t3"></i><i class="t3"></i><i></i><i></i><i class="t4"></i><i class="t4"></i><i class="t4"></i><i class="t4"></i><i class="t4"></i><i class="t4"></i><i class="t4"></i><i class="t4"></i>
+          </div>
+          <!-- actors, on their own layer: you, a bug on its ledge, a pull request -->
+          <div class="pf-actors">
+            <i class="mate" style="grid-area:5/3"></i>
+            <i class="bug"  style="grid-area:3/14"></i>
+            <i class="prq"  style="grid-area:3/16"></i>
+          </div>
+          </div>
+        </div>
+        <div class="legend">
+          <div><b>a commit is a floor tile</b> — the graph is the collision map, unmodified</div>
+          <div><b>deadline is health</b> — a bug costs a day, a merged PR buys one back</div>
+          <div><b>five tiers</b> — SPRINT down to HOTFIX FRIDAY, where the walk alone costs 9 days of a 3-day budget</div>
+          <div><b>one row per jump</b> — so the lone tile at Friday, column 12, is the step that makes the ledge above it reachable</div>
+        </div>
+      </div>
+    </div>
+    <p class="cap">The first thirty columns of level 1, exactly as
+      <a href="https://github.com/vlgutv22/claude_mate/blob/main/firmware/claude_mate_s3/game/level_01.h">level_01.h</a>
+      carries them — including the tutorial gap at column 10 and the ledge the first bug patrols.</p>
+
+    <div class="cta" style="justify-content:flex-start">
+      <a class="btn primary" href="#top">▶ Play SHIP IT</a>
+      <a class="btn ghost" href="https://github.com/vlgutv22/claude_mate/blob/main/docs/GAME.md">Why it is built this way →</a>
+    </div>
+
+    <div class="two" style="margin-top:22px">
+      <div class="card">
+        <span class="tag now">device · local only</span>
+        <h3>The device is the gamepad</h3>
+        <p>With Claude Mate linked and the daemon running, <b>the four keycaps drive the game on
+          screen</b> — the same four switches that step the triage queue, with nothing re-flashed
+          and nothing re-wired. PREV and NEXT walk, GO jumps and holds for height, the fourth key
+          goes back to the menu. The badge over the screen turns green when the device has the
+          controls.</p>
+        <p style="margin-top:10px">Honestly, and by construction: that path needs the daemon run
+          with <code>--web</code> and the game opened from <code>http://127.0.0.1:8788</code>, on
+          the machine the device is linked to. A page served over https cannot talk to a local
+          http server, so <b>the copy you play from this site is the keyboard one</b>.</p>
+      </div>
+      <div class="card">
+        <span class="tag done">no hardware</span>
+        <h3>The keyboard works for everyone</h3>
+        <p>No device, no daemon, no install: <b>← → to walk, ↑ to jump, esc for the menu</b>
+          (A / D / W and space do the same). That is the entire requirement, and it is how most
+          people will play it — the game was tuned in a browser long before it ran on hardware.</p>
+        <p style="margin-top:10px">Coyote time and jump buffering are in, because playing it proved
+          they had to be: the launch window for a gap is about eight frames, and without them only
+          one timing in five cleared the first jump.</p>
+      </div>
+    </div>
+
+    <div class="keycaps">
+      <div class="kc"><b>□</b><em>PREV</em><small>walk left — ← or A</small></div>
+      <div class="kc"><b>○</b><em>GO</em><small>jump, hold for height — ↑ or W</small></div>
+      <div class="kc"><b>△</b><em>NEXT</em><small>walk right — → or D</small></div>
+      <div class="kc"><b>✕</b><em>4th key</em><small>back to the menu — esc</small></div>
+    </div>
+
+    <p class="cap" style="margin-top:16px">The same game also runs <em>on</em> the S3, from the
+      device's own menu — same numbers, same jump arc, and the record survives a flat battery.
+      Twelve milestones are designed and one is built, which is the first thing on the list below.</p>
+  </section>
+</div>
+
+
+<!-- ═══════════════════════════════ SECTION 2 ═══════════════════════════════ -->
+
+<div class="wrap">
+  <section id="contribute">
+    <h2>Take a piece of it</h2>
+    <p class="sub">Not "PRs welcome" — a list of things the design specifies and the code does not
+      do yet, each with what it actually costs you and the file it lives in. Two of them need no
+      hardware and no Mac at all.</p>
+
+    <div class="cols">
+      <div class="card">
+        <span class="tag now">start here · no hardware</span>
+        <h3>Draw a level</h3>
+        <p>Twelve milestones are designed; <b>one is built</b>. A level is a plain
+          <b>7 × 108 character grid</b> — <code>.</code> is a day you shipped nothing,
+          <code>1</code>–<code>4</code> are the four greens — and level 1 ships as exactly that.
+          Two measured rules bound anything you draw: a jump clears two tiles across and rises
+          one row, so every raised ledge needs one step per row it climbs.</p>
+        <p class="lk">
+          <a href="https://github.com/vlgutv22/claude_mate/blob/main/docs/GAME.md#4-the-twelve-levels">docs/GAME.md §4</a>
+          <a href="https://github.com/vlgutv22/claude_mate/blob/main/firmware/claude_mate_s3/game/level_01.h">level_01.h</a>
+        </p>
+      </div>
+
+      <div class="card">
+        <span class="tag done">a weekend · no hardware</span>
+        <h3>Write the reachability checker</h3>
+        <p>The design asks for it in so many words: a real breadth-first search from the spawn
+          point over standing positions, not a per-tile sanity check — a ledge always looks fine
+          next to its own neighbours. The first pass at level 1 left <b>all seventeen pull
+          requests unreachable</b>, and only playing it found that. Nothing in
+          <code>tools/</code> does this yet.</p>
+        <p class="lk">
+          <a href="https://github.com/vlgutv22/claude_mate/blob/main/docs/GAME.md#2-deadline-is-health">docs/GAME.md §2</a>
+          <a href="https://github.com/vlgutv22/claude_mate/tree/main/tools">tools/</a>
+        </p>
+      </div>
+
+      <div class="card">
+        <span class="tag next">harder · C++ or JS</span>
+        <h3>Build an enemy that only exists on paper</h3>
+        <p>Five enemy types are specified; two are implemented. The <b>flaky test</b> blinks in and
+          out on a fixed cycle, the <b>merge conflict</b> is static and must be routed around, the
+          <b>regression</b> comes back once, angrier. Each also owes a codex card — every enemy
+          freezes the game to introduce itself, because nobody should learn a rule by losing a day
+          to it.</p>
+        <p class="lk">
+          <a href="https://github.com/vlgutv22/claude_mate/blob/main/docs/GAME.md#5-enemies">docs/GAME.md §5</a>
+          <a href="https://github.com/vlgutv22/claude_mate/blob/main/firmware/claude_mate_s3/game/ship_it.h">game/ship_it.h</a>
+        </p>
+      </div>
+
+      <div class="card">
+        <span class="tag done">small · needs a Mac</span>
+        <h3>Teach the detector a new terminal</h3>
+        <p>Session state is scraped from the live Claude&nbsp;Code TUI using substrings in
+          <code>patterns.json</code>, hot-reloaded in about a quarter of a second with no restart.
+          An unusual theme, a non-English locale or a new picker phrase needs one line — and the
+          file documents its own precedence and the traps, because a match that is too loose is
+          worse than none.</p>
+        <p class="lk">
+          <a href="https://github.com/vlgutv22/claude_mate/blob/main/patterns.json">patterns.json</a>
+          <a href="https://github.com/vlgutv22/claude_mate/blob/main/README.md#limitations">README · limitations</a>
+        </p>
+      </div>
+
+      <div class="card">
+        <span class="tag next">real work · a port</span>
+        <h3>Get the daemon off macOS</h3>
+        <p>The README says it plainly: serial device naming, <code>open</code> and the AppleScript
+          window raise are Mac-specific. The line protocol, the queue and both firmwares are not —
+          the device cannot tell what is on the other end of the wire, which is the whole reason a
+          port is a bounded job rather than a rewrite.</p>
+        <p class="lk">
+          <a href="https://github.com/vlgutv22/claude_mate/blob/main/docs/ARCHITECTURE.md">docs/ARCHITECTURE.md</a>
+          <a href="https://github.com/vlgutv22/claude_mate/blob/main/docs/PROTOCOL.md">docs/PROTOCOL.md</a>
+        </p>
+      </div>
+
+      <div class="card">
+        <span class="tag next">hard · needs the S3</span>
+        <h3>Spike the panel's hardware scroll</h3>
+        <p>The LCD sits on non-IOMUX pins, so the bus is capped at 40&nbsp;MHz, the SPI driver is
+          polled rather than DMA, and every flush pushes all 110&nbsp;KB: ~28&nbsp;ms, a ~30&nbsp;fps
+          ceiling before a single line of game logic. The ST7789's own scroll registers would move
+          the world for free in this rotation — but <code>Arduino_GFX</code> does not expose them,
+          so it is a bench experiment, not a plan.</p>
+        <p class="lk">
+          <a href="https://github.com/vlgutv22/claude_mate/blob/main/docs/GAME.md#7-why-this-runs-at-all">docs/GAME.md §7</a>
+          <a href="https://github.com/vlgutv22/claude_mate/blob/main/firmware/README.md">firmware/README.md</a>
+        </p>
+      </div>
+    </div>
+
+    <div class="lic" style="margin-top:22px">
+      <b>Before the first pull request.</b> The project is <b>CC BY-NC 4.0</b> — personal and
+      non-commercial, and contributions come in on the same terms. The
+      <a href="https://github.com/vlgutv22/claude_mate/blob/main/CLA.md">CLA</a> is one sentence in
+      your first PR, and
+      <a href="https://github.com/vlgutv22/claude_mate/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a>
+      explains why it exists rather than asking you to take it on faith. Say which rungs of the
+      <a href="https://github.com/vlgutv22/claude_mate/blob/main/docs/TESTING.md">test ladder</a> you
+      ran — <code>python3 daemon/claude_mate_daemon.py --mock</code> exercises the queue, the screen
+      and the LED policy with no hardware and no Claude at all. One naming rule: no new identifier
+      may contain "claude" or "anthropic" — prose is fine, identity is not.
+    </div>
+
+    <h3 style="font-size:19px;margin:34px 0 4px">Or just build one</h3>
+    <p class="sub" style="margin-bottom:18px">Four steps, and the only soldering is four switches
+      to a header. The repo names the exact parts and deliberately quotes no prices — what they
+      cost depends entirely on where you buy them.</p>
+
+    <ol class="parts steps">
+      <li><span class="q">1</span><span><span class="n">Print the enclosure</span>
+        <span class="d">— <a href="../assets/3d-model/claude_mate_s3.stl" download>claude_mate_s3.stl</a>:
+        body, 1&nbsp;mm faceplate, LCD shelf and rim, ≈&nbsp;55&nbsp;×&nbsp;43&nbsp;×&nbsp;23&nbsp;mm.
+        The Nano's enclosure is a
+        <a href="../assets/3d-model/claude_mate_v2.3mf" download>.3mf</a>.</span></span></li>
+
+      <li><span class="q">2</span><span><span class="n">Get the parts</span>
+        <span class="d">— one Waveshare ESP32-S3-LCD-1.47<b>B</b>, four Kailh Choc switches and
+        keycaps, one AA-sized 14500 Li-ion cell, two M2 screws, a USB-C cable and some hook-up
+        wire. No resistors, no debounce caps, nothing to solder on the board side.
+        <a href="https://github.com/vlgutv22/claude_mate/blob/main/README.md#bill-of-materials">Full BOM →</a></span></span></li>
+
+      <li><span class="q">3</span><span><span class="n">Wire and flash</span>
+        <span class="d">— four switches to GPIO&nbsp;3–6 and one shared ground, then
+        <code>./firmware/flash_s3.sh</code>: <code>arduino-cli upload</code> genuinely cannot flash
+        this board, and the firmware README gives the three reasons.
+        <a href="https://github.com/vlgutv22/claude_mate/blob/main/docs/WIRING.md">Wiring →</a>
+        <a href="https://github.com/vlgutv22/claude_mate/blob/main/firmware/README.md">Firmware →</a></span></span></li>
+
+      <li><span class="q">4</span><span><span class="n">Run the daemon and the hooks</span>
+        <span class="d">— Python&nbsp;3.9+ and one dependency, <code>pyserial</code>;
+        <code>install/install.sh</code> templates the LaunchAgent and loads it. Start with
+        <code>--mock</code> if the hardware hasn't arrived yet.
+        <a href="https://github.com/vlgutv22/claude_mate/blob/main/docs/INSTALL.md">Install →</a></span></span></li>
+    </ol>
+
+    <p class="cap">Iteration 1 is the cheaper way in and is still supported: an Arduino Nano, a
+      128×32 OLED, three buttons and one LED. Both builds speak the identical protocol, so
+      whatever you contribute to the daemon has to keep working for the Nano — which is a
+      constraint, and also the reason the project has stayed simple.</p>
+  </section>
+</div>
+
+
+</div>
+
+<footer><div class="wrap">
+  Works with <a href="https://claude.com/claude-code">Claude&nbsp;Code</a>.
+  Claude and Claude Code are trademarks of Anthropic,&nbsp;PBC.
+  Independent project — not affiliated with, sponsored by, or endorsed by Anthropic.
+</div></footer>
+
+<script type="module" src="./engine.js"></script>
+</body>
+</html>

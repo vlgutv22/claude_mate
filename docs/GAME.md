@@ -1,0 +1,446 @@
+# SHIP IT — a game on the glass
+
+> **Status: level 1 ships.** The engine, the start screen, the enemy codex, the
+> sound and the saved record all run on the device — see
+> [`ship_it.h`](../firmware/claude_mate_s3/game/ship_it.h). Levels 2–12 are
+> designed here and not built. The browser prototype in
+> [`game/proto`](../firmware/claude_mate_s3/game/proto) stays the place the feel
+> is worked out, and is kept local.
+
+A side-scroller for the ESP32-S3 companion. You are **Claude Mate**. Twelve
+levels are twelve months of a project. You walk your own contribution graph from
+the first day of a sprint to the milestone at the end of it, and **bugs eat your
+schedule**. Ship before the deadline.
+
+```
+┌────────────────────────────────────────────────────────┐
+│ M1 · KICKOFF                        ▓▓▓▓▓▓░░░░  14d    │  HUD: milestone + deadline
+├────────────────────────────────────────────────────────┤
+│         ▓▓                                             │
+│   ▒▒    ▓▓        ░░░░                    ▒▒▒▒         │  the contribution graph
+│   ▒▒         ▄▄                  ▄▄       ▒▒▒▒      ⚑  │  IS the terrain
+│ ▒▒▒▒▒▒▒     ▒▒▒▒▒▒▒▒        ▒▒▒▒▒▒▒▒▒   ▒▒▒▒▒▒▒▒▒▒▒▒  │
+│ ▓▓▓▓▓▓▓░░░░░▓▓▓▓▓▓▓▓░░░░░░░░▓▓▓▓▓▓▓▓▓░░░▓▓▓▓▓▓▓▓▓▓▓▓  │  ░ = a day you shipped
+│ ████████     ████████        █████████   ████████████  │      nothing = a hole
+└────────────────────────────────────────────────────────┘
+   ▲  you        ▲ bug         ▲ gap                  ▲ milestone
+```
+
+---
+
+## 1. The one rule that makes it work
+
+**A commit is a floor tile. A day you shipped nothing is a hole.**
+
+Everything follows from that. A streak is a bridge. A weekend off is a jump. A
+heavy day is a tall block you can climb. The level *is* a contribution graph —
+drawn in GitHub's own five-step green ramp, 7 rows for the days of the week,
+columns marching right through the sprint — and it is also, unmodified, the
+platformer's collision map.
+
+That is why this idea fits this hardware. No tilesets, no art pipeline, no
+sprite atlas: the terrain is **axis-aligned filled rectangles**, which is the one
+thing a 40 MHz polled SPI panel draws quickly.
+
+## 2. Deadline *is* health
+
+Mario has lives and a separate countdown. Here they are the **same resource**,
+and that is the design's second load-bearing decision.
+
+You do not have three lives. You have **days until the milestone**. A bug does
+not kill you — it costs you two days. Falling in a hole costs you a day and puts
+you back at the last commit you stood on. Run out of days and the milestone
+slips: that is the fail state, and it is the honest one, because in real work a
+bug never kills you, it eats your schedule.
+
+It also removes a whole UI: no lives counter, no separate timer. One number in
+the corner, counting down, and everything in the world is a claim on it.
+
+| Event | Cost / gain (at SPRINT — the harder tiers move these) |
+|---|---|
+| Every step you take | the drain, set per tier so a straight walk costs a known number of days |
+| A bug reaches you | **−1 day**, knockback, brief invulnerability |
+| Fall in a hole | **−1 day**, respawn at the last tile you stood on |
+| Stomp a bug | **+½ day** — fixing things buys schedule |
+| A **priority change** reaches you | **−2 days** and shoved four tiles back; cannot be stomped |
+| Merge a pull request | **+1 day**, and the screen says `PR MERGED` |
+| Reach the milestone | level complete; unused days carry over |
+
+The first row is the one that was missing, and its absence made everything below
+it decorative — see the difficulty table in §3, where the walk itself is finally
+priced. **You can never hold more days than the sprint started with**: merging
+early does not move the date, it only stops you losing it.
+
+**The vertical budget is ONE ROW per jump** — and missing this shipped a broken
+level. The apex of a full jump is 35.3 px. Standing on row R and landing on row
+R−k needs a rise of k×16:
+
+| Climb | Need | Margin | |
+|---|---|---|---|
+| 1 row | 16 px | **+19.3 px** | comfortable |
+| 2 rows | 32 px | **+3.3 px** | pixel-perfect — unreachable in practice |
+| 3 rows | 48 px | −12.7 px | impossible |
+
+Every raised ledge therefore needs **one step per row it rises**. Without those
+steps a breadth-first search over standing positions found **all seventeen pull
+requests unreachable** — the entire optional layer of the level was decoration.
+Reported from play as *"why can't I jump so high?"*, which is exactly what a
+3.3 px margin feels like.
+
+The lesson generalises past this level: horizontal reach was computed carefully
+from the start and vertical reach was never computed at all. Any level tool must
+check both, and the reachability test has to be a real search from the spawn
+point rather than a per-tile sanity check — a ledge always looks fine when you
+only compare it to its own neighbours.
+
+**The horizontal budget is two tiles, measured not chosen.** Walk 1.45 px/frame, jump
+−4.75, gravity 0.30: a full jump is airborne 31 frames and covers 45 px, i.e.
+**2.81 tiles**. A 1-tile gap clears with 29 px to spare, a 2-tile gap with 13 —
+and a **3-tile gap is impossible by 3 px**, which is worse than obviously
+impossible, because it looks reachable. Later levels buy wider crossings with a
+platform in the middle, never with a bigger jump: clearing three tiles would
+need 2.7 tiles of height on a 7-row playfield, which makes the character floaty
+and every ceiling meaningless.
+
+Carrying days over is what turns twelve levels into one arc rather than twelve
+separate scores: a sloppy sprint 3 is still hurting you in sprint 9.
+
+## 3. Controls
+
+Exactly the four switches already soldered on. No new hardware.
+
+| Button | In game |
+|---|---|
+| **PREV** | ← walk left |
+| **GO** | ↑ jump — held longer jumps higher |
+| **NEXT** | → walk right |
+| **4th** ×1 | pause · save · exit to CONDUCTOR |
+| **4th** ×2 | the device menu (as everywhere else) |
+| **4th** ×3 | the game menu — level select, restart sprint, abandon run |
+
+Three of those four need firmware that does not exist yet, and the reasons are
+specific:
+
+- **PREV/NEXT must be read as pin STATE, not as events.** `pollNavBtn` emits a
+  press and then auto-repeats at 400 ms / 200 ms. A platformer needs "is it held
+  down *this frame*", which is a raw `digitalRead`, and the existing debounce and
+  repeat must both be bypassed in game mode.
+- **The 4th button's tap is deferred `DBLCLICK_MS` (300 ms)** to watch for a
+  double. That is correct for the mirror and fatal for an action button — which
+  is exactly why the 4th button gets only non-action verbs here (pause, menus)
+  and never jump.
+- **The 4th button is also power-off at a 2 s hold.** Holding it during play
+  would switch the device off mid-level. Game mode must suppress that, and then
+  must offer some other way out — hence single-click = exit.
+
+And, as with MENU and SETTINGS, **game mode swallows its buttons**: none of them
+may reach the daemon, or every jump raises a terminal on the Mac.
+
+### Coyote time and jump buffering are not polish — they are required
+
+Found by playing the prototype, not by reading it. With a fixed jump arc and no
+air control, the launch window for every gap in level 1 is about **13 px, roughly
+eight frames**: jump one tile early and you land *in* the hole. Sweeping launch
+positions, only one of five timings cleared the first gap, and the level's own
+tutorial gap was the harshest jump in it.
+
+The level data was fine. The *feel* was wrong, and the fix is the standard pair
+rather than a bigger jump:
+
+- **Coyote time** — you may still jump for ~6 frames after walking off an edge.
+- **Jump buffering** — a jump pressed up to ~6 frames early fires the moment you
+  land.
+
+Twelve lines, and the same sweep then cleared **four of five** timings. Both must
+be in the firmware engine from the first commit; retrofitting them means
+re-tuning every level built without them.
+
+### The start screen sets the sprint, not the "difficulty"
+
+A run begins on a menu rather than in level 1, and it is driven by the same
+convention as the device SETTINGS page — PREV/NEXT move between rows, GO changes
+the value — so nothing new has to be learned to start.
+
+| Row | Values | What it changes |
+|---|---|---|
+| **DIFFICULTY** | five tiers, below | the whole economy, not just the clock |
+| **TUTORIAL** | ON · OFF | whether a new enemy freezes the game to introduce itself |
+| **START SPRINT** | — | GO begins the run |
+
+#### The clock was never a constraint, and that is why the top tier fell first try
+
+The first version of this table was three tiers moving two numbers, and its
+hardest setting was cleared on a first attempt. The reason was not the tuning of
+the tiers — it was that **§2's central claim was false of the code**.
+
+This document said the level costs about 14 days to walk. Measured, it cost
+**2.76**. The level is 105 tiles, walk speed is 1.45 px/step, so a straight run
+is 1159 steps; the drain was a flat `1/420` per step, which over 1159 steps is
+2.76 days. Against the hardest budget of 7 days that is two and a half times more
+clock than the level needs, before merging a single PR. `1/420` was a guess that
+was never checked against the map, so the deadline — the thing the whole design
+rests on — was decorative.
+
+So the drain is no longer a constant. **`walk` is the design input**: what a
+perfect straight run should cost in days. The drain is derived from it as
+`1159 / walk` steps per day, and the tier is defined by the gap between that and
+what you are given:
+
+| Tier | Days | Walk costs | Deficit | Enemy | PR | Bug hit | Priority change |
+|---|---|---|---|---|---|---|---|
+| **SPRINT** | 7 | 5 | −2 (slack) | 0.58 | +1 | −1 | −2 |
+| **CRUNCH** | 6 | 6 | 0 | 0.72 | +1 | −1 | −2 |
+| **CODE FREEZE** | 5 | 7 | +2 | 0.88 | +1 | −1½ | −2½ |
+| **DEATH MARCH** | 4 | 8 | +4 | 1.05 | +¾ | −1½ | −3 |
+| **HOTFIX FRIDAY** | 3 | 9 | +6 | 1.25 | +½ | −2 | −3 |
+
+All five are measured, not asserted — a scripted walk on each tier returns the
+`Walk costs` column to within 0.02 of a day.
+
+The deficit *is* the level. At SPRINT you can walk it and PRs are a bonus, which
+is the version someone can finish while still learning the jump. At CRUNCH a
+perfect run exactly ties, so any mistake has to be merged back. Above that the
+map has to be mined: HOTFIX FRIDAY needs 6 days out of a possible 13 (15 PRs at
++½, 11 stomps at +½), and the enemies that guard them move at 1.25 px/step
+against your 1.45.
+
+Higher tiers spend more than the clock, because "same run, less time" is only one
+kind of harder. Enemies close faster, PRs pay less, and hits cost more — so at
+the top a single bug undoes four merged PRs.
+
+**You can never bank more days than the sprint started with.** The cap used to be
+a flat 20 days, which on a 3-day sprint was no cap at all. Now it is the tier's
+own budget: merging work early does not move the date, it only stops you losing
+it. When the cap does bite, the toast says `already at cap` rather than silently
+eating the reward — a reward that does nothing teaches the wrong rule.
+
+**TUTORIAL OFF skips the enemy codex**, the freeze-and-explain card that fires
+the first time each enemy type appears. It is on by default and worth leaving on
+for one run; on a replay it is an interruption. It is a display toggle only —
+turning it off never changes what the enemies do.
+
+## 4. The twelve levels
+
+Twelve months of a release. Difficulty is not just "more bugs" — each level
+changes one thing about the *shape* of the graph, because the graph is the level.
+
+| # | Milestone | The sprint's shape | Introduces |
+|---|---|---|---|
+| 1 | **Kickoff** | dense, flat, forgiving | walking, one gap, one bug |
+| 2 | **Scaffolding** | rising streaks | climbing, longer jumps |
+| 3 | **First Light** | first real weekend gaps | run-up jumps |
+| 4 | **Dogfood** | floating platforms | bugs that patrol above you |
+| 5 | **Alpha** | sparse — a thin month | precision, few safe tiles |
+| 6 | **Feature Freeze** | dense but bug-infested | crowds |
+| 7 | **Hardening** | flaky tiles that blink out | timing |
+| 8 | **Beta** | two viable routes | risk/reward: fast vs safe |
+| 9 | **Release Candidate** | regressions respawn once | you cannot just clear it |
+| 10 | **Code Freeze** | almost no green | the sparsest month |
+| 11 | **Launch Week** | crunch: dense, dark, swarming | everything at once |
+| 12 | **Ship It** | the whole year, compressed | a victory lap that can still fail |
+
+Level 10 being the *emptiest* is deliberate. A code freeze means nobody is
+committing, so there is almost nothing to stand on — the theme and the
+difficulty curve point the same way, which is the test of whether a metaphor is
+doing real work or just decorating.
+
+## 5. Enemies
+
+All of them are bugs. What differs is how they behave, and each is a real thing
+that happens to a sprint.
+
+| Enemy | Behaviour | Ships in |
+|---|---|---|
+| **Bug** | patrols a platform, turns at edges. Stompable, and stomping pays | L1 |
+| **Priority change** | drifts vertically, denying a whole lane. **Cannot be stomped** — you do not fix a re-prioritisation by jumping on it. Rare: three, against eleven bugs | L1 |
+| **Flaky test** | blinks in and out on a fixed cycle; harmless while absent | L7 |
+| **Regression** | squashing it works — then it comes back once, angrier | L9 |
+| **Merge conflict** | static, blocks a corridor; cannot be squashed, must be routed around | L8 |
+
+**Every enemy type introduces itself.** The first time one comes on screen the
+game freezes and shows a card: the sprite at 3×, its name, and exactly what a
+collision costs. A player should never learn a rule by losing a day to it, and on
+a device with no manual, no tooltips and no mouse-over, the card is the only
+place that rule can live. Once per type, per run.
+
+Stomping paying **+½ day** is what stops the safe line being the right line. Bugs
+sit on the route you want, so "jump everything, touch nothing" is now worse than
+engaging — the same claim the PR economy makes, one verb down.
+
+## 6. What it looks like
+
+**Terrain** uses GitHub's own ramp, so a screenshot of the game and a screenshot
+of the graph are the same picture:
+
+| Cell | Colour | Meaning |
+|---|---|---|
+| `0` | background | nothing shipped — a hole |
+| `1` | `#9BE9A8` | a quiet day |
+| `2` | `#40C463` | a normal day |
+| `3` | `#30A14E` | a good day |
+| `4` | `#216E39` | a heavy day |
+
+**Claude Mate** is drawn from the project's own mascot — 14×12, terracotta
+(`#D97757`, the accent colour this repo already uses everywhere). Two dark eye
+slots, stubby arms, two legs. Squashes to 14×8 on landing, stretches to 12×14 at
+the top of a jump; that squash-and-stretch is most of what makes a jump *feel*
+like a jump, and it costs two rectangles.
+
+**Bugs** are 10×8, dark red, with two legs and a pair of pale eyes — readable at
+this size because they are the only round-ish thing on a screen made of squares.
+
+## 7. Why this runs at all
+
+The display is the constraint, and it is a hard one. The numbers were measured
+for this repo already:
+
+- The LCD sits on GPIO 40/41/42/45, which are **not** the S3's FSPI IOMUX pins,
+  so the bus routes through the GPIO matrix and is capped at **40 MHz**.
+- `Arduino_ESP32SPI` is **polled, not DMA** — it busy-waits a core.
+- `Arduino_Canvas::flush()` ignores its argument and always pushes the whole
+  110 KB buffer: **~28 ms**, i.e. a **~30 fps ceiling with zero game logic**.
+
+A full-width scroller is the *worst* shape for that, because every pixel is dirty
+every frame. Three things make it viable anyway, and they should be built in this
+order:
+
+1. **A short playfield.** Confine the world to a 320×112 band (7 rows × 16 px)
+   with a static HUD above that is never re-pushed. That is 65 % of the pixels,
+   ~18 ms, ~40 fps of headroom before logic.
+2. **Tile-aligned scrolling.** The camera moves in whole 16 px steps, so a scroll
+   is a memmove of the canvas plus one new 16 px column — not a redraw.
+3. **Dirty rectangles for actors.** Claude Mate and the bugs are the only things
+   that move within a tile. Redraw the tiles they left and the tiles they entered,
+   nothing else.
+
+If that is not enough, the escape hatch is the ST7789's **hardware scroll**
+(`VSCRDEF`/`VSCRSADD`), which in this landscape rotation scrolls horizontally —
+but the driver does not expose it, so it is a bench spike before anything is
+designed around it, not a plan.
+
+**The game loop must not block.** Longer than `LINK_WATCHDOG_MS` (30 s) and the
+device flips to NO LINK; block at all and the transports stop draining and the
+160-byte line buffers overflow. Like everything else here, it has to be a
+`poll()`-shaped state machine.
+
+**Memory is not a problem.** 8 MB PSRAM, 16 MB flash, and the sketch currently
+uses 33 % of a 3 MB partition. A level is 7 × 60 bytes.
+
+## 8. Sound
+
+The device cannot make any, and will not without hardware: the ESP32-S3 has no
+DAC, and this board's 3.3 V rail is a linear LDO with the backlight on a
+resistor-limited MOSFET, so there is no switching node a firmware trick could
+make audible.
+
+But the daemon can, and the plumbing now exists. The `O|` verb added for the
+sound toggle generalises to `O|SFX|<event>`, so a jump, a squash and a shipped
+milestone can play through the Mac's speakers while you play on the device. That
+is a genuinely nice property of a game on a networked device, and it costs one
+new key on a verb that already ships.
+
+## 9. Provenance of every asset
+
+Written down because "is any of this someone else's?" is a question that gets
+harder to answer the more art exists, and because an earlier draft of this
+section asserted an infringement that turned out not to be true.
+
+**The character is original.** An earlier version of this document said "the
+pixel creature is the Claude Code logo". It is not, and never was in the shipped
+sprite: `MATE_BITS` is a 14×12 rounded body with two knocked-out eye slots,
+stubby arms and two legs, drawn for this project. Anthropic's mark is a
+radiating starburst and shares no geometry with it. The claim was wrong, and
+left in the repo it read as a written admission of copying something that was
+not copied.
+
+**The terrain palette is a set of hex values.** `#9BE9A8 / #40C463 / #30A14E /
+#216E39` on `#0D1117` are GitHub's contribution ramp. Colour values are facts,
+not authorship, and a calendar heat-map is an idea rather than an expression.
+What *would* be a problem is passing the result off as a GitHub product, which
+nothing here does.
+
+**The pull-request glyph is a redrawing, not a copy.** `PR_BITS` is an 11×11
+original tracing of the shape GitHub's `git-pull-request` Octicon uses — two
+nodes, a branch line, a merge arrow. Octicons is MIT-licensed, so even a direct
+copy would be permitted with the notice retained; this is a hand-drawn
+reinterpretation at a size where almost no expressive detail survives. Credited
+here because it is derived from a recognisable design, not because it has to be.
+
+**The sound is synthesised, not sampled.** The daemon renders square and
+sawtooth waves from frequency tables at runtime (`SFX_RECIPES`). It ships no
+audio files. The *alert* path is a separate thing and does play macOS system
+sounds — but by invoking `afplay` on files already on the user's own machine,
+which is what those files are for, and it redistributes nothing.
+
+**No Mario anything.** No Nintendo music, sprites, level layouts, character or
+names. This matters less than it sounds: game *rules and mechanics are not
+copyrightable* — running, jumping and stomping an enemy are systems, and systems
+are excluded from copyright. What is protectable is the specific expression, and
+none of it is borrowed.
+
+**Everything else is written for this repo:** the level map, the enemy and
+priority-change sprites, the twelve-milestone structure, the day economy, and
+this document.
+
+### What can and cannot be owned here
+
+Worth stating plainly, because it is the most commonly misunderstood part of
+open-sourcing a game.
+
+**Ownable:** the source, the sprite art, the specific level layout, the text of
+this document, and the name — the last through trademark rather than copyright.
+
+**Not ownable:** the *idea*. "A platformer where the terrain is a contribution
+graph and the deadline is your health" is a rule set and a concept, and neither
+is protectable in any jurisdiction. Someone can read this document, build their
+own, and owe nothing. What they cannot do is take this code, this art, or this
+prose.
+
+The practical protection is therefore not the licence alone but the
+**contributor agreement** — see [`CLA.md`](../CLA.md). Without one, every
+contributor holds copyright in their own patch, and the project cannot be
+relicensed or commercialised later without going back to every one of them.
+
+## 10. What exists so far
+
+- This document.
+- [`firmware/claude_mate_s3/game/level_01.h`](../firmware/claude_mate_s3/game/level_01.h)
+  — level 1 as data, in the format an engine would consume, with the sprites and
+  the palette.
+- [`firmware/claude_mate_s3/game/proto/index.html`](../firmware/claude_mate_s3/game/proto/index.html)
+  — a playable prototype at the device's exact 320×172, kept **local only**. Run
+  `python3 -m http.server 8931` in that directory. It exists to be played, which
+  is how the vertical budget, the launch window and the character's animation
+  were all found to be wrong.
+
+**Standing still must be a state, not a three-frame cycle.** Reported from play
+as the character shaking while every other animation looked fine. Gravity was
+applied every step with no resting-contact check, so from a clean landing the
+character fell 0.3 px (no overlap yet, so `onGround` went false), then 0.6, then
+on the third step finally overlapped the floor and was snapped back out:
+
+```
+y=68.0 onGround  →  68.3  →  68.9  →  y=68.0 onGround  →  …
+drawn: 68            68        69        68
+```
+
+A 1 px vertical vibration at 20 Hz, and `onGround` true on **30 %** of frames —
+so coyote time, the thing that makes the jumps land at all, was being refreshed
+off a flickering signal. Probing one pixel down each step and re-seating fixes
+both: `y` is now constant while grounded, `onGround` is true 91 % of frames, and
+the drawn pixel row never changes while standing. Guard the probe on `vy >= 0` or
+it cancels the first frame of every jump.
+
+**Sprites are three fixed poses, never a scaled one.** The squash-and-stretch on
+the character was first done with `ctx.scale(1, sy)` over a sprite drawn as 1×1
+rectangles. That puts fractional rectangles on the canvas, the canvas antialiases
+them, and the result read as a glitch — the character shimmered while every other
+animation looked fine, because nothing else was scaled. It is now three discrete
+bitmaps (14×12 neutral, 14×8 landing, 14×14 rising) bottom-aligned to the same
+baseline. Measured over 30 frames: zero partially-transparent pixels. The device
+has no antialiasing at all, so any effect that depends on sub-pixel coverage is
+a prototype-only illusion and must not be built on.
+
+Nothing is wired into the firmware. The next step, if the concept survives
+review, is the engine described in §7 — playfield band, tile-aligned camera,
+dirty-rect actors — plus the input changes in §3.

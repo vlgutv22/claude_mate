@@ -1,0 +1,468 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SHIP IT — local prototype</title>
+<style>
+  :root{ --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+         --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+         --page:#faf7f5; --ink:#241c18; --dim:#6b5b53; --rule:#e3d8d1; --mate:#d97757; }
+  @media (prefers-color-scheme:dark){
+    :root{ --page:#17120f; --ink:#f0e7e2; --dim:#a4938a; --rule:#332721; } }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--page);color:var(--ink);font:400 15px/1.6 var(--sans);
+       display:flex;flex-direction:column;align-items:center;padding:32px 16px 60px}
+  h1{font:600 12px/1 var(--mono);letter-spacing:.2em;text-transform:uppercase;
+     color:var(--mate);margin:0 0 6px}
+  p.lede{font-size:22px;font-weight:500;letter-spacing:-.01em;margin:0 0 22px;text-align:center}
+  .device{background:linear-gradient(#c9714f,#b45f40);border-radius:18px;padding:14px 14px 0;
+          box-shadow:0 22px 44px -26px rgba(60,25,10,.6)}
+  canvas{display:block;width:640px;height:344px;border-radius:6px;background:#0d1117;
+         image-rendering:pixelated}
+  @media(max-width:700px){canvas{width:320px;height:172px}}
+  .keys{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;padding:14px 0}
+  .key{appearance:none;border:0;border-radius:7px;background:#efe9e4;color:#3a2b24;
+       font:600 11px/1.35 var(--mono);letter-spacing:.05em;padding:9px 4px;cursor:pointer;
+       text-align:center;transition:transform .05s,background .12s}
+  .key b{display:block;font-size:14px}
+  .key.down{transform:translateY(2px);background:var(--mate);color:#fff}
+  .bar{display:flex;gap:16px;align-items:center;margin-top:16px;flex-wrap:wrap;
+       justify-content:center;font:400 13px var(--mono);color:var(--dim)}
+  .set{display:flex;align-items:center;gap:9px;background:transparent;color:var(--ink);
+       border:1px solid var(--rule);border-radius:8px;padding:7px 12px;cursor:pointer;
+       font:600 11px var(--mono);letter-spacing:.07em}
+  .set .dot{width:9px;height:9px;border-radius:50%;background:#b9aca4}
+  .set[aria-pressed="true"] .dot{background:#40c463;box-shadow:0 0 0 3px rgba(64,196,99,.22)}
+  .legend{margin-top:26px;max-width:560px;color:var(--dim);font-size:13.5px}
+  .legend b{color:var(--ink)}
+</style>
+</head>
+<body>
+<h1>Claude Mate · local prototype</h1>
+<p class="lede">SHIP IT — merge pull requests or miss the milestone.</p>
+
+<div class="device">
+  <canvas id="scr" width="320" height="172"></canvas>
+  <div class="keys">
+    <button class="key" id="kPrev"><b>←</b>PREV</button>
+    <button class="key" id="kGo"><b>↑</b>GO · jump</button>
+    <button class="key" id="kNext"><b>→</b>NEXT</button>
+    <button class="key" id="kMenu"><b>⏻</b>4th · restart</button>
+  </div>
+</div>
+<div class="bar">
+  <button class="set" id="snd" aria-pressed="true"><span class="dot"></span>MAC SOUND</button>
+  <span>Arrow keys or A / W / D</span>
+</div>
+<p class="legend">Level 1 as the firmware header carries it. <b>The clock is the level.</b>
+  A straight run is 1159 steps, so each tier sets what that walk should cost in days and the
+  drain is derived from it — on <b>SPRINT</b> the walk costs 5 of your 7 days, on
+  <b>HOTFIX FRIDAY</b> it costs 9 against a budget of 3, and the missing 6 have to be merged
+  out of the map. PRs pay <b>+1 day</b> falling to <b>+½</b> at the top tier, a stomped bug
+  pays <b>+½</b>, and you can never bank more days than the sprint started with. A priority
+  change costs <b>−2</b> to <b>−3</b> and cannot be stomped.</p>
+
+<script>
+(() => {
+"use strict";
+const MAP=['............................................................................................................','...........................................................................................................4','.............................222................................333........................444.............4','.............222............2............2222......222.........3........22............222.4.........222....4','............2...........22.2...........333333.....2...........3........222.333.......2...4.........2.......4','2222222222.222222222..333333333333..333333333..333333333333..22222222..3333333333..333333333333..33333333334','3333333333.333333333..444444444444..444444444..444444444444..33333333..4444444444..444444444444..44444444444'];
+const BUGS=[[13,2,13,15],[18,4,16,19],[37,4,36,38],[43,2,41,44],[51,2,51,53],[56,4,54,58],[64,1,64,66],[79,4,78,80],[86,2,86,88],[100,2,100,102],[105,4,103,106]];
+const PRS=[[14,2],[15,2],[30,1],[31,1],[52,2],[53,2],[65,1],[66,1],[72,2],[76,3],[87,2],[92,1],[93,1],[101,2],[102,2]];
+const PRIOS=[[31,1,4],[67,0,3],[93,1,4]];
+const ROWS=7,COLS=108,T=16,W=320,H=172,HUD=24,PLAY_Y=HUD+12;
+const RAMP={"1":"#9be9a8","2":"#40c463","3":"#30a14e","4":"#216e39"};
+const solid=(c,r)=>c>=0&&c<COLS&&r>=0&&r<ROWS&&MAP[r][c]!==".";
+
+// THREE POSES, not one sprite scaled. g.scale(1,0.72) on a bitmap drawn as 1x1
+// fillRects turns every pixel into a FRACTIONAL rect, which the canvas
+// antialiases -- that is the shimmer that read as a glitch, and it only hit the
+// character because nothing else is ever scaled. Discrete poses are also what
+// the firmware would ship: three bitmaps, integer blits, no float anywhere.
+const MATE=["01111111111100","01111111111100","01101111110110","01101111110110",
+            "01111111111100","11111111111110","11111111111110","01111111111100",
+            "01111111111100","01111111111100","00110000011000","00110000011000"];
+// landing: flatter and wider, legs tucked
+const MATE_SQUASH=["00111111111100","01111111111110","11101111101110","11101111101110",
+                   "11111111111110","11111111111110","01111111111100","00110000011000"];
+// rising: taller and narrower, legs extended
+const MATE_STRETCH=["00011111111000","00111111111100","00110111101100","00110111101100",
+                    "00111111111100","01111111111110","01111111111110","00111111111100",
+                    "00111111111100","00111111111100","00111111111100","00011000011000",
+                    "00011000011000","00001000001000"];
+const BUG=["001000000100","000100001000","000011110000","001111111100","011110011110","111110011111","011110011110","111110011111","001111111100","010010010010"];
+const PRIO=["000001100000","000011110000","000110011000","001110011100","011110011110","111110011111","111110011111","011111111110","001110011100","000111111000","000011110000","000001100000"];
+const PR=["01110000000","11011000000","10001000000","11011001110","01110011011","00100010001","00100011011","00100001110","01110000000","11011000000","01110000000"];
+
+const cv=document.getElementById("scr"),g=cv.getContext("2d");
+g.imageSmoothingEnabled=false;
+function blit(b,x,y,col,flip){g.fillStyle=col;
+  for(let r=0;r<b.length;r++){const row=b[r];
+    for(let c=0;c<row.length;c++) if(row[c]==="1"){
+      const px=flip?x+(row.length-1-c):x+c; g.fillRect(px|0,(y+r)|0,1,1);}}}
+
+let AC=null,soundOn=true;
+function beep(fs,d,type,vol){ if(!soundOn)return;
+  try{ AC=AC||new (window.AudioContext||window.webkitAudioContext)();
+    if(AC.state==="suspended")AC.resume();
+    const t0=AC.currentTime;
+    fs.forEach((f,i)=>{const o=AC.createOscillator(),gn=AC.createGain();
+      o.type=type||"square";o.frequency.setValueAtTime(f,t0+i*d);
+      gn.gain.setValueAtTime(0,t0+i*d);
+      gn.gain.linearRampToValueAtTime(vol||0.05,t0+i*d+0.008);
+      gn.gain.exponentialRampToValueAtTime(0.0008,t0+i*d+d);
+      o.connect(gn);gn.connect(AC.destination);o.start(t0+i*d);o.stop(t0+i*d+d+0.02);});
+  }catch(e){}}
+const SFX={jump:()=>beep([520,760],.055),stomp:()=>beep([300,150],.05),
+  merge:()=>beep([660,880,1320],.065,"square",.055),hit:()=>beep([180,120],.09,"sawtooth",.05),
+  fall:()=>beep([400,260,160],.06,"sawtooth"),ship:()=>beep([523,659,784,1047,1319],.11,"square",.06)};
+
+// DIFFICULTY. The old table was three tiers that moved two numbers, and the top
+// of it was cleared first try -- because the clock was never a constraint. The
+// level is 105 tiles; at 1.45 px/step that is 1159 steps, and the drain was a
+// flat 1/420 per step, so WALKING THE WHOLE LEVEL COST 2.76 DAYS. Against a
+// 7-day budget you had two and a half times the clock you needed before merging
+// a single PR. The design doc's "the level costs ~14 days, so it cannot be
+// walked" was never true of the code; 1/420 was a guess that was never checked.
+//
+// So `walk` is now the design input and the drain is derived from it: `walk` is
+// what a perfect straight run costs, in days, and `drain` is the steps per day
+// that produces it. Beating a tier means beating that number.
+//
+//   days > walk   slack; PRs are a bonus
+//   days = walk   a perfect run exactly ties; any mistake needs a PR
+//   days < walk   the deficit IS the level -- you must merge your way across
+//
+// Higher tiers spend more axes than the clock, because "same run, less time" is
+// only one kind of harder: enemies get faster, PRs pay less, hits cost more.
+const CROSS=1159;                          // steps for a straight run, measured
+const D=w=>Math.round(CROSS/w);            // steps per day for a given walk cost
+const DIFFS=[
+  {name:"SPRINT",        days:7, walk:5, spd:0.58, pr:1,    stomp:.5, bug:1,   prio:2,
+   sub:"the plan, as written"},
+  {name:"CRUNCH",        days:6, walk:6, spd:0.72, pr:1,    stomp:.5, bug:1,   prio:2,
+   sub:"someone promised a demo"},
+  {name:"CODE FREEZE",   days:5, walk:7, spd:0.88, pr:1,    stomp:.5, bug:1.5, prio:2.5,
+   sub:"the branch is cut and the date is not moving"},
+  {name:"DEATH MARCH",   days:4, walk:8, spd:1.05, pr:0.75, stomp:.5, bug:1.5, prio:3,
+   sub:"every day of slack was spent last week"},
+  {name:"HOTFIX FRIDAY", days:3, walk:9, spd:1.25, pr:0.5,  stomp:.5, bug:2,   prio:3,
+   sub:"it is already broken in production"},
+];
+for(const d of DIFFS) d.drain=D(d.walk);
+let diff=0, tutorial=true, menuRow=0;
+
+// PROGRESS. localStorage here, NVS on the device (see ShipProgress in
+// game/ship_it.h) -- same rules either side so the two agree about what a
+// record IS. A harder tier wins outright and RESETS the numbers rather than
+// keeping the old ones: 12 PRs on SPRINT and 12 on HOTFIX FRIDAY are not the
+// same achievement. An easier tier still marks the level cleared but never
+// downgrades the record.
+const LEVELS=12, PKEY="shipit.progress.v1";
+let prog={done:0,tier:-1,prs:0,days:0};
+try{ const raw=localStorage.getItem(PKEY); if(raw)prog=JSON.parse(raw); }catch(e){}
+const progCount=()=>{let n=0;for(let i=0;i<LEVELS;i++)if(prog.done&(1<<i))n++;return n;};
+function progRecord(lvl,tier,prs,days){
+  const done=prog.done|(1<<lvl);
+  let best=false;
+  if(prog.tier<0||tier>prog.tier) best=true;
+  else if(tier===prog.tier) best=(prs>prog.prs)||(prs===prog.prs&&days>prog.days);
+  if(!best&&done===prog.done) return false;
+  if(best){prog.tier=tier;prog.prs=prs;prog.days=days;}
+  prog.done=done;
+  try{ localStorage.setItem(PKEY,JSON.stringify(prog)); }catch(e){}
+  return best;
+}
+
+// Days are written as halves and quarters all over the HUD, and "0.75 days"
+// reads like a spreadsheet rather than a schedule.
+const FRAC={".25":"¼",".5":"½",".75":"¾"};
+function dstr(n){const s=n<0?"-":"",a=Math.abs(n),w=Math.floor(a),
+  f=FRAC[String(+(a-w).toFixed(2)).replace("0","")]||"";
+  return s+((w||!f)?w:"")+f;}
+function dlabel(n){return dstr(n)+" day"+(Math.abs(n)>1?"s":"");}
+
+let S;
+function reset(){S={x:T,y:4*T,vx:0,vy:0,onGround:false,face:1,days:DIFFS[diff].days,cam:0,
+  bugs:BUGS.map(b=>({c:b[0]*T,r:b[1],from:b[2],to:b[3],dir:1})),
+  prs:PRS.map(p=>({c:p[0],r:p[1],got:false})),
+  prios:PRIOS.map(p=>({c:p[0]*T,y:p[1]*T,top:p[1]*T,bot:p[2]*T,dir:1})),
+  seen:{bug:!tutorial,prio:!tutorial},card:null,merged:0,state:"menu",flash:0,msg:"",
+  msgCol:"#e6edf3",squashT:0,t:0,started:false,coyote:0,buffer:0,inv:0,shipT:0,conf:[]};}
+reset();
+const keys={left:false,right:false,jump:false},jw={v:false};
+const GRAV=.30,WALK=1.45,JUMP=-4.75,MAXFALL=7;
+function hits(px,py){const x0=Math.floor((px+1)/T),x1=Math.floor((px+12)/T),
+  y0=Math.floor(py/T),y1=Math.floor((py+11)/T);
+  for(let c=x0;c<=x1;c++)for(let r=y0;r<=y1;r++)if(solid(c,r))return true;return false;}
+function toast(m,c){S.msg=m;S.msgCol=c||"#e6edf3";S.flash=52;}
+// You cannot bank more schedule than the sprint was given -- merging work early
+// does not move the date, it only stops you losing it. The cap used to be a flat
+// 20 days, which on a 3-day sprint was no cap at all. When it does bite, say so:
+// a reward that silently does nothing teaches the player the wrong rule.
+function gain(v,label,col){const cap=DIFFS[diff].days;
+  if(S.days>=cap){toast(label+"  ·  already at cap","#8b949e");return;}
+  const got=Math.min(v,cap-S.days);S.days+=got;
+  toast(label+"  +"+dlabel(got),col);}
+
+function step(){
+  S.t++;
+  if(S.state==="ship"){S.shipT++;for(const p of S.conf){p.y+=p.vy;p.x+=p.vx;if(p.y>H)p.y=-8;}return;}
+  if(S.state==="slip"||S.state==="card"||S.state==="menu")return;
+  if(!S.started||document.hidden)return;
+  S.days-=1/DIFFS[diff].drain;
+  if(S.days<=0){S.days=0;S.state="slip";toast("MILESTONE SLIPPED","#c4302b");SFX.fall();return;}
+  S.vx=(keys.right?WALK:0)-(keys.left?WALK:0); if(S.vx)S.face=S.vx>0?1:-1;
+  if(S.onGround)S.coyote=6; else if(S.coyote>0)S.coyote--;
+  if(keys.jump&&!jw.v)S.buffer=6; else if(S.buffer>0)S.buffer--;
+  if(S.buffer>0&&S.coyote>0){S.vy=JUMP;S.onGround=false;S.buffer=0;S.coyote=0;SFX.jump();}
+  if(!keys.jump&&S.vy<-1.8)S.vy=-1.8; jw.v=keys.jump;
+  S.vy=Math.min(S.vy+GRAV,MAXFALL);
+  const nx=S.x+S.vx; if(!hits(nx,S.y))S.x=nx;
+  const ny=S.y+S.vy;
+  if(!hits(S.x,ny)){S.y=ny;S.onGround=false;}
+  else{ if(S.vy>0){S.y=Math.floor((ny+11)/T)*T-12;S.onGround=true;} else S.y=Math.floor(ny/T)*T+T; S.vy=0;}
+  // RESTING CONTACT. Without this, standing still is not a state -- it is a
+  // three-frame cycle. Gravity is applied every step, so from a clean landing
+  // the character falls 0.3 px (no overlap yet, so onGround goes false), then
+  // 0.6, then on the third step it finally overlaps the floor and is snapped
+  // back out. Sampled while walking on flat ground:
+  //
+  //     y=68.0 onGround  ->  68.3  ->  68.9  ->  y=68.0 onGround  ->  ...
+  //     drawn: 68            68         69         68
+  //
+  // a 1 px vertical vibration at 20 Hz that reads as the sprite shaking, and
+  // onGround true on only a third of frames -- so coyote time, which is the
+  // thing that makes the jumps land, was being refreshed off a flickering
+  // signal. Probing one pixel down and re-seating cures both. Guarded on
+  // vy>=0 so it can never cancel the first frame of a jump.
+  if(S.vy>=0&&hits(S.x,S.y+1)){S.y=Math.floor((S.y+12)/T)*T-12;S.vy=0;S.onGround=true;}
+  S.x=Math.max(0,Math.min(S.x,(COLS-1)*T));
+  if(S.y>ROWS*T+40){S.days-=1;toast("-1 day · fell","#f0883e");SFX.fall();
+    let c=Math.floor(S.x/T);while(c>0&&!solid(c,5)&&!solid(c,6))c--;
+    let r=6;while(r>0&&!solid(c,r))r--; S.x=c*T;S.y=(r-1)*T;S.vy=0;S.inv=60;}
+  for(const b of S.bugs){ if(b.dead)continue;
+    b.c+=b.dir*DIFFS[diff].spd; const col=Math.floor((b.c+6)/T);
+    if(col<=b.from||col>=b.to||!solid(col,b.r+1))b.dir*=-1;
+    const bx=b.c,by=b.r*T+6;
+    if(Math.abs(bx-S.x)<12&&Math.abs(by-S.y)<12){
+      if(S.vy>.6&&S.y<by-2){b.dead=true;S.vy=-3.2;S.squashT=18;
+        gain(DIFFS[diff].stomp,"FIXED","#40c463");SFX.stomp();}
+      else if(S.inv<=0){const c=DIFFS[diff].bug;S.days-=c;
+        toast("-"+dlabel(c)+" · bug","#c4302b");SFX.hit();
+        S.x-=S.face*15;S.vy=-2.5;S.inv=75;}}}
+  if(S.inv>0)S.inv--;
+  for(const p of S.prios){ if(p.dead)continue;
+    p.y+=p.dir*(DIFFS[diff].spd*1.3); if(p.y<=p.top||p.y>=p.bot)p.dir*=-1;
+    if(Math.abs(p.c-S.x)<13&&Math.abs(p.y-S.y)<13&&S.inv<=0){
+      const c=DIFFS[diff].prio;S.days-=c;
+      toast("RE-SCOPED  -"+dlabel(c),"#d29922");SFX.hit();
+      S.x=Math.max(0,S.x-46);S.vy=-2.2;S.inv=80;}}
+  for(const p of S.prs){ if(p.got)continue;
+    if(Math.abs(p.c*T-S.x)<14&&Math.abs(p.r*T-S.y)<14){
+      p.got=true;S.merged++;gain(DIFFS[diff].pr,"PR MERGED","#a371f7");SFX.merge();}}
+  if(S.flash>0)S.flash--; if(S.squashT>0)S.squashT--;
+  const right=S.cam+W;
+  if(!S.seen.bug&&S.bugs.some(b=>!b.dead&&b.c>S.cam+40&&b.c<right-24))
+    {S.seen.bug=true;S.card="bug";S.state="card";SFX.hit();}
+  else if(!S.seen.prio&&S.prios.some(p=>!p.dead&&p.c>S.cam+40&&p.c<right-24))
+    {S.seen.prio=true;S.card="prio";S.state="card";SFX.hit();}
+  if(Math.floor(S.x/T)>=COLS-2){S.state="ship";S.shipT=0;SFX.ship();
+    // Written the moment the level is cleared, not when the screen is
+    // dismissed: the run is over either way.
+    S.newBest=progRecord(0,diff,S.merged,Math.max(0,S.days));
+    for(let i=0;i<44;i++)S.conf.push({x:Math.random()*W,y:-Math.random()*90,
+      vy:.7+Math.random()*1.9,vx:(Math.random()-.5)*.7,
+      c:["#9be9a8","#40c463","#30a14e","#a371f7","#d97757"][(Math.random()*5)|0]});}
+  S.cam=Math.max(0,Math.min(S.x-W/2+7,COLS*T-W));
+}
+
+function drawMenu(){
+  g.fillStyle="#0d1117";g.fillRect(0,0,W,H);
+  // the title, with Mate standing on a little run of commits
+  g.font="bold 22px ui-monospace,Menlo,monospace";
+  g.fillStyle="#9be9a8"; g.fillText("SHIP IT",18,36);
+  g.font="9px ui-monospace,Menlo,monospace"; g.fillStyle="#8b949e";
+  g.fillText("walk your graph to the milestone",18,50);
+  for(let i=0;i<5;i++){ g.fillStyle=["#9be9a8","#40c463","#30a14e","#216e39","#40c463"][i];
+    g.fillRect(232+i*16,44,14,14); }
+  blit(MATE,246,30,"#d97757");
+
+  const rows=[
+    ["DIFFICULTY", DIFFS[diff].name, DIFFS[diff].sub],
+    ["TUTORIAL",   tutorial?"ON":"OFF",
+     tutorial?"freeze and explain each new enemy":"no cards, straight in"],
+    ["START SPRINT", "", DIFFS[diff].days+" days \u00b7 the walk alone costs "
+     +DIFFS[diff].walk+" \u00b7 15 PRs on the map"],
+  ];
+  // 72 with a 28 pitch, not 76/30: the third row's sub-line sat at 146 and the
+  // record line lands at 150, so they overlapped by four pixels.
+  let y=72;
+  for(let i=0;i<rows.length;i++){
+    const sel=i===menuRow;
+    if(sel){ g.fillStyle="#161b22"; g.fillRect(10,y-11,W-20,22); 
+             g.fillStyle="#d97757"; g.fillRect(10,y-11,2,22); }
+    g.font="bold 11px ui-monospace,Menlo,monospace";
+    g.fillStyle=sel?"#e6edf3":"#8b949e"; g.fillText(rows[i][0],20,y);
+    if(rows[i][1]){
+      g.fillStyle=i===0?"#40c463":(tutorial?"#40c463":"#8b949e");
+      g.fillText(rows[i][1], W-24-g.measureText(rows[i][1]).width, y);
+    }
+    g.font="9px ui-monospace,Menlo,monospace"; g.fillStyle="#6e7681";
+    g.fillText(rows[i][2],20,y+10);
+    y+=28;
+  }
+  // The record, where you CHOOSE the run rather than only where you end one.
+  g.font="9px ui-monospace,Menlo,monospace";
+  let rec="no milestone shipped yet", rcol="#484f58";
+  if(prog.tier>=0){
+    rec="best: "+DIFFS[prog.tier].name+"   "+prog.prs+"/"+PRS.length+" PRs   "
+        +dstr(prog.days)+"d left";
+    rcol="#a371f7";
+  }
+  g.fillStyle=rcol; g.fillText(rec,W/2-g.measureText(rec).width/2,H-22);
+  g.fillStyle="#6e7681";
+  const t="PREV / NEXT  move    GO  change or start";
+  g.fillText(t,W/2-g.measureText(t).width/2,H-9);
+}
+
+function draw(){
+  if(S.state==="menu"){ drawMenu(); return; }
+  g.fillStyle="#0d1117";g.fillRect(0,0,W,H);
+  g.font="bold 10px ui-monospace,Menlo,monospace";
+  g.fillStyle="#e6edf3";g.fillText("M1 · KICKOFF",6,15);
+  blit(PR,128,5,"#a371f7");
+  g.fillStyle="#a371f7";g.fillText(S.merged+"/"+PRS.length,142,15);
+  const d=Math.max(0,S.days),bw=78,fw=Math.round(bw*Math.min(d,DIFFS[diff].days)/DIFFS[diff].days);
+  g.fillStyle="#21262d";g.fillRect(W-6-bw-32,6,bw,9);
+  const fr=d/DIFFS[diff].days;
+  g.fillStyle=fr>.5?"#40c463":fr>.25?"#d29922":"#c4302b";g.fillRect(W-6-bw-32,6,fw,9);
+  g.fillStyle="#e6edf3";g.fillText(Math.ceil(d)+"d",W-26,15);
+  g.fillStyle="#21262d";g.fillRect(0,HUD,W,1);
+  g.save();g.translate(-Math.round(S.cam),PLAY_Y);
+  const c0=Math.max(0,Math.floor(S.cam/T)-1),c1=Math.min(COLS-1,c0+22);
+  for(let c=c0;c<=c1;c++)for(let r=0;r<ROWS;r++){const ch=MAP[r][c];
+    if(ch==="."){g.strokeStyle="#161b22";g.lineWidth=1;g.strokeRect(c*T+1.5,r*T+1.5,T-3,T-3);}
+    else{let col=RAMP[ch]; if(S.state==="ship"&&c*3<S.shipT)col="#9be9a8";
+      g.fillStyle=col;g.fillRect(c*T+1,r*T+1,T-2,T-2);}}
+  g.fillStyle="#a371f7";g.fillRect((COLS-1)*T+2,0,3,ROWS*T);
+  g.fillStyle=S.state==="ship"?"#9be9a8":"#a371f7";g.fillRect((COLS-1)*T+5,6,10,8);
+  for(const p of S.prs){ if(p.got)continue;
+    const bob=Math.sin((S.t+p.c*9)/17)*1.6; blit(PR,p.c*T+3,p.r*T+3+bob,"#a371f7");}
+  for(const b of S.bugs) if(!b.dead) blit(BUG,b.c,b.r*T+6,"#c4302b",b.dir<0);
+  for(const p of S.prios) if(!p.dead) blit(PRIO,p.c,p.y+2,"#d29922");
+  // pick a pose; never scale. Each pose is bottom-aligned to the feet so the
+  // character does not appear to sink or hop when it changes.
+  let pose=MATE, ph=12;
+  if(S.squashT>0){ pose=MATE_SQUASH; ph=8; }
+  else if(!S.onGround&&S.vy<-1){ pose=MATE_STRETCH; ph=14; }
+  if(!(S.inv>0&&(S.t>>2)%2))
+    blit(pose, Math.round(S.x), Math.round(S.y)+(12-ph), "#d97757", S.face<0);
+  g.restore();
+  if(S.state==="ship"){
+    for(const p of S.conf){g.fillStyle=p.c;g.fillRect(p.x|0,p.y|0,3,3);}
+    if(S.shipT>26){
+      g.fillStyle="rgba(13,17,23,.94)";g.fillRect(0,40,W,110);
+      g.fillStyle="#40c463";g.fillRect(0,40,W,1);g.fillRect(0,149,W,1);
+      const ctr=(txt,y,col,size,bold)=>{
+        g.font=(bold?"bold ":"")+size+"px ui-monospace,Menlo,monospace";
+        g.fillStyle=col; g.fillText(txt,W/2-g.measureText(txt).width/2,y);};
+      ctr("MILESTONE SHIPPED",62,"#9be9a8",16,true);
+      ctr("M1 KICKOFF PASSED",80,"#e6edf3",10);
+      ctr(S.merged+"/"+PRS.length+" merged   "+dstr(Math.max(0,S.days))
+          +"d left   "+DIFFS[diff].name,94,"#8b949e",10);
+      ctr(S.newBest?"NEW BEST - PROGRESS SAVED":"PROGRESS SAVED",112,
+          S.newBest?"#a371f7":"#8b949e",10);
+      ctr("milestone "+progCount()+" of "+LEVELS+" - the next "
+          +(LEVELS-progCount())+" are coming soon",132,"#8b949e",10);
+      ctr("any button to go back",142,"#484f58",10);}}
+  if(S.state==="card"){
+    const D=S.card==="bug"
+      ?{name:"BUG",col:"#c4302b",bits:BUG,lines:[["Patrols a commit. Turns at every edge.",""],["Stomp it from above","+½ day"],["Let it reach you","-1 day"]]}
+      :{name:"PRIORITY CHANGE",col:"#d29922",bits:PRIO,lines:[["Drifts up and down. Denies a whole lane.",""],["CANNOT be stomped","go around"],["If it reaches you","-2 days, pushed back"]]};
+    g.fillStyle="rgba(13,17,23,.94)";g.fillRect(0,0,W,H);
+    g.strokeStyle=D.col;g.lineWidth=1;g.strokeRect(18.5,26.5,W-37,H-58);
+    g.save();g.translate(34,44);g.scale(3,3);blit(D.bits,0,0,D.col);g.restore();
+    g.font="bold 13px ui-monospace,Menlo,monospace";g.fillStyle=D.col;g.fillText(D.name,86,54);
+    g.font="9px ui-monospace,Menlo,monospace";let yy=70;
+    for(const [l,r] of D.lines){g.fillStyle=r?"#e6edf3":"#8b949e";g.fillText(l,86,yy);
+      if(r){g.fillStyle=D.col;g.fillText(r,W-30-g.measureText(r).width,yy);} yy+=15;}
+    g.fillStyle="#8b949e";const t="press any button to continue";
+    g.fillText(t,W/2-g.measureText(t).width/2,H-14);}
+  if(S.state==="slip"){
+    g.fillStyle="rgba(13,17,23,.9)";g.fillRect(0,64,W,44);
+    g.fillStyle="#c4302b";g.fillRect(0,64,W,1);g.fillRect(0,107,W,1);
+    g.font="bold 15px ui-monospace,Menlo,monospace";const a="MILESTONE SLIPPED";
+    g.fillStyle="#c4302b";g.fillText(a,W/2-g.measureText(a).width/2,86);
+    g.font="9px ui-monospace,Menlo,monospace";g.fillStyle="#8b949e";
+    const b="merge more pull requests";g.fillText(b,W/2-g.measureText(b).width/2,100);}
+  if(S.msg&&S.flash>0&&S.state==="play"){
+    g.font="bold 10px ui-monospace,Menlo,monospace";const w=g.measureText(S.msg).width;
+    g.fillStyle="rgba(13,17,23,.88)";g.fillRect(W/2-w/2-8,PLAY_Y+30,w+16,17);
+    g.fillStyle=S.msgCol;g.fillText(S.msg,W/2-w/2,PLAY_Y+42);}
+  if(!S.started&&S.state==="play"){
+    g.font="9px ui-monospace,Menlo,monospace";g.fillStyle="#8b949e";
+    const t="press → to start the sprint";g.fillText(t,W/2-g.measureText(t).width/2,PLAY_Y+98);}
+  if(S.state==="ship"||S.state==="slip"){
+    g.font="9px ui-monospace,Menlo,monospace";g.fillStyle="#8b949e";
+    const t="4th button to restart";g.fillText(t,W/2-g.measureText(t).width/2,H-8);}
+}
+
+const DT=1000/60;let acc=0,last=performance.now();
+function loop(now){acc=Math.min(acc+(now-last),250);last=now;
+  while(acc>=DT){step();acc-=DT;} draw(); requestAnimationFrame(loop);}
+requestAnimationFrame(loop);
+
+const KM={ArrowLeft:"left",KeyA:"left",ArrowRight:"right",KeyD:"right",
+  ArrowUp:"jump",KeyW:"jump",Space:"jump"};
+const btn={left:document.getElementById("kPrev"),jump:document.getElementById("kGo"),
+  right:document.getElementById("kNext")};
+function menuButton(k){
+  if(k==="left")  menuRow=(menuRow+2)%3;
+  else if(k==="right") menuRow=(menuRow+1)%3;
+  else if(k==="jump"){
+    if(menuRow===0){ diff=(diff+1)%DIFFS.length; S.days=DIFFS[diff].days; SFX.jump(); }
+    else if(menuRow===1){ tutorial=!tutorial; S.seen={bug:!tutorial,prio:!tutorial}; SFX.jump(); }
+    else { S.state="play"; SFX.merge(); }
+  }
+}
+function set(k,v){ if(!(k in keys))return;
+  if(v&&S.state==="menu"){ menuButton(k); return; }
+  if(v&&S.state==="card"){S.state="play";return;}
+  if(v&&S.state==="play")S.started=true;
+  keys[k]=v; btn[k]&&btn[k].classList.toggle("down",v);}
+addEventListener("keydown",e=>{if(e.code==="Enter"||e.code==="KeyR"){reset();return;}
+  const k=KM[e.code];if(k){e.preventDefault();set(k,true);}});
+addEventListener("keyup",e=>{const k=KM[e.code];if(k)set(k,false);});
+for(const [k,el] of Object.entries(btn)){
+  el.addEventListener("pointerdown",e=>{e.preventDefault();set(k,true);});
+  ["pointerup","pointerleave","pointercancel"].forEach(ev=>
+    el.addEventListener(ev,e=>{e.preventDefault();set(k,false);}));}
+document.getElementById("kMenu").addEventListener("click",reset);
+const sb=document.getElementById("snd");
+sb.addEventListener("click",()=>{soundOn=!soundOn;
+  sb.setAttribute("aria-pressed",String(soundOn)); if(soundOn)SFX.merge();});
+
+// Everything above is in an IIFE, so a harness has no way in. This is the door:
+// it reads state, never writes it, so it cannot become a cheat by accident.
+// A test hook, and unlike __shipit it WRITES: reaching the finish screen by
+// playing takes twenty seconds of correct jumps, which is not a thing a
+// harness can do reliably, and the screen is what needs checking. Named so it
+// is obvious in a stack trace that a human did not get here by playing.
+window.__finish=(prs,days)=>{
+  S.merged=prs; S.days=days; S.state="ship"; S.shipT=40;
+  S.newBest=progRecord(0,diff,prs,days);
+  return {newBest:S.newBest,prog:{...prog}};
+};
+window.__wipeProgress=()=>{ prog={done:0,tier:-1,prs:0,days:0};
+  try{localStorage.removeItem(PKEY);}catch(e){} return {...prog}; };
+window.__progress=()=>({...prog, count:progCount()});
+window.__setTier=(t)=>{ diff=t; return DIFFS[diff].name; };
+window.__shipit=()=>({state:S&&S.state,menuRow,tutorial,
+  diff:DIFFS[diff].name,days:S&&S.days,spd:DIFFS[diff].spd,
+  x:S&&S.x,y:S&&S.y,vy:S&&S.vy,onGround:S&&S.onGround,t:S&&S.t,
+  merged:S&&S.merged,col:S&&Math.floor(S.x/T)});
+})();
+</script>
+</body>
+</html>

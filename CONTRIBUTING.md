@@ -9,9 +9,38 @@ By participating you agree to abide by our
 
 > **License of contributions.** Claude Mate is licensed **CC BY-NC 4.0**
 > (Creative Commons Attribution-NonCommercial — see [LICENSE](LICENSE)).
-> Contributions are welcome for **personal, non-commercial** use; by submitting a
-> change you agree it is offered under that same non-commercial license.
+> Contributions are welcome for **personal, non-commercial** use.
 > **Commercial use of the project is not permitted.**
+>
+> **Contributors must also agree to the [CLA](CLA.md)** — one sentence in your
+> first pull request covers everything you contribute afterwards. You keep the
+> copyright in your own work; the agreement grants the project a licence broad
+> enough that it can be relicensed later.
+>
+> That last part is the reason it exists. Saying only "contributions are offered
+> under the same licence" leaves every contributor owning their patch under
+> CC BY-NC, which means the project could **never** change licence or be
+> published commercially without tracking down every person who ever landed a
+> line — including the ones who have changed address or moved on. It is a
+> one-way door, and it closes silently on the first merged pull request.
+
+---
+
+## Naming
+
+**Do not introduce new identifiers containing "claude" or "anthropic".** New
+environment variables, NVS keys, socket paths, launchd labels, package ids,
+domains and handles must be mark-free. Existing ones stay as they are, for
+compatibility.
+
+Referring to Claude Code in prose, docs and comments is fine and expected — that
+is nominative use, and it is what the project *does*. The rule is about
+**identity**, not description: the mark must not end up inside something this
+project calls itself.
+
+Do not add Anthropic logos, wordmarks, brand assets, or Anthropic's brand colours
+to new art, icons, or firmware screens. The device glyph and the game sprites are
+original to this project and must stay that way. See [TRADEMARKS.md](TRADEMARKS.md).
 
 ---
 

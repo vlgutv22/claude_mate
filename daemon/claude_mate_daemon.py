@@ -79,11 +79,13 @@ import queue
 import secrets
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import threading
 import time
 import urllib.parse
+import wave
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -215,6 +217,55 @@ ALERT_SOUNDS = {
 }
 SOUND_MIN_GAP_S = 2.0          # floor between sounds, whatever the state does
 
+# SHIP IT, the game on the device, over `O|SFX|<code>`. The board has no DAC, no
+# speaker and a backlight circuit with no inductor to abuse, so if the game is to
+# make a noise at all it has to be this machine making it.
+#
+# These were macOS system alert sounds for one version, and that was wrong in a
+# way that only shows up when you play: Basso and Glass are the vocabulary of an
+# OS telling you something, not of a game. The browser prototype uses WebAudio
+# square and sawtooth oscillators, and THAT is the sound the device should make
+# -- so the recipes below are the prototype's literals, and the daemon renders
+# them to WAV once at startup rather than reaching for a file someone at Apple
+# designed for a different purpose.
+#
+#   (frequencies Hz), note seconds, waveform, peak gain
+#
+# A recipe of several frequencies is played as a SEQUENCE, one note per entry,
+# each `dur` long -- that is what makes the merge an arpeggio and the ship a
+# fanfare rather than a chord.
+SFX_RECIPES = {
+    "J": ((520, 760),                  0.055, "square",   0.050),  # jump
+    "S": ((300, 150),                  0.050, "square",   0.050),  # stomped a bug
+    "M": ((660, 880, 1320),            0.065, "square",   0.055),  # merged a PR
+    "H": ((180, 120),                  0.090, "sawtooth", 0.050),  # a bug got you
+    "R": ((180, 120),                  0.090, "sawtooth", 0.050),  # re-scoped
+    "F": ((400, 260, 160),             0.060, "sawtooth", 0.050),  # fell
+    "X": ((400, 260, 160),             0.060, "sawtooth", 0.050),  # slipped
+    "W": ((523, 659, 784, 1047, 1319), 0.110, "square",   0.060),  # shipped
+}
+# R and X are not distinct sounds, and that is the prototype's choice rather
+# than an oversight here: a priority change reads as a hit and a slipped
+# milestone reads as a fall, which is what they are.
+
+# The prototype's gains are WebAudio linear gain into a browser, and the same
+# numbers rendered to a file and pushed through afplay land far below the system
+# alerts they sit beside -- quiet enough to miss over a fan. Everything is scaled
+# by this one factor, so the sounds keep their RELATIVE levels (the ship fanfare
+# stays the loudest) while landing somewhere a person can hear.
+SFX_GAIN     = 5.0
+SFX_RATE     = 44100
+SFX_ATTACK_S = 0.008           # the prototype's linear attack, then exp decay
+SFX_FLOOR    = 0.0008          # ...to here, which is where its ramp ends
+
+# Rendered WAVs live here. The version in the name is load-bearing: change a
+# recipe without changing it and every machine keeps playing the old sound from
+# cache forever.
+SFX_CACHE_DIR = os.path.join(
+    os.path.expanduser("~/Library/Caches/claude-mate"), "sfx-v1")
+
+GAME_SOUND_MIN_GAP_S = 0.06
+
 # A device with no token redials every couple of seconds; say what to do about
 # it at most this often, or the advice buries itself.
 NO_TOKEN_LOG_GAP_S = 60.0
@@ -222,6 +273,69 @@ NO_TOKEN_LOG_GAP_S = 60.0
 # Sentinel for "we have not told the firmware a loop state yet", so the first
 # resolve always emits (V|OFF) and clears any stale loop left by a prior daemon.
 _LOOP_UNSET = "\x00unset"
+
+
+def _sfx_render(freqs, dur: float, wave: str, vol: float) -> bytes:
+    """One recipe -> 16-bit mono PCM, reproducing WebAudio's envelope exactly.
+
+    The prototype gives each note its own oscillator and gain node, ramps the
+    gain linearly 0 -> vol over 8 ms, then EXPONENTIALLY down to 0.0008 by the
+    note's end. The exponential matters: a linear fade of a square wave at these
+    durations sounds like a click with a tail, and the whole character of the
+    thing is in that decay curve. WebAudio's exponentialRampToValueAtTime is
+    v0 * (v1/v0)^(progress), which is what the pow() below is.
+
+    Naive (non-band-limited) square and sawtooth, deliberately. WebAudio uses
+    band-limited wavetables, so this aliases slightly where that does not -- at
+    these frequencies the difference is inaudible, and the alternative is a
+    Fourier synthesis nobody can check against the prototype by ear."""
+    frames = bytearray()
+    span   = max(dur - SFX_ATTACK_S, 1e-6)
+    ratio  = SFX_FLOOR / vol
+    peak   = min(vol * SFX_GAIN, 0.85)         # headroom against clipping
+    for f in freqs:
+        n = int(SFX_RATE * dur)
+        for i in range(n):
+            t = i / SFX_RATE
+            if t < SFX_ATTACK_S:
+                env = t / SFX_ATTACK_S
+            else:
+                env = pow(ratio, (t - SFX_ATTACK_S) / span)
+            # Phase restarts per note, as it must: the prototype creates a new
+            # oscillator for each one.
+            ph = (f * t) % 1.0
+            sample = (2.0 * ph - 1.0) if wave == "sawtooth" else (1.0 if ph < 0.5 else -1.0)
+            v = int(max(-1.0, min(1.0, peak * env * sample)) * 32767)
+            frames += struct.pack("<h", v)
+    return bytes(frames)
+
+
+def sfx_build_cache() -> dict:
+    """Render every recipe to a WAV once and return {code: path}.
+
+    Returns {} on any failure -- a game with no sound is a working game, and a
+    daemon that will not start because it could not write a beep is not."""
+    out = {}
+    try:
+        os.makedirs(SFX_CACHE_DIR, exist_ok=True)
+        for code, (freqs, dur, wave_t, vol) in SFX_RECIPES.items():
+            path = os.path.join(SFX_CACHE_DIR, f"{code}.wav")
+            if not os.path.exists(path):
+                pcm = _sfx_render(freqs, dur, wave_t, vol)
+                # Written to a temp name and renamed, so a daemon killed
+                # mid-render cannot leave a truncated WAV cached forever.
+                tmp = path + ".part"
+                with wave.open(tmp, "wb") as w:
+                    w.setnchannels(1)
+                    w.setsampwidth(2)
+                    w.setframerate(SFX_RATE)
+                    w.writeframes(pcm)
+                os.replace(tmp, path)
+            out[code] = path
+    except Exception as exc:
+        log(f"game sound: could not build the cache ({exc}); game is silent")
+        return {}
+    return out
 
 
 def log(msg: str) -> None:
@@ -1070,6 +1184,12 @@ class Screen:
         # colour, sound), which is the rule the S3's colour LED already follows.
         self._sound = sound
         self._last_sound_at = 0.0
+        self._last_sfx_at   = 0.0
+        self.on_handshake_extra = None   # re-assert edge-driven device state
+        # Rendered lazily-but-once at construction: eight short WAVs, well
+        # under a tenth of a second of work, and doing it here means the
+        # first jump of the first run is not the one that pays for it.
+        self._sfx = sfx_build_cache() if sys.platform == "darwin" else {}
 
     # ---- selection -------------------------------------------------------- #
 
@@ -1327,6 +1447,34 @@ class Screen:
             log(f"sound: {exc}")
             self._sound = False        # one complaint, then stop trying
 
+    def play_sfx(self, code: str) -> None:
+        """One game sound, from `O|SFX|<code>`. Same contract as _play_alert:
+        never blocks, never raises, never becomes load-bearing.
+
+        It keeps its OWN clock rather than sharing _last_sound_at. Sharing would
+        break both directions -- the 2 s alert floor would swallow a level's
+        worth of jumps, and a run of jumps would suppress a genuine ERROR alert
+        that arrived mid-game, which is exactly the alert you would want to hear.
+        """
+        with self._lock:
+            on = self._sound
+        if not on or sys.platform != "darwin":
+            return
+        path = self._sfx.get(code)
+        if not path:
+            return
+        now = time.time()
+        if now - self._last_sfx_at < GAME_SOUND_MIN_GAP_S:
+            return
+        try:
+            subprocess.Popen(["afplay", path],
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+            self._last_sfx_at = now
+        except Exception as exc:
+            log(f"game sound: {exc}")
+
     def start_tick(self) -> None:
         """One-shot START blink (a job (re)started). The caller fires this only
         when nothing needs the human, so it never interrupts an alert loop."""
@@ -1351,6 +1499,16 @@ class Screen:
             self._loop_kind = _LOOP_UNSET      # firmware was reset -> forget it
         self.refresh(force=True)
         self.sync_led()
+        # Controller mode is edge-driven -- the daemon sends G| only when the
+        # grab CHANGES -- so a device that shows up while a page is already
+        # holding it would never be told, and would sit in menu semantics
+        # wondering why the game felt laggy. Same class of bug as the sound
+        # preference, and the same fix: re-assert on every handshake.
+        if self.on_handshake_extra is not None:
+            try:
+                self.on_handshake_extra()
+            except Exception as exc:
+                log(f"handshake extra: {exc}")
 
     def notify_change(self) -> None:
         """Called on any registry change: refresh frame + LED."""
@@ -1663,6 +1821,7 @@ class ButtonReader(threading.Thread):
         self._screen = screen
         self._stop_evt = threading.Event()  # NOT `_stop`: Thread.join() calls its own _stop()
         self.on_ack = None   # callback(sess): acknowledge a session's alert
+        self.bridge = None   # optional WebBridge: device-as-controller (--web)
         # FOCUS runs on side threads (it can block for seconds on sockets /
         # subprocesses). `_focus_serial` serializes them so two quick GOs
         # can't raise windows in finish-order instead of press-order, and
@@ -1710,7 +1869,23 @@ class ButtonReader(threading.Thread):
         if line == "K":                          # keepalive ack to our P: no-op
             return
         if line.startswith("B|") and len(line) >= 3:
-            ev = line[2]
+            code = line[2:].strip()
+            ev = code[0]
+            # Device-as-controller (--web): mirror every press to the browser,
+            # and while a page holds the GRAB the buttons belong to the GAME.
+            # One place covers P/N/G/K/M/F and anything added later; the return
+            # is what stops a jump from also raising a terminal on the Mac.
+            bridge = self.bridge
+            if bridge is not None:
+                bridge.push(code)
+                if bridge.grabbed():
+                    return
+            # +P / -P are press and release EDGES, which only exist while the
+            # device is in controller mode. They are meaningless to the session
+            # switcher -- acting on them would move the selection twice per
+            # press, once down and once up -- so they stop here.
+            if code[0] in "+-":
+                return
             # While the terminal view is open PREV/NEXT scroll it instead of
             # moving the selection. Reinterpreting here keeps the firmware a
             # dumb renderer -- it emits the same two verbs either way and never
@@ -2011,6 +2186,10 @@ class ButtonReader(threading.Thread):
         key, val = parts[0].strip().upper(), parts[1].strip()
         if key == "SND":
             self._screen.set_sound(val == "1")
+        elif key == "SFX":
+            # Deliberately NOT logged: a level fires hundreds of these and the
+            # log is something a person reads.
+            self._screen.play_sfx(val[:1].upper())
         else:
             log(f"unknown device option {key!r} (ignored)")
 
@@ -2209,6 +2388,24 @@ def main(argv: Optional[List[str]] = None) -> int:
              "keep it on this machine)",
     )
     parser.add_argument(
+        "--web",
+        action="store_true",
+        default=os.environ.get("CLAUDE_MATE_WEB", "") == "1",
+        help="serve the browser game on 127.0.0.1 and let the device's buttons "
+             "drive it while the page is open (off by default)",
+    )
+    parser.add_argument(
+        "--web-port",
+        type=int,
+        default=int(os.environ.get("CLAUDE_MATE_WEB_PORT", 8788)),
+        help="loopback port for --web (default: 8788)",
+    )
+    parser.add_argument(
+        "--web-root",
+        default=os.environ.get("CLAUDE_MATE_WEB_ROOT") or None,
+        help="directory served by --web (default: <repo>/site/game)",
+    )
+    parser.add_argument(
         "--sound",
         action="store_true",
         default=os.environ.get("CLAUDE_MATE_SOUND", "") == "1",
@@ -2273,9 +2470,49 @@ def main(argv: Optional[List[str]] = None) -> int:
         if kind == "START" and registry.top_alert() is None:
             screen.start_tick()
 
+    # Device-as-controller. Loopback only, opt-in, and entirely optional: an
+    # import or bind failure costs the game, never the daemon. The import is
+    # lazy and inside the branch because tools/test_net_link.py exec_modules
+    # this file by path, where a module-level import would need daemon/ on
+    # sys.path.
+    web = None
+    if args.web:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        try:
+            from webbridge import WebBridge
+        except Exception as exc:
+            log(f"--web: cannot import webbridge.py: {exc}")
+        else:
+            candidate = WebBridge(root=args.web_root, port=args.web_port,
+                                  device=link.is_open, log=log)
+
+            def _controller(on: bool, _link=link) -> None:
+                # Put the DEVICE into controller mode for as long as a page is
+                # driving it. Without this the buttons keep their menu
+                # semantics -- 40 ms debounce, then 400 ms before auto-repeat,
+                # then one event every 200 ms -- which is right for a selection
+                # list and unplayable as a gamepad. In controller mode the
+                # firmware reads the pins raw and sends press/release edges.
+                try:
+                    _link.write_line("G|1" if on else "G|0")
+                except Exception as exc:
+                    log(f"controller mode: {exc}")
+                log("device controller mode: %s" % ("ON" if on else "off"))
+
+            candidate.on_grab = _controller
+            # ...and re-assert it whenever a device says hello, so one that
+            # connects mid-game lands in controller mode rather than in menu
+            # semantics.
+            screen.on_handshake_extra = (
+                lambda _b=candidate: _controller(_b.grabbed()))
+            if candidate.start():
+                web = candidate
+        log(f"  web    : {'on' if web else 'DISABLED'}")
+
     socket_server = SocketServer(args.sock, registry, on_update, on_haptic)
     button_reader = ButtonReader(link, screen)
     button_reader.on_ack = on_ack
+    button_reader.bridge = web
     maintainer = SerialMaintainer(link, screen)
     ticker = Ticker(screen, registry)
 
@@ -2325,6 +2562,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             link.write_line("F|0|-1|MATE|daemon stopped||")
         except Exception:
             pass
+        if web is not None:
+            web.stop()
         if mdns is not None:
             mdns.stop()
         link.close()      # LinkHub.close() also stops the TCP listener

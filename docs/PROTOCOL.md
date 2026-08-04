@@ -111,7 +111,21 @@ input buffer at 96 bytes and drops malformed/oversized lines).
 |------|---------|
 | `F\|<flags>\|<sel>\|<r0>\|<r1>\|<r2>\|<r3>` | **The whole screen**, pre-rendered as four size-1 rows. See field table below. At least 7 fields; `r3` is the **last** field and may itself contain `\|`. |
 | `V\|<kind>` | LED alert control (indication LED only; never touches the OLED). `<kind>` is `START`, `INPUT`, `DONE`, `ERROR`, or `OFF`. See **LED** below. |
+| `G\|2` | **BLE gamepad mode.** The device comes up as an ordinary Bluetooth HID gamepad (four buttons, no axes, physical order) and needs no daemon, no Wi-Fi and no loopback from then on — which is the only way a page served over **https** can be driven by this hardware, since it cannot reach `http://127.0.0.1`. Entering parks the Wi-Fi link (`net.shutdown()`), because the S3 has one 2.4 GHz radio and sharing it costs the link that matters; `G\|0` leaves and gives the radio back. Reachable from the device itself at **SETTINGS → BLE gamepad** — the verb exists so the mode can also be entered, and tested, from the far end of a cable. Verified on hardware: advertises as `Claude Mate` with service `0x1812`, and `deinit` + Wi-Fi restart round-trips cleanly. |
+| `G\|1` `G\|0` | **Controller mode** on / off. Sent by the daemon when a browser page takes or releases the grab on the `--web` bridge (see `daemon/webbridge.py`). While on, the device stops acting on its own buttons, reads the four pins raw and emits press/release **edges** (`B\|+P` …), draws a gamepad face **once** instead of per frame, and drops the backlight to a fraction of its normal duty. That last part is not decoration: a full flush is 110 KB over SPI, and doing it once a second to redraw a screen nobody is looking at — on battery, while the Mac has the buttons — is the overuse the mode exists to avoid. The device leaves on `G\|0`, or on a two-second hold of the 4th button if the Mac never sends one (a crashed tab, a killed daemon). An older firmware ignores `G\|` entirely and simply keeps its menu semantics. **The device can also enter this mode by itself**, from **SETTINGS → Game controller**, with no daemon involvement at all — so `G\|1` arriving while it is already in controller mode is a no-op rather than an error, and the daemon must not assume it is the only thing that puts the device there. |
 | `P` | Ping / keepalive, sent every ~15 s. The Arduino replies with `K` (NOT `H` — `H` means "I rebooted" and triggers a full resend + LED re-arm, which would restart the blink phase every ping). |
+
+> **Adding a downlink verb? These letters are already taken, and not by this
+> table.** On the S3, USB serial lines go to the **config console** first —
+> `handleConfigLine()` — and only fall through to the protocol handler if it
+> declines them. It owns `?`, `W`, `S`, `T`, `X`, `R`, `Y`, `Z`. A protocol verb
+> that collides with one of those is **silently unreachable over USB** while
+> working perfectly over TCP, so it survives every test that does not run on a
+> cabled device. This is not hypothetical: controller mode first shipped as
+> `X|1`, which the console answered with `refusing: send X|WIPE to clear
+> config` — one lax compare away from wiping the Wi-Fi credentials and the
+> token every time somebody opened the game. `tools/test_controller_mode.py`
+> asserts the two sets stay disjoint.
 
 **`F` line fields** — each row is ≤ 21 chars (size-1), drawn top to bottom:
 
@@ -185,6 +199,7 @@ distinguish a short press (emit on release) from a long press (emit once at
 | `B\|K` | **GO** long press (D2, held ≥ ~500 ms) — acknowledge the shown session's alert WITHOUT raising anything. No-op when nothing is unacknowledged. Also sent by a **short press of the ACK button** on a 4-button device: same verb, same effect, no daemon-side distinction. |
 | `B\|F` | Toggle **FOLLOW** mode directly. Identical in effect to a GO double-click, but unambiguous: no 300 ms window to race. Turning it ON raises the shown terminal immediately, exactly as the double-click does. No stock firmware emits this today (the 4th button became MIRROR); it is kept because the daemon accepting it costs nothing and a device with a fifth switch would want it. |
 | `B\|M` | **MIRROR** button tapped — open/close the terminal view for the session on the glass. |
+| `B\|+P` `B\|-P` `B\|+G` `B\|-G` `B\|+N` `B\|-N` `B\|+M` `B\|-M` | Press / release **edges**, emitted **only in controller mode** (see `G\|` below). Debounce drops to 8 ms and there is no auto-repeat and no deferred tap, because a gamepad is asked a different question than a menu is: not "was it pressed" but "is it held down *this frame*". The ordinary verbs cannot answer it — 40 ms of debounce, then 400 ms before the first repeat, then one event per 200 ms, is a held direction that moves once, stalls for most of a second, then stutters. A daemon that does not know these codes must **ignore** them rather than treat `+` as the verb; acting on both edges would move the selection twice per press. |
 | `O\|<KEY>\|<value>` | A device-set **option**. Unknown keys are ignored, so an older daemon and a newer firmware interoperate in both directions — the same rule the `B\|` verbs follow. Currently only `O\|SND\|0` / `O\|SND\|1`: mute or unmute the **macOS** alert sound. It crosses the link because it is the one device setting whose effect happens on the Mac — the device has no speaker, so a mute reached for on the device has to travel. Re-sent on every connect, since the daemon keeps no per-device state to remember it in. |
 
 ### 1c. Daemon → Arduino: the MIRROR view

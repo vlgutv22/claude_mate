@@ -107,6 +107,8 @@
 #include "board_s3.h"
 #include "netcfg.h"
 #include "settings.h"
+#include "blepad.h"
+#include "game/ship_it.h"
 
 // ---- Display -----------------------------------------------------------------
 // Drawn into an off-screen canvas and flushed in one go: the frame is rebuilt
@@ -144,11 +146,43 @@ MateSettings cfg;
 // terminal you were not looking at. The daemon simply sees no button events,
 // needs no protocol change, and keeps its frame current the whole time, so
 // leaving the menu is instant.
-enum UiMode : uint8_t { UI_CONDUCTOR, UI_MENU, UI_PAGE };
+enum UiMode : uint8_t { UI_CONDUCTOR, UI_MENU, UI_PAGE, UI_GAME, UI_PAD };
+
+// CONTROLLER MODE. The daemon turns this on (G|1) while a browser page is
+// driving the device's buttons, and off (G|0) when the page goes away.
+//
+// It exists because the ordinary button semantics are unplayable as a gamepad,
+// and not by a little: pollNavBtn debounces for 40 ms, then waits 400 ms before
+// auto-repeating, then emits one event every 200 ms. That is correct for a
+// selection list and it means a held direction moves you once, stalls for most
+// of a second, then stutters. Reported as "huge delay", and it was.
+//
+// Here the pins are read raw every loop and PRESS/RELEASE EDGES go up the link
+// (B|+P, B|-P, ...), so the page knows what is held down right now, which is
+// the only question a platformer asks.
+//
+// It is also the low-power screen. Nobody is looking at the glass while they
+// play on a monitor, so the pad face is drawn ONCE and the backlight drops --
+// a full flush is 110 KB over SPI, and doing that 30 times a second to render a
+// screen nobody is watching is exactly the overuse this mode avoids.
+static bool     padActive   = false;
+static bool     padDirty    = false;   // only the pad's OWN changes redraw it
+static uint8_t  padHeld     = 0;      // bitmask, for the on-glass key preview
+static UiMode   padReturnTo = UI_CONDUCTOR;
+static bool     padManual   = false;  // switched on here, not by the daemon
+// Which way the presses leave the device. PAD_LINK is the daemon (serial or
+// TCP, whichever is up); PAD_BLE is a standard HID gamepad and needs no daemon,
+// no Wi-Fi and no loopback -- which is the only way the PUBLIC site can ever be
+// driven by this hardware, since https cannot reach http://127.0.0.1.
+enum PadVia : uint8_t { PAD_LINK, PAD_BLE };
+static PadVia   padVia      = PAD_LINK;
+static unsigned long padLastInput = 0;   // for the radio policy; see loop()
+static bool     padWifiParked = false;
+static unsigned long padWifiUpSince = 0;
 static UiMode uiMode = UI_CONDUCTOR;
 
 enum MenuItem : uint8_t {
-  MI_CONDUCTOR, MI_SETTINGS, MI_ABOUT, MI_WIFI, MI_SLEEP
+  MI_CONDUCTOR, MI_SETTINGS, MI_GAME, MI_SLEEP
 };
 static uint8_t menuIdx = MI_CONDUCTOR;
 
@@ -156,19 +190,24 @@ enum PageId : uint8_t { PG_SETTINGS, PG_ABOUT };
 static PageId  pageId  = PG_SETTINGS;
 static uint8_t pageIdx = 0;          // selected row within the page
 
-// Settings rows, in screen order.
+// Settings rows, in screen order: the one mode switch first, then the
+// preferences, then the two rows that open something else, then the destructive
+// one last and on its own.
+//
+// SR_PAD is an ACTION, not a stored preference. Controller mode is somewhere the
+// device IS, not something it remembers -- and the daemon drives it too, so a
+// persisted "on" would fight the browser page for who decides.
 enum SetRow : uint8_t {
-  SR_SLEEP, SR_BRIGHT, SR_LED, SR_SOUND, SR_FLIP, SR_RESET, SR_COUNT
+  SR_PAD, SR_BLE, SR_SLEEP, SR_BRIGHT, SR_LED, SR_SOUND, SR_FLIP,
+  SR_WIFI, SR_ABOUT, SR_RESET, SR_COUNT
 };
-// Which row is at the top of the visible window. The page scrolls now: five
-// rows fit and there are six, which is exactly the case the static_assert below
-// used to reject outright. Scrolling was named in its own comment as one of the
-// two ways out, and it is the one that keeps paying off.
+// Which row is at the top of the visible window. Five rows fit and there are
+// nine, so the page scrolls -- and the scrollbar in drawSettingsPage() is what
+// says the other four exist, since a cut list otherwise just looks complete.
+// Everything here is computed from SR_COUNT, so rows can be added without
+// touching the geometry; that is the whole reason absorbing ABOUT and WI-FI
+// from the top-level strip cost nothing but their two cases.
 static uint8_t pageTop = 0;
-// The page does not scroll, so a sixth row would simply not be drawn -- and
-// would look like a bug in the setting rather than in the layout. Adding one
-// means either raising PAGE_ROWS_VIS (and finding the pixels) or teaching the
-// page to scroll; this makes the compiler say so instead of the screen.
 // The page scrolls, so rows may exceed PAGE_ROWS_VIS -- but the WINDOW must
 // still be at least one row, and pageTop arithmetic assumes it.
 static_assert(PAGE_ROWS_VIS >= 1, "the settings window needs at least one row");
@@ -842,23 +881,9 @@ static void iconSettings(int16_t cx, int16_t cy, int16_t s, uint16_t col) {
   }
 }
 
-static void iconAbout(int16_t cx, int16_t cy, int16_t s, uint16_t col) {
-  int16_t r = s * 3 / 8;
-  gfx->drawCircle(cx, cy, r, col);
-  gfx->drawCircle(cx, cy, r - 1, col);
-  gfx->fillRect(cx - 1, cy - r / 2 - 1, 3, 3, col);          // the dot
-  gfx->fillRect(cx - 1, cy - r / 6,     3, r * 5 / 6, col);  // the stem
-}
-
-static void iconWifi(int16_t cx, int16_t cy, int16_t s, uint16_t col) {
-  // Ascending bars rather than arcs: the same shape the status bar already uses
-  // for signal strength, so the two are obviously about the same thing.
-  int16_t bw = s / 7, gap = s / 5, x = cx - (gap * 3) / 2, base = cy + s / 3;
-  for (int i = 0; i < 4; i++) {
-    int16_t h = (s / 5) + i * (s / 6);
-    gfx->fillRect(x + i * gap, base - h, bw, h, col);
-  }
-}
+// iconAbout and iconWifi lived here until ABOUT and WI-FI became settings rows.
+// The rows are text, so the icons had no caller left, and an unused static is
+// a warning today and a puzzle later. The status bar draws its own signal bars.
 
 static void iconSleep(int16_t cx, int16_t cy, int16_t s, uint16_t col) {
   // A crescent: a filled disc with a background-coloured disc bitten out of it.
@@ -866,6 +891,22 @@ static void iconSleep(int16_t cx, int16_t cy, int16_t s, uint16_t col) {
   int16_t r = s * 3 / 8;
   gfx->fillCircle(cx, cy, r, col);
   gfx->fillCircle(cx + r / 2, cy - r / 3, r * 7 / 8, C_BG);
+}
+
+static void iconGame(int16_t cx, int16_t cy, int16_t s, uint16_t col) {
+  // Mate itself, not a controller glyph: the mascot IS the character you play,
+  // and a tile that shows the thing you will be moving needs no caption. Drawn
+  // from the same parts as the sprite -- body, two eye slots, two legs -- so the
+  // tile and the game agree at a glance.
+  int16_t w = s * 3 / 4, h = s * 5 / 8;
+  int16_t x = cx - w / 2, y = cy - h / 2 - s / 8;
+  gfx->fillRoundRect(x, y, w, h, 3, col);
+  int16_t ew = w / 5, eh = h / 3;
+  gfx->fillRect(x + w / 6, y + h / 5, ew, eh, C_BG);
+  gfx->fillRect(x + w - w / 6 - ew, y + h / 5, ew, eh, C_BG);
+  int16_t lw = w / 5, lh = s / 4;
+  gfx->fillRect(x + w / 5, y + h, lw, lh, col);
+  gfx->fillRect(x + w - w / 5 - lw, y + h, lw, lh, col);
 }
 
 struct MenuDef {
@@ -879,10 +920,15 @@ struct MenuDef {
 static const MenuDef MENU[MENU_COUNT] = {
   {"CONDUCTOR", iconConductor, C_WORK},
   {"SETTINGS",  iconSettings,  C_TEXT},
-  {"ABOUT",     iconAbout,     C_TEXT},
-  {"WI-FI",     iconWifi,      C_DONE},
+  {"SHIP IT",   iconGame,      GH_MATE},
   {"SLEEP",     iconSleep,     C_IDLE},
 };
+static_assert(sizeof(MENU) / sizeof(MENU[0]) == MENU_COUNT,
+              "MENU_COUNT and the MENU table disagree -- drawMenu() indexes "
+              "the table by MENU_COUNT and would walk off the end");
+
+ShipIt game;
+BlePad  blepad;
 
 // Centre text of the given size at x.
 static void drawCentred(int16_t cx, int16_t y, uint8_t size, const char *s,
@@ -929,6 +975,21 @@ static void drawSetRow(uint8_t row, int16_t y, bool sel) {
   uint16_t    vcol = C_TEXT;
 
   switch (row) {
+    case SR_PAD:
+      label = "Game controller";
+      // An arrow, like Factory reset: this row GOES somewhere rather than
+      // holding a value. It reads "on" nowhere, because the moment you are in
+      // controller mode you are looking at the pad face, not at this list.
+      value = "\x10";
+      vcol  = C_DIM;
+      break;
+    case SR_BLE:
+      label = "BLE gamepad";
+      // Needs no daemon, no Wi-Fi and no loopback, which is the only way the
+      // PUBLIC site can drive this hardware: https cannot reach 127.0.0.1.
+      value = "\x10";
+      vcol  = C_DIM;
+      break;
     case SR_SLEEP:
       label = "Sleep screen";
       value = cfg.hibLabel();
@@ -967,6 +1028,26 @@ static void drawSetRow(uint8_t row, int16_t y, bool sel) {
         vcol  = cfg.flipped() ? C_DONE : C_DIM;
       }
       break;
+    case SR_WIFI: {
+      label = "Wi-Fi setup";
+      // The one row that answers before you press it. This is where you come
+      // when the device is not linked, so "joining" or "linked" settles the
+      // question you walked in with. Lowercased from stateName() rather than
+      // mapped again here: a second table would be one more thing to forget to
+      // update, and this one cannot fall out of step with the enum.
+      char *p = buf;
+      for (const char *s = net.stateName(); *s && p < buf + sizeof(buf) - 1; s++)
+        *p++ = (*s >= 'A' && *s <= 'Z') ? (char)(*s - 'A' + 'a') : *s;
+      *p = 0;
+      value = buf;
+      vcol  = net.connected() ? C_DONE : C_WAIT;
+      break;
+    }
+    case SR_ABOUT:
+      label = "About";
+      value = "\x10";
+      vcol  = C_DIM;
+      break;
     case SR_RESET:
       label = "Factory reset";
       if (resetArmedMs) { value = "HOLD GO"; vcol = C_ERROR; }
@@ -1004,7 +1085,7 @@ static void drawSettingsPage() {
   gfx->setTextColor(resetArmedMs ? C_ERROR : C_DIM);
   gfx->setCursor(PAD_X, MENU_HINT_Y);
   gfx->print(resetArmedMs ? "hold GO to wipe wifi + token + settings"
-                          : "PREV/NEXT row   GO change   4th back");
+                          : "PREV/NEXT row   GO select   4th back");
 }
 
 // About: a readout, at size 1, because these are numbers you lean in for and
@@ -1058,6 +1139,49 @@ static void drawAboutPage() {
   gfx->print("4th button: back");
 }
 
+// The gamepad face. Drawn once per state change, never per frame: this screen
+// is a still image and a full flush is 110 KB of SPI.
+static void drawPad() {
+  drawCentred(SCREEN_W / 2, 16, 2,
+              padVia == PAD_BLE ? "BLE GAMEPAD" : "CONTROLLER", C_TEXT);
+  gfx->setTextSize(1);
+  // Say which of the situations this actually is. Switched on from the settings
+  // row there may be nothing listening yet, so the useful sentence is what to
+  // do next -- not a claim about the Mac that is not yet true.
+  const char *sub;
+  uint16_t    subCol = C_DIM;
+  if (padVia == PAD_BLE) {
+    if (blepad.connected()) { sub = "paired -- any page, any origin"; subCol = C_DONE; }
+    else                    { sub = "pair \"Claude Mate\" in Bluetooth"; subCol = C_WAIT; }
+  } else {
+    sub = padManual ? "open 127.0.0.1:8788 to play"
+                    : "the Mac has the buttons";
+  }
+  gfx->setTextColor(subCol);
+  gfx->setCursor(SCREEN_W / 2 - (int16_t)strlen(sub) * GLYPH_W / 2, 40);
+  gfx->print(sub);
+
+  // The four keys in their real physical arrangement: the 4th sits alone above
+  // the row of three, the way it does on the board.
+  struct Cap { int16_t x, y; const char *label; uint8_t bit; };
+  static const Cap CAPS[4] = {
+    { 64, 60, "4th", 3 },
+    { 64, 108, "PREV", 0 }, { 136, 108, "GO", 1 }, { 208, 108, "NEXT", 2 },
+  };
+  for (uint8_t i = 0; i < 4; i++) {
+    bool down = padHeld & (1 << CAPS[i].bit);
+    int16_t w = 60, h = 40;
+    int16_t x = CAPS[i].x, y = CAPS[i].y;
+    if (down) gfx->fillRoundRect(x, y, w, h, 7, C_WORK);
+    else      gfx->drawRoundRect(x, y, w, h, 7, C_DIMMER);
+    drawCentred(x + w / 2, y + h / 2 - 4, 1, CAPS[i].label, down ? C_BG : C_DIM);
+  }
+  gfx->setTextColor(C_DIMMER);
+  const char *out = "hold 4th to leave";
+  gfx->setCursor(SCREEN_W / 2 - (int16_t)strlen(out) * GLYPH_W / 2, 156);
+  gfx->print(out);
+}
+
 static void render() {
   gfx->fillScreen(C_BG);
   bool blip = (long)(millis() - blipUntil) < 0;
@@ -1075,6 +1199,12 @@ static void render() {
     gfx->print("PREV/NEXT move   GO open   4th back");
     gfx->fillRect(0, ACCENT_Y, SCREEN_W, ACCENT_H,
                   blip ? C_TEXT : MENU[menuIdx].colour);
+  } else if (uiMode == UI_PAD) {
+    drawPad();
+  } else if (uiMode == UI_GAME) {
+    // No status bar and no accent bar: the game owns all 172 px. The battery
+    // and the link are exactly the things you did not come here to look at.
+    game.draw(gfx);
   } else if (uiMode == UI_PAGE) {
     drawStatusBar();
     if (pageId == PG_SETTINGS) drawSettingsPage();
@@ -1101,6 +1231,60 @@ static void requestRender() {
     needRender = true;
     dirtyMs = millis();
   }
+}
+
+// Controller mode is entered from two directions -- the daemon's G|1 when a
+// browser page takes the grab, and the settings row when you switch it on
+// yourself -- and both have to leave the device in exactly the same state, so
+// both come through here rather than each setting five variables and hoping.
+//
+// `manual` changes nothing except what the face SAYS. Entered from the menu
+// there may be no page listening yet, and "the Mac has the buttons" would be
+// a sentence that is both untrue and unhelpful at the moment you most need to
+// know what to do next.
+static void enterPad(bool manual, PadVia via = PAD_LINK) {
+  if (uiMode == UI_PAD) {
+    // Already here. A page taking the grab while you sit in the manually
+    // entered pad is NOT a no-op: the face is now saying the wrong thing.
+    if (!manual && padManual) { padManual = false; padDirty = true;
+                                requestRender(); }
+    return;
+  }
+  if (via == PAD_BLE && !blepad.begin("Claude Mate")) {
+    // Refuse rather than open a controller that cannot send anything. A mode
+    // that silently does nothing is worse than one that will not start.
+    return;
+  }
+  padVia      = via;
+  padManual   = manual;
+  padReturnTo = (uiMode == UI_GAME) ? UI_CONDUCTOR : uiMode;
+  uiMode      = UI_PAD;
+  padActive   = true;
+  padHeld     = 0;
+  padDirty    = true;
+  padLastInput  = millis();
+  padWifiParked = false;
+  // Allow the first park immediately: the modular subtract makes this "already
+  // past the check window" without special-casing a device that just booted.
+  padWifiUpSince = millis() - PAD_WIFI_CHECK_MS;
+  analogWrite(LCD_BL, PAD_BL_DUTY);        // nobody is looking at this screen
+  requestRender();
+}
+
+static void leavePad() {
+  if (uiMode != UI_PAD) return;
+  if (padVia == PAD_BLE) {
+    blepad.end();                          // frees the controller, not just idle
+    if (padWifiParked) net.restart();      // give the radio back to the daemon
+  }
+  padVia    = PAD_LINK;
+  padWifiParked = false;
+  uiMode    = padReturnTo;
+  padActive = false;
+  padManual = false;
+  padHeld   = 0;
+  analogWrite(LCD_BL, cfg.blDuty());
+  requestRender();
 }
 
 // -----------------------------------------------------------------------------
@@ -1158,10 +1342,43 @@ static void handleLine(char *line) {
       break;
     }
 
+    case 'G': {                            // G|1 / G|0 -- gamepad (controller)
+                                           // mode. NOT 'X': that is X|WIPE in
+                                           // handleConfigLine, which sees USB
+                                           // serial lines first and answered
+                                           // "refusing: send X|WIPE" instead --
+                                           // so the mode never engaged, and a
+                                           // sloppier value could have wiped
+                                           // the config.
+      char *bar = strchr(line, '|');
+      if (!bar) break;
+      // 1 = the daemon drives it (SSE), 2 = come up as a BLE HID gamepad,
+      // 0 = leave. Extending the verb that already means "gamepad" rather than
+      // inventing one keeps this out of the config console's letters, which is
+      // the collision that cost a whole debugging session once already.
+      //
+      // G|2 also makes BLE mode reachable without a thumb, which is the only
+      // way it can be tested from the far end of a cable.
+      if (bar[1] == '1')      enterPad(false);
+      else if (bar[1] == '2') enterPad(false, PAD_BLE);
+      else                    leavePad();
+      break;
+    }
+
     case 'V': {                            // V|<KIND> -- play an LED pattern
       char *bar = strchr(line, '|');
       if (!bar || bar[1] == 0) break;
       ledForKind(bar + 1);
+      // Playing on a BLE pad, the daemon's screen is not on the glass and the
+      // radio is parked for most of the time -- so an alert that needs a HUMAN
+      // has to take the device back rather than wait to be noticed. ERROR and
+      // INPUT are the two that mean someone is blocked; DONE and START are
+      // news, and news can wait until you stop.
+      if (uiMode == UI_PAD && padVia == PAD_BLE &&
+          (!strcmp(bar + 1, "ERROR") || !strcmp(bar + 1, "INPUT"))) {
+        padReturnTo = UI_CONDUCTOR;
+        leavePad();
+      }
       break;
     }
 
@@ -1237,9 +1454,16 @@ static bool handleConfigLine(char *line) {
       // diagnosed without guessing at what someone set in the menu. `screen`
       // reporting "off" is the difference between a broken backlight and a
       // hibernate timeout doing its job.
+      // Name every mode. The ternary stopped at "page" when there were three,
+      // so UI_GAME and UI_PAD both reported as "page" -- and this line is the
+      // only way to ask a cabled device what it is doing, which makes a wrong
+      // answer here expensive exactly when you are already confused.
       Serial.printf("ui    : %s  screen %s%s  bright %u/%u  led %s  flip %s\n",
                     uiMode == UI_CONDUCTOR ? "conductor"
-                                           : uiMode == UI_MENU ? "menu" : "page",
+                    : uiMode == UI_MENU    ? "menu"
+                    : uiMode == UI_PAGE    ? (pageId == PG_ABOUT ? "about"
+                                                                 : "settings")
+                    : uiMode == UI_GAME    ? "game" : "pad",
                     cfg.hibLabel(), screenOn ? "" : " (asleep now)",
                     (unsigned)(cfg.blIdx() + 1), (unsigned)BL_STEPS,
                     cfg.ledLabel(), cfg.flipped() ? "on" : "off");
@@ -1420,6 +1644,12 @@ static void onButton(char ev) {
 static void pollNavBtn(Btn &b, char ev) {
   bool raw = (digitalRead(b.pin) == LOW);   // pull-up: LOW = pressed
   unsigned long now = millis();
+  // The game reads these three pins directly, every step, because a platformer
+  // needs "is it held down NOW" and this poller deals in events with a 400/200
+  // ms auto-repeat. Track the level so that leaving the game does not deliver
+  // the release of a press the menu never saw as an event.
+  if (uiMode == UI_GAME) { b.pressed = raw; b.changeMs = now; b.longFired = true;
+                           return; }
   if (raw != b.pressed && (now - b.changeMs) >= DEBOUNCE_MS) {
     b.pressed  = raw;
     b.changeMs = now;
@@ -1452,6 +1682,8 @@ static void pollNavBtn(Btn &b, char ev) {
 static void pollGoBtn(Btn &b) {
   bool raw = (digitalRead(b.pin) == LOW);
   unsigned long now = millis();
+  if (uiMode == UI_GAME) { b.pressed = raw; b.changeMs = now; b.longFired = true;
+                           return; }
   if (raw != b.pressed && (now - b.changeMs) >= DEBOUNCE_MS) {
     b.pressed  = raw;
     b.changeMs = now;
@@ -1636,6 +1868,21 @@ static void sendSoundPref() {
   emitLine(buf);
 }
 
+// The game's noises, made by the Mac. This board has no DAC, no speaker and a
+// backlight circuit with no inductor to abuse, so the link is the only speaker
+// there is -- which does mean a run played with the daemon down is silent, and
+// nothing can be done about that from here.
+//
+// Gated on the device's own SOUND setting as well as the daemon's: the daemon
+// would ignore these anyway with sound off, but a jump is several frames of
+// link traffic and there is no reason to spend it on something already muted.
+static void sendSfx(char code) {
+  if (!cfg.sound()) return;
+  char buf[10];
+  snprintf(buf, sizeof(buf), "O|SFX|%c", code);
+  emitLine(buf);
+}
+
 // PREV/NEXT/GO while a firmware-local screen is up. Never reaches the daemon.
 static void menuButton(char ev) {
   if (uiMode == UI_MENU) {
@@ -1651,12 +1898,7 @@ static void menuButton(char ev) {
         case MI_CONDUCTOR: uiMode = UI_CONDUCTOR; break;
         case MI_SETTINGS:  uiMode = UI_PAGE; pageId = PG_SETTINGS; pageIdx = 0;
                            pageTop = 0; resetArmedMs = 0; break;
-        case MI_ABOUT:     uiMode = UI_PAGE; pageId = PG_ABOUT; break;
-        case MI_WIFI:      // The portal takes the screen over on its own, via
-                           // net.state() == SETUP in render().
-                           uiMode = UI_CONDUCTOR;
-                           net.startPortalNow();
-                           break;
+        case MI_GAME:      uiMode = UI_GAME; game.open(); break;
         case MI_SLEEP:     cfg.flush();      // the deferred commit will not run
                            powerOff();       // never returns
                            break;
@@ -1683,6 +1925,25 @@ static void menuButton(char ev) {
 
   if (ev == 'G') {                            // short press: change the value
     switch (pageIdx) {
+      case SR_PAD:    // Switch the device into controller mode from the device.
+                      // padReturnTo becomes UI_PAGE, so the two-second hold on
+                      // the 4th button drops you back on this row rather than
+                      // somewhere you did not come from.
+                      enterPad(true);
+                      break;
+      case SR_BLE:    // Same face, different wire: a standard HID gamepad the
+                      // Mac pairs with once. enterPad() refuses if the stack
+                      // will not start, leaving you on this row rather than in
+                      // a controller that cannot send anything.
+                      enterPad(true, PAD_BLE);
+                      break;
+      case SR_WIFI:   // The portal takes the screen over on its own, via
+                      // net.state() == SETUP in render(), which outranks every
+                      // firmware-local screen -- so hand the glass back first.
+                      uiMode = UI_CONDUCTOR;
+                      net.startPortalNow();
+                      break;
+      case SR_ABOUT:  pageId = PG_ABOUT; break;
       case SR_SLEEP:  cfg.cycleHib(); break;
       case SR_BRIGHT: cfg.cycleBl();
                       analogWrite(LCD_BL, cfg.blDuty());   // apply immediately;
@@ -1748,9 +2009,21 @@ static bool          clickPending = false;
 static unsigned long clickMs      = 0;
 
 static void fourthTap() {
-  if (uiMode == UI_MENU)      { uiMode = UI_CONDUCTOR; requestRender(); return; }
-  if (uiMode == UI_PAGE)      { uiMode = UI_MENU; resetArmedMs = 0;
+  // In the game the 4th button steps OUT one level at a time -- play back to the
+  // start screen, start screen back to the menu -- so a mis-tap mid-level costs
+  // you the run but not the screen you were on.
+  if (uiMode == UI_GAME)      { if (game.fourth()) uiMode = UI_MENU;
                                 requestRender(); return; }
+  if (uiMode == UI_MENU)      { uiMode = UI_CONDUCTOR; requestRender(); return; }
+  if (uiMode == UI_PAGE) {
+    // One level at a time, the same rule the game follows. About is reached
+    // FROM settings now, so it backs out to the settings page -- landing on
+    // the top-level strip would skip a level and lose your place in the list.
+    if (pageId == PG_ABOUT) { pageId = PG_SETTINGS; pageIdx = SR_ABOUT;
+                              scrollToSelection(); requestRender(); return; }
+    uiMode = UI_MENU; resetArmedMs = 0;
+    requestRender(); return;
+  }
   onButton('M');                              // CONDUCTOR: toggle the mirror
 }
 
@@ -1794,6 +2067,10 @@ static void pollTapBtn(Btn &b) {
   // dark to switch it off should not need two goes.
   if (b.pressed && !b.longFired && (now - b.pressMs) >= POWEROFF_HOLD_MS) {
     b.longFired  = true;                      // swallow the release
+    // NOT during a game. The 4th button is the only way out of a level, and a
+    // thumb that rests on it for two seconds while thinking about a jump would
+    // switch the device off mid-run. Holding it leaves the game instead.
+    if (uiMode == UI_GAME) { uiMode = UI_MENU; requestRender(); return; }
     cfg.flush();                              // deferred commit will not run
     powerOff();                               // never returns
   }
@@ -1815,7 +2092,102 @@ static void pollPendingClick() {
   fourthTap();
 }
 
+// Controller mode reads the pins itself, every loop, and sends edges. No
+// debounce beyond 8 ms, no auto-repeat, no deferred tap: the page needs to know
+// what is held down THIS frame, and every one of those mechanisms exists to
+// answer a different question.
+static void pollPadButtons() {
+  static const uint8_t PINS[4] = {PIN_BTN_PREV, PIN_BTN_GO, PIN_BTN_NEXT,
+                                  PIN_BTN_MIRROR};
+  static const char    CODE[4] = {'P', 'G', 'N', 'M'};
+  static bool          was[4]  = {false, false, false, false};
+  static unsigned long chg[4]  = {0, 0, 0, 0};
+  static unsigned long mirrorDownMs = 0;
+
+  unsigned long now = millis();
+  for (uint8_t i = 0; i < 4; i++) {
+    bool raw = (digitalRead(PINS[i]) == LOW);
+    if (raw == was[i] || (now - chg[i]) < PAD_DEBOUNCE_MS) continue;
+    was[i] = raw;
+    chg[i] = now;
+    if (raw) padHeld |= (1 << i); else padHeld &= ~(1 << i);
+    // Over BLE the whole four-switch state goes as ONE HID report -- a host
+    // asks "what is held now", not "what changed" -- so there is nothing to
+    // emit per edge. Over the daemon link the edges ARE the protocol.
+    if (padVia == PAD_BLE) {
+      blepad.setButtons(padHeld);
+    } else {
+      char buf[6] = {'B', '|', raw ? '+' : '-', CODE[i], 0, 0};
+      emitLine(buf);
+    }
+    padLastInput = now;                     // drives the radio policy in loop()
+    padDirty = true;
+    notePoke();          // playing is not idling: do not blank mid-game
+    requestRender();                        // only on a change: the pad face is
+                                            // otherwise a still image
+    if (i == 3) mirrorDownMs = raw ? now : 0;
+  }
+  // The way OUT if the Mac never says G|0 -- a crashed tab, a daemon killed
+  // mid-game. Hold the 4th button for two seconds. It does NOT power off here:
+  // that is the same thumb-resting hazard the game has, and a controller you
+  // cannot leave is worse than one you have to hold a button to leave.
+  if (mirrorDownMs && (now - mirrorDownMs) >= POWEROFF_HOLD_MS) {
+    mirrorDownMs = 0;
+    was[3] = false;
+    padHeld = 0;
+    // Never leave the other end holding the button you left with -- a stuck
+    // key is the one bug a controller cannot recover from on its own.
+    if (padVia == PAD_BLE) blepad.setButtons(0);
+    else                   emitLine("B|-M");
+    leavePad();
+  }
+}
+
+// THE RADIO POLICY for BLE gamepad mode.
+//
+// One 2.4 GHz radio, shared. Holding Wi-Fi up while you play costs latency on
+// the link that actually matters, and the Wi-Fi path is the one that was
+// misbehaving in the first place. But a device that goes deaf for a whole
+// session is worse than a laggy one: the daemon is the reason this thing
+// exists, and an error you find out about an hour later is an error you found
+// out about too late.
+//
+// So the radio follows your thumbs, because nothing else can tell it. A HID
+// gamepad is one-way -- the browser has no channel back -- so "are you mid
+// level?" is answered by "did you press anything in the last few seconds?".
+// Presses mean playing and the radio is parked; stillness means you stopped to
+// read something, or paused, or wandered off, and the radio goes back up to see
+// what the daemon has. If what it has is urgent, the V| handler above takes the
+// device off the pad entirely.
+static void pollPadRadio() {
+  if (uiMode != UI_PAD || padVia != PAD_BLE) return;
+  blepad.poll();                            // re-advertise if the host went away
+
+  unsigned long now = millis();
+  bool playing = (now - padLastInput) < PAD_PLAY_IDLE_MS;
+
+  if (!playing) {
+    if (padWifiParked) {                    // you stopped -- go and look
+      net.restart();
+      padWifiParked  = false;
+      padWifiUpSince = now;
+      requestRender();
+    }
+    return;
+  }
+  // Playing. Park the radio -- but never mid-attempt. Tearing a join down
+  // before it can finish would mean the check never actually happens, and the
+  // device would spend the session neither playing cleanly nor learning
+  // anything, which is the worst of both.
+  if (!padWifiParked && (now - padWifiUpSince) >= PAD_WIFI_CHECK_MS) {
+    net.shutdown();                         // poll() no-ops in OFF: no blocking
+    padWifiParked = true;
+    requestRender();
+  }
+}
+
 static void pollButtons() {
+  if (uiMode == UI_PAD) { pollPadButtons(); return; }
   pollNavBtn(prevBtn, 'P');
   pollGoBtn(goBtn);
   pollNavBtn(nextBtn, 'N');
@@ -1908,6 +2280,7 @@ void setup() {
   // Emit hello once so a daemon already listening on USB sends full state. The
   // WiFi path sends its own H the moment the handshake completes (see loop()).
   if (Serial) { Serial.println("H"); sendSoundPref(); }
+  game.sfx = sendSfx;                       // the Mac is the game's only speaker
 }
 
 void loop() {
@@ -1920,12 +2293,27 @@ void loop() {
   // close to unusable exactly when you most need it (no link, so you have come
   // to the menu to fix something). The link is not wanted while you are in
   // Settings anyway, and it resumes the instant you leave.
-  net.holdReconnect(uiMode != UI_CONDUCTOR);
+  // ...but the GAME's start screen is an exception to the exception. The hold
+  // exists because the mDNS browse and the TCP connect BLOCK this loop for most
+  // of a second, which made the menu near-unusable with no daemon to find. In a
+  // level that would be far worse -- a 600 ms freeze mid-jump. But the game's
+  // only speaker is the daemon, so holding unconditionally means a link that
+  // dropped before you pressed START stays dropped, and the whole run is silent
+  // with no way to fix it short of leaving. Reconnecting is therefore allowed on
+  // the start screen and the codex cards, where nothing is moving and a hitch
+  // costs nothing, and forbidden the instant a level is running.
+  // UI_PAD is exempt for the same reason the game's start screen is: the pad is
+  // a still image, so a blocking browse costs nothing to look at -- and if the
+  // link drops while the Mac holds the grab, nothing can send G|0 to release
+  // it. Holding reconnection there would strand the device in controller mode.
+  net.holdReconnect(uiMode != UI_CONDUCTOR && uiMode != UI_PAD &&
+                    !(uiMode == UI_GAME && game.idle()));
   net.poll();
   net.applyPendingConfig();
   pumpUsb();
   pumpNet();
   pollButtons();
+  pollPadRadio();
   pollLed();
   pollBattery();
   pollHibernate();
@@ -1986,6 +2374,34 @@ void loop() {
   // Not while the screen is dark: a full flush is ~28 ms of SPI at 40 MHz and
   // there is nothing to see. needRender stays SET, so wakeScreen() shows the
   // current frame rather than the one from when the screen went out.
+  // A sprint in progress renders every pass and never coalesces: the throttle
+  // below exists to stop a chatty daemon starving the display, and a game has
+  // the opposite problem. notePoke() keeps the hibernate timer from blanking
+  // the screen under someone mid-level, which idle-detection would otherwise do
+  // to a player who is holding a button but sending the daemon nothing.
+  if (uiMode == UI_GAME) {
+    game.tick();
+    notePoke();
+    if (screenOn) { needRender = false; render(); }
+    return;
+  }
+
+  // THE PAD IS A STILL IMAGE. Frames, LED updates and the blink phase all call
+  // requestRender() about once a second, and honouring that here would spend a
+  // full 110 KB flush -- ~28 ms of SPI -- redrawing a screen nobody is looking
+  // at, on battery, while the Mac has the buttons. Only the pad's own changes
+  // are worth a redraw; everything else is dropped, not queued.
+  if (uiMode == UI_PAD) {
+    if (needRender && screenOn && padDirty) {
+      needRender = false;
+      padDirty   = false;
+      render();
+    } else {
+      needRender = false;
+    }
+    return;
+  }
+
   if (needRender && screenOn) {
     bool quiet = (Serial.available() == 0) && (now - lastRxMs) >= 8;
     if (quiet || (now - dirtyMs) >= 60) {

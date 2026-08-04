@@ -292,14 +292,21 @@ struct Btn {
 // a fifth of the width and runs out of height at five rows, while a strip has
 // room to spare in the axis it actually has.
 //
-// Only the SELECTED item is labelled. Five labels at once would either be
+// Only the SELECTED item is labelled. Six labels at once would either be
 // unreadable at size 1 or collide at size 2, and the icons carry the
 // recognition once you have been here twice.
-#define MENU_COUNT      5
+//
+// FOUR items. It was six until ABOUT and WI-FI moved into the settings page,
+// where they belong: neither is a place you go, they are things you read and
+// things you set, and keeping them on the strip meant the top level grew every
+// time the device learned a new trick. The pitch stays at 52 -- it was chosen
+// so six tiles cleared the glass, and four at the same pitch simply leaves more
+// air. Only the origin moves: three gaps span 156, so slot 0 centres at 82.
+#define MENU_COUNT      4
 #define MENU_ICON       34    // unselected tile, px square
 #define MENU_ICON_SEL   46    // ...and the selected one
-#define MENU_PITCH      58    // centre-to-centre
-#define MENU_CX0        44    // centre of slot 0: (320 - 4*58) / 2
+#define MENU_PITCH      52    // centre-to-centre
+#define MENU_CX0        82    // centre of slot 0: (320 - 3*52) / 2
 #define MENU_CY         80    // vertical centre of the strip
 #define MENU_LABEL_Y    116   // selected item's label (size 2, centred)
 #define MENU_HINT_Y     150   // the what-the-buttons-do line (size 1, dim)
@@ -338,7 +345,7 @@ struct Btn {
 // Shown on the About page and by the serial `?`. The only place a flashed
 // device can tell you which build it is running -- which matters because the
 // flash script writes in verified pieces and a partial run is otherwise silent.
-#define FW_VERSION "s3-2.1"
+#define FW_VERSION "s3-2.2"
 
 // ---- Timing (identical semantics to the Nano build) ------------------------
 #define SERIAL_BAUD     115200
@@ -358,6 +365,28 @@ struct Btn {
 // the thing on the single tap: it already costs a daemon round-trip, so 300 ms
 // disappears into latency that was there anyway.
 #define DBLCLICK_MS     300UL
+// Controller mode. 8 ms is well past any switch bounce this hardware shows and
+// well under one 60 Hz frame, so an edge is never missed and never doubled --
+// where the menu's 40 ms would eat a quick tap-and-release entirely.
+// THE RADIO POLICY, for BLE gamepad mode. One 2.4 GHz radio is shared between
+// BLE and Wi-Fi, so holding both up while you play costs latency on the link
+// that matters. The device cannot be TOLD whether you are mid-level -- a HID
+// gamepad is a one-way device and the browser has no way back to it -- so it
+// infers from your thumbs: presses mean playing, stillness means you stopped.
+//
+// PAD_PLAY_IDLE_MS is the "you have stopped" threshold. Long enough to survive
+// reading a codex card or lining up a jump, short enough that an alert waiting
+// on the daemon is not missed for minutes. PAD_WIFI_CHECK_MS bounds how often a
+// still pad re-checks, so a paused game does not flap the radio.
+#define PAD_PLAY_IDLE_MS    6000UL
+#define PAD_WIFI_CHECK_MS   20000UL
+
+#define PAD_DEBOUNCE_MS  8UL
+// A dim but not dark panel: the pad face stays readable if you glance down,
+// while the backlight -- the largest draw on the board -- runs at a fraction of
+// its normal duty for as long as the page holds the grab.
+#define PAD_BL_DUTY      24
+
 #define REPEAT_DELAY_MS 400UL  // PREV/NEXT held this long -> auto-repeat
 #define REPEAT_MS       200UL  // ...then one event every 200 ms
 #define BLINK_MS        400UL  // flash / blink half-period (~2.5 Hz)

@@ -74,3 +74,12 @@ packaging/dist/
 # ---------------------------------------------------------------------------
 .env
 .env.local
+
+# ---------------------------------------------------------------------------
+# Browser-testing scratch
+# ---------------------------------------------------------------------------
+# MCP Playwright writes screenshots to the working directory by default, and
+# `git add -A` will happily commit them -- which is how pad-before/after.png
+# reached this repo. Verification artefacts are not source.
+.tmp/
+/*.png
