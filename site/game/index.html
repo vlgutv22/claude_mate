@@ -67,9 +67,113 @@
   .lede{font-size:20px; color:var(--muted); max-width:62ch}
   .note{font-size:14.5px; color:var(--muted); border-left:2px solid var(--line); padding-left:14px}
   footer{border-top:1px solid var(--line); padding:30px 0; font-size:14px; color:var(--muted)}
+
+  /* ---- consent notice (only ever built if analytics is configured) -------- */
+  .consent{position:fixed; left:16px; right:16px; bottom:16px; z-index:50;
+    max-width:640px; margin:0 auto; display:flex; gap:14px; align-items:center;
+    flex-wrap:wrap; justify-content:space-between;
+    background:var(--raise); border:1px solid var(--line);
+    border-radius:var(--radius); padding:14px 16px;
+    box-shadow:0 10px 30px rgba(0,0,0,.28)}
+  .consent p{margin:0; font-size:14px; color:var(--muted); flex:1 1 280px}
+  .consent .row{display:flex; gap:8px}
+  .consent button{padding:8px 14px; border-radius:8px; font-weight:600;
+    font-size:14px; cursor:pointer; border:1px solid var(--line);
+    background:var(--paper); color:var(--ink)}
+  .consent button.yes{background:var(--accent); border-color:var(--accent); color:#fff}
 </style>
+<!-- ---------------------------------------------------------------------------
+  Google Tag Manager, container GTM-5P8X3RNW.
+
+  The container is loaded UNCONDITIONALLY, but Consent Mode v2 defaults are
+  pushed to dataLayer FIRST -- before gtm.js is even requested. That ordering is
+  the whole point: a tag inside the container that respects consent (GA4 does)
+  then stays dormant until someone says yes, and starts measuring the moment
+  they do, with no reload. Push the defaults after the loader and the first hit
+  escapes ungated, which is the usual way this is got wrong.
+
+  This publishes from the EU and GA4 stores an identifier on the visitor's
+  device, which is not a thing you may do first and ask about afterwards.
+  Decline is a real answer: stored, never re-asked, nothing sent. The choice
+  lives in localStorage, exempt because it exists solely to honour the answer.
+
+  Never runs on localhost, 127.0.0.1 or file:// -- a property whose numbers
+  include your own development is one you cannot trust. That also keeps it off
+  the copy the daemon serves at 127.0.0.1:8788.
+
+  Duplicated verbatim in site/game/index.html. There is no build step and the
+  two pages are already independent documents that carry their own stylesheets,
+  so a shared file would have to be reached by a relative path -- and the daemon
+  serves site/game/ AS ITS WEB ROOT, where ../ does not exist. Change both.
+---------------------------------------------------------------------------- -->
+<script>
+(function () {
+  var GTM_ID = 'GTM-5P8X3RNW';
+  var LOCAL  = ['127.0.0.1', 'localhost', '[::1]', '::1'];
+  var KEY    = 'cm-analytics-consent';
+
+  if (location.protocol === 'file:' ||
+      LOCAL.indexOf(location.hostname) !== -1) return;
+
+  window.dataLayer = window.dataLayer || [];
+  function gtag() { dataLayer.push(arguments); }
+
+  // BEFORE the container. wait_for_update gives a stored "yes" time to land
+  // before any tag decides it has been denied.
+  gtag('consent', 'default', {
+    ad_storage: 'denied',
+    ad_user_data: 'denied',
+    ad_personalization: 'denied',
+    analytics_storage: 'denied',
+    wait_for_update: 500
+  });
+
+  var saved = null;
+  try { saved = localStorage.getItem(KEY); } catch (e) {}
+  if (saved === 'granted') gtag('consent', 'update', { analytics_storage: 'granted' });
+
+  // Google's own snippet, unmodified except for taking the id from above.
+  (function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':
+  new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],
+  j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
+  'https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);
+  })(window,document,'script','dataLayer',GTM_ID);
+
+  if (saved) return;                                       // already answered
+
+  function ask() {
+    var box = document.createElement('div');
+    box.className = 'consent';
+    box.setAttribute('role', 'dialog');
+    box.setAttribute('aria-label', 'Analytics consent');
+    box.innerHTML =
+      '<p>Anonymous page analytics, to see whether any of this is read. ' +
+      'Nothing is stored unless you say yes.</p>' +
+      '<span class="row">' +
+        '<button type="button" class="no">No thanks</button>' +
+        '<button type="button" class="yes">Allow</button>' +
+      '</span>';
+    function done(answer) {
+      try { localStorage.setItem(KEY, answer); } catch (e) {}
+      if (answer === 'granted')
+        gtag('consent', 'update', { analytics_storage: 'granted' });
+      box.remove();
+    }
+    box.querySelector('.yes').addEventListener('click', function () { done('granted'); });
+    box.querySelector('.no').addEventListener('click', function () { done('denied'); });
+    document.body.appendChild(box);
+  }
+  if (document.readyState === 'loading')
+    document.addEventListener('DOMContentLoaded', ask);
+  else ask();
+})();
+</script>
 </head>
 <body>
+<!-- Google Tag Manager (noscript) -->
+<noscript><iframe src="https://www.googletagmanager.com/ns.html?id=GTM-5P8X3RNW"
+height="0" width="0" style="display:none;visibility:hidden"></iframe></noscript>
+<!-- End Google Tag Manager (noscript) -->
 
 <header class="bar"><div class="wrap">
   <strong>Claude&nbsp;Mate</strong>

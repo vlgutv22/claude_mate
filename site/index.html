@@ -262,39 +262,43 @@
 </style>
 
 <!-- ---------------------------------------------------------------------------
-  Analytics (GA4).
+  Google Tag Manager, container GTM-5P8X3RNW.
 
-  INERT until GA_ID below is a real measurement id. Left as the placeholder it
-  loads nothing at all -- no script, no cookie, no banner -- so the page can be
-  developed and reviewed without a half-configured tag reporting to nowhere.
+  The container is loaded UNCONDITIONALLY, but Consent Mode v2 defaults are
+  pushed to dataLayer FIRST -- before gtm.js is even requested. That ordering is
+  the whole point: a tag inside the container that respects consent (GA4 does)
+  then stays dormant until someone says yes, and starts measuring the moment
+  they do, with no reload. Push the defaults after the loader and the first hit
+  escapes ungated, which is the usual way this is got wrong.
 
-  It also never runs on localhost, 127.0.0.1 or file://, because a property
-  whose numbers include your own development is a property you cannot trust.
+  This publishes from the EU and GA4 stores an identifier on the visitor's
+  device, which is not a thing you may do first and ask about afterwards.
+  Decline is a real answer: stored, never re-asked, nothing sent. The choice
+  lives in localStorage, exempt because it exists solely to honour the answer.
 
-  CONSENT. This site is published from the EU, and GA4 stores an identifier on
-  the visitor's device, which is not something you may do first and ask about
-  afterwards. So Consent Mode v2 is installed with everything DENIED by default
-  and the tag only measures after someone says yes; the choice is remembered in
-  localStorage, which is exempt as it exists solely to honour their answer.
-  Decline is a real answer -- it is stored and never asked again, and nothing is
-  sent. To drop the banner and the gating entirely, delete this block.
+  Never runs on localhost, 127.0.0.1 or file:// -- a property whose numbers
+  include your own development is one you cannot trust. That also keeps it off
+  the copy the daemon serves at 127.0.0.1:8788.
+
+  Duplicated verbatim in site/game/index.html. There is no build step and the
+  two pages are already independent documents that carry their own stylesheets,
+  so a shared file would have to be reached by a relative path -- and the daemon
+  serves site/game/ AS ITS WEB ROOT, where ../ does not exist. Change both.
 ---------------------------------------------------------------------------- -->
 <script>
 (function () {
-  var GA_ID       = 'G-XXXXXXXXXX';   // <-- put the real measurement id here
-  var PLACEHOLDER = 'G-XXXXXXXXXX';
-  var LOCAL = ['127.0.0.1', 'localhost', '[::1]', '::1'];
-  var KEY   = 'cm-analytics-consent';
+  var GTM_ID = 'GTM-5P8X3RNW';
+  var LOCAL  = ['127.0.0.1', 'localhost', '[::1]', '::1'];
+  var KEY    = 'cm-analytics-consent';
 
-  if (GA_ID === PLACEHOLDER) return;                       // not configured
   if (location.protocol === 'file:' ||
-      LOCAL.indexOf(location.hostname) !== -1) return;      // not in the numbers
+      LOCAL.indexOf(location.hostname) !== -1) return;
 
   window.dataLayer = window.dataLayer || [];
   function gtag() { dataLayer.push(arguments); }
-  window.gtag = gtag;
 
-  // Must be set BEFORE gtag.js is fetched, or the first hit escapes ungated.
+  // BEFORE the container. wait_for_update gives a stored "yes" time to land
+  // before any tag decides it has been denied.
   gtag('consent', 'default', {
     ad_storage: 'denied',
     ad_user_data: 'denied',
@@ -307,12 +311,12 @@
   try { saved = localStorage.getItem(KEY); } catch (e) {}
   if (saved === 'granted') gtag('consent', 'update', { analytics_storage: 'granted' });
 
-  var s = document.createElement('script');
-  s.async = true;
-  s.src = 'https://www.googletagmanager.com/gtag/js?id=' + encodeURIComponent(GA_ID);
-  document.head.appendChild(s);
-  gtag('js', new Date());
-  gtag('config', GA_ID);
+  // Google's own snippet, unmodified except for taking the id from above.
+  (function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':
+  new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],
+  j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
+  'https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);
+  })(window,document,'script','dataLayer',GTM_ID);
 
   if (saved) return;                                       // already answered
 
@@ -330,7 +334,8 @@
       '</span>';
     function done(answer) {
       try { localStorage.setItem(KEY, answer); } catch (e) {}
-      if (answer === 'granted') gtag('consent', 'update', { analytics_storage: 'granted' });
+      if (answer === 'granted')
+        gtag('consent', 'update', { analytics_storage: 'granted' });
       box.remove();
     }
     box.querySelector('.yes').addEventListener('click', function () { done('granted'); });
@@ -344,6 +349,10 @@
 </script>
 </head>
 <body>
+<!-- Google Tag Manager (noscript) -->
+<noscript><iframe src="https://www.googletagmanager.com/ns.html?id=GTM-5P8X3RNW"
+height="0" width="0" style="display:none;visibility:hidden"></iframe></noscript>
+<!-- End Google Tag Manager (noscript) -->
 
 <header class="bar"><div class="wrap">
   <div class="brand"><span class="dot"></span> Claude&nbsp;Mate</div>
