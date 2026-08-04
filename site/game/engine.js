@@ -343,13 +343,20 @@ function pollGamepad() {
   }
 }
 
+const LOCAL_HOSTS = ['127.0.0.1', 'localhost', '[::1]', '::1'];
+
 function connectDevice() {
   refreshBadge();
+  // ONLY where a daemon could actually be. EventSource retries on its own
+  // forever, so pointing it at an origin that has no /events -- the published
+  // site, where this page is just static files -- is not a harmless 404: it is
+  // a reconnect loop against someone else's server for as long as the tab is
+  // open. Bluetooth is the path that works there, and it needs no bridge.
+  const local = location.protocol === 'file:' ||
+                LOCAL_HOSTS.indexOf(location.hostname) !== -1;
+  if (!local) return;
   // Same-origin when the daemon serves this page; otherwise try the loopback
-  // port directly, which works when the page is opened from disk. A page served
-  // over HTTPS cannot reach http://127.0.0.1 -- mixed content -- which is
-  // exactly why the daemon serves the game itself, and why the BLE path above
-  // is the only one the published site can use.
+  // port directly, which works when the page is opened from disk.
   const base = location.protocol === 'file:' ? 'http://127.0.0.1:8788' : '';
   let es;
   try { es = new EventSource(base + '/events?grab=1'); } catch (e) { return; }
