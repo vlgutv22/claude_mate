@@ -1352,8 +1352,16 @@ static void handleLine(char *line) {
                                            // the config.
       char *bar = strchr(line, '|');
       if (!bar) break;
-      if (bar[1] == '1') enterPad(false);    // false: the Mac asked, not the user
-      else               leavePad();
+      // 1 = the daemon drives it (SSE), 2 = come up as a BLE HID gamepad,
+      // 0 = leave. Extending the verb that already means "gamepad" rather than
+      // inventing one keeps this out of the config console's letters, which is
+      // the collision that cost a whole debugging session once already.
+      //
+      // G|2 also makes BLE mode reachable without a thumb, which is the only
+      // way it can be tested from the far end of a cable.
+      if (bar[1] == '1')      enterPad(false);
+      else if (bar[1] == '2') enterPad(false, PAD_BLE);
+      else                    leavePad();
       break;
     }
 
