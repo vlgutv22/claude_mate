@@ -1910,6 +1910,12 @@ class ButtonReader(threading.Thread):
                 self._ack_only()
             elif ev == "F":                      # ACK button held: toggle FOLLOW
                 self._follow_pressed()
+            elif ev == "C":                      # ACTIONS: type "continue"
+                self._continue_pressed()
+            elif ev == "T":                      # ACTIONS: new terminal, focused
+                self._new_terminal_pressed()
+            elif ev == "A":                      # ACTIONS: switch account
+                self._switch_account_pressed()
             else:
                 log(f"unknown button event: {line!r}")
             return
@@ -2120,6 +2126,71 @@ class ButtonReader(threading.Thread):
             t.daemon = True
             self._mirror_timer = t
             t.start()
+
+    def _continue_pressed(self) -> None:
+        """B|C -- type "continue" into the shown session and press Enter.
+
+        The reason the ACTIONS menu exists. A session that hit its 5-hour limit
+        or took an API error is sitting there waiting for a human to say one
+        word, and the whole point of a desk device is not having to turn back to
+        the laptop to say it. Goes to the session on the glass -- WYSIWYG, the
+        same rule GO follows -- and only to a wrapped one, because a hook-only
+        session has no PTY to type into.
+        """
+        sess = self._screen.current_shown()
+        if sess is None:
+            log("CONTINUE pressed but no session shown")
+            return
+        if not sess.focus_ctrl:
+            log(f"CONTINUE -> {sess.name}: not a wrapped session, nothing to type into")
+            return
+        ok = wrapper_ctrl_send(sess.focus_ctrl, "submit continue")
+        log(f"CONTINUE -> {sess.name}: {'sent' if ok else 'FAILED'}")
+
+    def _new_terminal_pressed(self) -> None:
+        """B|T -- open a new terminal, in the shown session's directory, and
+        focus it. Off the reader thread: `open` can block for seconds while
+        Terminal launches, and this thread must keep draining button events."""
+        sess = self._screen.current_shown()
+        cwd = (sess.cwd if sess and sess.cwd else os.path.expanduser("~"))
+
+        def run() -> None:
+            try:
+                # `open -a Terminal <dir>` opens a new window already cd'd
+                # there, and brings Terminal forward -- which IS the focus the
+                # device asked for, so no separate raise is needed.
+                subprocess.run(["open", "-a", "Terminal", cwd],
+                               capture_output=True, timeout=20)
+                log(f"NEW TERMINAL -> {cwd}")
+            except Exception as exc:
+                log(f"new terminal: {exc}")
+
+        threading.Thread(target=run, name="new-terminal", daemon=True).start()
+
+    def _switch_account_pressed(self) -> None:
+        """B|A -- continue the shown session on whichever account has the most
+        limit left.
+
+        The device deliberately does NOT pick which account: choosing needs
+        every profile's remaining usage, which lives on the Mac, and a
+        four-button device is the wrong place to browse a list of logins. It
+        asks for "somewhere with headroom" and the wrapper -- which owns the
+        process and therefore the only thing that can re-exec it -- does the
+        rest.
+        """
+        sess = self._screen.current_shown()
+        if sess is None:
+            log("SWITCH pressed but no session shown")
+            return
+        if not sess.focus_ctrl:
+            log(f"SWITCH -> {sess.name}: not a wrapped session")
+            return
+
+        def run() -> None:
+            ok = wrapper_ctrl_send(sess.focus_ctrl, "switch --best")
+            log(f"SWITCH -> {sess.name}: {'requested' if ok else 'FAILED'}")
+
+        threading.Thread(target=run, name="switch-account", daemon=True).start()
 
     def _follow_pressed(self) -> None:
         """B|F -- the 4-button device's dedicated FOLLOW toggle.

@@ -534,6 +534,22 @@ def ctrl_listener():
                     conn.sendall(b"ok\n")
                 except OSError:
                     pass
+            elif data.startswith("switch"):
+                # Continue this conversation on another account. Recorded, then
+                # the child is asked to exit; the exec happens in main's tail so
+                # the terminal is restored first and we are not replacing the
+                # process from inside a socket handler.
+                global g_switch_req
+                g_switch_req = data[6:].strip() or "--best"
+                try:
+                    conn.sendall(b"ok\n")
+                except OSError:
+                    pass
+                if g_child_pid > 0:
+                    try:
+                        os.kill(g_child_pid, signal.SIGTERM)
+                    except OSError:
+                        pass
             else:
                 known = data.startswith("focus") or data.startswith("collapse")
                 if known:
@@ -601,6 +617,15 @@ g_screen_text = ""
 g_inject = bytearray()
 g_inject_lock = threading.Lock()
 g_wake_w = -1                      # relay's self-pipe write end; set by main()
+
+# A switch asked for from the device. The wrapper OWNS the claude process, so it
+# is the only thing that can replace it -- hence the request lands here, the
+# child is asked to exit, and the exec happens on the way out (see main's tail),
+# after cleanup has restored the terminal. Holding the request also tells
+# cleanup() to LEAVE the context file in place: the switcher is about to read it
+# to find out which conversation to carry.
+g_switch_req = ""
+g_child_pid = -1
 
 def queue_input(data: bytes):
     """Hand keystrokes to the relay from another thread."""
@@ -1344,6 +1369,9 @@ def main():
     rows, cols = get_winsize(sys.stdin.fileno())
 
     pid, master_fd = pty.fork()
+    if pid > 0:
+        global g_child_pid
+        g_child_pid = pid          # so a `switch` can ask claude to stand down
     if pid == 0:
         # Child: become the real claude.
         exec_real_claude(sys.argv[1:])
@@ -1500,7 +1528,8 @@ def main():
             return
         _cleaned[0] = True
         _running[0] = False                             # stop the monitor (no post-end report)
-        ctx_clear()                                     # live state, worthless once we exit
+        if not g_switch_req:
+            ctx_clear()                                 # live state, worthless once we exit
         try:
             signal.set_wakeup_fd(-1)
         except Exception:
@@ -1699,6 +1728,32 @@ def main():
             # POLL_MS, which is plenty responsive for an away-from-keyboard alert.
     finally:
         cleanup()
+
+    # A switch asked for from the device. Done HERE, at the very end, on purpose:
+    # cleanup() has already restored the terminal, deregistered the session and
+    # dropped the socket, so the switcher starts from a clean shell exactly as if
+    # you had typed it -- and it is not replacing the process from inside a
+    # socket handler mid-teardown. It reads the context file cleanup() was told
+    # to leave behind, copies the transcript, and re-execs this wrapper with
+    # --resume. os.execv never returns; if it fails we fall through and exit
+    # normally rather than stranding the terminal.
+    if g_switch_req:
+        switcher = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "claude-mate-switch")
+        try:
+            os.waitpid(pid, 0)                          # let claude finish exiting
+        except OSError:
+            pass
+        try:
+            sys.stdout.write("\r\n[claude-mate] switching account...\r\n")
+            sys.stdout.flush()
+        except Exception:
+            pass
+        try:
+            os.execv(sys.executable,
+                     [sys.executable, switcher, "--yes"] + g_switch_req.split())
+        except OSError as exc:
+            sys.stderr.write(f"[claude-mate-wrap] switch failed: {exc}\n")
 
     # Propagate claude's exit code. cleanup() has already closed master_fd, so a
     # child still alive on an abnormal break path gets SIGHUP and exits; we poll

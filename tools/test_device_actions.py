@@ -148,6 +148,58 @@ check("screen still returns a length-prefixed frame",
 clear()
 check("...and screen queues no input", queued() == b"")
 
+# --------------------------------------------------------------------------- #
+# The daemon end: do the new ACTIONS verbs reach their handlers?
+# --------------------------------------------------------------------------- #
+# Driven with NO session registered on purpose. Each handler's first act is to
+# resolve the session on the glass, so with none there it logs and returns --
+# which proves the verb was dispatched without B|T actually opening a Terminal
+# window on the machine running the tests.
+print("\n-- the daemon dispatches the ACTIONS verbs --")
+
+import pty as _pty
+import subprocess as _sp
+import threading as _th
+
+DAEMON = os.path.join(REPO, "daemon", "claude_mate_daemon.py")
+m_fd, s_fd = _pty.openpty()
+dlog = []
+
+
+def _reader(fh):
+    for ln in fh:
+        dlog.append(ln.rstrip())
+
+
+denv = dict(os.environ, CLAUDE_MATE_PORT=os.ttyname(s_fd),
+            CLAUDE_MATE_SOCK=os.path.join(tmp, "d.sock"),
+            CLAUDE_MATE_BAUD="115200")
+dproc = _sp.Popen([sys.executable, DAEMON], env=denv,
+                  stderr=_sp.PIPE, text=True)
+_th.Thread(target=_reader, args=(dproc.stderr,), daemon=True).start()
+try:
+    wait_for(lambda: any("serial opened" in l for l in dlog), 12.0)
+    for verb, want in (("C", "CONTINUE"), ("T", "NEW TERMINAL"), ("A", "SWITCH")):
+        n = len(dlog)
+        os.write(m_fd, f"B|{verb}\n".encode())
+        hit = wait_for(lambda w=want, k=n: any(w in l for l in dlog[k:]), 6.0)
+        check(f"B|{verb} reaches the {want} handler", hit)
+    n = len(dlog)
+    os.write(m_fd, b"B|Z\n")
+    check("an unknown verb is still reported, not silently eaten",
+          wait_for(lambda k=n: any("unknown button" in l for l in dlog[k:]), 6.0))
+finally:
+    dproc.terminate()
+    try:
+        dproc.wait(timeout=10)
+    except Exception:
+        dproc.kill()
+    for fd in (m_fd, s_fd):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
 print(f"\n{checks - len(failures)}/{checks} checks passed")
 shutil.rmtree(tmp, ignore_errors=True)
 if failures:

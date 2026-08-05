@@ -146,7 +146,8 @@ MateSettings cfg;
 // terminal you were not looking at. The daemon simply sees no button events,
 // needs no protocol change, and keeps its frame current the whole time, so
 // leaving the menu is instant.
-enum UiMode : uint8_t { UI_CONDUCTOR, UI_MENU, UI_PAGE, UI_GAME, UI_PAD };
+enum UiMode : uint8_t { UI_CONDUCTOR, UI_MENU, UI_PAGE, UI_GAME, UI_PAD,
+                       UI_ACTIONS };
 
 // CONTROLLER MODE. The daemon turns this on (G|1) while a browser page is
 // driving the device's buttons, and off (G|0) when the page goes away.
@@ -187,6 +188,22 @@ enum MenuItem : uint8_t {
 static uint8_t menuIdx = MI_CONDUCTOR;
 
 enum PageId : uint8_t { PG_SETTINGS, PG_ABOUT };
+
+// The ACTIONS sheet -- what the 4th button opens over the triage view.
+//
+// Everything here is done to the session ON THE GLASS, the same WYSIWYG rule GO
+// follows, and every item is a thing you would otherwise have to turn to the
+// laptop for. SEND CONTINUE is the reason it exists: a session that hit its
+// 5-hour limit or took an API error is waiting for one word, and walking back
+// to the keyboard to type it is the friction this device is supposed to remove.
+//
+// One press per item, no sub-menus: choosing WHICH account to switch to needs
+// every profile's remaining usage, which lives on the Mac, so the device asks
+// for "somewhere with headroom" and lets the wrapper decide.
+enum ActRow : uint8_t {
+  AR_VIEW, AR_PREVIEW, AR_CONTINUE, AR_NEWTERM, AR_SWITCH, AR_COUNT
+};
+static uint8_t actIdx = 0;
 static PageId  pageId  = PG_SETTINGS;
 static uint8_t pageIdx = 0;          // selected row within the page
 
@@ -1182,6 +1199,41 @@ static void drawPad() {
   gfx->print(out);
 }
 
+// The ACTIONS sheet. Same row geometry as the settings page, so the two read as
+// one family and the muscle memory transfers: PREV/NEXT move, GO does it, the
+// 4th button backs out.
+static void drawActions() {
+  static const char *LABEL[AR_COUNT] = {
+    "View terminal", "Preview on glass", "Send \"continue\"",
+    "New terminal", "Switch account",
+  };
+  static const char *HINT[AR_COUNT] = {
+    "raise the real window", "show it here", "unstick a limit or error",
+    "opens in this folder", "one with limit left",
+  };
+  drawCentred(SCREEN_W / 2, 8, 2, "ACTIONS", C_TEXT);
+  for (uint8_t i = 0; i < AR_COUNT; i++) {
+    int16_t y = 34 + i * 24;
+    bool sel = (i == actIdx);
+    if (sel) gfx->fillRect(0, y, SCREEN_W, 22, C_DIMMER);
+    gfx->setTextSize(1);
+    // The one destructive-ish item is the one that REPLACES your session, so it
+    // is the only label that gets a colour of its own.
+    gfx->setTextColor(sel ? (i == AR_SWITCH ? C_WAIT : C_TEXT) : C_DIM);
+    gfx->setCursor(PAD_X, y + 3);
+    gfx->print(LABEL[i]);
+    if (sel) {
+      gfx->setTextColor(C_DIM);
+      gfx->setCursor(PAD_X, y + 13);
+      gfx->print(HINT[i]);
+    }
+  }
+  gfx->setTextSize(1);
+  gfx->setTextColor(C_DIM);
+  gfx->setCursor(PAD_X, MENU_HINT_Y);
+  gfx->print("PREV/NEXT   GO do it   4th back");
+}
+
 static void render() {
   gfx->fillScreen(C_BG);
   bool blip = (long)(millis() - blipUntil) < 0;
@@ -1190,6 +1242,8 @@ static void render() {
   // portal can start from paths that do not go through the menu at all.
   if (net.state() == MateNet::SETUP) {
     drawSetup();
+  } else if (uiMode == UI_ACTIONS) {
+    drawActions();
   } else if (uiMode == UI_MENU) {
     drawStatusBar();
     drawMenu();
@@ -1463,7 +1517,8 @@ static bool handleConfigLine(char *line) {
                     : uiMode == UI_MENU    ? "menu"
                     : uiMode == UI_PAGE    ? (pageId == PG_ABOUT ? "about"
                                                                  : "settings")
-                    : uiMode == UI_GAME    ? "game" : "pad",
+                    : uiMode == UI_GAME    ? "game"
+                    : uiMode == UI_ACTIONS ? "actions" : "pad",
                     cfg.hibLabel(), screenOn ? "" : " (asleep now)",
                     (unsigned)(cfg.blIdx() + 1), (unsigned)BL_STEPS,
                     cfg.ledLabel(), cfg.flipped() ? "on" : "off");
@@ -1885,6 +1940,28 @@ static void sendSfx(char code) {
 
 // PREV/NEXT/GO while a firmware-local screen is up. Never reaches the daemon.
 static void menuButton(char ev) {
+  if (uiMode == UI_ACTIONS) {
+    if (ev == 'P') { actIdx = (uint8_t)((actIdx + AR_COUNT - 1) % AR_COUNT); return; }
+    if (ev == 'N') { actIdx = (uint8_t)((actIdx + 1) % AR_COUNT); return; }
+    // 'K' is GO's long press. Here it means the same as 'G': there is no
+    // long-press gesture on this sheet, and LONGPRESS_MS is easy to overshoot --
+    // a press that did nothing because you held it a beat too long reads as a
+    // dead row. (The settings page keeps K distinct; it has rows that confirm.)
+    if (ev == 'G' || ev == 'K') {
+      // Every item is one verb to the daemon, and every one of them CLOSES the
+      // sheet: these are actions, not settings, and leaving it up over a
+      // terminal that just got raised would be covering the thing you asked for.
+      switch (actIdx) {
+        case AR_VIEW:     emitBtn('G'); break;   // raise the real window
+        case AR_PREVIEW:  emitBtn('M'); break;   // the on-glass mirror
+        case AR_CONTINUE: emitBtn('C'); break;   // type "continue" + Enter
+        case AR_NEWTERM:  emitBtn('T'); break;   // new terminal, focused
+        case AR_SWITCH:   emitBtn('A'); break;   // continue on another account
+      }
+      uiMode = UI_CONDUCTOR;
+    }
+    return;
+  }
   if (uiMode == UI_MENU) {
     if (ev == 'P') menuIdx = (uint8_t)((menuIdx + MENU_COUNT - 1) % MENU_COUNT);
     else if (ev == 'N') menuIdx = (uint8_t)((menuIdx + 1) % MENU_COUNT);
@@ -2014,6 +2091,7 @@ static void fourthTap() {
   // you the run but not the screen you were on.
   if (uiMode == UI_GAME)      { if (game.fourth()) uiMode = UI_MENU;
                                 requestRender(); return; }
+  if (uiMode == UI_ACTIONS)   { uiMode = UI_CONDUCTOR; requestRender(); return; }
   if (uiMode == UI_MENU)      { uiMode = UI_CONDUCTOR; requestRender(); return; }
   if (uiMode == UI_PAGE) {
     // One level at a time, the same rule the game follows. About is reached
@@ -2024,7 +2102,13 @@ static void fourthTap() {
     uiMode = UI_MENU; resetArmedMs = 0;
     requestRender(); return;
   }
-  onButton('M');                              // CONDUCTOR: toggle the mirror
+  // CONDUCTOR: open the ACTIONS sheet. This used to toggle the mirror directly;
+  // the mirror is now the second item on the sheet, one more press away, which
+  // is the price of the other four being reachable at all.
+  actIdx = 0;                                 // always open on the same row
+  uiMode = UI_ACTIONS;
+  notePoke();
+  requestRender();
 }
 
 static void fourthDoubleTap() {
