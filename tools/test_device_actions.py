@@ -197,13 +197,20 @@ try:
     for n_ in ("zeta", "alpha", "mid"):
         os.makedirs(os.path.join(accts, n_), exist_ok=True)
     _d.ACCOUNTS_DIR = accts
+    # 'default' leads the list and the profiles follow it, sorted. It is the
+    # ~/.claude login and NOT a directory under the profiles root, so listing
+    # only that root let the device switch away from the main account with no
+    # way back to it.
     check("saved accounts are listed in a stable, sorted order",
-          _d.account_profiles() == ["alpha", "mid", "zeta"])
+          _d.account_profiles() == ["default", "alpha", "mid", "zeta"])
     check("...and capped at what the device's picker can show",
           len(_d.account_profiles()) <= _d.ACCT_MAX)
+    check("...and 'default' points at ~/.claude, not at a profile directory",
+          _d.account_dir("default") == os.path.expanduser("~/.claude")
+          and _d.account_dir("alpha") == os.path.join(accts, "alpha"))
     _d.ACCOUNTS_DIR = os.path.join(tmp, "no-such-dir")
-    check("a missing profiles dir yields no accounts, not a crash",
-          _d.account_profiles() == [])
+    check("a missing profiles dir still offers the default login, not a crash",
+          _d.account_profiles() == ["default"])
 
     n = len(dlog)
     os.write(m_fd, b"B|Z\n")

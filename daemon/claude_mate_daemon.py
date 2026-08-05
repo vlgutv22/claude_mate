@@ -87,7 +87,7 @@ import time
 import urllib.parse
 import wave
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 try:
     import serial  # pyserial
@@ -1526,19 +1526,52 @@ ACCOUNTS_DIR = os.path.expanduser(
 ACCT_MAX = 5                       # what the device's picker can show
 
 
-def account_profiles() -> List[str]:
+def account_profiles(limit: int = ACCT_MAX) -> List[str]:
     """The SAVED logins, in a stable order both ends agree on.
 
-    Each is a profile directory under ~/.claude-accounts holding its own
-    credentials. Sorted, so the index the device sends back means the same name
-    the daemon sent -- an ordering that drifted between the two would switch you
-    to the wrong account, which is the one mistake this must not make.
+    'default' first -- it is the ~/.claude login, usually the main one, and it
+    is not a directory under the profiles root, so listing only that root left
+    the device able to switch AWAY from your main account and never back to it.
+    The rest are profile directories under ~/.claude-accounts, each holding its
+    own credentials, sorted -- so the index the device sends back means the same
+    name the daemon sent. An ordering that drifted between the two ends would
+    switch you to the wrong account, which is the one mistake this must not make.
     """
     try:
-        return sorted(d for d in os.listdir(ACCOUNTS_DIR)
-                      if os.path.isdir(os.path.join(ACCOUNTS_DIR, d)))[:ACCT_MAX]
+        rest = sorted(d for d in os.listdir(ACCOUNTS_DIR)
+                      if os.path.isdir(os.path.join(ACCOUNTS_DIR, d)))
     except OSError:
-        return []
+        rest = []
+    names = ["default"] + rest
+    return names[:limit] if limit else names
+
+
+def account_dir(name: str) -> str:
+    """A profile's config dir. 'default' is ~/.claude, which is NOT under the
+    profiles root -- the same rule claude-mate-switch follows."""
+    return (os.path.expanduser("~/.claude") if name == "default"
+            else os.path.join(ACCOUNTS_DIR, name))
+
+
+# What the device was ACTUALLY told, in order. The device answers with an index,
+# so the only list that can decode it is the one it was sent -- not a fresh
+# listdir at press time. Profiles appear and disappear while the device is
+# linked (starting a session on a new name creates one), and a name sorting into
+# the middle renumbers every row below it: the device would still be showing the
+# old rows and the press would land on the neighbour. Switching to an account
+# you did not choose is the one mistake this feature must not make.
+_pushed_accounts: List[str] = []
+_pushed_lock = threading.Lock()
+
+
+def set_pushed_accounts(names: List[str]) -> None:
+    with _pushed_lock:
+        _pushed_accounts[:] = list(names)
+
+
+def pushed_accounts() -> List[str]:
+    with _pushed_lock:
+        return list(_pushed_accounts)
 
 
 _wrap_mod: Any = None
@@ -1597,13 +1630,17 @@ def wrapper_ctrl_send(ctrl: str, cmd: str) -> bool:
         c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         c.settimeout(2.0)
         c.connect(ctrl)
-        c.sendall(cmd.encode("ascii") + b"\n")
+        # utf-8, not ascii: a command can carry a profile name, and a profile is
+        # a directory the user named. `.encode("ascii")` on one with an accent in
+        # it raises UnicodeEncodeError -- not an OSError, so it escaped the
+        # handler below and killed the calling thread instead of failing the send.
+        c.sendall(cmd.encode("utf-8", "replace") + b"\n")
+        buf = b""
         try:
             deadline = time.monotonic() + WRAPPER_ACK_TIMEOUT_S
             c.settimeout(WRAPPER_LIVE_TIMEOUT_S)   # a live wrapper 'go's in ms
-            buf = b""
-            while b"ok" not in buf:
-                chunk = c.recv(16)
+            while b"ok" not in buf and not buf.startswith(b"err"):
+                chunk = c.recv(64)
                 if not chunk:          # EOF: pre-ack wrapper (or already done)
                     break
                 buf += chunk
@@ -1611,6 +1648,13 @@ def wrapper_ctrl_send(ctrl: str, cmd: str) -> bool:
         except socket.timeout:
             log(f"wrapper {cmd} ack timeout ({ctrl}); continuing")
         c.close()
+        # A wrapper that REFUSES says so ('err <why>') rather than closing
+        # silently, and the caller must not report the command as done: the
+        # device would show a switch that never happened.
+        if buf.startswith(b"err"):
+            log(f"wrapper refused {cmd!r}: "
+                f"{buf.decode('utf-8', 'replace').strip()[4:] or 'no reason given'}")
+            return False
         return True
     except OSError as exc:
         log(f"wrapper {cmd} failed ({ctrl}): {exc}")
@@ -2233,9 +2277,13 @@ class ButtonReader(threading.Thread):
         Switching accounts does NOT mean logging in again. Every one of these is
         a login you already have -- a profile directory under
         ~/.claude-accounts, holding its own credentials -- and the switch
-        continues this conversation there. The index is this daemon's own
-        ordering from the L| lines it pushed, so the device and the Mac cannot
-        disagree about which name row 3 was.
+        continues this conversation there. The index is decoded against the list
+        the device was actually PUSHED (the L| lines it is showing), never
+        against a fresh reading of the profiles directory: the two are read at
+        different moments, and a profile created in between -- which happens
+        simply by starting a session on a new name -- renumbers our list while
+        the glass still shows the old rows, so row 3 would no longer be the name
+        the device is highlighting.
 
         The wrapper does the work: it owns the claude process, so it is the only
         thing that can replace it.
@@ -2247,11 +2295,12 @@ class ButtonReader(threading.Thread):
         if not sess.focus_ctrl:
             log(f"SWITCH -> {sess.name}: not a wrapped session")
             return
-        names = account_profiles()
+        names = pushed_accounts()
         try:
             name = names[int(index)]
         except (ValueError, IndexError):
-            log(f"SWITCH -> {sess.name}: no saved account at index {index!r}")
+            log(f"SWITCH -> {sess.name}: index {index!r} names no account the "
+                f"device was sent ({names or 'nothing pushed yet'})")
             return
 
         def run() -> None:
@@ -2400,10 +2449,12 @@ class Ticker(threading.Thread):
     ticking (the frame is re-sent only when its bytes actually change), and
     keeps the LED honest."""
 
-    def __init__(self, screen: Screen, registry: Registry) -> None:
+    def __init__(self, screen: Screen, registry: Registry,
+                 on_slow_tick: Optional[Callable[[], None]] = None) -> None:
         super().__init__(name="ticker", daemon=True)
         self._screen = screen
         self._reg = registry
+        self._slow = on_slow_tick        # every 5 s, alongside the prune
         self._stop_evt = threading.Event()  # NOT `_stop`: Thread.join() calls its own _stop()
         self._last_prune = 0.0
 
@@ -2415,6 +2466,11 @@ class Ticker(threading.Thread):
             if now - self._last_prune >= 5.0:
                 self._reg.prune()
                 self._last_prune = now
+                if self._slow:
+                    try:
+                        self._slow()
+                    except Exception as exc:   # housekeeping must never stop the tick
+                        log(f"slow tick: {exc}")
             self._screen.notify_change()
             self._stop_evt.wait(1.0)
 
@@ -2625,19 +2681,45 @@ def main(argv: Optional[List[str]] = None) -> int:
         names = account_profiles()
         if not names:
             return
+        # Say what will not fit rather than quietly showing the first five: a
+        # picker that silently omits the account you were looking for reads as
+        # "that login is gone".
+        hidden = len(account_profiles(0)) - len(names)
+        if hidden > 0:
+            log(f"accounts: {hidden} more not shown -- the picker holds {ACCT_MAX}")
         chips = [""] * len(names)
         if with_chips:
             for i, n in enumerate(names):
-                chips[i] = account_headroom_chip(os.path.join(ACCOUNTS_DIR, n))
+                # "" -- not the expanded path -- is how the wrapper spells "the
+                # default login". Claude Code suffixes the Keychain service with
+                # a hash of $CLAUDE_CONFIG_DIR only for profiles; ~/.claude's
+                # entry has no suffix, so passing its path finds no token and
+                # the account lists with no limit -- the one number the choice
+                # is actually made on.
+                chips[i] = account_headroom_chip("" if n == "default"
+                                                 else account_dir(n))
+        sent = 0
         for i, n in enumerate(names):
             try:
-                link.write_line(f"L|{i}|{len(names)}|{n[:14]}|{chips[i]}")
+                # The RETURN VALUE, not just the absence of an exception: a
+                # closed port answers False rather than raising, and counting
+                # that as sent would leave us decoding the device's presses
+                # against a list it never received.
+                if not link.write_line(f"L|{i}|{len(names)}|{n[:14]}|{chips[i]}"):
+                    break
+                sent = i + 1
             except Exception as exc:
                 log(f"accounts: {exc}")
-                return
+                break
+        # Only what actually went out: a burst cut short leaves the device
+        # holding the rows it got, and that prefix is what its indices mean.
+        set_pushed_accounts(names[:sent])
+        if not sent:
+            log("saved accounts: nothing reached the device (link down)")
+            return
         log("saved accounts -> device: " +
             ", ".join(f"{i}:{n}{(' ' + chips[i]) if chips[i] else ''}"
-                      for i, n in enumerate(names)))
+                      for i, n in enumerate(names[:sent])))
 
     def push_accounts() -> None:
         """Names first, then chips once the network has answered.
@@ -2655,6 +2737,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         threading.Thread(target=enrich, name="acct-usage", daemon=True).start()
 
     _handshake_extra.append(push_accounts)
+
+    def refresh_accounts() -> None:
+        """Re-push when the saved logins have changed under us.
+
+        The handshake is the only other push, and profiles come and go while the
+        device stays linked -- picking a new name at the wrapper's account prompt
+        creates one. Since the device answers with an INDEX, a list that drifts
+        here and not there does not merely look stale, it decodes to the wrong
+        name. Cheap: one listdir, and a push only on a real difference."""
+        if account_profiles() != pushed_accounts():
+            push_accounts()
 
     web = None
     if args.web:
@@ -2706,7 +2799,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     button_reader.on_ack = on_ack
     button_reader.bridge = web
     maintainer = SerialMaintainer(link, screen)
-    ticker = Ticker(screen, registry)
+    ticker = Ticker(screen, registry, on_slow_tick=refresh_accounts)
 
     threads: List[threading.Thread] = [
         socket_server,

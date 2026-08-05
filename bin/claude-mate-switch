@@ -110,11 +110,20 @@ def headroom(cfg_dir):
 
 
 def all_accounts():
-    """Every profile including 'default', with email and remaining headroom."""
+    """Every profile including 'default', with email and remaining headroom.
+
+    Note the two different spellings of "the default login". Its email comes
+    from ~/.claude.json, which is NOT inside ~/.claude, so account_email wants
+    None; its token comes from a Keychain entry whose service name is suffixed
+    with a hash of $CLAUDE_CONFIG_DIR *only for profiles*, so _access_token
+    wants ''. Handing it the expanded ~/.claude path looks right and finds
+    nothing -- the default account then listed with no limit and --best could
+    never choose it, which for most people excludes their main login from the
+    one question this tool asks."""
     out = []
     for name in ["default"] + W.list_profiles():
         d = profile_dir(name)
-        chip, pct = headroom(d)
+        chip, pct = headroom("" if name == "default" else d)
         out.append({"name": name, "dir": d,
                     "email": W.account_email(None if name == "default" else d),
                     "chip": chip, "pct": pct})
@@ -137,7 +146,45 @@ def target_transcript(ctx, dest_cfg):
 
 
 def domain_of(email):
-    return email.rsplit("@", 1)[-1].lower() if "@" in (email or "") else ""
+    # One implementation, in the wrapper: the same comparison decides whether
+    # the wrapper refuses a device-initiated switch and whether this prompts,
+    # and the two must not be able to disagree about what an organisation is.
+    return W.email_domain(email)
+
+
+# Flags that name a DIFFERENT conversation than the one we are carrying. They
+# are dropped on the way through; --resume <id> replaces them. The value is
+# optional for some (claude's --from-pr and --resume both take one or not), so
+# a following word that is not itself a flag goes with them -- leaving it behind
+# would hand claude a stray positional, which it reads as an initial prompt.
+_CONV_FLAGS = {"--resume", "-r", "--continue", "-c", "--from-pr",
+               "--session-id", "--fork-session"}
+
+
+def resume_argv(ctx, sid):
+    """The flags to restart claude with: the ones this session was started with,
+    minus anything naming another conversation, plus --resume <id>.
+
+    Not cosmetic. Resuming with a bare --resume drops the session's character on
+    the floor -- a --dangerously-skip-permissions session comes back asking to
+    confirm every tool call, a chosen --model or --effort reverts to the default
+    -- so the conversation survives the switch but the way you were working it
+    does not."""
+    argv = list(ctx.get("argv") or [])
+    out, i = [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a in _CONV_FLAGS:
+            i += 1
+            if i < len(argv) and not argv[i].startswith("-"):
+                i += 1                      # its value, if it took one
+            continue
+        if a.split("=", 1)[0] in _CONV_FLAGS:
+            i += 1                          # --resume=<id> style
+            continue
+        out.append(a)
+        i += 1
+    return out + ["--resume", sid]
 
 
 def switch(ctx, dest, dry_run=False, yes=False):
@@ -165,6 +212,11 @@ def switch(ctx, dest, dry_run=False, yes=False):
               f"different\n        organisation's account and replays it to "
               f"that account's API.")
         if not (dry_run or yes):
+            # No terminal means nobody can answer, and "nobody answered" must
+            # never read as consent for this particular question.
+            if not sys.stdin.isatty():
+                sys.exit("  aborted: this needs a typed confirmation and there "
+                         "is no terminal to type it in.")
             try:
                 if input("  type the target domain to confirm: ").strip().lower() != b:
                     sys.exit("  aborted.")
@@ -179,7 +231,26 @@ def switch(ctx, dest, dry_run=False, yes=False):
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copy2(src, dst)          # copy2: keep mtime, so --resume ordering holds
     except OSError as exc:
-        sys.exit(f"claude-mate-switch: copy failed: {exc}")
+        # The wrapper has already ended claude to get here, so say plainly that
+        # the conversation still exists and how to walk back into it. A dead
+        # terminal plus an errno is not a recoverable position for anyone.
+        sys.exit(f"claude-mate-switch: copy failed: {exc}\n"
+                 f"  Nothing moved. The conversation is intact on "
+                 f"{ctx['account']}:\n"
+                 f"    cd {ctx.get('cwd') or '.'} && claude --resume "
+                 f"{ctx['session_id']}")
+
+    # Resume WHERE THE CONVERSATION LIVES. `claude --resume <id>` looks for the
+    # transcript under the project directory derived from the current directory,
+    # so resuming from anywhere else finds nothing -- "No conversation found with
+    # session ID", with the copy sitting correctly in place one directory away.
+    # The switch can be started from another terminal (--tty) or from a shell
+    # that has since cd'd, which is exactly when this bites.
+    if ctx.get("cwd") and os.path.isdir(ctx["cwd"]):
+        try:
+            os.chdir(ctx["cwd"])
+        except OSError as exc:
+            sys.exit(f"claude-mate-switch: cannot enter {ctx['cwd']}: {exc}")
 
     # Re-exec through the WRAPPER, not bare claude: the new session must be
     # tracked and reported to the daemon exactly like the old one, or the device
@@ -190,9 +261,13 @@ def switch(ctx, dest, dry_run=False, yes=False):
     else:
         env["CLAUDE_CONFIG_DIR"] = dest["dir"]
     env["CLAUDE_MATE_ACCOUNT"] = dest["name"]          # skip the picker
+    if not dest["email"]:
+        print(f"\n  NOTE: no login recorded for {dest['name']}. If claude asks you "
+              f"to /login,\n        the conversation is already copied -- finish "
+              f"the login and it resumes.")
     print(f"\n  resuming on {dest['name']}...\n")
-    os.execve(sys.executable, [sys.executable, WRAP,
-                               "--resume", ctx["session_id"]], env)
+    os.execve(sys.executable,
+              [sys.executable, WRAP] + resume_argv(ctx, ctx["session_id"]), env)
 
 
 def main():

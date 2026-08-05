@@ -534,22 +534,37 @@ def ctrl_listener():
                     conn.sendall(b"ok\n")
                 except OSError:
                     pass
-            elif data.startswith("switch"):
-                # Continue this conversation on another account. Recorded, then
-                # the child is asked to exit; the exec happens in main's tail so
-                # the terminal is restored first and we are not replacing the
-                # process from inside a socket handler.
+            elif data == "switch" or data.startswith("switch "):
+                # Continue this conversation on another account. Exact verb, not
+                # a prefix: everything else here matches loosely, but this one
+                # ENDS the session, so it must never be triggered by a command
+                # that merely starts with the same six letters.
+                #
+                # Checked before the child is touched, and refused with 'err' so
+                # the daemon can say why. A switch kills claude to do its work;
+                # discovering afterwards that it cannot proceed costs the session
+                # for nothing -- which is what a device press into a fresh
+                # session used to do (claude died, then "no transcript recorded
+                # for this terminal yet", and the terminal was back at a shell).
                 global g_switch_req
-                g_switch_req = data[6:].strip() or "--best"
-                try:
-                    conn.sendall(b"ok\n")
-                except OSError:
-                    pass
-                if g_child_pid > 0:
+                req = data[6:].strip() or "--best"
+                why = switch_refusal(req)
+                if why:
                     try:
-                        os.kill(g_child_pid, signal.SIGTERM)
+                        conn.sendall(f"err {why}\n".encode("utf-8", "replace"))
                     except OSError:
                         pass
+                else:
+                    g_switch_req = req
+                    try:
+                        conn.sendall(b"ok\n")
+                    except OSError:
+                        pass
+                    if g_child_pid > 0:
+                        try:
+                            os.kill(g_child_pid, signal.SIGTERM)
+                        except OSError:
+                            pass
             else:
                 known = data.startswith("focus") or data.startswith("collapse")
                 if known:
@@ -626,6 +641,15 @@ g_wake_w = -1                      # relay's self-pipe write end; set by main()
 # to find out which conversation to carry.
 g_switch_req = ""
 g_child_pid = -1
+
+# What this session IS, for the tracker and for anything that has to recreate
+# it: the conversation id we handed claude (see session_argv) and the flags the
+# user started with. The flags matter -- a switch that resumes without them
+# silently drops --dangerously-skip-permissions, --model, --effort and the rest,
+# so you land in a different session than the one you were carrying.
+g_claude_sid = ""
+g_user_argv = []
+g_started_at = 0.0
 
 def queue_input(data: bytes):
     """Hand keystrokes to the relay from another thread."""
@@ -1062,6 +1086,12 @@ def account_email(cfg_dir=None):
     except (OSError, ValueError):
         return ""
 
+def email_domain(email):
+    """The organisation half of a login, lowercased ('' if there is none).
+    Two accounts whose domains differ are two tenancies, which is the one
+    distinction a switch is not allowed to make quietly."""
+    return email.rsplit("@", 1)[-1].lower() if "@" in (email or "") else ""
+
 def list_profiles():
     try:
         return sorted(d for d in os.listdir(ACCOUNTS_DIR)
@@ -1257,6 +1287,131 @@ def usage_poller():
 CTX_DIR = os.path.join(tempfile.gettempdir(), f"claude-mate-ctx-{os.getuid()}")
 CTX_STALE_S = 900.0          # a context not refreshed for this long is dead
 
+# --------------------------------------------------------------------------- #
+# Which conversation is THIS one — asked, not guessed
+# --------------------------------------------------------------------------- #
+# Everything above hangs off one fact: which transcript file belongs to this
+# terminal. Claude Code names it <session-id>.jsonl, so the honest way to know
+# is to CHOOSE the id and hand it to claude (`--session-id`), instead of looking
+# at a directory afterwards and picking the newest file. That guess was wrong in
+# the field, and wrong in the worst possible way: two terminals, two projects,
+# and a switch that copied the OTHER project's 7 MB conversation into a
+# different organisation's account.
+#
+# Only a fresh session can be told its id. --resume <id> already names one;
+# --continue, a bare --resume and --from-pr do not, and claude rejects
+# --session-id next to them -- those fall back to the (now verified) scan below.
+#
+# Whether a given claude HAS that flag is remembered, never waited for. The only
+# way to ask is to run `claude --help`, and nothing may sit in front of a
+# terminal you just opened: a binary that answers slowly -- or is not really
+# claude and answers never -- would hold the session there. So a cold cache
+# means "no id this time" (the verified scan below still works) and the answer
+# is fetched in the background for the next session. It changes only when the
+# binary does.
+def caps_path():
+    return os.path.join(CTX_DIR, "claude-caps.json")
+
+def _caps_key(binary):
+    try:
+        st = os.stat(binary)
+    except OSError:
+        return ""
+    return f"{binary}:{int(st.st_mtime)}:{st.st_size}"
+
+def _caps_load():
+    """{binary-key: has-the-flag}. One entry per binary rather than one entry
+    full stop: a machine can have more than one claude on it (an upgrade
+    mid-flight, a $CLAUDE_REAL pointing somewhere else), and a single-slot cache
+    would have them evicting each other forever."""
+    try:
+        with open(caps_path()) as fh:
+            blob = json.load(fh)
+        return blob if isinstance(blob, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+def claude_caps_cached(binary):
+    """True / False for a remembered answer, None if we have never asked."""
+    key = _caps_key(binary)
+    if not key:
+        return None
+    val = _caps_load().get(key)
+    return None if val is None else bool(val)
+
+def probe_session_id_support(binary):
+    """Ask the binary and remember the answer. Returns what it found.
+
+    stdin is /dev/null on purpose: this runs while a session is live, and a
+    subprocess sharing the terminal's stdin would eat the user's keystrokes."""
+    key = _caps_key(binary)
+    if not key:
+        return False
+    try:
+        out = subprocess.run([binary, "--help"], capture_output=True,
+                             stdin=subprocess.DEVNULL, timeout=20)
+    except Exception:
+        return False                      # probe never ran: remember nothing
+    ok = b"--session-id" in (out.stdout or b"") + (out.stderr or b"")
+    blob = _caps_load()
+    blob.pop(key, None)
+    blob = dict(list(blob.items())[-3:])        # the last few binaries, no more
+    blob[key] = ok
+    try:
+        os.makedirs(CTX_DIR, mode=0o700, exist_ok=True)
+        tmp = caps_path() + f".{os.getpid()}.tmp"
+        with open(tmp, "w") as fh:
+            json.dump(blob, fh)
+        os.replace(tmp, caps_path())            # atomic: two sessions may probe
+    except OSError:
+        pass
+    return ok
+
+def warm_claude_caps():
+    """Fetch the answer for next time, off the startup path. Called from the
+    parent AFTER the PTY fork -- a thread running across fork() is how a child
+    ends up deadlocked on a lock nobody will release."""
+    rc = real_claude()
+    if rc and claude_caps_cached(rc) is None:
+        threading.Thread(target=probe_session_id_support, args=(rc,),
+                         daemon=True).start()
+
+def session_argv(argv):
+    """(argv to give claude, the session id we will KNOW it is using).
+
+    Returns the id unchanged when the user's own flags already name one, ''
+    when claude alone decides it (--continue, bare --resume, --fork-session),
+    and otherwise mints one and passes it down."""
+    named, resuming, fork = "", False, False
+    for i, a in enumerate(argv):
+        nxt = argv[i + 1] if i + 1 < len(argv) else ""
+        if a == "--session-id" and nxt:
+            named = named or nxt
+        elif a.startswith("--session-id="):
+            named = named or a.split("=", 1)[1]
+        elif a in ("--resume", "-r"):
+            resuming = True
+            if nxt and not nxt.startswith("-"):
+                named = named or nxt          # --resume <id>: that IS the id
+        elif a.startswith("--resume="):
+            resuming = True
+            named = named or a.split("=", 1)[1]
+        elif a in ("--continue", "-c") or a == "--from-pr" or a.startswith("--from-pr="):
+            resuming = True
+        elif a == "--fork-session":
+            fork = True                       # claude mints an id we are not told
+    if fork:
+        return argv, ""
+    if named:
+        return argv, named
+    if resuming:
+        return argv, ""
+    rc = real_claude()
+    if not rc or claude_caps_cached(rc) is not True:
+        return argv, ""       # unknown or too old: the scan below still works
+    sid = str(uuid.uuid4())
+    return argv + ["--session-id", sid], sid
+
 def ctx_key(tty=None):
     """Identify a terminal. The tty device name with the path stripped; a
     pid-derived fallback for the (wrapped-but-not-a-tty) cases that never reach
@@ -1267,40 +1422,95 @@ def ctx_key(tty=None):
 def ctx_path(tty=None):
     return os.path.join(CTX_DIR, ctx_key(tty) + ".json")
 
-def find_transcript(cfg_dir, cwd, since=0.0):
+def project_dir_names(cwd):
+    """The directory names Claude Code might have mangled this cwd into.
+
+    The rule is undocumented and it is NOT just '/' -> '-': '_' and '.' are
+    mangled too, so /Users/x/Projects/claude_mate lives in
+    -Users-x-Projects-claude-mate. Getting that wrong is what broke the old
+    guess -- the name never matched, so the search fell through to "newest
+    .jsonl anywhere". Hence a SET of candidates, used only to order the search
+    and to break a tie for a transcript too young to say where it belongs;
+    never as the answer on its own."""
+    return {cwd.replace("/", "-"), re.sub(r"[/._]", "-", cwd)}
+
+def transcript_cwd(path, lines=12):
+    """The working directory Claude Code recorded INSIDE a transcript, or ''.
+
+    The only authority on which directory a conversation belongs to, and the
+    reason this no longer has to trust a filename. The first records are session
+    metadata with no cwd, so read a few lines rather than one."""
+    try:
+        with open(path, errors="ignore") as fh:
+            for _ in range(lines):
+                line = fh.readline()
+                if not line:
+                    break
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict) and rec.get("cwd"):
+                    return rec["cwd"]
+    except OSError:
+        pass
+    return ""
+
+def find_transcript(cfg_dir, cwd, since=0.0, sid=""):
     """This session's transcript file, or ''.
 
-    Claude Code writes <cfg>/projects/<mangled-cwd>/<session-id>.jsonl. The
-    mangling is not documented and this code deliberately does NOT reproduce it:
-    it globs every project directory and takes the newest .jsonl touched since
-    we started, which is correct however the name is derived. `since` is what
-    keeps it honest -- without it the newest file from some OTHER directory's
-    session would look like ours."""
+    Claude Code writes <cfg>/projects/<mangled-cwd>/<session-id>.jsonl. With an
+    id in hand (the normal case now -- see session_argv) the file is simply the
+    one with that name, wherever the mangling put it: no heuristic, no tie to
+    break, and correct even for a session that has not typed anything yet.
+
+    Without one, fall back to scanning -- but VERIFY. A candidate is accepted
+    only if the cwd recorded inside it is this one; a file too new to have
+    recorded anything is accepted only from a directory whose name is a
+    plausible mangling of this cwd. The old version took the newest .jsonl from
+    any project directory, which is how a switch in one terminal walked off with
+    another terminal's conversation."""
     root = os.path.join(cfg_dir or os.path.expanduser("~/.claude"), "projects")
-    best, best_mtime = "", since
     try:
         entries = os.listdir(root)
     except OSError:
         return ""
-    # Prefer the directory whose name is this cwd with the separators mangled --
-    # every observed name is exactly that -- but fall back to scanning all of
-    # them rather than returning nothing if the rule ever changes.
-    guess = cwd.replace("/", "-")
-    order = ([guess] if guess in entries else []) + [e for e in entries if e != guess]
+
+    if sid:
+        for name in entries:
+            p = os.path.join(root, name, sid + ".jsonl")
+            if os.path.exists(p):
+                return p
+        return ""
+
+    names = project_dir_names(cwd)
+    here = os.path.realpath(cwd)
+    best, best_mtime = "", since
+    order = ([e for e in entries if e in names]
+             + [e for e in entries if e not in names])
     for name in order:
         d = os.path.join(root, name)
         try:
-            for fn in os.listdir(d):
-                if not fn.endswith(".jsonl"):
-                    continue
-                p = os.path.join(d, fn)
-                m = os.path.getmtime(p)
-                if m > best_mtime:
-                    best, best_mtime = p, m
+            listing = os.listdir(d)
         except OSError:
             continue
-        if best and name == guess:
-            break                     # the cwd's own directory wins outright
+        for fn in listing:
+            if not fn.endswith(".jsonl"):
+                continue
+            p = os.path.join(d, fn)
+            try:
+                m = os.path.getmtime(p)
+            except OSError:
+                continue
+            if m <= best_mtime:
+                continue
+            rec = transcript_cwd(p)
+            if rec:
+                if os.path.realpath(rec) != here:
+                    continue          # another directory's conversation
+            elif name not in names:
+                continue              # unverifiable AND not our project dir
+            best, best_mtime = p, m
     return best
 
 def ctx_write(state="", started=0.0):
@@ -1310,7 +1520,7 @@ def ctx_write(state="", started=0.0):
     try:
         os.makedirs(CTX_DIR, mode=0o700, exist_ok=True)
         cfg = os.environ.get("CLAUDE_CONFIG_DIR", "")
-        transcript = find_transcript(cfg, os.getcwd(), started)
+        transcript = find_transcript(cfg, os.getcwd(), started, g_claude_sid)
         blob = json.dumps({
             "tty": MY_TTY,
             "pid": os.getpid(),
@@ -1319,6 +1529,9 @@ def ctx_write(state="", started=0.0):
             "config_dir": cfg,
             "transcript": transcript,
             "session_id": (os.path.basename(transcript)[:-6] if transcript else ""),
+            # The flags this session was started with, so a switch can resume it
+            # as the same kind of session rather than a default one.
+            "argv": list(g_user_argv),
             "state": state,
             "limit": g_meta.get("limit", ""),
             "model": g_meta.get("model", ""),
@@ -1340,6 +1553,51 @@ def ctx_clear():
         os.unlink(ctx_path())
     except OSError:
         pass
+
+def switch_argv(req):
+    """The switcher's argv for a `switch` request.
+
+    An account name is ONE argument, however many spaces are in it: a profile is
+    a directory the user named, and "work 2" is a perfectly ordinary name for
+    one. Splitting on whitespace turned it into two arguments and the switcher
+    rejected the second -- after claude had already been killed for it. Only a
+    flag request ('--best') is a list of words."""
+    req = (req or "").strip()
+    return req.split() if req.startswith("-") else [req]
+
+def switch_refusal(req):
+    """Why a switch request cannot be honoured, or '' if it can.
+
+    Answered BEFORE claude is asked to exit. The wrapper has to end the session
+    to switch it, so a refusal discovered on the way out costs you the session
+    and gives nothing back: pressing the device's account button in a session
+    that had not spoken yet killed claude, printed "no transcript recorded for
+    this terminal yet", and left a shell prompt. Every reason that can be known
+    up front is checked up front."""
+    name = "" if req.startswith("-") else req      # otherwise it is a flag
+    if name:
+        if name == account_label():
+            return f"already on {name}"
+        if name != "default" and not os.path.isdir(os.path.join(ACCOUNTS_DIR, name)):
+            return f"no such account: {name}"
+        # A move between ORGANISATIONS is a decision, and the switcher's rule is
+        # that a human types the target domain to make it. A button on a desk
+        # device cannot type, and the device is not even told the emails -- it
+        # offers names and remaining-limit chips, so the natural way to use it
+        # (pick whichever has headroom left) is exactly how you would cross the
+        # boundary without meaning to. Refuse, and say where to do it
+        # deliberately. This is the check that makes the switcher's --yes safe.
+        here = account_email(os.environ.get("CLAUDE_CONFIG_DIR") or None)
+        there = account_email(None if name == "default"
+                              else os.path.join(ACCOUNTS_DIR, name))
+        a, b = email_domain(here), email_domain(there)
+        if a and b and a != b:
+            return (f"{a} -> {b} is another organisation; confirm it yourself "
+                    f"with: claude-mate-switch {name!r}")
+    if not find_transcript(os.environ.get("CLAUDE_CONFIG_DIR", ""),
+                           os.getcwd(), g_started_at, g_claude_sid):
+        return "nothing to carry yet -- say something to claude first"
+    return ""
 
 # --------------------------------------------------------------------------- #
 # Main
@@ -1366,12 +1624,22 @@ def main():
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         exec_real_claude(sys.argv[1:])
 
+    # Name the conversation before starting it, so the tracker never has to
+    # guess which transcript is ours (see session_argv). Deliberately AFTER the
+    # two unwrapped exec paths above: an unwrapped claude feeds no tracker and
+    # must run exactly as the user typed it. g_user_argv keeps the user's own
+    # flags so a switch can resume as the same kind of session.
+    global g_user_argv, g_claude_sid
+    g_user_argv = list(sys.argv[1:])
+    sys.argv[1:], g_claude_sid = session_argv(sys.argv[1:])
+
     rows, cols = get_winsize(sys.stdin.fileno())
 
     pid, master_fd = pty.fork()
     if pid > 0:
         global g_child_pid
         g_child_pid = pid          # so a `switch` can ask claude to stand down
+        warm_claude_caps()         # for the NEXT session; costs this one nothing
     if pid == 0:
         # Child: become the real claude.
         exec_real_claude(sys.argv[1:])
@@ -1494,7 +1762,9 @@ def main():
     # written once. `_started` is what stops find_transcript() from adopting a
     # stale file that some earlier session left in this directory.
     _started = time.time()
-    ctx_write("idle", _started)
+    global g_started_at
+    g_started_at = _started            # the ctrl thread needs it too, to answer
+    ctx_write("idle", _started)        # "is there anything here to carry yet?"
     def monitor():
         while _running[0]:
             time.sleep(POLL_MS)
@@ -1749,9 +2019,16 @@ def main():
             sys.stdout.flush()
         except Exception:
             pass
+        # No --yes. The one thing that flag skips is the cross-organisation
+        # confirmation, and passing it unconditionally meant a device press
+        # could move a conversation into another org's account -- printing the
+        # warning to a terminal nobody was sitting at and proceeding anyway.
+        # switch_refusal() has already turned that case away, before claude was
+        # killed for it; anything that gets this far is same-org or unknowable,
+        # neither of which prompts.
         try:
-            os.execv(sys.executable,
-                     [sys.executable, switcher, "--yes"] + g_switch_req.split())
+            os.execv(sys.executable, [sys.executable, switcher]
+                                     + switch_argv(g_switch_req))
         except OSError as exc:
             sys.stderr.write(f"[claude-mate-wrap] switch failed: {exc}\n")
 

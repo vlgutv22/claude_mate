@@ -623,18 +623,31 @@ claude-mate-switch --dry-run work2 # show the move, touch nothing
 
 It works because the wrapper publishes a small **context file per terminal**
 under `$TMPDIR` — which transcript is in flight, under which account, in which
-directory, and how depleted that account is. Temp and per-terminal on purpose:
-it describes a running process, is worthless once that process exits (and is
-unlinked then), and two terminals in the same directory are two different
-conversations that must not carry each other off. A context not refreshed for
-15 minutes is treated as dead rather than resumed.
+directory, with which flags, and how depleted that account is. Temp and
+per-terminal on purpose: it describes a running process, is worthless once that
+process exits (and is unlinked then), and two terminals in the same directory
+are two different conversations that must not carry each other off. A context
+not refreshed for 15 minutes is treated as dead rather than resumed.
+
+Which transcript is *this* terminal's is **asked, not guessed**: the wrapper
+mints the conversation id and hands it to claude (`--session-id`), so the file
+is the one with that name wherever Claude Code's undocumented directory
+mangling puts it. The earlier version looked at the newest `.jsonl` under the
+config dir and picked wrong in the field — a terminal in one project offering
+to carry off another terminal's conversation from another project. Sessions
+that name their own conversation (`--resume`, `--continue`) fall back to a
+search that now verifies the directory recorded *inside* each transcript.
 
 > **One caution.** The copy puts one account's conversation into another
 > account's local store, and resuming replays it to that account's API. Between
 > two of your own profiles that is unremarkable. Between accounts belonging to
 > **different organisations** it may not be — so the tool never switches
 > without being told where, prints the two logins side by side, and if their
-> email domains differ makes you type the target domain to confirm.
+> email domains differ makes you type the target domain to confirm. A switch
+> asked for **from the device** is refused outright in that case: there is no
+> keyboard on a desk gadget to answer with, the picker there offers names and
+> remaining limits rather than emails, and "whichever has headroom left" is
+> exactly how you would cross the boundary without meaning to.
 
 **Account + remaining limit on the device** — each wrapped session reports
 which account it runs as (the profile name, or `default`), shown right-aligned

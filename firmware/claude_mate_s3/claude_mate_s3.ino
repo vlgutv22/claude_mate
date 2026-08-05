@@ -214,6 +214,12 @@ static char    acctName[ACCT_MAX][ACCT_NAME + 1];
 static char    acctChip[ACCT_MAX][ACCT_CHIP + 1];
 static uint8_t acctCount = 0;
 static uint8_t acctIdx   = 0;
+// The account the USER chose, by name. The list is rebuilt in place whenever
+// the Mac re-pushes it, and it always re-pushes at least once: names first,
+// then the same names with their remaining-limit chips a network round trip
+// later -- which arrives exactly while someone is standing at this picker
+// waiting for those chips. Row numbers do not survive that; a name does.
+static char    acctSel[ACCT_NAME + 1] = "";
 static PageId  pageId  = PG_SETTINGS;
 static uint8_t pageIdx = 0;          // selected row within the page
 
@@ -1495,7 +1501,18 @@ static void handleLine(char *line) {
         if (i + 1 > acctCount) acctCount = i + 1;
       }
       if (n > ACCT_MAX) n = ACCT_MAX;
-      if (acctIdx >= acctCount && acctCount) acctIdx = 0;
+      // Follow the NAME, not the row. `i == 0` has just emptied the list, so
+      // every re-push used to collapse the highlight to row 0 -- and the second
+      // push (the one carrying the chips) lands seconds later, while a thumb is
+      // hovering over GO. The selection moved, nothing on screen said so, and
+      // the next press switched to an account nobody chose.
+      if (acctCount) {
+        uint8_t keep = 0xFF;
+        for (uint8_t k = 0; acctSel[0] && k < acctCount; k++)
+          if (!strcmp(acctName[k], acctSel)) { keep = k; break; }
+        if (keep != 0xFF)              acctIdx = keep;
+        else if (acctIdx >= acctCount) acctIdx = 0;
+      }
       if (uiMode == UI_ACCOUNTS) requestRender();
       break;
     }
@@ -2024,12 +2041,24 @@ static void sendSfx(char code) {
 static void menuButton(char ev) {
   if (uiMode == UI_ACCOUNTS) {
     if (!acctCount) { if (ev == 'G' || ev == 'K') uiMode = UI_ACTIONS; return; }
-    if (ev == 'P') { acctIdx = (uint8_t)((acctIdx + acctCount - 1) % acctCount); return; }
-    if (ev == 'N') { acctIdx = (uint8_t)((acctIdx + 1) % acctCount); return; }
+    // Every move re-states the choice by name, which is what survives a re-push.
+    if (ev == 'P' || ev == 'N') {
+      acctIdx = (ev == 'P') ? (uint8_t)((acctIdx + acctCount - 1) % acctCount)
+                            : (uint8_t)((acctIdx + 1) % acctCount);
+      copyField(acctSel, sizeof(acctSel), acctName[acctIdx]);
+      return;
+    }
     if (ev == 'G' || ev == 'K') {
       // B|A<index> -- continue on THAT saved account. The index is the daemon's
       // own ordering from the L| lines it sent, so the two cannot disagree
       // about which name row 3 is.
+      //
+      // Unless a re-push is landing in this instant: the list is rebuilt row by
+      // row, so for the few milliseconds of the burst the highlighted row may
+      // not be the account whose name is selected. Say nothing rather than say
+      // the wrong number -- the next line puts it back and the next press works.
+      if (acctIdx >= acctCount ||
+          (acctSel[0] && strcmp(acctName[acctIdx], acctSel))) return;
       char buf[6] = {'B', '|', 'A', (char)('0' + acctIdx), 0, 0};
       emitLine(buf);
       uiMode = UI_CONDUCTOR;
@@ -2057,6 +2086,7 @@ static void menuButton(char ev) {
           // continue on, so it opens the picker rather than letting the Mac
           // decide. Nothing is sent until you pick one.
           acctIdx = 0;
+          copyField(acctSel, sizeof(acctSel), acctCount ? acctName[0] : "");
           uiMode = UI_ACCOUNTS;
           return;
       }
