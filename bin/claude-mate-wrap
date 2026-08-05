@@ -61,6 +61,16 @@ and the remaining-limit chip (e.g. '5h82%' = 82% of the 5-hour window left,
 'wk31%' = 31% of the week left -- whichever window is more depleted) on the
 model+effort row.
 
+Carrying a conversation to another account: an account is a $CLAUDE_CONFIG_DIR,
+read once at startup, so a session can never change account in place -- and each
+profile keeps its own projects/ tree, so a new one cannot see the old one's
+transcripts. `claude-mate-switch` closes that gap: this wrapper publishes a
+per-terminal context file (which transcript is in flight, under which account,
+in which directory) under $TMPDIR, and the switch copies that transcript into
+the target profile and re-execs `claude --resume`. Temp and per-terminal on
+purpose -- it describes a running process, is worthless once that process is
+gone, and two terminals in one directory are two different conversations.
+
 Config (env):
   CLAUDE_MATE_SOCK          daemon socket (default /tmp/claude-mate.sock)
   CLAUDE_MATE_DEBUG         if set to a path, append screen+state snapshots there
@@ -72,7 +82,8 @@ Config (env):
 Requires: pyte  (pip install pyte)
 """
 import os, sys, pty, tty, termios, fcntl, struct, signal, select, socket, \
-       threading, time, re, json, uuid, subprocess, shutil, atexit, hashlib
+       threading, time, re, json, uuid, subprocess, shutil, atexit, hashlib, \
+       tempfile
 
 try:
     import pyte
@@ -1062,10 +1073,17 @@ def account_label():
         return "default"
     return os.path.basename(os.path.normpath(cfg)).lstrip(".") or "default"
 
-def _access_token():
-    """This session's OAuth access token, or ''. File first (Linux / explicit
-    installs), then the Keychain (the macOS default)."""
-    cfg = os.environ.get("CLAUDE_CONFIG_DIR", "")
+def _access_token(cfg=None):
+    """OAuth access token for a config dir, or ''. File first (Linux / explicit
+    installs), then the Keychain (the macOS default).
+
+    `cfg` defaults to THIS session's config dir. It is a parameter so
+    claude-mate-switch can read another profile's remaining limit without
+    running as that profile -- picking a switch target is exactly the question
+    "which of my accounts still has headroom", and answering it needs every
+    profile's token, not just the one we happen to be inside."""
+    if cfg is None:
+        cfg = os.environ.get("CLAUDE_CONFIG_DIR", "")
     path = os.path.join(cfg or os.path.expanduser("~/.claude"),
                         ".credentials.json")
     raw = ""
@@ -1133,6 +1151,112 @@ def usage_poller():
             if lim:
                 g_meta["limit"] = lim
         time.sleep(max(30.0, USAGE_POLL_S))
+
+# --------------------------------------------------------------------------- #
+# Session context tracker — what claude-mate-switch needs to move you
+# --------------------------------------------------------------------------- #
+# An account IS a $CLAUDE_CONFIG_DIR, chosen before exec'ing claude and fixed
+# for the life of the process. So "switch account" can only ever mean "start
+# claude again somewhere else", and the thing that makes that seamless rather
+# than a restart is knowing WHICH conversation was in flight in THIS terminal.
+#
+# Hence a tracker, and hence one file per terminal rather than one per user: two
+# wrapped terminals in the same directory are two different conversations, and a
+# switch in one must not drag the other's transcript along. The tty name is the
+# only identifier that means "this terminal" to both the wrapper and a command
+# the user types into it afterwards.
+#
+# TMP ON PURPOSE. This is live state about a running process -- it is worthless
+# once the process is gone and actively misleading if it outlives it. Kept under
+# the temp dir so a reboot clears it, written 0600 in a 0700 directory (it names
+# working directories and transcript paths), and unlinked by cleanup() on the
+# way out. Stale files from a crash are ignored by mtime, not trusted.
+CTX_DIR = os.path.join(tempfile.gettempdir(), f"claude-mate-ctx-{os.getuid()}")
+CTX_STALE_S = 900.0          # a context not refreshed for this long is dead
+
+def ctx_key(tty=None):
+    """Identify a terminal. The tty device name with the path stripped; a
+    pid-derived fallback for the (wrapped-but-not-a-tty) cases that never reach
+    the tracker anyway, so the key can never be empty."""
+    t = MY_TTY if tty is None else tty
+    return os.path.basename(t) if t else f"pid-{os.getpid()}"
+
+def ctx_path(tty=None):
+    return os.path.join(CTX_DIR, ctx_key(tty) + ".json")
+
+def find_transcript(cfg_dir, cwd, since=0.0):
+    """This session's transcript file, or ''.
+
+    Claude Code writes <cfg>/projects/<mangled-cwd>/<session-id>.jsonl. The
+    mangling is not documented and this code deliberately does NOT reproduce it:
+    it globs every project directory and takes the newest .jsonl touched since
+    we started, which is correct however the name is derived. `since` is what
+    keeps it honest -- without it the newest file from some OTHER directory's
+    session would look like ours."""
+    root = os.path.join(cfg_dir or os.path.expanduser("~/.claude"), "projects")
+    best, best_mtime = "", since
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return ""
+    # Prefer the directory whose name is this cwd with the separators mangled --
+    # every observed name is exactly that -- but fall back to scanning all of
+    # them rather than returning nothing if the rule ever changes.
+    guess = cwd.replace("/", "-")
+    order = ([guess] if guess in entries else []) + [e for e in entries if e != guess]
+    for name in order:
+        d = os.path.join(root, name)
+        try:
+            for fn in os.listdir(d):
+                if not fn.endswith(".jsonl"):
+                    continue
+                p = os.path.join(d, fn)
+                m = os.path.getmtime(p)
+                if m > best_mtime:
+                    best, best_mtime = p, m
+        except OSError:
+            continue
+        if best and name == guess:
+            break                     # the cwd's own directory wins outright
+    return best
+
+def ctx_write(state="", started=0.0):
+    """Publish this terminal's context. Best-effort and never fatal: the tracker
+    is a convenience for a command the user may never run, and must not be able
+    to take down a working session."""
+    try:
+        os.makedirs(CTX_DIR, mode=0o700, exist_ok=True)
+        cfg = os.environ.get("CLAUDE_CONFIG_DIR", "")
+        transcript = find_transcript(cfg, os.getcwd(), started)
+        blob = json.dumps({
+            "tty": MY_TTY,
+            "pid": os.getpid(),
+            "cwd": os.getcwd(),
+            "account": account_label(),
+            "config_dir": cfg,
+            "transcript": transcript,
+            "session_id": (os.path.basename(transcript)[:-6] if transcript else ""),
+            "state": state,
+            "limit": g_meta.get("limit", ""),
+            "model": g_meta.get("model", ""),
+            "started_at": started,
+            "updated_at": time.time(),
+        }, indent=2)
+        # Atomic: a switch running concurrently must never read half a file.
+        p = ctx_path()
+        tmp = p + f".{os.getpid()}.tmp"
+        with open(tmp, "w") as fh:
+            fh.write(blob)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, p)
+    except Exception:
+        pass
+
+def ctx_clear():
+    try:
+        os.unlink(ctx_path())
+    except OSError:
+        pass
 
 # --------------------------------------------------------------------------- #
 # Main
@@ -1277,6 +1401,12 @@ def main():
     # a keepalive/state report afterwards and re-register the just-ended session
     # (a ghost the daemon would then keep alive via last_update_ts).
     _running = [True]
+    # The transcript does not exist yet at launch -- claude creates it on the
+    # first turn -- so the tracker is refreshed from the monitor rather than
+    # written once. `_started` is what stops find_transcript() from adopting a
+    # stale file that some earlier session left in this directory.
+    _started = time.time()
+    ctx_write("idle", _started)
     def monitor():
         while _running[0]:
             time.sleep(POLL_MS)
@@ -1285,6 +1415,7 @@ def main():
             try:
                 load_patterns()   # hot-reload tuning without a restart
                 evaluate()
+                ctx_write(state["cur"], _started)
             except Exception:
                 pass
     threading.Thread(target=monitor, daemon=True).start()
@@ -1309,6 +1440,7 @@ def main():
             return
         _cleaned[0] = True
         _running[0] = False                             # stop the monitor (no post-end report)
+        ctx_clear()                                     # live state, worthless once we exit
         try:
             signal.set_wakeup_fd(-1)
         except Exception:

@@ -607,6 +607,35 @@ selects a profile non-interactively, and an already-exported
 prompts `/login` there on first run — and keeps its own settings, history, and
 MCP config. With no profile dirs, nothing changes.
 
+**Hit the limit? Carry the conversation across** — `claude-mate-switch`
+continues *this terminal's* conversation on another account. An account is a
+config dir read once at startup, so nothing can change account in place; and
+each profile keeps its own `projects/` tree, so a new account cannot see the
+old one's transcripts. The switch closes that gap: a transcript is just a file,
+so copying it into the target profile's tree makes `claude --resume` find it.
+
+```sh
+claude-mate-switch                 # accounts, remaining limits, and what would move
+claude-mate-switch work2           # copy the conversation there and resume
+claude-mate-switch --best          # whichever account has the most headroom left
+claude-mate-switch --dry-run work2 # show the move, touch nothing
+```
+
+It works because the wrapper publishes a small **context file per terminal**
+under `$TMPDIR` — which transcript is in flight, under which account, in which
+directory, and how depleted that account is. Temp and per-terminal on purpose:
+it describes a running process, is worthless once that process exits (and is
+unlinked then), and two terminals in the same directory are two different
+conversations that must not carry each other off. A context not refreshed for
+15 minutes is treated as dead rather than resumed.
+
+> **One caution.** The copy puts one account's conversation into another
+> account's local store, and resuming replays it to that account's API. Between
+> two of your own profiles that is unremarkable. Between accounts belonging to
+> **different organisations** it may not be — so the tool never switches
+> without being told where, prints the two logins side by side, and if their
+> email domains differ makes you type the target domain to confirm.
+
 **Account + remaining limit on the device** — each wrapped session reports
 which account it runs as (the profile name, or `default`), shown right-aligned
 on the state row, and how much of that account's plan limit is left, shown as
