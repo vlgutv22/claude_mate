@@ -184,6 +184,27 @@ try:
         os.write(m_fd, f"B|{verb}\n".encode())
         hit = wait_for(lambda w=want, k=n: any(w in l for l in dlog[k:]), 6.0)
         check(f"B|{verb} reaches the {want} handler", hit)
+    # The index the device sends back must name the SAME account the daemon
+    # sent. If the two orderings ever drift you switch to the wrong login --
+    # the one mistake this feature must not make -- so the order is pinned.
+    import importlib.machinery as _im, importlib.util as _iu
+    _spec = _iu.spec_from_loader(
+        "cmd_t", _im.SourceFileLoader("cmd_t", DAEMON))
+    _d = _iu.module_from_spec(_spec)
+    sys.modules["cmd_t"] = _d          # dataclass needs the module registered
+    _spec.loader.exec_module(_d)
+    accts = os.path.join(tmp, "accounts")
+    for n_ in ("zeta", "alpha", "mid"):
+        os.makedirs(os.path.join(accts, n_), exist_ok=True)
+    _d.ACCOUNTS_DIR = accts
+    check("saved accounts are listed in a stable, sorted order",
+          _d.account_profiles() == ["alpha", "mid", "zeta"])
+    check("...and capped at what the device's picker can show",
+          len(_d.account_profiles()) <= _d.ACCT_MAX)
+    _d.ACCOUNTS_DIR = os.path.join(tmp, "no-such-dir")
+    check("a missing profiles dir yields no accounts, not a crash",
+          _d.account_profiles() == [])
+
     n = len(dlog)
     os.write(m_fd, b"B|Z\n")
     check("an unknown verb is still reported, not silently eaten",

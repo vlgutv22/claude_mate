@@ -1521,6 +1521,66 @@ class Screen:
 # --------------------------------------------------------------------------- #
 
 
+ACCOUNTS_DIR = os.path.expanduser(
+    os.environ.get("CLAUDE_MATE_ACCOUNTS_DIR", "~/.claude-accounts"))
+ACCT_MAX = 5                       # what the device's picker can show
+
+
+def account_profiles() -> List[str]:
+    """The SAVED logins, in a stable order both ends agree on.
+
+    Each is a profile directory under ~/.claude-accounts holding its own
+    credentials. Sorted, so the index the device sends back means the same name
+    the daemon sent -- an ordering that drifted between the two would switch you
+    to the wrong account, which is the one mistake this must not make.
+    """
+    try:
+        return sorted(d for d in os.listdir(ACCOUNTS_DIR)
+                      if os.path.isdir(os.path.join(ACCOUNTS_DIR, d)))[:ACCT_MAX]
+    except OSError:
+        return []
+
+
+_wrap_mod: Any = None
+
+
+def account_headroom_chip(cfg_dir: str) -> str:
+    """A profile's remaining-limit chip ('5h82%'), or '' if unknown.
+
+    Borrowed from the wrapper rather than reimplemented: reading a profile's
+    token means knowing that Claude Code keys the Keychain entry as
+    "Claude Code-credentials-<sha256(cfg_dir)[:8]>", which was established by
+    experiment and is exactly the sort of detail that rots when it is written
+    down twice. Any failure is '' -- an unknown limit must never stop the
+    picker listing the account.
+    """
+    global _wrap_mod
+    if _wrap_mod is None:
+        try:
+            import importlib.machinery
+            import importlib.util
+            path = os.path.join(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))), "bin", "claude-mate-wrap")
+            spec = importlib.util.spec_from_loader(
+                "cm_wrap_helpers",
+                importlib.machinery.SourceFileLoader("cm_wrap_helpers", path))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            _wrap_mod = mod
+        except Exception as exc:
+            log(f"account usage unavailable: {exc}")
+            _wrap_mod = False
+    if not _wrap_mod:
+        return ""
+    try:
+        tok = _wrap_mod._access_token(cfg_dir)
+        if not tok:
+            return ""
+        return _wrap_mod._format_limit(_wrap_mod._fetch_usage(tok) or {})
+    except Exception:
+        return ""
+
+
 def wrapper_ctrl_send(ctrl: str, cmd: str) -> bool:
     """Send one command line ('focus') to a PTY wrapper's per-session control
     socket and WAIT for its ack. The wrapper replies in two stages -- 'go' the
@@ -1914,8 +1974,8 @@ class ButtonReader(threading.Thread):
                 self._continue_pressed()
             elif ev == "T":                      # ACTIONS: new terminal, focused
                 self._new_terminal_pressed()
-            elif ev == "A":                      # ACTIONS: switch account
-                self._switch_account_pressed()
+            elif ev == "A":                      # ACTIONS: switch saved account
+                self._switch_account_pressed(code[1:])
             else:
                 log(f"unknown button event: {line!r}")
             return
@@ -2167,16 +2227,18 @@ class ButtonReader(threading.Thread):
 
         threading.Thread(target=run, name="new-terminal", daemon=True).start()
 
-    def _switch_account_pressed(self) -> None:
-        """B|A -- continue the shown session on whichever account has the most
-        limit left.
+    def _switch_account_pressed(self, index: str = "") -> None:
+        """B|A<i> -- continue the shown session on SAVED account number <i>.
 
-        The device deliberately does NOT pick which account: choosing needs
-        every profile's remaining usage, which lives on the Mac, and a
-        four-button device is the wrong place to browse a list of logins. It
-        asks for "somewhere with headroom" and the wrapper -- which owns the
-        process and therefore the only thing that can re-exec it -- does the
-        rest.
+        Switching accounts does NOT mean logging in again. Every one of these is
+        a login you already have -- a profile directory under
+        ~/.claude-accounts, holding its own credentials -- and the switch
+        continues this conversation there. The index is this daemon's own
+        ordering from the L| lines it pushed, so the device and the Mac cannot
+        disagree about which name row 3 was.
+
+        The wrapper does the work: it owns the claude process, so it is the only
+        thing that can replace it.
         """
         sess = self._screen.current_shown()
         if sess is None:
@@ -2185,10 +2247,17 @@ class ButtonReader(threading.Thread):
         if not sess.focus_ctrl:
             log(f"SWITCH -> {sess.name}: not a wrapped session")
             return
+        names = account_profiles()
+        try:
+            name = names[int(index)]
+        except (ValueError, IndexError):
+            log(f"SWITCH -> {sess.name}: no saved account at index {index!r}")
+            return
 
         def run() -> None:
-            ok = wrapper_ctrl_send(sess.focus_ctrl, "switch --best")
-            log(f"SWITCH -> {sess.name}: {'requested' if ok else 'FAILED'}")
+            ok = wrapper_ctrl_send(sess.focus_ctrl, f"switch {name}")
+            log(f"SWITCH -> {sess.name}: continue on saved account "
+                f"{name!r} ({'requested' if ok else 'FAILED'})")
 
         threading.Thread(target=run, name="switch-account", daemon=True).start()
 
@@ -2546,6 +2615,47 @@ def main(argv: Optional[List[str]] = None) -> int:
     # lazy and inside the branch because tools/test_net_link.py exec_modules
     # this file by path, where a module-level import would need daemon/ on
     # sys.path.
+    # ---- the saved-account list the device's picker shows ------------------ #
+    # Pushed on every handshake. Switching accounts on the device means picking
+    # one of these -- logins that already exist, each with its own credentials
+    # -- never signing in again, so the device must know their names.
+    _handshake_extra: List[Any] = []
+
+    def send_accounts(with_chips: bool = False) -> None:
+        names = account_profiles()
+        if not names:
+            return
+        chips = [""] * len(names)
+        if with_chips:
+            for i, n in enumerate(names):
+                chips[i] = account_headroom_chip(os.path.join(ACCOUNTS_DIR, n))
+        for i, n in enumerate(names):
+            try:
+                link.write_line(f"L|{i}|{len(names)}|{n[:14]}|{chips[i]}")
+            except Exception as exc:
+                log(f"accounts: {exc}")
+                return
+        log("saved accounts -> device: " +
+            ", ".join(f"{i}:{n}{(' ' + chips[i]) if chips[i] else ''}"
+                      for i, n in enumerate(names)))
+
+    def push_accounts() -> None:
+        """Names first, then chips once the network has answered.
+
+        The names are free and the device needs them immediately; the remaining
+        limits cost one HTTPS round trip per profile, which must not sit in the
+        handshake path. So: send what we know, then send it again enriched.
+        Which account has headroom is the whole basis of the choice, so it is
+        worth the second push."""
+        send_accounts(False)
+
+        def enrich() -> None:
+            send_accounts(True)
+
+        threading.Thread(target=enrich, name="acct-usage", daemon=True).start()
+
+    _handshake_extra.append(push_accounts)
+
     web = None
     if args.web:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -2571,14 +2681,25 @@ def main(argv: Optional[List[str]] = None) -> int:
                 log("device controller mode: %s" % ("ON" if on else "off"))
 
             candidate.on_grab = _controller
-            # ...and re-assert it whenever a device says hello, so one that
-            # connects mid-game lands in controller mode rather than in menu
-            # semantics.
-            screen.on_handshake_extra = (
+            _handshake_extra.append(
                 lambda _b=candidate: _controller(_b.grabbed()))
             if candidate.start():
                 web = candidate
         log(f"  web    : {'on' if web else 'DISABLED'}")
+
+    # Everything the device needs re-asserted when it says hello. A list rather
+    # than one callback because these are independent: the account list must be
+    # pushed whether or not --web is on, and controller mode only exists when it
+    # is. Edge-driven state that is never re-asserted is correct only while
+    # nothing reconnects, which is not a property this device has.
+    def _on_handshake() -> None:
+        for fn in _handshake_extra:
+            try:
+                fn()
+            except Exception as exc:
+                log(f"handshake extra: {exc}")
+
+    screen.on_handshake_extra = _on_handshake
 
     socket_server = SocketServer(args.sock, registry, on_update, on_haptic)
     button_reader = ButtonReader(link, screen)
