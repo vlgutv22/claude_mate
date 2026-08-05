@@ -484,7 +484,12 @@ def ctrl_listener():
             os.unlink(CTRL_SOCK)
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         srv.bind(CTRL_SOCK)
-        os.chmod(CTRL_SOCK, 0o666)
+        # 0600, NOT 0666. This socket could always be asked for the rendered
+        # screen; it can now also be asked to TYPE INTO the session, which turns
+        # "any local account can read your terminal" into "any local account can
+        # act as you inside Claude". The daemon runs as the same user (it is a
+        # per-user LaunchAgent), so nothing legitimate needs group or other.
+        os.chmod(CTRL_SOCK, 0o600)
         srv.listen(4)
     except OSError:
         return
@@ -495,7 +500,9 @@ def ctrl_listener():
             break
         try:
             try:
-                data = conn.recv(64).decode(errors="ignore").strip()
+                # 512, not 64: `submit <text>` carries a payload, and a silently
+                # truncated command would type half a line into the session.
+                data = conn.recv(512).decode(errors="ignore").strip()
             except OSError:
                 data = ""
             if data.startswith("screen"):
@@ -508,6 +515,23 @@ def ctrl_listener():
                     conn.sendall(("\n".join(["SCREEN %d" % len(rows)] + rows
                                             + ["ok"]) + "\n")
                                  .encode("utf-8", "replace"))
+                except OSError:
+                    pass
+            elif data.startswith("submit "):
+                # Type a line into the session and press Enter -- the device's
+                # way to say "continue" after a limit or an error, without
+                # reaching for the laptop. The text is whatever follows; the CR
+                # is added here so the verb means one whole thing and a caller
+                # can never half-submit.
+                #
+                # Deliberately NOT a general remote-keyboard: control bytes are
+                # dropped, so this cannot send Ctrl-C, an escape sequence, or a
+                # bracketed-paste marker into the TUI.
+                text = "".join(c for c in data[7:] if c.isprintable())
+                if text:
+                    queue_input(text.encode("utf-8", "replace") + b"\r")
+                try:
+                    conn.sendall(b"ok\n")
                 except OSError:
                     pass
             else:
@@ -568,6 +592,40 @@ g_meta = {"model": "", "effort": "", "account": "", "limit": ""}
 # by the resize handler). Rebinding a str is atomic under the GIL, the same
 # atomic-publish trick used for _patterns, so no lock is needed to read it.
 g_screen_text = ""
+
+# Text the device asked us to type into the session, waiting for the relay loop
+# to hand it to the child's PTY. The ctrl thread cannot write to master_fd
+# itself: the relay owns that fd, drains it non-blocking, and keeps a backlog in
+# `pend` -- a second writer would interleave mid-sequence and corrupt a paste.
+# So the ctrl thread queues here and pokes the relay's self-pipe to wake it.
+g_inject = bytearray()
+g_inject_lock = threading.Lock()
+g_wake_w = -1                      # relay's self-pipe write end; set by main()
+
+def queue_input(data: bytes):
+    """Hand keystrokes to the relay from another thread."""
+    with g_inject_lock:
+        g_inject.extend(data)
+    if g_wake_w >= 0:
+        try:
+            os.write(g_wake_w, b"\0")   # break select() out of its 1s wait
+        except OSError:
+            pass
+
+def drain_inject(pend):
+    """Move queued device input into the relay's outbound buffer.
+
+    A function rather than three lines inline in the relay, because it is the
+    only part of the path a test can reach: the rest of main() needs a real
+    controlling terminal (it calls tcsetattr, which raises SIGTTOU and stops the
+    process anywhere else), so an end-to-end test of typing would be testing the
+    harness. This seam is the mechanism itself."""
+    if not g_inject:
+        return False
+    with g_inject_lock:
+        pend.extend(g_inject)
+        del g_inject[:]
+    return True
 
 def parse_meta(screen_text):
     """Refresh g_meta from the current screen if model/effort are visible."""
@@ -1371,6 +1429,8 @@ def main():
     wake_r, wake_w = os.pipe()
     os.set_blocking(wake_r, False)
     os.set_blocking(wake_w, False)
+    global g_wake_w
+    g_wake_w = wake_w              # let queue_input() wake this loop immediately
 
     def on_winch(signum, frame):
         winch_pending[0] = True       # async-signal-safe: just flag it
@@ -1565,6 +1625,12 @@ def main():
                     apply_resize()
                 except Exception:
                     pass
+
+            # Text the device asked us to type, queued by the ctrl thread. Moved
+            # into `pend` here so injected bytes go through exactly the same
+            # non-blocking drain as your own keystrokes -- one writer, one
+            # ordering, and a full PTY buffer cannot stall the relay.
+            drain_inject(pend)
 
             rset = [master_fd, wake_r]
             if stdin_open:
