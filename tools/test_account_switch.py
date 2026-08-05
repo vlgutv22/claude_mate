@@ -52,6 +52,14 @@ os.makedirs(os.environ["TMPDIR"], exist_ok=True)
 
 W = load(WRAP, "cmwrap_t")
 
+# Setting $TMPDIR is NOT enough and this test learned it the hard way: the
+# mkdtemp() above already called tempfile.gettempdir(), which caches, so the
+# wrapper's CTX_DIR resolved to the REAL temp dir and this test wrote a context
+# file into the user's system temp -- outside the tree it cleans up. Redirect
+# the module cache too, and pin CTX_DIR (already computed at import) by hand.
+tempfile.tempdir = os.environ["TMPDIR"]
+W.CTX_DIR = os.path.join(os.environ["TMPDIR"], f"claude-mate-ctx-{os.getuid()}")
+
 
 def mk_transcript(cfg, projdir, sid, when=None, body='{"x":1}\n'):
     d = os.path.join(cfg, "projects", projdir)
@@ -177,6 +185,8 @@ os.makedirs(W.CTX_DIR, mode=0o700, exist_ok=True)
 S.W.MY_TTY = "/dev/ttys044"
 with open(S.W.ctx_path(), "w") as fh:
     json.dump(dict(ctx_live, updated_at=time.time() - 99_999), fh)
+check("the CLI's own context dir is inside the test tree, not system temp",
+      S.W.CTX_DIR.startswith(tmp))
 check("a stale context is rejected, not resumed", S.read_context() is None)
 with open(S.W.ctx_path(), "w") as fh:
     json.dump(ctx_live, fh)
