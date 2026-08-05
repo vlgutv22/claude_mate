@@ -2721,6 +2721,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             ", ".join(f"{i}:{n}{(' ' + chips[i]) if chips[i] else ''}"
                       for i, n in enumerate(names[:sent])))
 
+    _last_push: List[List[str]] = [[]]        # the list this daemon last aimed at
+
     def push_accounts() -> None:
         """Names first, then chips once the network has answered.
 
@@ -2729,6 +2731,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         handshake path. So: send what we know, then send it again enriched.
         Which account has headroom is the whole basis of the choice, so it is
         worth the second push."""
+        _last_push[0] = account_profiles()
         send_accounts(False)
 
         def enrich() -> None:
@@ -2745,8 +2748,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         device stays linked -- picking a new name at the wrapper's account prompt
         creates one. Since the device answers with an INDEX, a list that drifts
         here and not there does not merely look stale, it decodes to the wrong
-        name. Cheap: one listdir, and a push only on a real difference."""
-        if account_profiles() != pushed_accounts():
+        name. Cheap: one listdir, and a push only on a real difference.
+
+        Compared against what was last SENT AT, not what reached the device.
+        While the device is unplugged nothing reaches it, and a comparison
+        against "what it received" would find a difference every five seconds
+        forever -- each one costing an HTTPS usage call per profile, for a
+        picker nobody can see. A reconnect re-pushes from the handshake anyway."""
+        if account_profiles() != _last_push[0]:
             push_accounts()
 
     web = None
