@@ -1202,6 +1202,18 @@ static void drawPad() {
 // The ACTIONS sheet. Same row geometry as the settings page, so the two read as
 // one family and the muscle memory transfers: PREV/NEXT move, GO does it, the
 // 4th button backs out.
+// Five rows have to fit 172 px next to a title and a footer, and the first
+// attempt did not: rows at 34 + i*24 put the LAST row's hint at y143..151 and
+// the footer at MENU_HINT_Y (150), overlapping by two pixels -- visible only
+// when the bottom row was selected, which is the row that replaces your
+// session. Worked out instead of eyeballed:
+//   title   8..24   (size 2)
+//   rows    30 + i*24, block 22 tall -> last is 126..148, its hint 139..147
+//   footer  158..166, clear of 148 and inside 172
+#define ACT_Y0     30
+#define ACT_ROW_H  24
+#define ACT_HINT_Y 158
+
 static void drawActions() {
   static const char *LABEL[AR_COUNT] = {
     "View terminal", "Preview on glass", "Send \"continue\"",
@@ -1213,7 +1225,7 @@ static void drawActions() {
   };
   drawCentred(SCREEN_W / 2, 8, 2, "ACTIONS", C_TEXT);
   for (uint8_t i = 0; i < AR_COUNT; i++) {
-    int16_t y = 34 + i * 24;
+    int16_t y = ACT_Y0 + i * ACT_ROW_H;
     bool sel = (i == actIdx);
     if (sel) gfx->fillRect(0, y, SCREEN_W, 22, C_DIMMER);
     gfx->setTextSize(1);
@@ -1230,7 +1242,7 @@ static void drawActions() {
   }
   gfx->setTextSize(1);
   gfx->setTextColor(C_DIM);
-  gfx->setCursor(PAD_X, MENU_HINT_Y);
+  gfx->setCursor(PAD_X, ACT_HINT_Y);
   gfx->print("PREV/NEXT   GO do it   4th back");
 }
 
