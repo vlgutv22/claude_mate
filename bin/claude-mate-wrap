@@ -483,12 +483,25 @@ def ctrl_listener():
         if os.path.exists(CTRL_SOCK):
             os.unlink(CTRL_SOCK)
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        srv.bind(CTRL_SOCK)
         # 0600, NOT 0666. This socket could always be asked for the rendered
         # screen; it can now also be asked to TYPE INTO the session, which turns
         # "any local account can read your terminal" into "any local account can
         # act as you inside Claude". The daemon runs as the same user (it is a
         # per-user LaunchAgent), so nothing legitimate needs group or other.
+        #
+        # The umask is what makes it 0600 *from the moment it exists*. chmod
+        # alone left a window -- bind() creates the node with the process umask,
+        # normally 022, which for a socket is srwxr-xr-x: world-CONNECTABLE
+        # until the next line ran. Microseconds, on a path an attacker would
+        # have to be watching for, and still the wrong way round: permissions
+        # that are corrected are permissions that were briefly wrong. The chmod
+        # stays as the belt to that pair of braces (a umask of 0 in some exotic
+        # parent, an fs that ignores it).
+        old_umask = os.umask(0o177)
+        try:
+            srv.bind(CTRL_SOCK)
+        finally:
+            os.umask(old_umask)
         os.chmod(CTRL_SOCK, 0o600)
         srv.listen(4)
     except OSError:
@@ -1580,23 +1593,36 @@ def switch_refusal(req):
             return f"already on {name}"
         if name != "default" and not os.path.isdir(os.path.join(ACCOUNTS_DIR, name)):
             return f"no such account: {name}"
-        # A move between ORGANISATIONS is a decision, and the switcher's rule is
-        # that a human types the target domain to make it. A button on a desk
-        # device cannot type, and the device is not even told the emails -- it
-        # offers names and remaining-limit chips, so the natural way to use it
-        # (pick whichever has headroom left) is exactly how you would cross the
-        # boundary without meaning to. Refuse, and say where to do it
-        # deliberately. This is the check that makes the switcher's --yes safe.
-        here = account_email(os.environ.get("CLAUDE_CONFIG_DIR") or None)
-        there = account_email(None if name == "default"
-                              else os.path.join(ACCOUNTS_DIR, name))
-        a, b = email_domain(here), email_domain(there)
-        if a and b and a != b:
-            return (f"{a} -> {b} is another organisation; confirm it yourself "
-                    f"with: claude-mate-switch {name!r}")
+        # NO CROSS-ORGANISATION REFUSAL HERE, and the reason is worth keeping.
+        #
+        # This used to compare the two logins' email domains and turn the switch
+        # away when they differed, on the theory that moving a conversation
+        # between tenancies is a decision a button cannot make. The theory was
+        # wrong about WHICH accounts are reachable. Every target is a login the
+        # user installed and authenticated themselves -- `default` is ~/.claude,
+        # and the rest are directories under ACCOUNTS_DIR that exist only
+        # because someone ran a login in them. There is no untrusted tenancy on
+        # the menu; there is only "your accounts, at whichever companies you
+        # work for".
+        #
+        # So the check could not distinguish the case it was written for from
+        # the case the feature exists for, and in practice only ever saw the
+        # latter: three profiles on three domains, every pair "cross-org", every
+        # device switch refused -- silently, because the refusal only reached a
+        # log file. A guard that fires on 100% of legitimate use is not a guard,
+        # it is an outage. The domain change is now ANNOUNCED by the switcher
+        # (see claude-mate-switch) rather than used to refuse.
+        #
+        # What still refuses is everything above and below: an account you are
+        # already on, one that does not exist, and a session with nothing to
+        # carry -- all answered before claude is killed for the attempt.
     if not find_transcript(os.environ.get("CLAUDE_CONFIG_DIR", ""),
                            os.getcwd(), g_started_at, g_claude_sid):
-        return "nothing to carry yet -- say something to claude first"
+        # Short on purpose: these words now go on the device's screen, which is
+        # 21 characters wide and gets two rows for a message. A sentence with
+        # advice in it wrapped to "nothing to carry yet / -- say something to c+"
+        # and the advice was the half that got cut.
+        return "nothing to carry yet"
     return ""
 
 # --------------------------------------------------------------------------- #
@@ -2019,13 +2045,14 @@ def main():
             sys.stdout.flush()
         except Exception:
             pass
-        # No --yes. The one thing that flag skips is the cross-organisation
-        # confirmation, and passing it unconditionally meant a device press
-        # could move a conversation into another org's account -- printing the
-        # warning to a terminal nobody was sitting at and proceeding anyway.
-        # switch_refusal() has already turned that case away, before claude was
-        # killed for it; anything that gets this far is same-org or unknowable,
-        # neither of which prompts.
+        # No --yes, and nothing for it to skip any more: the switcher announces
+        # a change of organisation and proceeds, rather than stopping for a
+        # typed confirmation. That matters HERE more than anywhere. This runs
+        # after cleanup(), with claude already gone -- a prompt at this point
+        # would strand the terminal at a question, having ended the session to
+        # ask it, which is the same "no effect" the refusal used to produce.
+        # Everything that can refuse has already refused, up front, while the
+        # session was still alive.
         try:
             os.execv(sys.executable, [sys.executable, switcher]
                                      + switch_argv(g_switch_req))

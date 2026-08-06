@@ -85,8 +85,24 @@ def clear():
         del W.g_inject[:]
 
 
+def _connectable():
+    """Ready means ACCEPTING, not merely present. bind() creates the path
+    several statements before listen(), so waiting on os.path.exists caught the
+    socket mid-setup: connect refused, and the mode read back as the umask's
+    755 rather than the 600 the next line sets."""
+    c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        c.settimeout(1)
+        c.connect(W.CTRL_SOCK)
+        return True
+    except OSError:
+        return False
+    finally:
+        c.close()
+
+
 threading.Thread(target=W.ctrl_listener, daemon=True).start()
-check("the control socket comes up", wait_for(lambda: os.path.exists(W.CTRL_SOCK)))
+check("the control socket comes up", wait_for(_connectable))
 
 # --------------------------------------------------------------------------- #
 print("\n-- the socket can now WRITE to your session, so: 0600 --")
@@ -211,6 +227,71 @@ try:
     _d.ACCOUNTS_DIR = os.path.join(tmp, "no-such-dir")
     check("a missing profiles dir still offers the default login, not a crash",
           _d.account_profiles() == ["default"])
+
+    # ----------------------------------------------------------------------- #
+    # Saying WHY a press did nothing.
+    #
+    # Every one of these verbs can decline for an ordinary reason, and the
+    # wrapper answers all of them in words. Those words used to reach a log file
+    # and nothing else, which at arm's length is indistinguishable from a device
+    # that ignored the press -- the field report was "I can choose on device but
+    # no effect", after four presses in ninety seconds.
+    print("\n-- a refused press says so, on the glass --")
+
+    check("a message that fits one row leaves the second empty",
+          _d._wrap2("already on work 2") == ("already on work 2", ""))
+    # Two domains a letter apart, which is the shape that made this matter: a
+    # name you are meant to read and tell from its neighbour.
+    check("...and a longer one breaks between WORDS, not mid-domain",
+          _d._wrap2("one.example -> ones.example")
+          == ("one.example ->", "ones.example"))
+    over = _d._wrap2("x " * 40)
+    check("...while an overrunning one is marked, not silently halved",
+          all(len(r) <= _d.ROW_CHARS for r in over) and over[1].endswith("+"))
+    check("a bar in a reason cannot forge a frame field",
+          "|" not in "".join(_d._wrap2("switch|failed")))
+
+    scr = object.__new__(_d.Screen)     # the frame only; no link, no audio
+    scr._follow, scr._notice = False, None
+    plain, _, _ = scr._compose([], None)
+    scr._notice = ("already on work 2", time.monotonic() + 30)
+    noted, _, _ = scr._compose([], None)
+    check("the notice reaches the frame the device actually renders",
+          "already on work 2" in noted and "already on" not in plain)
+    check("...without changing the frame's shape",
+          noted.count("|") == plain.count("|"))
+    scr._notice = ("gone by now", time.monotonic() - 0.01)
+    expired, _, _ = scr._compose([], None)
+    check("...and an expired one is dropped by the next frame, timer or not",
+          "gone by now" not in expired and expired == plain)
+    check("...clearing itself rather than being re-checked forever",
+          scr._notice is None)
+
+    # The reason survives the socket. The read loop used to stop at the first
+    # chunk once it began with 'err', so anything past 64 bytes was cut -- fine
+    # for a log, useless for a message someone is meant to read and act on.
+    # Deliberately past 64 bytes: that was the old recv size, and the loop
+    # stopped at the first chunk once it began with 'err'.
+    long_why = ("already on work 2 -- pick one of the other saved accounts "
+                "from the picker instead")
+    srv_path = os.path.join(tmp, "refuse.sock")
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(srv_path)
+    srv.listen(1)
+
+    def _refuse():
+        conn, _ = srv.accept()
+        conn.recv(512)
+        conn.sendall(f"err {long_why}\n".encode())
+        conn.close()
+
+    _th.Thread(target=_refuse, daemon=True).start()
+    ok, why = _d.wrapper_ctrl_call(srv_path, "switch work 2")
+    srv.close()
+    check("a refusal is reported as a failure, with the wrapper's own words",
+          ok is False and why == long_why)
+    check("...read to the newline, so a reason past one 64-byte recv survives",
+          len(long_why) > 64 and len(why) == len(long_why))
 
     n = len(dlog)
     os.write(m_fd, b"B|Z\n")

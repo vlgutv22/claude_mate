@@ -187,7 +187,7 @@ def resume_argv(ctx, sid):
     return out + ["--resume", sid]
 
 
-def switch(ctx, dest, dry_run=False, yes=False):
+def switch(ctx, dest, dry_run=False, yes=False):   # `yes`: legacy, see main()
     src = ctx.get("transcript") or ""
     if not src or not os.path.exists(src):
         sys.exit("claude-mate-switch: no transcript recorded for this terminal "
@@ -203,25 +203,21 @@ def switch(ctx, dest, dry_run=False, yes=False):
     print(f"  conv : {ctx['session_id']}  ({os.path.getsize(src)//1024} KB)")
     print(f"  copy : {dst}")
 
-    # Different organisations is a decision, not a detail. Say so plainly and
-    # make the person type something, rather than quietly relocating one
-    # tenancy's conversation into another.
+    # Different organisations is worth SAYING, and it is no longer worth
+    # stopping for. Every account reachable from here is one you installed and
+    # logged into yourself; which company each belongs to is a fact about your
+    # working life, not a trust boundary this tool discovered. Demanding a typed
+    # domain made the common case -- "this account is out of limit, continue on
+    # the other one" -- impossible from the device, which cannot type, and
+    # tedious from the terminal, which is where you already said which account
+    # you wanted. So: print it, large, and carry on. Both lines are printed
+    # before the copy, so a switch you did not mean is visible in the scrollback
+    # of the terminal it happened in.
     a, b = domain_of(here_email), domain_of(dest["email"])
     if a and b and a != b:
         print(f"\n  NOTE: {a} -> {b}. This copies the conversation into a "
               f"different\n        organisation's account and replays it to "
               f"that account's API.")
-        if not (dry_run or yes):
-            # No terminal means nobody can answer, and "nobody answered" must
-            # never read as consent for this particular question.
-            if not sys.stdin.isatty():
-                sys.exit("  aborted: this needs a typed confirmation and there "
-                         "is no terminal to type it in.")
-            try:
-                if input("  type the target domain to confirm: ").strip().lower() != b:
-                    sys.exit("  aborted.")
-            except (EOFError, KeyboardInterrupt):
-                sys.exit("\n  aborted.")
 
     if dry_run:
         print("\n  --dry-run: nothing copied, nothing started.")
@@ -279,8 +275,11 @@ def main():
                     help="pick the account with the most headroom left")
     ap.add_argument("--dry-run", action="store_true",
                     help="show the move without copying or starting anything")
+    # Accepted and ignored. It used to skip the cross-organisation prompt;
+    # there is no prompt to skip now, and silently rejecting a flag that used to
+    # work would break the muscle memory of anyone who learned it.
     ap.add_argument("--yes", "-y", action="store_true",
-                    help="skip the cross-organisation confirmation")
+                    help=argparse.SUPPRESS)
     ap.add_argument("--tty", metavar="DEV",
                     help="act on another terminal's session (e.g. ttys008); "
                          "defaults to this one. Listing works from anywhere, "

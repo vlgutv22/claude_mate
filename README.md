@@ -639,15 +639,23 @@ that name their own conversation (`--resume`, `--continue`) fall back to a
 search that now verifies the directory recorded *inside* each transcript.
 
 > **One caution.** The copy puts one account's conversation into another
-> account's local store, and resuming replays it to that account's API. Between
-> two of your own profiles that is unremarkable. Between accounts belonging to
-> **different organisations** it may not be — so the tool never switches
-> without being told where, prints the two logins side by side, and if their
-> email domains differ makes you type the target domain to confirm. A switch
-> asked for **from the device** is refused outright in that case: there is no
-> keyboard on a desk gadget to answer with, the picker there offers names and
-> remaining limits rather than emails, and "whichever has headroom left" is
-> exactly how you would cross the boundary without meaning to.
+> account's local store, and resuming replays it to that account's API. The
+> tool never switches without being told where, prints both logins side by
+> side, and says so plainly when their email domains differ — but it does not
+> *stop*. It used to: a differing domain was read as "another organisation" and
+> refused. Every account it can reach is one you installed and logged into
+> yourself, so on a real three-account fleet spread across three domains that
+> rule refused every possible switch, and said so only in a log file — breaking
+> the exact case the feature exists for (*this account is out of limit,
+> continue on another*). Announce, don't block.
+
+**When a press declines, the device says why.** Any of these can fail for an
+ordinary reason — already on that account, nothing said yet worth carrying, not
+a wrapped session — and the wrapper answers each in words. Those words go on
+the glass for about four seconds, across the middle two rows, keeping the
+session name above them. A press that silently does nothing is indistinguishable
+from a broken button, and the cure for "I pressed it and nothing happened" is
+not to press harder.
 
 **Account + remaining limit on the device** — each wrapped session reports
 which account it runs as (the profile name, or `default`), shown right-aligned

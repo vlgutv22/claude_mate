@@ -158,6 +158,10 @@ WRAPPER_ACK_TIMEOUT_S = 12.0  # overall deadline for the completion ack ('ok');
                               # (~10s: tmux select-window/pane + osascript).
                               # Pre-ack wrappers close the socket at once (EOF),
                               # so the wait degrades to fire-and-forget.
+NOTICE_S = 4.0              # how long a transient message holds the middle two
+                            # rows. Long enough to read at arm's length after
+                            # looking down at the press, short enough that the
+                            # screen is never lying about a session for long.
 PING_PERIOD = 15.0          # keepalive ping interval
 RECONNECT_DELAY = 2.0       # wait between serial (re)connection attempts
 SESSION_DONE_TTL = 120.0    # drop a 'done' session after this long with no update
@@ -1126,6 +1130,28 @@ def _fit_meta(model: str, effort: str, width: int) -> str:
     return cands[-1][:width] if cands else ""
 
 
+def _wrap2(text: str) -> Tuple[str, str]:
+    """Word-wrap a short message into the two 21-char rows a notice gets.
+
+    Words first, because breaking a domain name across rows makes the thing you
+    are being asked to notice unreadable. A word longer than a row is cut rather
+    than allowed to swallow both -- overflow ends in an ellipsis so a truncated
+    message never reads as a complete one that happens to be odd."""
+    rows, i = ["", ""], 0
+    for w in _sanitize(text).split():
+        w = w[:ROW_CHARS]
+        cand = f"{rows[i]} {w}".strip()
+        if len(cand) <= ROW_CHARS:
+            rows[i] = cand
+        elif i == 0:
+            i = 1
+            rows[i] = w
+        else:                                     # '+' = "and more", the same
+            rows[1] = rows[1][:ROW_CHARS - 1] + "+"   # mark the fleet strip uses
+            break
+    return (rows[0], rows[1])
+
+
 def _display_names(sessions: List[Session]) -> Dict[str, str]:
     """Map session key -> display name truncated to ROW_CHARS (the full size-1
     row now), disambiguating collisions (sibling dirs with a long common prefix)
@@ -1186,10 +1212,50 @@ class Screen:
         self._last_sound_at = 0.0
         self._last_sfx_at   = 0.0
         self.on_handshake_extra = None   # re-assert edge-driven device state
+        # A transient message across the middle two rows: (text, expires_at).
+        # An ACTIONS-sheet verb can fail for ordinary reasons -- the session is
+        # already on that account, it has said nothing worth carrying yet -- and
+        # the wrapper answers every one of them in words. Those words used to go
+        # to the log and nowhere else, which from arm's length is exactly what a
+        # dead button looks like: the fix for "I pressed it and nothing
+        # happened" is not to press harder, it is to say what happened. Rendered
+        # by the daemon into the existing frame, so it costs no firmware change
+        # and works on a device that is already flashed.
+        self._notice: Optional[Tuple[str, float]] = None
         # Rendered lazily-but-once at construction: eight short WAVs, well
         # under a tenth of a second of work, and doing it here means the
         # first jump of the first run is not the one that pays for it.
         self._sfx = sfx_build_cache() if sys.platform == "darwin" else {}
+
+    # ---- transient messages ----------------------------------------------- #
+
+    def notice(self, text: str, secs: float = NOTICE_S) -> None:
+        """Say something on the glass for a few seconds.
+
+        Set OUTSIDE the lock-holding path and pushed immediately: a message
+        about a press has to land while the finger is still near the button, not
+        on whatever tick comes next. A timer forces one more refresh when it
+        expires, otherwise a device with nothing else happening would keep the
+        stale message until the next state change -- which, for an idle fleet at
+        2am, could be hours."""
+        with self._lock:
+            self._notice = (text, time.monotonic() + secs)
+        self.refresh(force=True)
+        t = threading.Timer(secs + 0.05, self.refresh, kwargs={"force": True})
+        t.daemon = True
+        t.start()
+
+    def _notice_rows(self) -> Optional[Tuple[str, str]]:
+        """The live notice as two rows, or None. Expiry is checked HERE rather
+        than by the timer, so a frame composed for any other reason after the
+        deadline also drops it."""
+        if self._notice is None:
+            return None
+        text, until = self._notice
+        if time.monotonic() >= until:
+            self._notice = None
+            return None
+        return _wrap2(text)
 
     # ---- selection -------------------------------------------------------- #
 
@@ -1284,7 +1350,10 @@ class Screen:
         6th bar and takes the rest verbatim), which is what lets the strip use
         '|' as its visual divider."""
         follow = self._follow
+        note = self._notice_rows()
         if subject is None:
+            if note:
+                return (f"F|0|-1|MATE|{note[0]}|{note[1]}|", None, False)
             return (f"F|{2 if follow else 0}|-1|MATE|no sessions||", None, False)
 
         names = _display_names(queue)
@@ -1343,6 +1412,13 @@ class Screen:
 
         flash = subject.unacked_alert()
         flags = (1 if flash else 0) | (2 if follow else 0)
+        # A notice takes the middle two rows and leaves r0 and r3 alone: you
+        # keep the name of the session it is ABOUT, and the fleet strip that
+        # tells you nothing has moved underneath. Losing state+time and
+        # model+effort for four seconds costs nothing; losing which session is
+        # being talked about would make the message ambiguous.
+        if note:
+            r1, r2 = note
         line = f"F|{flags}|{sel}|{r0}|{r1}|{r2}|{r3}"
         return (line, subject.key, flash)
 
@@ -1615,6 +1691,11 @@ def account_headroom_chip(cfg_dir: str) -> str:
 
 
 def wrapper_ctrl_send(ctrl: str, cmd: str) -> bool:
+    """wrapper_ctrl_call, for callers that only care whether it worked."""
+    return wrapper_ctrl_call(ctrl, cmd)[0]
+
+
+def wrapper_ctrl_call(ctrl: str, cmd: str) -> Tuple[bool, str]:
     """Send one command line ('focus') to a PTY wrapper's per-session control
     socket and WAIT for its ack. The wrapper replies in two stages -- 'go' the
     moment it accepts the command (liveness), 'ok' only after its window op
@@ -1623,9 +1704,14 @@ def wrapper_ctrl_send(ctrl: str, cmd: str) -> bool:
     (stopped process whose socket the kernel still accepts) costs ~1s, while a
     live-but-slow op gets the full WRAPPER_ACK_TIMEOUT_S deadline. Pre-ack
     wrappers close the socket immediately (recv -> EOF), degrading to
-    fire-and-forget. Returns success."""
+    fire-and-forget.
+
+    Returns (ok, why). `why` is the wrapper's own words when it refuses, and
+    the caller is expected to SHOW them: a refusal that only reaches the log is
+    indistinguishable, from where the user is standing, from a device that
+    ignored the press."""
     if not ctrl or not os.path.exists(ctrl):
-        return False
+        return (False, "session is gone")
     try:
         c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         c.settimeout(2.0)
@@ -1639,26 +1725,36 @@ def wrapper_ctrl_send(ctrl: str, cmd: str) -> bool:
         try:
             deadline = time.monotonic() + WRAPPER_ACK_TIMEOUT_S
             c.settimeout(WRAPPER_LIVE_TIMEOUT_S)   # a live wrapper 'go's in ms
-            while b"ok" not in buf and not buf.startswith(b"err"):
-                chunk = c.recv(64)
+            # A refusal is read to its NEWLINE, not to the first chunk. Stopping
+            # at "buf starts with err" truncated the reason at whatever one recv
+            # happened to return -- 64 bytes, mid-word ("...is another organis"),
+            # which is fine for a log nobody reads and useless for a message we
+            # now put on the glass. 512 to match the wrapper's own recv.
+            while not (b"ok" in buf or (buf.startswith(b"err") and b"\n" in buf)):
+                chunk = c.recv(512)
                 if not chunk:          # EOF: pre-ack wrapper (or already done)
                     break
                 buf += chunk
                 c.settimeout(max(0.1, deadline - time.monotonic()))
         except socket.timeout:
+            # Deliberately NOT a failure. `focus` uses the return value to
+            # decide whether to run its own window-raising fallback, and a slow
+            # ack from a wrapper that did raise the window would then raise it
+            # twice. A timeout means "no answer yet", which is not "refused".
             log(f"wrapper {cmd} ack timeout ({ctrl}); continuing")
-        c.close()
+        finally:
+            c.close()
         # A wrapper that REFUSES says so ('err <why>') rather than closing
         # silently, and the caller must not report the command as done: the
         # device would show a switch that never happened.
         if buf.startswith(b"err"):
-            log(f"wrapper refused {cmd!r}: "
-                f"{buf.decode('utf-8', 'replace').strip()[4:] or 'no reason given'}")
-            return False
-        return True
+            why = buf.decode("utf-8", "replace").strip()[4:] or "no reason given"
+            log(f"wrapper refused {cmd!r}: {why}")
+            return (False, why)
+        return (True, "")
     except OSError as exc:
         log(f"wrapper {cmd} failed ({ctrl}): {exc}")
-        return False
+        return (False, "could not reach the session")
 
 
 def wrapper_ctrl_screen(ctrl: str) -> Optional[List[str]]:
@@ -2244,12 +2340,19 @@ class ButtonReader(threading.Thread):
         sess = self._screen.current_shown()
         if sess is None:
             log("CONTINUE pressed but no session shown")
+            self._screen.notice("continue: no session")
             return
         if not sess.focus_ctrl:
             log(f"CONTINUE -> {sess.name}: not a wrapped session, nothing to type into")
+            self._screen.notice("continue: not a wrapped session")
             return
-        ok = wrapper_ctrl_send(sess.focus_ctrl, "submit continue")
+        ok, why = wrapper_ctrl_call(sess.focus_ctrl, "submit continue")
         log(f"CONTINUE -> {sess.name}: {'sent' if ok else 'FAILED'}")
+        # Only on failure. A successful `continue` shows itself -- the session
+        # goes from waiting to working within a second or two, on the same
+        # screen -- and a notice would cover exactly that with older news.
+        if not ok:
+            self._screen.notice(why or "continue failed")
 
     def _new_terminal_pressed(self) -> None:
         """B|T -- open a new terminal, in the shown session's directory, and
@@ -2291,9 +2394,11 @@ class ButtonReader(threading.Thread):
         sess = self._screen.current_shown()
         if sess is None:
             log("SWITCH pressed but no session shown")
+            self._screen.notice("switch: no session")
             return
         if not sess.focus_ctrl:
             log(f"SWITCH -> {sess.name}: not a wrapped session")
+            self._screen.notice("switch: not a wrapped session")
             return
         names = pushed_accounts()
         try:
@@ -2301,12 +2406,18 @@ class ButtonReader(threading.Thread):
         except (ValueError, IndexError):
             log(f"SWITCH -> {sess.name}: index {index!r} names no account the "
                 f"device was sent ({names or 'nothing pushed yet'})")
+            self._screen.notice("switch: no such account")
             return
 
         def run() -> None:
-            ok = wrapper_ctrl_send(sess.focus_ctrl, f"switch {name}")
+            # The wrapper's own words, on the glass. Every refusal it can give
+            # is a thing the person holding the device can act on -- they are
+            # already on that account, the session has nothing to carry yet --
+            # and none of them is worth making someone read a log to learn.
+            ok, why = wrapper_ctrl_call(sess.focus_ctrl, f"switch {name}")
             log(f"SWITCH -> {sess.name}: continue on saved account "
                 f"{name!r} ({'requested' if ok else 'FAILED'})")
+            self._screen.notice(f"-> {name}" if ok else (why or "switch failed"))
 
         threading.Thread(target=run, name="switch-account", daemon=True).start()
 

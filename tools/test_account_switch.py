@@ -11,8 +11,10 @@ in the right place under a different profile.
 No claude, no network, no hardware. Profiles, config dirs and transcripts are
 all fabricated in a temp tree.
 """
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -267,18 +269,32 @@ check("a switch to the account you are already on is refused, not performed",
       "already on" in W.switch_refusal("acct-a"))
 check("...an account that does not exist likewise",
       "no such account" in W.switch_refusal("nosuch"))
-check("...and a move to ANOTHER ORGANISATION most of all",
-      "other-org.test" in W.switch_refusal("acct-c"))
-check("...naming where to do that deliberately",
-      "claude-mate-switch" in W.switch_refusal("acct-c"))
 check("a switch between your own accounts is allowed",
       W.switch_refusal("acct-b") == "")
+# This used to be refused, and refusing it was the bug. Every account on the
+# device's picker is one the user installed and logged into; which company each
+# belongs to is not a trust boundary the daemon discovered. The check fired on
+# every pair of a real three-account fleet -- so the feature could not do the
+# one thing it exists for (the account you are on is out of limit) -- and said
+# so only in a log file.
+check("a move to another ORGANISATION is allowed too: it is your account as well",
+      W.switch_refusal("acct-c") == "")
+check("...so no refusal mentions organisations any more",
+      "organisation" not in (W.switch_refusal("acct-b")
+                             + W.switch_refusal("acct-c")))
 check("--best is a request, not an account name",
       W.switch_refusal("--best") == "")
 
 W.g_claude_sid = "never-started"
 check("a session with nothing to carry is refused while it is still alive",
       "nothing to carry" in W.switch_refusal("acct-b"))
+# Every refusal is shown on a 21-char-wide screen, two rows of it. One that does
+# not fit arrives on the glass with its second half cut off, which is how the
+# advice-bearing end of a sentence gets lost.
+for _req in ("acct-a", "nosuch", "acct-b"):
+    _why = W.switch_refusal(_req)
+    check(f"the refusal {_why!r} ({len(_why)}c) fits the device's two rows",
+          len(_why) <= 42)
 W.g_claude_sid = "mine"
 
 
@@ -429,6 +445,42 @@ check("...as the target account, with the picker skipped",
       and seen.get("env", {}).get("CLAUDE_MATE_ACCOUNT") == "acct-d")
 check("...and the transcript really landed there",
       os.path.exists(os.path.join(cfg_d, "projects", mangled, "mine.jsonl")))
+
+# The same move to a DIFFERENT-DOMAIN account, with yes=False and no terminal to
+# type into. This is the exact shape the old code turned away ("this needs a
+# typed confirmation and there is no terminal to type it in") -- which is also
+# the shape every device-initiated switch has, since the wrapper re-execs the
+# switcher after the session is already gone. It must reach the exec, and it
+# must still SAY what it is doing.
+cfg_e = mk_profile("acct-e", "me@other-org.test")
+dest_e = {"name": "acct-e", "dir": cfg_e, "email": "me@other-org.test", "chip": ""}
+seen_e, out_e = {}, io.StringIO()
+
+
+def fake_execve_e(path, argv, env):
+    seen_e.update(path=path, argv=argv, env=env)
+    raise SystemExit(0)
+
+
+back, os.execve = os.getcwd(), fake_execve_e
+try:
+    with contextlib.redirect_stdout(out_e):
+        S.switch(dict(ctx_live, cwd=work_dir, argv=[]), dest_e, yes=False)
+except SystemExit:
+    pass
+finally:
+    os.execve = real_execve
+    os.chdir(back)
+
+check("a cross-organisation switch with nobody to ask now PROCEEDS",
+      seen_e.get("env", {}).get("CLAUDE_MATE_ACCOUNT") == "acct-e")
+check("...carrying the conversation with it",
+      os.path.exists(os.path.join(cfg_e, "projects", mangled, "mine.jsonl")))
+check("...and announcing the change of organisation rather than hiding it",
+      "other-org.test" in out_e.getvalue()
+      and "example.com" in out_e.getvalue())
+check("...without ever asking for a typed confirmation",
+      "type the target domain" not in out_e.getvalue())
 
 
 # --------------------------------------------------------------------------- #
