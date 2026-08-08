@@ -34,7 +34,9 @@
  * is not a mechanic, it is a wall. It cannot be stomped (it is your manager),
  * and a collision is the most expensive in the game: 2.5 days MORE than a
  * priority change on the same tier (4.5 / 4.5 / 5 / 5.5 / 5.5), a 60 px
- * shove and 90 frames of invulnerability. On DEATH MARCH and HOTFIX FRIDAY
+ * shove SWEPT against terrain -- walls stop it; a knockback that teleports
+ * through a wall can drop the player into the pyramid's sealed hollow --
+ * and 90 frames of invulnerability. On DEATH MARCH and HOTFIX FRIDAY
  * that is more than the whole budget -- the card says so, and avoiding the
  * PM entirely is the intended reading at those tiers. Two ways past, both
  * taught by the terrain: take the catwalk above its floor, or bait the chase
@@ -126,7 +128,7 @@ static const GameSpawn LVL2_PRIOS[] = {
 // Patrol 0.7x tier speed; chase 1.35x capped at 1.2 px/step (always slower
 // than your 1.45 walk); sight is the same floor within 96 px; cannot be
 // stomped; costs the tier's priority-change penalty PLUS 2.5 days, shoves
-// 60 px back, 90 frames of invulnerability.
+// 60 px back (swept -- terrain stops the shove), 90 frames of invulnerability.
 static const GameSpawn LVL2_PMS[] = {
   { 30, 4, 28, 34 },      // beat 3: the floor under the teaching catwalk
   { 93, 4, 91, 96 },      // beat 7: between the perches

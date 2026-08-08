@@ -440,6 +440,16 @@ function hits(px, py) {
   return false;
 }
 function toast(m, c) { Sx.msg = m; Sx.msgCol = c || P.text; Sx.flash = 52; }
+
+// A knockback is a shove, not a teleport: walk the player back pixel by pixel
+// and let terrain stop it. Level 2's pyramid made this load-bearing -- a raw
+// `x -= 46` from the prio at col 112 passes THROUGH the pyramid's wall into
+// its sealed hollow, a pit no jump can leave, and the run is over for a
+// reason the player cannot see. On level 1 the swept and unswept shoves land
+// on the same pixel at every priority-change site, so nothing shipped changes.
+function shove(px) {
+  while (px-- > 0 && Sx.x > 0 && !hits(Sx.x - 1, Sx.y)) Sx.x -= 1;
+}
 function gain(v, label, col) {
   const cap = DIFFS[diff].days;
   if (Sx.days >= cap) { toast(label + '  ·  already at cap', '#8b949e'); return; }
@@ -554,7 +564,7 @@ function step() {
     if (p.y <= p.top || p.y >= p.bot) p.dir *= -1;
     if (Math.abs(p.c - Sx.x) < 13 && Math.abs(p.y - Sx.y) < 13 && Sx.inv <= 0) {
       Sx.days -= d.prio; toast('RE-SCOPED  -' + dstr(d.prio) + 'd', P.prio); SFX.hit();
-      Sx.x = Math.max(0, Sx.x - 46); Sx.vy = -2.2; Sx.inv = 80;
+      shove(46); Sx.vy = -2.2; Sx.inv = 80;
       Sx.shake = 11; Sx.hurt = 20; burst(p.c + 6, p.y + 6, 20, P.prio, 1.6, 0.3);
       Sx.trail.length = 0;
     }
@@ -576,7 +586,7 @@ function step() {
     } else { m.c = nc; m.dir = dir; }
     if (Math.abs(m.c - Sx.x) < 13 && Math.abs(my - Sx.y) < 13 && Sx.inv <= 0) {
       Sx.days -= d.pm; toast('QUICK SYNC  -' + dstr(d.pm) + 'd', P.pm); SFX.hit();
-      Sx.x = Math.max(0, Sx.x - 60); Sx.vy = -2.4; Sx.inv = 90;
+      shove(60); Sx.vy = -2.4; Sx.inv = 90;
       Sx.shake = 13; Sx.hurt = 22; burst(m.c + 6, my + 6, 24, P.pm, 1.8, 0.3);
       Sx.trail.length = 0;
     }

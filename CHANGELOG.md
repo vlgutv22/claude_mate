@@ -29,8 +29,13 @@ they are the project's history, not the current behavior (which the
   on sight* at 1.35×, capped at 1.2 px/step — deliberately below the 1.45
   walk, because a meeting you cannot outrun is not a mechanic, it is a wall.
   It cannot be stomped, and a collision costs the tier's priority-change
-  penalty **plus 2½ days** (4½/4½/5/5½/5½ across the tiers), a six-tile shove
+  penalty **plus 2½ days** (4½/4½/5/5½/5½ across the tiers), a 60 px shove
   and 90 frames of invulnerability. It gets a codex card like everyone else.
+  Knockbacks are now swept against terrain instead of teleporting — the
+  review found that a raw 46 px shove from the priority change at level 2's
+  col 112 could pass through the pyramid's wall into its sealed hollow, a
+  pit no jump can leave; on level 1 the swept shove lands on the same pixel
+  at every site, so nothing shipped changes.
 - **Added: `tools/test_levels.py`**, the reachability checker the design doc
   demanded after level 1's first draft shipped with all seventeen PRs
   unreachable: a breadth-first search over standing positions using only the

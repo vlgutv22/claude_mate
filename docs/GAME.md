@@ -67,7 +67,7 @@ the corner, counting down, and everything in the world is a claim on it.
 | Fall in a hole | **−1 day**, respawn at the last tile you stood on |
 | Stomp a bug | **+½ day** — fixing things buys schedule |
 | A **priority change** reaches you | **−2 days** and shoved four tiles back; cannot be stomped |
-| A **product manager** catches you (L2) | **−4½ days** — the priority-change cost **plus 2½**, on every tier — and shoved six tiles back; cannot be stomped |
+| A **product manager** catches you (L2) | **−4½ days** — the priority-change cost **plus 2½**, on every tier — and shoved 60 px back (walls stop the shove); cannot be stomped |
 | Merge a pull request | **+1 day**, and the screen says `PR MERGED` |
 | Reach the milestone | level complete; unused days carry over |
 
