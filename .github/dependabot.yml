@@ -1,13 +1,19 @@
 version: 2
+#
+# NO github-actions ecosystem here, deliberately. Automatic bumps of the CI
+# actions are OFF: every one of them opens a pull request, and a pull request is
+# permanent in a way a branch is not -- GitHub keeps refs/pull/<n>/* forever, so
+# the commits it touched stay reachable by SHA even after the branch is deleted
+# and the history rewritten. That is not a hypothetical here: purging content
+# from this repo's history has already needed a full recreate because closed
+# Dependabot PRs had re-pinned the old commits. The four workflow actions are
+# pinned by major version, change a few times a year, and are quicker to bump by
+# hand than to un-pin afterwards.
+#
+# This does NOT turn off Dependabot security ALERTS -- those are a repository
+# setting, not this file, and they stay on.
+#
 updates:
-  # Keep GitHub Actions used by the CI workflow current.
-  - package-ecosystem: github-actions
-    directory: "/"
-    schedule:
-      interval: weekly
-    commit-message:
-      prefix: "ci"
-
   # The daemon's only runtime dependency (pyserial) and the wrapper's (pyte).
   - package-ecosystem: pip
     directory: "/daemon"
