@@ -58,11 +58,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      # site/game/level_01.js is GENERATED from the firmware level header, so
-      # the two engines cannot drift. Editing the header without regenerating
-      # is exactly the mistake this catches; the failure prints the diff and
-      # the one command that fixes it.
-      - name: Check site/game/level_01.js matches the firmware header
+      # Every site/game/level_NN.js is GENERATED from its firmware level
+      # header, so the two engines cannot drift. Editing a header without
+      # regenerating is exactly the mistake this catches; the failure prints
+      # the diff and the one command that fixes it.
+      - name: Check site/game/level_NN.js matches the firmware headers
         run: python3 tools/gen_level.py --check
 
   firmware-build:

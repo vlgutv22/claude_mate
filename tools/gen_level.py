@@ -1,17 +1,26 @@
 #!/usr/bin/env python3
 """Generate the web game's level data from the firmware level header.
 
-The firmware header is the single source of truth for level geometry, actor
+The firmware headers are the single source of truth for level geometry, actor
 spawns, the palette and the sprites. The browser prototype used to carry its
 own copy of all of that, which is exactly the kind of duplication that drifts:
 someone widens a gap in C, nobody widens it in JS, and the two engines quietly
 stop being the same game.
 
     firmware/claude_mate_s3/game/level_01.h   ->   site/game/level_01.js
+    firmware/claude_mate_s3/game/level_02.h   ->   site/game/level_02.js
+
+Each header owns its own geometry and actors; the palette and the sprites are
+game-wide and may be DEFINED in any one header (the character lives in
+level_01.h, the product manager in level_02.h, where each first appears) but
+are merged and emitted into EVERY generated module, so each level_NN.js is
+self-contained and any level can draw any actor. Defining the same sprite or
+palette entry in two headers is an error -- that is the drift this tool exists
+to prevent.
 
 Usage:
-    python3 tools/gen_level.py            # write site/game/level_01.js
-    python3 tools/gen_level.py --check    # exit 1 if the file on disk is stale
+    python3 tools/gen_level.py            # write every site/game/level_NN.js
+    python3 tools/gen_level.py --check    # exit 1 if any file on disk is stale
 
 The parser is deliberately regex-based -- no C toolchain, no libclang, nothing
 to install in CI -- and deliberately strict: every section it expects must be
@@ -31,9 +40,20 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-DEFAULT_INPUT = REPO / "firmware" / "claude_mate_s3" / "game" / "level_01.h"
-DEFAULT_OUTPUT = REPO / "site" / "game" / "level_01.js"
+GAME_DIR = REPO / "firmware" / "claude_mate_s3" / "game"
+SITE_DIR = REPO / "site" / "game"
 GENERATOR = "tools/gen_level.py"
+
+# One row per level: the firmware header, the define prefix inside it, and the
+# ES module it generates. Adding a level is adding a row.
+LEVELS = [
+    (GAME_DIR / "level_01.h", "LVL1", SITE_DIR / "level_01.js"),
+    (GAME_DIR / "level_02.h", "LVL2", SITE_DIR / "level_02.js"),
+]
+
+# Kept for tools that import this module to parse level 1 on its own.
+DEFAULT_INPUT = LEVELS[0][0]
+DEFAULT_OUTPUT = LEVELS[0][2]
 
 
 class LevelParseError(RuntimeError):
@@ -167,56 +187,73 @@ SPRITES = [
     ("mateStretch",  "MATE_STRETCH",   "MATE_W"),
     ("bug",          "BUG",            "BUG_W"),
     ("prio",         "PRIO",           "PRIO_W"),
+    ("pm",           "PM",             "PM_W"),
     ("pr",           "PR",             "PR_W"),
+]
+
+# js key, C symbol suffix, required in every level header. Product managers
+# arrive with level 2; a header without a PMS array simply fields none.
+ACTOR_KINDS = [
+    ("bugs",  "BUGS",  True),
+    ("prios", "PRIOS", True),
+    ("pms",   "PMS",   False),
+    ("prs",   "PRS",   True),
 ]
 
 PALETTE_KEYS = {
     "GH_L1": "l1", "GH_L2": "l2", "GH_L3": "l3", "GH_L4": "l4",
     "GH_BG": "bg", "GH_GRID": "grid", "GH_MATE": "mate", "GH_BUG": "bug",
-    "GH_PRIO": "prio", "GH_PR": "pr", "GH_TEXT": "text",
+    "GH_PRIO": "prio", "GH_PM": "pm", "GH_PR": "pr", "GH_TEXT": "text",
 }
 
 
-def parse_header(path: Path) -> dict:
+def parse_header(path: Path, prefix: str = "LVL1") -> dict:
     if not path.is_file():
         raise LevelParseError(f"input header not found: {path}")
     src = strip_comments(path.read_text(encoding="utf-8", errors="strict"))
 
-    rows = find_int_define(src, "LVL1_ROWS", path)
-    cols = find_int_define(src, "LVL1_COLS", path)
-    tile = find_int_define(src, "LVL1_TILE", path)
-    start_col = find_int_define(src, "LVL1_START_COL", path)
-    start_row = find_int_define(src, "LVL1_START_ROW", path)
-    flag_col = find_int_define(src, "LVL1_FLAG_COL", path)
+    rows = find_int_define(src, f"{prefix}_ROWS", path)
+    cols = find_int_define(src, f"{prefix}_COLS", path)
+    tile = find_int_define(src, f"{prefix}_TILE", path)
+    start_col = find_int_define(src, f"{prefix}_START_COL", path)
+    start_row = find_int_define(src, f"{prefix}_START_ROW", path)
+    flag_col = find_int_define(src, f"{prefix}_FLAG_COL", path)
 
-    m = re.search(r'#define[ \t]+LVL1_NAME[ \t]+"((?:[^"\\]|\\.)*)"', src)
+    m = re.search(r'#define[ \t]+%s_NAME[ \t]+"((?:[^"\\]|\\.)*)"' % prefix, src)
     if not m:
-        raise LevelParseError(f"{path}: missing `#define LVL1_NAME \"...\"`")
+        raise LevelParseError(f"{path}: missing `#define {prefix}_NAME \"...\"`")
     name = c_unescape(m.group(1))
 
     # ---- map -------------------------------------------------------------
     block = find_array_block(
-        src, r"static\s+const\s+char\s+LVL1_MAP\s*\[[^\]]*\]\s*\[[^\]]*\]\s*=\s*\{",
-        "LVL1_MAP", path)
+        src, r"static\s+const\s+char\s+%s_MAP\s*\[[^\]]*\]\s*\[[^\]]*\]\s*=\s*\{" % prefix,
+        f"{prefix}_MAP", path)
     grid = string_literals(block)
     if len(grid) != rows:
         raise LevelParseError(
-            f"{path}: LVL1_MAP has {len(grid)} rows but LVL1_ROWS is {rows}")
+            f"{path}: {prefix}_MAP has {len(grid)} rows but {prefix}_ROWS is {rows}")
     for i, row in enumerate(grid):
         if len(row) != cols:
             raise LevelParseError(
-                f"{path}: LVL1_MAP row {i} is {len(row)} chars but LVL1_COLS is {cols}")
+                f"{path}: {prefix}_MAP row {i} is {len(row)} chars but "
+                f"{prefix}_COLS is {cols}")
         bad = sorted(set(row) - set(".1234"))
         if bad:
             raise LevelParseError(
-                f"{path}: LVL1_MAP row {i} has unknown tile(s) {bad!r}; "
+                f"{path}: {prefix}_MAP row {i} has unknown tile(s) {bad!r}; "
                 f"expected only '.' and '1'..'4'")
 
     # ---- actors ----------------------------------------------------------
     actors: dict[str, list[dict]] = {}
-    for js_key, sym in (("bugs", "LVL1_BUGS"), ("prios", "LVL1_PRIOS"), ("prs", "LVL1_PRS")):
-        block = find_array_block(
-            src, r"static\s+const\s+GameSpawn\s+%s\s*\[\s*\]\s*=\s*\{" % sym, sym, path)
+    for js_key, suffix, required in ACTOR_KINDS:
+        sym = f"{prefix}_{suffix}"
+        decl = r"static\s+const\s+GameSpawn\s+%s\s*\[\s*\]\s*=\s*\{" % sym
+        if not re.search(decl, src):
+            if required:
+                raise LevelParseError(f"{path}: missing declaration of {sym}")
+            actors[js_key] = []
+            continue
+        block = find_array_block(src, decl, sym, path)
         spawns = []
         for entry in re.finditer(r"\{([^{}]*)\}", block):
             nums = re.findall(r"-?\d+", entry.group(1))
@@ -230,11 +267,11 @@ def parse_header(path: Path) -> dict:
                     f"{path}: {sym} spawn at (col={col}, row={row}) is outside "
                     f"the {cols}x{rows} grid")
             spawns.append({"col": col, "row": row, "from": frm, "to": to})
-        if not spawns:
+        if required and not spawns:
             raise LevelParseError(f"{path}: {sym} is empty")
         actors[js_key] = spawns
 
-    # ---- palette ---------------------------------------------------------
+    # ---- palette (whatever this header defines; merged later) ------------
     palette: dict[str, dict] = {}
     for m in re.finditer(
             r"#define[ \t]+(GH_\w+)[ \t]+RGB565\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", src):
@@ -256,34 +293,31 @@ def parse_header(path: Path) -> dict:
             "rgb565": ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3),
             "args": (r, g, b),
         }
-    missing = [s for s in PALETTE_KEYS if PALETTE_KEYS[s] not in palette]
-    if missing:
-        raise LevelParseError(
-            f"{path}: palette is missing {', '.join(sorted(missing))}")
 
-    # ---- sprites ---------------------------------------------------------
+    # ---- sprites (whatever this header defines; merged later) ------------
     sprites: dict[str, dict] = {}
-    for js_name, prefix, width_def in SPRITES:
-        height_def = f"{prefix}_H"
+    for js_name, sp_prefix, width_def in SPRITES:
+        height_def = f"{sp_prefix}_H"
+        decl = (r"static\s+const\s+char\s*\*\s*const\s+%s_BITS\s*\[[^\]]*\]\s*=\s*\{"
+                % sp_prefix)
+        if not re.search(decl, src):
+            continue
         h = find_int_define(src, height_def, path)
         w = find_int_define(src, width_def, path)
-        block = find_array_block(
-            src,
-            r"static\s+const\s+char\s*\*\s*const\s+%s_BITS\s*\[[^\]]*\]\s*=\s*\{" % prefix,
-            f"{prefix}_BITS", path)
+        block = find_array_block(src, decl, f"{sp_prefix}_BITS", path)
         bits = string_literals(block)
         if len(bits) != h:
             raise LevelParseError(
-                f"{path}: {prefix}_BITS has {len(bits)} rows but {height_def} is {h}")
+                f"{path}: {sp_prefix}_BITS has {len(bits)} rows but {height_def} is {h}")
         for i, row in enumerate(bits):
             if len(row) != w:
                 raise LevelParseError(
-                    f"{path}: {prefix}_BITS row {i} is {len(row)} px wide but "
+                    f"{path}: {sp_prefix}_BITS row {i} is {len(row)} px wide but "
                     f"{width_def} is {w}")
             bad = sorted(set(row) - set("01"))
             if bad:
                 raise LevelParseError(
-                    f"{path}: {prefix}_BITS row {i} has non-bit character(s) {bad!r}")
+                    f"{path}: {sp_prefix}_BITS row {i} has non-bit character(s) {bad!r}")
         sprites[js_name] = {"w": w, "h": h, "bits": bits}
 
     return {
@@ -291,6 +325,40 @@ def parse_header(path: Path) -> dict:
         "start": {"col": start_col, "row": start_row}, "flagCol": flag_col,
         "map": grid, "palette": palette, "sprites": sprites, **actors,
     }
+
+
+def merge_assets(parsed: list) -> tuple:
+    """Merge palette + sprites across headers; duplicates are drift, so raise."""
+    palette: dict[str, dict] = {}
+    sprites: dict[str, dict] = {}
+    pal_home: dict[str, Path] = {}
+    spr_home: dict[str, Path] = {}
+    for path, level in parsed:
+        for key, ent in level["palette"].items():
+            if key in palette:
+                raise LevelParseError(
+                    f"{path}: palette entry {ent['sym']} is already defined in "
+                    f"{pal_home[key]}; a colour must live in exactly one header")
+            palette[key] = ent
+            pal_home[key] = path
+        for name, sp in level["sprites"].items():
+            if name in sprites:
+                raise LevelParseError(
+                    f"{path}: sprite {name} is already defined in "
+                    f"{spr_home[name]}; a sprite must live in exactly one header")
+            sprites[name] = sp
+            spr_home[name] = path
+    missing = sorted(v for k, v in PALETTE_KEYS.items() if v not in palette)
+    if missing:
+        raise LevelParseError(
+            f"palette is missing {', '.join(missing)} across all level headers")
+    missing = [n for n, _, _ in SPRITES if n not in sprites]
+    if missing:
+        raise LevelParseError(
+            f"sprites missing {', '.join(missing)} across all level headers")
+    # canonical order, independent of which header carried what
+    sprites = {n: sprites[n] for n, _, _ in SPRITES}
+    return palette, sprites
 
 
 # --------------------------------------------------------------------------
@@ -323,8 +391,10 @@ def render_body(level: dict) -> str:
     add("  ],")
     add("")
     add("  // Actors: (col, row) spawn in the grid above. Bugs patrol columns")
-    add("  // from..to; priority changes drift rows from..to; PRs do not move.")
-    for key, label in (("bugs", "bugs"), ("prios", "priority changes"), ("prs", "pull requests")):
+    add("  // from..to; priority changes drift rows from..to; product managers")
+    add("  // patrol columns from..to and chase on sight; PRs do not move.")
+    for key, label in (("bugs", "bugs"), ("prios", "priority changes"),
+                       ("pms", "product managers"), ("prs", "pull requests")):
         add("  %s: [ // %d %s" % (key, len(level[key]), label))
         for s in level[key]:
             add("    { col: %3d, row: %d, from: %3d, to: %3d }," %
@@ -375,12 +445,13 @@ def render(level: dict, source: Path) -> str:
         "// GENERATED FILE -- DO NOT EDIT BY HAND.",
         "//",
         "// Source:     %s" % rel_src,
+        "// Assets:     palette + sprites merged from every level header",
         "// Generator:  %s" % GENERATOR,
         "// Regenerate: python3 %s" % GENERATOR,
         "// Verify:     python3 %s --check   (CI runs this)" % GENERATOR,
         "//",
-        "// The firmware header is the single source of truth for this level's",
-        "// geometry, actors, palette and sprites. Edit the header and rerun the",
+        "// The firmware headers are the single source of truth for level",
+        "// geometry, actors, palette and sprites. Edit a header and rerun the",
         "// generator; anything hand-edited here is lost on the next run, and CI",
         "// fails in the meantime so the two engines cannot drift apart.",
         "//",
@@ -398,7 +469,10 @@ def render(level: dict, source: Path) -> str:
 # --------------------------------------------------------------------------
 
 def check(generated: str, out_path: Path) -> int:
-    rel_out = out_path.as_posix()
+    try:
+        rel_out = out_path.resolve().relative_to(REPO).as_posix()
+    except ValueError:
+        rel_out = out_path.as_posix()
     if not out_path.is_file():
         print(f"gen_level: {rel_out} does not exist -- run `python3 {GENERATOR}`",
               file=sys.stderr)
@@ -426,37 +500,47 @@ def check(generated: str, out_path: Path) -> int:
     return 1
 
 
+def build_all() -> list:
+    """Parse every level header, merge the shared assets, render every module.
+
+    Returns [(output Path, level dict, generated text), ...].
+    """
+    parsed = [(hdr, parse_header(hdr, prefix)) for hdr, prefix, _ in LEVELS]
+    palette, sprites = merge_assets(parsed)
+    out = []
+    for (hdr, prefix, dest), (_, level) in zip(LEVELS, parsed):
+        level = {**level, "palette": palette, "sprites": sprites}
+        out.append((dest, level, render(level, hdr)))
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
-        description="Generate the web game's level module from the firmware header.")
-    ap.add_argument("--input", type=Path, default=DEFAULT_INPUT,
-                    help="firmware level header (default: %(default)s)")
-    ap.add_argument("--output", type=Path, default=DEFAULT_OUTPUT,
-                    help="ES module to write (default: %(default)s)")
+        description="Generate the web game's level modules from the firmware headers.")
     ap.add_argument("--check", action="store_true",
-                    help="regenerate in memory and exit 1 if the file on disk differs")
-    ap.add_argument("--stdout", action="store_true",
-                    help="print the generated module instead of writing it")
+                    help="regenerate in memory and exit 1 if any file on disk differs")
     args = ap.parse_args(argv)
 
     try:
-        level = parse_header(args.input)
-        generated = render(level, args.input)
+        built = build_all()
     except LevelParseError as exc:
         print(f"gen_level: {exc}", file=sys.stderr)
         return 2
 
-    if args.stdout:
-        sys.stdout.write(generated)
-        return 0
     if args.check:
-        return check(generated, args.output)
+        rc = 0
+        for dest, _, generated in built:
+            rc = max(rc, check(generated, dest))
+        return rc
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(generated, encoding="utf-8")
-    print("gen_level: wrote %s (%d bugs, %d priority changes, %d PRs, %dx%d map)" % (
-        args.output.as_posix(), len(level["bugs"]), len(level["prios"]),
-        len(level["prs"]), level["rows"], level["cols"]))
+    for dest, level, generated in built:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(generated, encoding="utf-8")
+        print("gen_level: wrote %s (%d bugs, %d priority changes, %d PMs, "
+              "%d PRs, %dx%d map)" % (
+                  dest.as_posix(), len(level["bugs"]), len(level["prios"]),
+                  len(level["pms"]), len(level["prs"]),
+                  level["rows"], level["cols"]))
     return 0
 
 
