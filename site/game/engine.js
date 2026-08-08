@@ -2,9 +2,9 @@
 //
 // TWO ENGINES, ONE GAME. The device engine (firmware/claude_mate_s3/game/ship_it.h)
 // draws 320x172 integer pixels onto glass at ~30 fps. This one draws the same
-// 320x172 world and then makes a browser earn its keep. They share the level and
-// the physics constants -- level_01.js is GENERATED from the firmware header, so
-// they cannot drift -- and share nothing else.
+// 320x172 world and then makes a browser earn its keep. They share the levels and
+// the physics constants -- every level_NN.js is GENERATED from its firmware
+// header, so they cannot drift -- and share nothing else.
 //
 // THE RENDERING IS TWO LAYERS, and that is the whole answer to "full width, but
 // proportional to the device, with better text":
@@ -25,30 +25,60 @@
 // Physics runs at a fixed 60 Hz on both. The constants below are the device's,
 // and they are load-bearing: the level is BUILT to this jump arc.
 
-import { LEVEL } from './level_01.js';
+import { LEVEL as LEVEL_1 } from './level_01.js';
+import { LEVEL as LEVEL_2 } from './level_02.js';
 
 // ---------------------------------------------------------------------------
 // The world
 // ---------------------------------------------------------------------------
 const W = 320, H = 172;
-const T = LEVEL.tile, ROWS = LEVEL.rows, COLS = LEVEL.cols;
+
+// The campaign. Every generated level module carries the full merged palette
+// and sprite set, so any of them can stand in for "the assets"; what actually
+// varies per level is the map, its width and the actor rosters. The menu's
+// one-line pitch for each level lives here rather than in the data: it is
+// menu copy, not level geometry.
+const CAMPAIGN = [LEVEL_1, LEVEL_2];
+const CAMPAIGN_SUB = [
+  'dense, flat, forgiving',
+  'rising streaks · a product manager walks the floor',
+];
+let lvl = 0;
+let LEVEL = CAMPAIGN[lvl];
+let COLS = LEVEL.cols;
+
+const T = LEVEL_1.tile, ROWS = LEVEL_1.rows;   // every level shares the band
 const HUD_H = 24, PLAY_Y = HUD_H + 12;
 
 const GRAV = 0.30, WALK = 1.45, JUMP = -4.75, MAXFALL = 7;
 const COYOTE = 6, BUFFER = 6;
-const CROSS = 1159;                       // steps for a straight run, measured
+// The day-pricing unit: level 1's crossing, measured. The drain is derived
+// from THIS level's steps, so a level 20% longer costs 20% more days to walk
+// -- length is difficulty, priced by the same clock.
+const CROSS = 1159;
 
-const P = LEVEL.palette;
+const P = LEVEL_1.palette;                // identical in every generated level
 const RAMP = { '1': P.l1, '2': P.l2, '3': P.l3, '4': P.l4 };
 
+// `pm` is the product manager: cannot be stomped, chases on sight (capped
+// below your walk speed -- always escapable), and costs the tier's
+// priority-change penalty plus 2.5 days. On the top two tiers that is more
+// than the whole budget, which is the point: some meetings you do not survive,
+// you avoid.
 const DIFFS = [
-  { name: 'SPRINT',        days: 7, walk: 5, spd: 0.58, pr: 1,    stomp: .5, bug: 1,   prio: 2,   sub: 'the plan, as written' },
-  { name: 'CRUNCH',        days: 6, walk: 6, spd: 0.72, pr: 1,    stomp: .5, bug: 1,   prio: 2,   sub: 'someone promised a demo' },
-  { name: 'CODE FREEZE',   days: 5, walk: 7, spd: 0.88, pr: 1,    stomp: .5, bug: 1.5, prio: 2.5, sub: 'the branch is cut, the date is not' },
-  { name: 'DEATH MARCH',   days: 4, walk: 8, spd: 1.05, pr: 0.75, stomp: .5, bug: 1.5, prio: 3,   sub: 'the slack was spent last week' },
-  { name: 'HOTFIX FRIDAY', days: 3, walk: 9, spd: 1.25, pr: 0.5,  stomp: .5, bug: 2,   prio: 3,   sub: 'already broken in production' },
+  { name: 'SPRINT',        days: 7, walk: 5, spd: 0.58, pr: 1,    stomp: .5, bug: 1,   prio: 2,   pm: 4.5, sub: 'the plan, as written' },
+  { name: 'CRUNCH',        days: 6, walk: 6, spd: 0.72, pr: 1,    stomp: .5, bug: 1,   prio: 2,   pm: 4.5, sub: 'someone promised a demo' },
+  { name: 'CODE FREEZE',   days: 5, walk: 7, spd: 0.88, pr: 1,    stomp: .5, bug: 1.5, prio: 2.5, pm: 5,   sub: 'the branch is cut, the date is not' },
+  { name: 'DEATH MARCH',   days: 4, walk: 8, spd: 1.05, pr: 0.75, stomp: .5, bug: 1.5, prio: 3,   pm: 5.5, sub: 'the slack was spent last week' },
+  { name: 'HOTFIX FRIDAY', days: 3, walk: 9, spd: 1.25, pr: 0.5,  stomp: .5, bug: 2,   prio: 3,   pm: 5.5, sub: 'already broken in production' },
 ];
 for (const d of DIFFS) d.drain = Math.round(CROSS / d.walk);
+
+// What a perfect straight run across the CURRENT level costs in days -- the
+// number the start screen quotes. Exact for level 1 by construction (CROSS is
+// its measurement); proportional for longer maps.
+const walkCost = d =>
+  Math.round(((COLS - 2 - LEVEL.start.col) * T / WALK) / d.drain);
 
 const LEVELS = 12, PKEY = 'shipit.progress.v1';
 
@@ -189,14 +219,23 @@ function blit(sp, x, y, col, flip) {
 let diff = 0, tutorial = true, menuRow = 0;
 let Sx;                                     // the run
 
+// Switching level swaps the module and rebuilds the run state, so nothing --
+// not the world canvas, not a stale actor list -- can be drawn against the
+// wrong map even for one frame.
+function setLevel(i) {
+  lvl = i; LEVEL = CAMPAIGN[i]; COLS = LEVEL.cols;
+  reset(); Sx.state = 'menu';
+}
+
 function reset() {
   const d = DIFFS[diff];
   Sx = {
     x: T, y: 4 * T, vx: 0, vy: 0, onGround: false, face: 1, days: d.days, cam: 0,
     bugs:  LEVEL.bugs.map(b  => ({ c: b.col * T, r: b.row, from: b.from, to: b.to, dir: 1, dead: false })),
     prios: LEVEL.prios.map(p => ({ c: p.col * T, y: p.row * T, top: p.from * T, bot: p.to * T, dir: 1, dead: false })),
+    pms:   LEVEL.pms.map(m   => ({ c: m.col * T, r: m.row, from: m.from, to: m.to, dir: 1, dead: false })),
     prs:   LEVEL.prs.map(p   => ({ c: p.col, r: p.row, got: false })),
-    seen: { bug: !tutorial, prio: !tutorial }, card: null,
+    seen: { bug: !tutorial, prio: !tutorial, pm: !tutorial }, card: null,
     merged: 0, state: 'play', flash: 0, msg: '', msgCol: P.text,
     squashT: 0, t: 0, started: false, coyote: 0, buffer: 0, inv: 0,
     shipT: 0, conf: [], newBest: false,
@@ -377,11 +416,12 @@ function nav(k) {
   if (Sx.state === 'card') { Sx.card = null; Sx.state = 'play'; jw.v = true; return; }
   if (Sx.state === 'slip' || Sx.state === 'ship') { Sx.state = 'menu'; menuRow = 0; return; }
   if (Sx.state !== 'menu') return;
-  if (k === 'left')  { menuRow = (menuRow + 2) % 3; SFX.move(); }
-  else if (k === 'right') { menuRow = (menuRow + 1) % 3; SFX.move(); }
+  if (k === 'left')  { menuRow = (menuRow + 3) % 4; SFX.move(); }
+  else if (k === 'right') { menuRow = (menuRow + 1) % 4; SFX.move(); }
   else {
-    if (menuRow === 0)      { diff = (diff + 1) % DIFFS.length; Sx.days = DIFFS[diff].days; SFX.jump(); }
-    else if (menuRow === 1) { tutorial = !tutorial; SFX.jump(); }
+    if (menuRow === 0)      { setLevel((lvl + 1) % CAMPAIGN.length); SFX.jump(); }
+    else if (menuRow === 1) { diff = (diff + 1) % DIFFS.length; Sx.days = DIFFS[diff].days; SFX.jump(); }
+    else if (menuRow === 2) { tutorial = !tutorial; SFX.jump(); }
     else                    { reset(); Sx.started = true; SFX.merge(); }
   }
 }
@@ -520,6 +560,28 @@ function step() {
     }
   }
 
+  for (const m of Sx.pms) {
+    if (m.dead) continue;
+    const my = m.r * T + 4;
+    // Line of sight is its own floor: the same row band, within six tiles.
+    // Chase speed is CAPPED below the 1.45 walk -- a meeting you cannot
+    // outrun is not a mechanic, it is a wall. Patrolling it ambles at 0.7x.
+    const sees = Math.abs(my - Sx.y) < 22 && Math.abs(m.c - Sx.x) < 96;
+    const dir = sees ? (Sx.x >= m.c ? 1 : -1) : m.dir;
+    const sp  = sees ? Math.min(1.2, d.spd * 1.35) : d.spd * 0.7;
+    const nc  = m.c + dir * sp;
+    const col = Math.floor((nc + 6) / T);
+    if (col <= m.from || col >= m.to || !solid(col, m.r + 1)) {
+      if (!sees) m.dir = -m.dir;      // patrol turns; a chase waits at the edge
+    } else { m.c = nc; m.dir = dir; }
+    if (Math.abs(m.c - Sx.x) < 13 && Math.abs(my - Sx.y) < 13 && Sx.inv <= 0) {
+      Sx.days -= d.pm; toast('QUICK SYNC  -' + dstr(d.pm) + 'd', P.pm); SFX.hit();
+      Sx.x = Math.max(0, Sx.x - 60); Sx.vy = -2.4; Sx.inv = 90;
+      Sx.shake = 13; Sx.hurt = 22; burst(m.c + 6, my + 6, 24, P.pm, 1.8, 0.3);
+      Sx.trail.length = 0;
+    }
+  }
+
   for (const p of Sx.prs) {
     if (p.got) continue;
     if (Math.abs(p.c * T - Sx.x) < 14 && Math.abs(p.r * T - Sx.y) < 14) {
@@ -538,11 +600,13 @@ function step() {
     Sx.seen.bug = true; Sx.card = 'bug'; Sx.state = 'card'; SFX.hit();
   } else if (!Sx.seen.prio && Sx.prios.some(p => !p.dead && p.c > Sx.cam + 40 && p.c < right - 24)) {
     Sx.seen.prio = true; Sx.card = 'prio'; Sx.state = 'card'; SFX.hit();
+  } else if (!Sx.seen.pm && Sx.pms.some(m => !m.dead && m.c > Sx.cam + 40 && m.c < right - 24)) {
+    Sx.seen.pm = true; Sx.card = 'pm'; Sx.state = 'card'; SFX.hit();
   }
 
   if (Math.floor(Sx.x / T) >= COLS - 2) {
     Sx.state = 'ship'; Sx.shipT = 0; SFX.ship(); Sx.shake = 6;
-    Sx.newBest = progRecord(0, diff, Sx.merged, Math.max(0, Sx.days));
+    Sx.newBest = progRecord(lvl, diff, Sx.merged, Math.max(0, Sx.days));
     for (let i = 0; i < 90; i++) Sx.conf.push({
       x: Math.random() * W, y: -Math.random() * 120,
       vy: .7 + Math.random() * 2.1, vx: (Math.random() - .5) * .9,
@@ -612,6 +676,7 @@ function drawWorld() {
   }
   for (const b of Sx.bugs) if (!b.dead) blit(LEVEL.sprites.bug, b.c - cam, PLAY_Y + b.r * T + 6, P.bug, b.dir < 0);
   for (const p of Sx.prios) if (!p.dead) blit(LEVEL.sprites.prio, p.c - cam, PLAY_Y + p.y + 2, P.prio);
+  for (const m of Sx.pms) if (!m.dead) blit(LEVEL.sprites.pm, m.c - cam, PLAY_Y + m.r * T + 3, P.pm, m.dir < 0);
 
   // particles
   for (const p of Sx.parts) {
@@ -747,43 +812,47 @@ function drawMenu() {
 
   const d = DIFFS[diff];
   const rows = [
+    ['MILESTONE', LEVEL.name, CAMPAIGN_SUB[lvl]],
     ['DIFFICULTY', d.name, d.sub],
     ['TUTORIAL', tutorial ? 'ON' : 'OFF',
       tutorial ? 'freeze and explain each new enemy' : 'no cards, straight in'],
     ['START SPRINT', '',
-      d.days + ' days \u00b7 the walk alone costs ' + d.walk + ' \u00b7 ' + LEVEL.prs.length + ' PRs on the map'],
+      d.days + ' days \u00b7 the walk alone costs ' + walkCost(d) + ' \u00b7 ' + LEVEL.prs.length + ' PRs on the map'],
   ];
-  let y = 262;
+  let y = 240;
   for (let i = 0; i < rows.length; i++) {
     const sel = i === menuRow;
-    if (sel) { R(30, y - 40, UI_W - 60, 70, '#161b22'); R(30, y - 40, 7, 70, P.mate); }
-    txt(rows[i][0], 54, y, 30, sel ? P.text : '#8b949e', 'left', 700);
+    if (sel) { R(30, y - 34, UI_W - 60, 60, '#161b22'); R(30, y - 34, 7, 60, P.mate); }
+    txt(rows[i][0], 54, y, 27, sel ? P.text : '#8b949e', 'left', 700);
     if (rows[i][1]) {
-      const vwid = tw(rows[i][1], 30, 700);
-      txt(rows[i][1], UI_W - 56 - vwid, y, 30, (i === 1 && !tutorial) ? '#8b949e' : P.l2, 'left', 700);
+      const vwid = tw(rows[i][1], 27, 700);
+      txt(rows[i][1], UI_W - 56 - vwid, y, 27, (i === 2 && !tutorial) ? '#8b949e' : P.l2, 'left', 700);
     }
-    txt(rows[i][2], 54, y + 28, 18, '#6e7681', 'left', 500);
-    y += 86;
+    txt(rows[i][2], 54, y + 24, 17, '#6e7681', 'left', 500);
+    y += 70;
   }
 
+  // The record is a single best across the campaign, so no "/N": the run it
+  // was set on may not be the level currently selected.
   const rec = prog.tier < 0 ? 'no milestone shipped yet'
-    : 'best: ' + DIFFS[prog.tier].name + '   ' + prog.prs + '/' + LEVEL.prs.length
+    : 'best: ' + DIFFS[prog.tier].name + '   ' + prog.prs
       + ' PRs   ' + dstr(prog.days) + 'd left';
-  centre(rec, 496, 18, prog.tier < 0 ? '#484f58' : P.pr, 600);
+  centre(rec, 500, 18, prog.tier < 0 ? '#484f58' : P.pr, 600);
   centre(controller === 'DEVICE'
     ? 'the device is your controller  \u00b7  outer keys move  \u00b7  \u25cb changes or starts'
     : '\u2190 \u2192 move  \u00b7  \u2191 change or start  \u00b7  esc back', 524, 17, '#6e7681', 500);
 }
 
 function drawCard() {
-  const bug = Sx.card === 'bug';
-  const col = bug ? P.bug : P.prio;
+  // Card ids are sprite keys on purpose: 'bug' | 'prio' | 'pm'.
+  const kind = Sx.card;
+  const col = kind === 'bug' ? P.bug : kind === 'pm' ? P.pm : P.prio;
   vx.fillStyle = 'rgba(13,17,23,0.94)'; vx.fillRect(0, 0, view.width, view.height);
   vx.strokeStyle = col; vx.lineWidth = Math.max(1, L * 1.4);
   vx.strokeRect(56 * L, 82 * L, (UI_W - 112) * L, 374 * L);
 
   // the sprite, blown up with nearest-neighbour so it stays pixel art
-  const sp = bug ? LEVEL.sprites.bug : LEVEL.sprites.prio;
+  const sp = LEVEL.sprites[kind];
   const tmp = document.createElement('canvas');
   tmp.width = sp.w; tmp.height = sp.h;
   const tg = tmp.getContext('2d');
@@ -793,12 +862,17 @@ function drawCard() {
   vx.imageSmoothingEnabled = false;
   vx.drawImage(tmp, 106 * L, 150 * L, sp.w * 8 * L, sp.h * 8 * L);
 
-  txt(bug ? 'BUG' : 'PRIORITY CHANGE', 300, 182, 42, col, 'left', 800);
+  txt(kind === 'bug' ? 'BUG' : kind === 'pm' ? 'PRODUCT MANAGER' : 'PRIORITY CHANGE',
+      300, 182, 42, col, 'left', 800);
   const d = DIFFS[diff];
-  const lines = bug
+  const lines = kind === 'bug'
     ? [['Patrols a commit. Turns at every edge.', ''],
        ['Stomp it from above', '+\u00bd day'],
        ['Let it reach you', '\u2212' + dstr(d.bug) + ' days']]
+    : kind === 'pm'
+    ? [['Patrols its floor. Chases when it sees you.', ''],
+       ['CANNOT be stomped', 'but you walk faster'],
+       ['If it catches you', '\u2212' + dstr(d.pm) + ' days, shoved way back']]
     : [['Drifts up and down. Denies a whole lane.', ''],
        ['CANNOT be stomped', 'go around it'],
        ['If it reaches you', '\u2212' + dstr(d.prio) + ' days, pushed back']];
@@ -886,12 +960,18 @@ requestAnimationFrame(frame);
 window.__shipit = () => ({
   state: Sx.state, x: Sx.x, y: Sx.y, cam: Sx.cam, days: Sx.days, onGround: Sx.onGround,
   merged: Sx.merged, inv: Sx.inv, parts: Sx.parts.length, trail: Sx.trail.length,
-  diff: DIFFS[diff].name, controller, S, L, uiW: UI_W,
+  diff: DIFFS[diff].name, level: LEVEL.name, lvl, cols: COLS, controller, S, L, uiW: UI_W,
 });
 window.__finish = (prs, days) => {
   Sx.merged = prs; Sx.days = days; Sx.state = 'ship'; Sx.shipT = 40;
-  Sx.newBest = progRecord(0, diff, prs, days);
+  Sx.newBest = progRecord(lvl, diff, prs, days);
   return { newBest: Sx.newBest, prog: { ...prog } };
+};
+// Teleport, for the harness only: obviously named, does nothing the keyboard
+// could not do slower, and keeps collision tests out of the realm of luck.
+window.__warp = (x, y) => {
+  Sx.x = x; Sx.y = y; Sx.vx = Sx.vy = 0; Sx.inv = 0; Sx.trail.length = 0;
+  return { x: Sx.x, y: Sx.y };
 };
 window.__btn = deviceButton;   // exercise the device path without a device
 window.__wipeProgress = () => { prog = { done: 0, tier: -1, prs: 0, days: 0 };
