@@ -607,6 +607,56 @@ selects a profile non-interactively, and an already-exported
 prompts `/login` there on first run — and keeps its own settings, history, and
 MCP config. With no profile dirs, nothing changes.
 
+**Hit the limit? Carry the conversation across** — `claude-mate-switch`
+continues *this terminal's* conversation on another account. An account is a
+config dir read once at startup, so nothing can change account in place; and
+each profile keeps its own `projects/` tree, so a new account cannot see the
+old one's transcripts. The switch closes that gap: a transcript is just a file,
+so copying it into the target profile's tree makes `claude --resume` find it.
+
+```sh
+claude-mate-switch                 # accounts, remaining limits, and what would move
+claude-mate-switch work2           # copy the conversation there and resume
+claude-mate-switch --best          # whichever account has the most headroom left
+claude-mate-switch --dry-run work2 # show the move, touch nothing
+```
+
+It works because the wrapper publishes a small **context file per terminal**
+under `$TMPDIR` — which transcript is in flight, under which account, in which
+directory, with which flags, and how depleted that account is. Temp and
+per-terminal on purpose: it describes a running process, is worthless once that
+process exits (and is unlinked then), and two terminals in the same directory
+are two different conversations that must not carry each other off. A context
+not refreshed for 15 minutes is treated as dead rather than resumed.
+
+Which transcript is *this* terminal's is **asked, not guessed**: the wrapper
+mints the conversation id and hands it to claude (`--session-id`), so the file
+is the one with that name wherever Claude Code's undocumented directory
+mangling puts it. The earlier version looked at the newest `.jsonl` under the
+config dir and picked wrong in the field — a terminal in one project offering
+to carry off another terminal's conversation from another project. Sessions
+that name their own conversation (`--resume`, `--continue`) fall back to a
+search that now verifies the directory recorded *inside* each transcript.
+
+> **One caution.** The copy puts one account's conversation into another
+> account's local store, and resuming replays it to that account's API. The
+> tool never switches without being told where, prints both logins side by
+> side, and says so plainly when their email domains differ — but it does not
+> *stop*. It used to: a differing domain was read as "another organisation" and
+> refused. Every account it can reach is one you installed and logged into
+> yourself, so on a real three-account fleet spread across three domains that
+> rule refused every possible switch, and said so only in a log file — breaking
+> the exact case the feature exists for (*this account is out of limit,
+> continue on another*). Announce, don't block.
+
+**When a press declines, the device says why.** Any of these can fail for an
+ordinary reason — already on that account, nothing said yet worth carrying, not
+a wrapped session — and the wrapper answers each in words. Those words go on
+the glass for about four seconds, across the middle two rows, keeping the
+session name above them. A press that silently does nothing is indistinguishable
+from a broken button, and the cure for "I pressed it and nothing happened" is
+not to press harder.
+
 **Account + remaining limit on the device** — each wrapped session reports
 which account it runs as (the profile name, or `default`), shown right-aligned
 on the state row, and how much of that account's plan limit is left, shown as

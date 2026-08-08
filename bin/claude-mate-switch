@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+"""claude-mate-switch — continue this terminal's conversation on another account.
+
+WHY THIS EXISTS. An account, to Claude Code, is a $CLAUDE_CONFIG_DIR: one login
+per directory, read once at startup and fixed for the life of the process. So
+there is no such thing as switching account in place. Hitting the 5-hour or
+weekly limit means starting claude again somewhere else -- and, until now,
+losing the conversation, because each profile keeps its own projects/ tree and
+the new account cannot see the old one's transcripts.
+
+WHAT MAKES IT SEAMLESS. A transcript is just a file. Copy
+<old-cfg>/projects/<dir>/<id>.jsonl to the same relative place under the target
+profile and `claude --resume <id>` finds it -- verified: resuming a copied
+transcript under a foreign config dir gets past session lookup to the auth
+stage ("Not logged in"), where a genuinely unknown id returns "No conversation
+found with session ID". So the whole trick is knowing which transcript belongs
+to this terminal, which is what the wrapper's context tracker records.
+
+  claude-mate-switch                 # show accounts, remaining limits, and the
+                                     # conversation this terminal would carry
+  claude-mate-switch work2           # copy the transcript there and resume
+  claude-mate-switch --best          # pick whichever account has most headroom
+  claude-mate-switch --dry-run work2 # print what would happen, touch nothing
+
+READ THIS ONCE. The copy puts one account's conversation into another account's
+local store, and resuming replays it to that account's API. Between two of your
+own personal profiles that is unremarkable. Between accounts belonging to
+DIFFERENT ORGANISATIONS it may not be: the content leaves one tenancy and
+enters another, and neither org's admin agreed to that. The tool therefore
+never switches without being told which target, warns when the two profiles'
+logins are on different email domains, and has --dry-run.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import shutil
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+WRAP = os.path.join(HERE, "claude-mate-wrap")
+
+
+def load_wrapper():
+    """Import the wrapper for its account/usage helpers.
+
+    By path, because it is an executable with no .py extension. Safe to import:
+    everything meaningful is behind `if __name__ == "__main__"`, so this gets
+    the functions without starting a session. Reusing them rather than copying
+    matters here -- the Keychain service-name derivation
+    ("Claude Code-credentials-<sha256(cfg)[:8]>") is the kind of detail that is
+    discovered once by experiment and must not be reimplemented from memory."""
+    spec = importlib.util.spec_from_loader(
+        "claude_mate_wrap",
+        importlib.machinery.SourceFileLoader("claude_mate_wrap", WRAP))
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+    except Exception as exc:
+        sys.exit(f"claude-mate-switch: cannot load {WRAP}: {exc}")
+    return mod
+
+
+W = load_wrapper()
+
+
+# --------------------------------------------------------------------------- #
+# This terminal's context
+# --------------------------------------------------------------------------- #
+def read_context(tty=None):
+    """The tracker file for a terminal (this one by default), or None.
+
+    Staleness is checked rather than assumed: a wrapper killed with SIGKILL
+    never runs cleanup(), so a context file can outlive its session and would
+    otherwise offer to migrate a conversation that ended days ago."""
+    path = W.ctx_path(tty)
+    try:
+        with open(path) as fh:
+            ctx = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if time.time() - float(ctx.get("updated_at") or 0) > W.CTX_STALE_S:
+        return None
+    return ctx
+
+
+def profile_dir(name):
+    """'default' means ~/.claude, which is NOT under the profiles root."""
+    if not name or name == "default":
+        return os.path.expanduser("~/.claude")
+    return os.path.join(W.ACCOUNTS_DIR, name)
+
+
+def headroom(cfg_dir):
+    """(chip, worst-remaining-percent) for a profile. (-1) sorts last, so an
+    account we cannot read is never chosen by --best."""
+    tok = W._access_token(cfg_dir)
+    if not tok:
+        return "", -1.0
+    data = W._fetch_usage(tok) or {}
+    chip = W._format_limit(data)
+    try:
+        r5 = 100.0 - float(data["five_hour"]["utilization"])
+        r7 = 100.0 - float(data["seven_day"]["utilization"])
+    except (KeyError, TypeError, ValueError):
+        return chip, -1.0
+    return chip, min(r5, r7)
+
+
+def all_accounts():
+    """Every profile including 'default', with email and remaining headroom.
+
+    Note the two different spellings of "the default login". Its email comes
+    from ~/.claude.json, which is NOT inside ~/.claude, so account_email wants
+    None; its token comes from a Keychain entry whose service name is suffixed
+    with a hash of $CLAUDE_CONFIG_DIR *only for profiles*, so _access_token
+    wants ''. Handing it the expanded ~/.claude path looks right and finds
+    nothing -- the default account then listed with no limit and --best could
+    never choose it, which for most people excludes their main login from the
+    one question this tool asks."""
+    out = []
+    for name in ["default"] + W.list_profiles():
+        d = profile_dir(name)
+        chip, pct = headroom("" if name == "default" else d)
+        out.append({"name": name, "dir": d,
+                    "email": W.account_email(None if name == "default" else d),
+                    "chip": chip, "pct": pct})
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# The move
+# --------------------------------------------------------------------------- #
+def target_transcript(ctx, dest_cfg):
+    """Where the transcript lands under the target profile.
+
+    The SAME directory name, taken from the source path rather than recomputed
+    from the cwd: claude's cwd-to-directory mangling is undocumented, and the
+    one thing we know for certain is the name it already chose."""
+    src = ctx["transcript"]
+    return os.path.join(dest_cfg, "projects",
+                        os.path.basename(os.path.dirname(src)),
+                        os.path.basename(src))
+
+
+def domain_of(email):
+    # One implementation, in the wrapper: the same comparison decides whether
+    # the wrapper refuses a device-initiated switch and whether this prompts,
+    # and the two must not be able to disagree about what an organisation is.
+    return W.email_domain(email)
+
+
+# Flags that name a DIFFERENT conversation than the one we are carrying. They
+# are dropped on the way through; --resume <id> replaces them. The value is
+# optional for some (claude's --from-pr and --resume both take one or not), so
+# a following word that is not itself a flag goes with them -- leaving it behind
+# would hand claude a stray positional, which it reads as an initial prompt.
+_CONV_FLAGS = {"--resume", "-r", "--continue", "-c", "--from-pr",
+               "--session-id", "--fork-session"}
+
+
+def resume_argv(ctx, sid):
+    """The flags to restart claude with: the ones this session was started with,
+    minus anything naming another conversation, plus --resume <id>.
+
+    Not cosmetic. Resuming with a bare --resume drops the session's character on
+    the floor -- a --dangerously-skip-permissions session comes back asking to
+    confirm every tool call, a chosen --model or --effort reverts to the default
+    -- so the conversation survives the switch but the way you were working it
+    does not."""
+    argv = list(ctx.get("argv") or [])
+    out, i = [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a in _CONV_FLAGS:
+            i += 1
+            if i < len(argv) and not argv[i].startswith("-"):
+                i += 1                      # its value, if it took one
+            continue
+        if a.split("=", 1)[0] in _CONV_FLAGS:
+            i += 1                          # --resume=<id> style
+            continue
+        out.append(a)
+        i += 1
+    return out + ["--resume", sid]
+
+
+def switch(ctx, dest, dry_run=False, yes=False):   # `yes`: legacy, see main()
+    src = ctx.get("transcript") or ""
+    if not src or not os.path.exists(src):
+        sys.exit("claude-mate-switch: no transcript recorded for this terminal "
+                 "yet -- say something to claude first, then switch.")
+
+    dst = target_transcript(ctx, dest["dir"])
+    here_email = ctx.get("account") and W.account_email(
+        None if ctx["account"] == "default" else ctx.get("config_dir")) or ""
+
+    print(f"  from : {ctx['account']:<12} {here_email or '(unknown)'}")
+    print(f"  to   : {dest['name']:<12} {dest['email'] or '(not logged in)'}"
+          f"   {dest['chip'] or 'usage unknown'}")
+    print(f"  conv : {ctx['session_id']}  ({os.path.getsize(src)//1024} KB)")
+    print(f"  copy : {dst}")
+
+    # Different organisations is worth SAYING, and it is no longer worth
+    # stopping for. Every account reachable from here is one you installed and
+    # logged into yourself; which company each belongs to is a fact about your
+    # working life, not a trust boundary this tool discovered. Demanding a typed
+    # domain made the common case -- "this account is out of limit, continue on
+    # the other one" -- impossible from the device, which cannot type, and
+    # tedious from the terminal, which is where you already said which account
+    # you wanted. So: print it, large, and carry on. Both lines are printed
+    # before the copy, so a switch you did not mean is visible in the scrollback
+    # of the terminal it happened in.
+    a, b = domain_of(here_email), domain_of(dest["email"])
+    if a and b and a != b:
+        print(f"\n  NOTE: {a} -> {b}. This copies the conversation into a "
+              f"different\n        organisation's account and replays it to "
+              f"that account's API.")
+
+    if dry_run:
+        print("\n  --dry-run: nothing copied, nothing started.")
+        return 0
+
+    try:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)          # copy2: keep mtime, so --resume ordering holds
+    except OSError as exc:
+        # The wrapper has already ended claude to get here, so say plainly that
+        # the conversation still exists and how to walk back into it. A dead
+        # terminal plus an errno is not a recoverable position for anyone.
+        sys.exit(f"claude-mate-switch: copy failed: {exc}\n"
+                 f"  Nothing moved. The conversation is intact on "
+                 f"{ctx['account']}:\n"
+                 f"    cd {ctx.get('cwd') or '.'} && claude --resume "
+                 f"{ctx['session_id']}")
+
+    # Resume WHERE THE CONVERSATION LIVES. `claude --resume <id>` looks for the
+    # transcript under the project directory derived from the current directory,
+    # so resuming from anywhere else finds nothing -- "No conversation found with
+    # session ID", with the copy sitting correctly in place one directory away.
+    # The switch can be started from another terminal (--tty) or from a shell
+    # that has since cd'd, which is exactly when this bites.
+    if ctx.get("cwd") and os.path.isdir(ctx["cwd"]):
+        try:
+            os.chdir(ctx["cwd"])
+        except OSError as exc:
+            sys.exit(f"claude-mate-switch: cannot enter {ctx['cwd']}: {exc}")
+
+    # Re-exec through the WRAPPER, not bare claude: the new session must be
+    # tracked and reported to the daemon exactly like the old one, or the device
+    # loses the session the moment you switch.
+    env = dict(os.environ)
+    if dest["name"] == "default":
+        env.pop("CLAUDE_CONFIG_DIR", None)
+    else:
+        env["CLAUDE_CONFIG_DIR"] = dest["dir"]
+    env["CLAUDE_MATE_ACCOUNT"] = dest["name"]          # skip the picker
+    if not dest["email"]:
+        print(f"\n  NOTE: no login recorded for {dest['name']}. If claude asks you "
+              f"to /login,\n        the conversation is already copied -- finish "
+              f"the login and it resumes.")
+    print(f"\n  resuming on {dest['name']}...\n")
+    os.execve(sys.executable,
+              [sys.executable, WRAP] + resume_argv(ctx, ctx["session_id"]), env)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="claude-mate-switch", description=__doc__.split("\n\n")[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("account", nargs="?", help="profile to continue on")
+    ap.add_argument("--best", action="store_true",
+                    help="pick the account with the most headroom left")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="show the move without copying or starting anything")
+    # Accepted and ignored. It used to skip the cross-organisation prompt;
+    # there is no prompt to skip now, and silently rejecting a flag that used to
+    # work would break the muscle memory of anyone who learned it.
+    ap.add_argument("--yes", "-y", action="store_true",
+                    help=argparse.SUPPRESS)
+    ap.add_argument("--tty", metavar="DEV",
+                    help="act on another terminal's session (e.g. ttys008); "
+                         "defaults to this one. Listing works from anywhere, "
+                         "but a switch re-execs HERE, so use it from the "
+                         "terminal you want claude to end up in.")
+    args = ap.parse_args()
+
+    ctx = read_context(args.tty)
+    if ctx is None:
+        where = f"on {args.tty}" if args.tty else "in this terminal"
+        sys.exit(f"claude-mate-switch: no live wrapped session {where}.\n"
+                 "  The tracker is per-terminal and per-session; run this from "
+                 "the terminal\n  whose conversation you want to carry over, "
+                 "while it is still open.")
+
+    accounts = all_accounts()
+    others = [a for a in accounts if a["name"] != ctx["account"]]
+
+    if not args.account and not args.best:
+        print(f"this terminal: {ctx['account']} · {ctx['cwd']}")
+        print(f"conversation : {ctx['session_id'] or '(none yet)'}"
+              f"   state {ctx.get('state') or '?'}\n")
+        print("accounts:")
+        for a in accounts:
+            mark = "*" if a["name"] == ctx["account"] else " "
+            print(f" {mark} {a['name']:<12} {a['email'] or '(not logged in)':<38}"
+                  f" {a['chip'] or '-'}")
+        print("\n* = this terminal.  Switch with: claude-mate-switch <account>")
+        return 0
+
+    if args.best:
+        ranked = sorted(others, key=lambda a: a["pct"], reverse=True)
+        if not ranked or ranked[0]["pct"] < 0:
+            sys.exit("claude-mate-switch: no other account with readable usage.")
+        dest = ranked[0]
+    else:
+        matches = [a for a in accounts if a["name"] == args.account]
+        if not matches:
+            sys.exit(f"claude-mate-switch: unknown account {args.account!r}. "
+                     f"Known: {', '.join(a['name'] for a in accounts)}")
+        dest = matches[0]
+
+    if dest["name"] == ctx["account"]:
+        sys.exit(f"claude-mate-switch: already on {dest['name']}.")
+    return switch(ctx, dest, dry_run=args.dry_run, yes=args.yes)
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

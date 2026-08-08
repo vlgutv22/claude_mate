@@ -146,7 +146,8 @@ MateSettings cfg;
 // terminal you were not looking at. The daemon simply sees no button events,
 // needs no protocol change, and keeps its frame current the whole time, so
 // leaving the menu is instant.
-enum UiMode : uint8_t { UI_CONDUCTOR, UI_MENU, UI_PAGE, UI_GAME, UI_PAD };
+enum UiMode : uint8_t { UI_CONDUCTOR, UI_MENU, UI_PAGE, UI_GAME, UI_PAD,
+                       UI_ACTIONS, UI_ACCOUNTS };
 
 // CONTROLLER MODE. The daemon turns this on (G|1) while a browser page is
 // driving the device's buttons, and off (G|0) when the page goes away.
@@ -187,6 +188,38 @@ enum MenuItem : uint8_t {
 static uint8_t menuIdx = MI_CONDUCTOR;
 
 enum PageId : uint8_t { PG_SETTINGS, PG_ABOUT };
+
+// The ACTIONS sheet -- what the 4th button opens over the triage view.
+//
+// Everything here is done to the session ON THE GLASS, the same WYSIWYG rule GO
+// follows, and every item is a thing you would otherwise have to turn to the
+// laptop for. SEND CONTINUE is the reason it exists: a session that hit its
+// 5-hour limit or took an API error is waiting for one word, and walking back
+// to the keyboard to type it is the friction this device is supposed to remove.
+//
+// One press per item, no sub-menus: choosing WHICH account to switch to needs
+// every profile's remaining usage, which lives on the Mac, so the device asks
+// for "somewhere with headroom" and lets the wrapper decide.
+enum ActRow : uint8_t {
+  AR_VIEW, AR_PREVIEW, AR_CONTINUE, AR_NEWTERM, AR_SWITCH, AR_COUNT
+};
+static uint8_t actIdx = 0;
+
+// The saved accounts the daemon knows about, pushed on every handshake. Five
+// fits the sheet; a sixth would need scrolling and nobody has six logins.
+#define ACCT_MAX   5
+#define ACCT_NAME  14
+#define ACCT_CHIP  7
+static char    acctName[ACCT_MAX][ACCT_NAME + 1];
+static char    acctChip[ACCT_MAX][ACCT_CHIP + 1];
+static uint8_t acctCount = 0;
+static uint8_t acctIdx   = 0;
+// The account the USER chose, by name. The list is rebuilt in place whenever
+// the Mac re-pushes it, and it always re-pushes at least once: names first,
+// then the same names with their remaining-limit chips a network round trip
+// later -- which arrives exactly while someone is standing at this picker
+// waiting for those chips. Row numbers do not survive that; a name does.
+static char    acctSel[ACCT_NAME + 1] = "";
 static PageId  pageId  = PG_SETTINGS;
 static uint8_t pageIdx = 0;          // selected row within the page
 
@@ -1182,6 +1215,86 @@ static void drawPad() {
   gfx->print(out);
 }
 
+// The ACTIONS sheet. Same row geometry as the settings page, so the two read as
+// one family and the muscle memory transfers: PREV/NEXT move, GO does it, the
+// 4th button backs out.
+// Five rows in 172 px, at a size you can read from across a desk.
+//
+// The first cut used size-1 labels with a size-1 hint under each. It fit, and
+// it was too small to be worth glancing at -- which defeats a device whose
+// entire job is being glanceable. So: size-2 labels and no hints. The labels
+// have to carry it alone, which is a fair constraint on a five-item sheet.
+//
+//   title   6..22    (size 2)
+//   rows    28 + i*26, block 22 -> last 132..154
+//   footer  158..166, clear of 154 and inside 172
+#define ACT_Y0     28
+#define ACT_ROW_H  26
+#define ACT_HINT_Y 158
+
+static void drawActions() {
+  static const char *LABEL[AR_COUNT] = {
+    "View terminal", "Preview on glass", "Send \"continue\"",
+    "New terminal", "Switch account",
+  };
+  drawCentred(SCREEN_W / 2, 6, 2, "ACTIONS", C_TEXT);
+  for (uint8_t i = 0; i < AR_COUNT; i++) {
+    int16_t y = ACT_Y0 + i * ACT_ROW_H;
+    bool sel = (i == actIdx);
+    if (sel) gfx->fillRect(0, y, SCREEN_W, 22, C_DIMMER);
+    gfx->setTextSize(2);
+    // Switch account is the only item that REPLACES the running session, so it
+    // is the only one that gets a colour of its own.
+    gfx->setTextColor(sel ? (i == AR_SWITCH ? C_WAIT : C_TEXT) : C_DIM);
+    gfx->setCursor(PAD_X, y + 3);
+    gfx->print(LABEL[i]);
+  }
+  gfx->setTextSize(1);
+  gfx->setTextColor(C_DIM);
+  gfx->setCursor(PAD_X, ACT_HINT_Y);
+  gfx->print("PREV/NEXT   GO do it   4th back");
+}
+
+// The saved-account picker, reached from Switch account.
+//
+// SWITCHING NEVER MEANS LOGGING IN. These are the logins you already have --
+// the profile directories under ~/.claude-accounts, each holding its own
+// credentials -- and picking one continues this conversation there. The daemon
+// pushes the list on every handshake (L| lines); an account it could not read a
+// token for is shown but marked, because offering to switch to something that
+// would dump you at /login is exactly the thing this must not do.
+static void drawAccounts() {
+  drawCentred(SCREEN_W / 2, 6, 2, "ACCOUNT", C_TEXT);
+  if (acctCount == 0) {
+    gfx->setTextSize(1);
+    gfx->setTextColor(C_DIM);
+    gfx->setCursor(PAD_X, 60);
+    gfx->print("no saved accounts -- mkdir ~/.claude-accounts/<name>");
+  }
+  for (uint8_t i = 0; i < acctCount; i++) {
+    int16_t y = ACT_Y0 + i * ACT_ROW_H;
+    bool sel = (i == acctIdx);
+    if (sel) gfx->fillRect(0, y, SCREEN_W, 22, C_DIMMER);
+    gfx->setTextSize(2);
+    gfx->setTextColor(sel ? C_TEXT : C_DIM);
+    gfx->setCursor(PAD_X, y + 3);
+    gfx->print(acctName[i]);
+    // The remaining-limit chip, right-aligned: the whole reason you are here is
+    // that one account ran out, so how much is left in each IS the choice.
+    const char *chip = acctChip[i];
+    if (chip[0]) {
+      int16_t w = (int16_t)strlen(chip) * GLYPH_W * 2;
+      gfx->setTextColor(sel ? C_DONE : C_DIM);
+      gfx->setCursor(SCREEN_W - PAD_X - w, y + 3);
+      gfx->print(chip);
+    }
+  }
+  gfx->setTextSize(1);
+  gfx->setTextColor(C_DIM);
+  gfx->setCursor(PAD_X, ACT_HINT_Y);
+  gfx->print("PREV/NEXT   GO continue here   4th back");
+}
+
 static void render() {
   gfx->fillScreen(C_BG);
   bool blip = (long)(millis() - blipUntil) < 0;
@@ -1190,6 +1303,10 @@ static void render() {
   // portal can start from paths that do not go through the menu at all.
   if (net.state() == MateNet::SETUP) {
     drawSetup();
+  } else if (uiMode == UI_ACTIONS) {
+    drawActions();
+  } else if (uiMode == UI_ACCOUNTS) {
+    drawAccounts();
   } else if (uiMode == UI_MENU) {
     drawStatusBar();
     drawMenu();
@@ -1365,6 +1482,41 @@ static void handleLine(char *line) {
       break;
     }
 
+    case 'L': {  // L|<i>|<n>|<name>|<chip> -- one SAVED account, pushed on
+                 // handshake. i==0 resets the list, so a shrinking set of
+                 // profiles cannot leave a stale row behind.
+      char *p1 = strchr(line, '|');       if (!p1) break;
+      char *p2 = strchr(p1 + 1, '|');     if (!p2) break;
+      char *p3 = strchr(p2 + 1, '|');     if (!p3) break;
+      *p1 = *p2 = *p3 = 0;
+      uint8_t i = (uint8_t)atoi(p1 + 1);
+      uint8_t n = (uint8_t)atoi(p2 + 1);
+      char *name = p3 + 1;
+      char *chip = strchr(name, '|');
+      if (chip) *chip++ = 0; else chip = (char *)"";
+      if (i == 0) acctCount = 0;
+      if (i < ACCT_MAX) {
+        copyField(acctName[i], sizeof(acctName[i]), name);
+        copyField(acctChip[i], sizeof(acctChip[i]), chip);
+        if (i + 1 > acctCount) acctCount = i + 1;
+      }
+      if (n > ACCT_MAX) n = ACCT_MAX;
+      // Follow the NAME, not the row. `i == 0` has just emptied the list, so
+      // every re-push used to collapse the highlight to row 0 -- and the second
+      // push (the one carrying the chips) lands seconds later, while a thumb is
+      // hovering over GO. The selection moved, nothing on screen said so, and
+      // the next press switched to an account nobody chose.
+      if (acctCount) {
+        uint8_t keep = 0xFF;
+        for (uint8_t k = 0; acctSel[0] && k < acctCount; k++)
+          if (!strcmp(acctName[k], acctSel)) { keep = k; break; }
+        if (keep != 0xFF)              acctIdx = keep;
+        else if (acctIdx >= acctCount) acctIdx = 0;
+      }
+      if (uiMode == UI_ACCOUNTS) requestRender();
+      break;
+    }
+
     case 'V': {                            // V|<KIND> -- play an LED pattern
       char *bar = strchr(line, '|');
       if (!bar || bar[1] == 0) break;
@@ -1463,7 +1615,9 @@ static bool handleConfigLine(char *line) {
                     : uiMode == UI_MENU    ? "menu"
                     : uiMode == UI_PAGE    ? (pageId == PG_ABOUT ? "about"
                                                                  : "settings")
-                    : uiMode == UI_GAME    ? "game" : "pad",
+                    : uiMode == UI_GAME    ? "game"
+                    : uiMode == UI_ACTIONS ? "actions"
+                    : uiMode == UI_ACCOUNTS ? "accounts" : "pad",
                     cfg.hibLabel(), screenOn ? "" : " (asleep now)",
                     (unsigned)(cfg.blIdx() + 1), (unsigned)BL_STEPS,
                     cfg.ledLabel(), cfg.flipped() ? "on" : "off");
@@ -1885,6 +2039,61 @@ static void sendSfx(char code) {
 
 // PREV/NEXT/GO while a firmware-local screen is up. Never reaches the daemon.
 static void menuButton(char ev) {
+  if (uiMode == UI_ACCOUNTS) {
+    if (!acctCount) { if (ev == 'G' || ev == 'K') uiMode = UI_ACTIONS; return; }
+    // Every move re-states the choice by name, which is what survives a re-push.
+    if (ev == 'P' || ev == 'N') {
+      acctIdx = (ev == 'P') ? (uint8_t)((acctIdx + acctCount - 1) % acctCount)
+                            : (uint8_t)((acctIdx + 1) % acctCount);
+      copyField(acctSel, sizeof(acctSel), acctName[acctIdx]);
+      return;
+    }
+    if (ev == 'G' || ev == 'K') {
+      // B|A<index> -- continue on THAT saved account. The index is the daemon's
+      // own ordering from the L| lines it sent, so the two cannot disagree
+      // about which name row 3 is.
+      //
+      // Unless a re-push is landing in this instant: the list is rebuilt row by
+      // row, so for the few milliseconds of the burst the highlighted row may
+      // not be the account whose name is selected. Say nothing rather than say
+      // the wrong number -- the next line puts it back and the next press works.
+      if (acctIdx >= acctCount ||
+          (acctSel[0] && strcmp(acctName[acctIdx], acctSel))) return;
+      char buf[6] = {'B', '|', 'A', (char)('0' + acctIdx), 0, 0};
+      emitLine(buf);
+      uiMode = UI_CONDUCTOR;
+    }
+    return;
+  }
+  if (uiMode == UI_ACTIONS) {
+    if (ev == 'P') { actIdx = (uint8_t)((actIdx + AR_COUNT - 1) % AR_COUNT); return; }
+    if (ev == 'N') { actIdx = (uint8_t)((actIdx + 1) % AR_COUNT); return; }
+    // 'K' is GO's long press. Here it means the same as 'G': there is no
+    // long-press gesture on this sheet, and LONGPRESS_MS is easy to overshoot --
+    // a press that did nothing because you held it a beat too long reads as a
+    // dead row. (The settings page keeps K distinct; it has rows that confirm.)
+    if (ev == 'G' || ev == 'K') {
+      // Every item is one verb to the daemon, and every one of them CLOSES the
+      // sheet: these are actions, not settings, and leaving it up over a
+      // terminal that just got raised would be covering the thing you asked for.
+      switch (actIdx) {
+        case AR_VIEW:     emitBtn('G'); break;   // raise the real window
+        case AR_PREVIEW:  emitBtn('M'); break;   // the on-glass mirror
+        case AR_CONTINUE: emitBtn('C'); break;   // type "continue" + Enter
+        case AR_NEWTERM:  emitBtn('T'); break;   // new terminal, focused
+        case AR_SWITCH:
+          // NOT a verb: switching means choosing which of your SAVED logins to
+          // continue on, so it opens the picker rather than letting the Mac
+          // decide. Nothing is sent until you pick one.
+          acctIdx = 0;
+          copyField(acctSel, sizeof(acctSel), acctCount ? acctName[0] : "");
+          uiMode = UI_ACCOUNTS;
+          return;
+      }
+      uiMode = UI_CONDUCTOR;
+    }
+    return;
+  }
   if (uiMode == UI_MENU) {
     if (ev == 'P') menuIdx = (uint8_t)((menuIdx + MENU_COUNT - 1) % MENU_COUNT);
     else if (ev == 'N') menuIdx = (uint8_t)((menuIdx + 1) % MENU_COUNT);
@@ -2014,6 +2223,8 @@ static void fourthTap() {
   // you the run but not the screen you were on.
   if (uiMode == UI_GAME)      { if (game.fourth()) uiMode = UI_MENU;
                                 requestRender(); return; }
+  if (uiMode == UI_ACCOUNTS)  { uiMode = UI_ACTIONS; requestRender(); return; }
+  if (uiMode == UI_ACTIONS)   { uiMode = UI_CONDUCTOR; requestRender(); return; }
   if (uiMode == UI_MENU)      { uiMode = UI_CONDUCTOR; requestRender(); return; }
   if (uiMode == UI_PAGE) {
     // One level at a time, the same rule the game follows. About is reached
@@ -2024,7 +2235,13 @@ static void fourthTap() {
     uiMode = UI_MENU; resetArmedMs = 0;
     requestRender(); return;
   }
-  onButton('M');                              // CONDUCTOR: toggle the mirror
+  // CONDUCTOR: open the ACTIONS sheet. This used to toggle the mirror directly;
+  // the mirror is now the second item on the sheet, one more press away, which
+  // is the price of the other four being reachable at all.
+  actIdx = 0;                                 // always open on the same row
+  uiMode = UI_ACTIONS;
+  notePoke();
+  requestRender();
 }
 
 static void fourthDoubleTap() {

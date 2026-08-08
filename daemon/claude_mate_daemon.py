@@ -87,7 +87,7 @@ import time
 import urllib.parse
 import wave
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 try:
     import serial  # pyserial
@@ -158,6 +158,10 @@ WRAPPER_ACK_TIMEOUT_S = 12.0  # overall deadline for the completion ack ('ok');
                               # (~10s: tmux select-window/pane + osascript).
                               # Pre-ack wrappers close the socket at once (EOF),
                               # so the wait degrades to fire-and-forget.
+NOTICE_S = 4.0              # how long a transient message holds the middle two
+                            # rows. Long enough to read at arm's length after
+                            # looking down at the press, short enough that the
+                            # screen is never lying about a session for long.
 PING_PERIOD = 15.0          # keepalive ping interval
 RECONNECT_DELAY = 2.0       # wait between serial (re)connection attempts
 SESSION_DONE_TTL = 120.0    # drop a 'done' session after this long with no update
@@ -1126,6 +1130,28 @@ def _fit_meta(model: str, effort: str, width: int) -> str:
     return cands[-1][:width] if cands else ""
 
 
+def _wrap2(text: str) -> Tuple[str, str]:
+    """Word-wrap a short message into the two 21-char rows a notice gets.
+
+    Words first, because breaking a domain name across rows makes the thing you
+    are being asked to notice unreadable. A word longer than a row is cut rather
+    than allowed to swallow both -- overflow ends in an ellipsis so a truncated
+    message never reads as a complete one that happens to be odd."""
+    rows, i = ["", ""], 0
+    for w in _sanitize(text).split():
+        w = w[:ROW_CHARS]
+        cand = f"{rows[i]} {w}".strip()
+        if len(cand) <= ROW_CHARS:
+            rows[i] = cand
+        elif i == 0:
+            i = 1
+            rows[i] = w
+        else:                                     # '+' = "and more", the same
+            rows[1] = rows[1][:ROW_CHARS - 1] + "+"   # mark the fleet strip uses
+            break
+    return (rows[0], rows[1])
+
+
 def _display_names(sessions: List[Session]) -> Dict[str, str]:
     """Map session key -> display name truncated to ROW_CHARS (the full size-1
     row now), disambiguating collisions (sibling dirs with a long common prefix)
@@ -1186,10 +1212,50 @@ class Screen:
         self._last_sound_at = 0.0
         self._last_sfx_at   = 0.0
         self.on_handshake_extra = None   # re-assert edge-driven device state
+        # A transient message across the middle two rows: (text, expires_at).
+        # An ACTIONS-sheet verb can fail for ordinary reasons -- the session is
+        # already on that account, it has said nothing worth carrying yet -- and
+        # the wrapper answers every one of them in words. Those words used to go
+        # to the log and nowhere else, which from arm's length is exactly what a
+        # dead button looks like: the fix for "I pressed it and nothing
+        # happened" is not to press harder, it is to say what happened. Rendered
+        # by the daemon into the existing frame, so it costs no firmware change
+        # and works on a device that is already flashed.
+        self._notice: Optional[Tuple[str, float]] = None
         # Rendered lazily-but-once at construction: eight short WAVs, well
         # under a tenth of a second of work, and doing it here means the
         # first jump of the first run is not the one that pays for it.
         self._sfx = sfx_build_cache() if sys.platform == "darwin" else {}
+
+    # ---- transient messages ----------------------------------------------- #
+
+    def notice(self, text: str, secs: float = NOTICE_S) -> None:
+        """Say something on the glass for a few seconds.
+
+        Set OUTSIDE the lock-holding path and pushed immediately: a message
+        about a press has to land while the finger is still near the button, not
+        on whatever tick comes next. A timer forces one more refresh when it
+        expires, otherwise a device with nothing else happening would keep the
+        stale message until the next state change -- which, for an idle fleet at
+        2am, could be hours."""
+        with self._lock:
+            self._notice = (text, time.monotonic() + secs)
+        self.refresh(force=True)
+        t = threading.Timer(secs + 0.05, self.refresh, kwargs={"force": True})
+        t.daemon = True
+        t.start()
+
+    def _notice_rows(self) -> Optional[Tuple[str, str]]:
+        """The live notice as two rows, or None. Expiry is checked HERE rather
+        than by the timer, so a frame composed for any other reason after the
+        deadline also drops it."""
+        if self._notice is None:
+            return None
+        text, until = self._notice
+        if time.monotonic() >= until:
+            self._notice = None
+            return None
+        return _wrap2(text)
 
     # ---- selection -------------------------------------------------------- #
 
@@ -1284,7 +1350,10 @@ class Screen:
         6th bar and takes the rest verbatim), which is what lets the strip use
         '|' as its visual divider."""
         follow = self._follow
+        note = self._notice_rows()
         if subject is None:
+            if note:
+                return (f"F|0|-1|MATE|{note[0]}|{note[1]}|", None, False)
             return (f"F|{2 if follow else 0}|-1|MATE|no sessions||", None, False)
 
         names = _display_names(queue)
@@ -1343,6 +1412,13 @@ class Screen:
 
         flash = subject.unacked_alert()
         flags = (1 if flash else 0) | (2 if follow else 0)
+        # A notice takes the middle two rows and leaves r0 and r3 alone: you
+        # keep the name of the session it is ABOUT, and the fleet strip that
+        # tells you nothing has moved underneath. Losing state+time and
+        # model+effort for four seconds costs nothing; losing which session is
+        # being talked about would make the message ambiguous.
+        if note:
+            r1, r2 = note
         line = f"F|{flags}|{sel}|{r0}|{r1}|{r2}|{r3}"
         return (line, subject.key, flash)
 
@@ -1521,7 +1597,105 @@ class Screen:
 # --------------------------------------------------------------------------- #
 
 
+ACCOUNTS_DIR = os.path.expanduser(
+    os.environ.get("CLAUDE_MATE_ACCOUNTS_DIR", "~/.claude-accounts"))
+ACCT_MAX = 5                       # what the device's picker can show
+
+
+def account_profiles(limit: int = ACCT_MAX) -> List[str]:
+    """The SAVED logins, in a stable order both ends agree on.
+
+    'default' first -- it is the ~/.claude login, usually the main one, and it
+    is not a directory under the profiles root, so listing only that root left
+    the device able to switch AWAY from your main account and never back to it.
+    The rest are profile directories under ~/.claude-accounts, each holding its
+    own credentials, sorted -- so the index the device sends back means the same
+    name the daemon sent. An ordering that drifted between the two ends would
+    switch you to the wrong account, which is the one mistake this must not make.
+    """
+    try:
+        rest = sorted(d for d in os.listdir(ACCOUNTS_DIR)
+                      if os.path.isdir(os.path.join(ACCOUNTS_DIR, d)))
+    except OSError:
+        rest = []
+    names = ["default"] + rest
+    return names[:limit] if limit else names
+
+
+def account_dir(name: str) -> str:
+    """A profile's config dir. 'default' is ~/.claude, which is NOT under the
+    profiles root -- the same rule claude-mate-switch follows."""
+    return (os.path.expanduser("~/.claude") if name == "default"
+            else os.path.join(ACCOUNTS_DIR, name))
+
+
+# What the device was ACTUALLY told, in order. The device answers with an index,
+# so the only list that can decode it is the one it was sent -- not a fresh
+# listdir at press time. Profiles appear and disappear while the device is
+# linked (starting a session on a new name creates one), and a name sorting into
+# the middle renumbers every row below it: the device would still be showing the
+# old rows and the press would land on the neighbour. Switching to an account
+# you did not choose is the one mistake this feature must not make.
+_pushed_accounts: List[str] = []
+_pushed_lock = threading.Lock()
+
+
+def set_pushed_accounts(names: List[str]) -> None:
+    with _pushed_lock:
+        _pushed_accounts[:] = list(names)
+
+
+def pushed_accounts() -> List[str]:
+    with _pushed_lock:
+        return list(_pushed_accounts)
+
+
+_wrap_mod: Any = None
+
+
+def account_headroom_chip(cfg_dir: str) -> str:
+    """A profile's remaining-limit chip ('5h82%'), or '' if unknown.
+
+    Borrowed from the wrapper rather than reimplemented: reading a profile's
+    token means knowing that Claude Code keys the Keychain entry as
+    "Claude Code-credentials-<sha256(cfg_dir)[:8]>", which was established by
+    experiment and is exactly the sort of detail that rots when it is written
+    down twice. Any failure is '' -- an unknown limit must never stop the
+    picker listing the account.
+    """
+    global _wrap_mod
+    if _wrap_mod is None:
+        try:
+            import importlib.machinery
+            import importlib.util
+            path = os.path.join(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))), "bin", "claude-mate-wrap")
+            spec = importlib.util.spec_from_loader(
+                "cm_wrap_helpers",
+                importlib.machinery.SourceFileLoader("cm_wrap_helpers", path))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            _wrap_mod = mod
+        except Exception as exc:
+            log(f"account usage unavailable: {exc}")
+            _wrap_mod = False
+    if not _wrap_mod:
+        return ""
+    try:
+        tok = _wrap_mod._access_token(cfg_dir)
+        if not tok:
+            return ""
+        return _wrap_mod._format_limit(_wrap_mod._fetch_usage(tok) or {})
+    except Exception:
+        return ""
+
+
 def wrapper_ctrl_send(ctrl: str, cmd: str) -> bool:
+    """wrapper_ctrl_call, for callers that only care whether it worked."""
+    return wrapper_ctrl_call(ctrl, cmd)[0]
+
+
+def wrapper_ctrl_call(ctrl: str, cmd: str) -> Tuple[bool, str]:
     """Send one command line ('focus') to a PTY wrapper's per-session control
     socket and WAIT for its ack. The wrapper replies in two stages -- 'go' the
     moment it accepts the command (liveness), 'ok' only after its window op
@@ -1530,31 +1704,57 @@ def wrapper_ctrl_send(ctrl: str, cmd: str) -> bool:
     (stopped process whose socket the kernel still accepts) costs ~1s, while a
     live-but-slow op gets the full WRAPPER_ACK_TIMEOUT_S deadline. Pre-ack
     wrappers close the socket immediately (recv -> EOF), degrading to
-    fire-and-forget. Returns success."""
+    fire-and-forget.
+
+    Returns (ok, why). `why` is the wrapper's own words when it refuses, and
+    the caller is expected to SHOW them: a refusal that only reaches the log is
+    indistinguishable, from where the user is standing, from a device that
+    ignored the press."""
     if not ctrl or not os.path.exists(ctrl):
-        return False
+        return (False, "session is gone")
     try:
         c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         c.settimeout(2.0)
         c.connect(ctrl)
-        c.sendall(cmd.encode("ascii") + b"\n")
+        # utf-8, not ascii: a command can carry a profile name, and a profile is
+        # a directory the user named. `.encode("ascii")` on one with an accent in
+        # it raises UnicodeEncodeError -- not an OSError, so it escaped the
+        # handler below and killed the calling thread instead of failing the send.
+        c.sendall(cmd.encode("utf-8", "replace") + b"\n")
+        buf = b""
         try:
             deadline = time.monotonic() + WRAPPER_ACK_TIMEOUT_S
             c.settimeout(WRAPPER_LIVE_TIMEOUT_S)   # a live wrapper 'go's in ms
-            buf = b""
-            while b"ok" not in buf:
-                chunk = c.recv(16)
+            # A refusal is read to its NEWLINE, not to the first chunk. Stopping
+            # at "buf starts with err" truncated the reason at whatever one recv
+            # happened to return -- 64 bytes, mid-word ("...is another organis"),
+            # which is fine for a log nobody reads and useless for a message we
+            # now put on the glass. 512 to match the wrapper's own recv.
+            while not (b"ok" in buf or (buf.startswith(b"err") and b"\n" in buf)):
+                chunk = c.recv(512)
                 if not chunk:          # EOF: pre-ack wrapper (or already done)
                     break
                 buf += chunk
                 c.settimeout(max(0.1, deadline - time.monotonic()))
         except socket.timeout:
+            # Deliberately NOT a failure. `focus` uses the return value to
+            # decide whether to run its own window-raising fallback, and a slow
+            # ack from a wrapper that did raise the window would then raise it
+            # twice. A timeout means "no answer yet", which is not "refused".
             log(f"wrapper {cmd} ack timeout ({ctrl}); continuing")
-        c.close()
-        return True
+        finally:
+            c.close()
+        # A wrapper that REFUSES says so ('err <why>') rather than closing
+        # silently, and the caller must not report the command as done: the
+        # device would show a switch that never happened.
+        if buf.startswith(b"err"):
+            why = buf.decode("utf-8", "replace").strip()[4:] or "no reason given"
+            log(f"wrapper refused {cmd!r}: {why}")
+            return (False, why)
+        return (True, "")
     except OSError as exc:
         log(f"wrapper {cmd} failed ({ctrl}): {exc}")
-        return False
+        return (False, "could not reach the session")
 
 
 def wrapper_ctrl_screen(ctrl: str) -> Optional[List[str]]:
@@ -1910,6 +2110,12 @@ class ButtonReader(threading.Thread):
                 self._ack_only()
             elif ev == "F":                      # ACK button held: toggle FOLLOW
                 self._follow_pressed()
+            elif ev == "C":                      # ACTIONS: type "continue"
+                self._continue_pressed()
+            elif ev == "T":                      # ACTIONS: new terminal, focused
+                self._new_terminal_pressed()
+            elif ev == "A":                      # ACTIONS: switch saved account
+                self._switch_account_pressed(code[1:])
             else:
                 log(f"unknown button event: {line!r}")
             return
@@ -2121,6 +2327,100 @@ class ButtonReader(threading.Thread):
             self._mirror_timer = t
             t.start()
 
+    def _continue_pressed(self) -> None:
+        """B|C -- type "continue" into the shown session and press Enter.
+
+        The reason the ACTIONS menu exists. A session that hit its 5-hour limit
+        or took an API error is sitting there waiting for a human to say one
+        word, and the whole point of a desk device is not having to turn back to
+        the laptop to say it. Goes to the session on the glass -- WYSIWYG, the
+        same rule GO follows -- and only to a wrapped one, because a hook-only
+        session has no PTY to type into.
+        """
+        sess = self._screen.current_shown()
+        if sess is None:
+            log("CONTINUE pressed but no session shown")
+            self._screen.notice("continue: no session")
+            return
+        if not sess.focus_ctrl:
+            log(f"CONTINUE -> {sess.name}: not a wrapped session, nothing to type into")
+            self._screen.notice("continue: not a wrapped session")
+            return
+        ok, why = wrapper_ctrl_call(sess.focus_ctrl, "submit continue")
+        log(f"CONTINUE -> {sess.name}: {'sent' if ok else 'FAILED'}")
+        # Only on failure. A successful `continue` shows itself -- the session
+        # goes from waiting to working within a second or two, on the same
+        # screen -- and a notice would cover exactly that with older news.
+        if not ok:
+            self._screen.notice(why or "continue failed")
+
+    def _new_terminal_pressed(self) -> None:
+        """B|T -- open a new terminal, in the shown session's directory, and
+        focus it. Off the reader thread: `open` can block for seconds while
+        Terminal launches, and this thread must keep draining button events."""
+        sess = self._screen.current_shown()
+        cwd = (sess.cwd if sess and sess.cwd else os.path.expanduser("~"))
+
+        def run() -> None:
+            try:
+                # `open -a Terminal <dir>` opens a new window already cd'd
+                # there, and brings Terminal forward -- which IS the focus the
+                # device asked for, so no separate raise is needed.
+                subprocess.run(["open", "-a", "Terminal", cwd],
+                               capture_output=True, timeout=20)
+                log(f"NEW TERMINAL -> {cwd}")
+            except Exception as exc:
+                log(f"new terminal: {exc}")
+
+        threading.Thread(target=run, name="new-terminal", daemon=True).start()
+
+    def _switch_account_pressed(self, index: str = "") -> None:
+        """B|A<i> -- continue the shown session on SAVED account number <i>.
+
+        Switching accounts does NOT mean logging in again. Every one of these is
+        a login you already have -- a profile directory under
+        ~/.claude-accounts, holding its own credentials -- and the switch
+        continues this conversation there. The index is decoded against the list
+        the device was actually PUSHED (the L| lines it is showing), never
+        against a fresh reading of the profiles directory: the two are read at
+        different moments, and a profile created in between -- which happens
+        simply by starting a session on a new name -- renumbers our list while
+        the glass still shows the old rows, so row 3 would no longer be the name
+        the device is highlighting.
+
+        The wrapper does the work: it owns the claude process, so it is the only
+        thing that can replace it.
+        """
+        sess = self._screen.current_shown()
+        if sess is None:
+            log("SWITCH pressed but no session shown")
+            self._screen.notice("switch: no session")
+            return
+        if not sess.focus_ctrl:
+            log(f"SWITCH -> {sess.name}: not a wrapped session")
+            self._screen.notice("switch: not a wrapped session")
+            return
+        names = pushed_accounts()
+        try:
+            name = names[int(index)]
+        except (ValueError, IndexError):
+            log(f"SWITCH -> {sess.name}: index {index!r} names no account the "
+                f"device was sent ({names or 'nothing pushed yet'})")
+            self._screen.notice("switch: no such account")
+            return
+
+        def run() -> None:
+            # The wrapper's own words, on the glass. Every refusal it can give
+            # is a thing the person holding the device can act on -- they are
+            # already on that account, the session has nothing to carry yet --
+            # and none of them is worth making someone read a log to learn.
+            ok, why = wrapper_ctrl_call(sess.focus_ctrl, f"switch {name}")
+            log(f"SWITCH -> {sess.name}: continue on saved account "
+                f"{name!r} ({'requested' if ok else 'FAILED'})")
+            self._screen.notice(f"-> {name}" if ok else (why or "switch failed"))
+
+        threading.Thread(target=run, name="switch-account", daemon=True).start()
+
     def _follow_pressed(self) -> None:
         """B|F -- the 4-button device's dedicated FOLLOW toggle.
 
@@ -2260,10 +2560,12 @@ class Ticker(threading.Thread):
     ticking (the frame is re-sent only when its bytes actually change), and
     keeps the LED honest."""
 
-    def __init__(self, screen: Screen, registry: Registry) -> None:
+    def __init__(self, screen: Screen, registry: Registry,
+                 on_slow_tick: Optional[Callable[[], None]] = None) -> None:
         super().__init__(name="ticker", daemon=True)
         self._screen = screen
         self._reg = registry
+        self._slow = on_slow_tick        # every 5 s, alongside the prune
         self._stop_evt = threading.Event()  # NOT `_stop`: Thread.join() calls its own _stop()
         self._last_prune = 0.0
 
@@ -2275,6 +2577,11 @@ class Ticker(threading.Thread):
             if now - self._last_prune >= 5.0:
                 self._reg.prune()
                 self._last_prune = now
+                if self._slow:
+                    try:
+                        self._slow()
+                    except Exception as exc:   # housekeeping must never stop the tick
+                        log(f"slow tick: {exc}")
             self._screen.notify_change()
             self._stop_evt.wait(1.0)
 
@@ -2475,6 +2782,93 @@ def main(argv: Optional[List[str]] = None) -> int:
     # lazy and inside the branch because tools/test_net_link.py exec_modules
     # this file by path, where a module-level import would need daemon/ on
     # sys.path.
+    # ---- the saved-account list the device's picker shows ------------------ #
+    # Pushed on every handshake. Switching accounts on the device means picking
+    # one of these -- logins that already exist, each with its own credentials
+    # -- never signing in again, so the device must know their names.
+    _handshake_extra: List[Any] = []
+
+    def send_accounts(with_chips: bool = False) -> None:
+        names = account_profiles()
+        if not names:
+            return
+        # Say what will not fit rather than quietly showing the first five: a
+        # picker that silently omits the account you were looking for reads as
+        # "that login is gone".
+        hidden = len(account_profiles(0)) - len(names)
+        if hidden > 0:
+            log(f"accounts: {hidden} more not shown -- the picker holds {ACCT_MAX}")
+        chips = [""] * len(names)
+        if with_chips:
+            for i, n in enumerate(names):
+                # "" -- not the expanded path -- is how the wrapper spells "the
+                # default login". Claude Code suffixes the Keychain service with
+                # a hash of $CLAUDE_CONFIG_DIR only for profiles; ~/.claude's
+                # entry has no suffix, so passing its path finds no token and
+                # the account lists with no limit -- the one number the choice
+                # is actually made on.
+                chips[i] = account_headroom_chip("" if n == "default"
+                                                 else account_dir(n))
+        sent = 0
+        for i, n in enumerate(names):
+            try:
+                # The RETURN VALUE, not just the absence of an exception: a
+                # closed port answers False rather than raising, and counting
+                # that as sent would leave us decoding the device's presses
+                # against a list it never received.
+                if not link.write_line(f"L|{i}|{len(names)}|{n[:14]}|{chips[i]}"):
+                    break
+                sent = i + 1
+            except Exception as exc:
+                log(f"accounts: {exc}")
+                break
+        # Only what actually went out: a burst cut short leaves the device
+        # holding the rows it got, and that prefix is what its indices mean.
+        set_pushed_accounts(names[:sent])
+        if not sent:
+            log("saved accounts: nothing reached the device (link down)")
+            return
+        log("saved accounts -> device: " +
+            ", ".join(f"{i}:{n}{(' ' + chips[i]) if chips[i] else ''}"
+                      for i, n in enumerate(names[:sent])))
+
+    _last_push: List[List[str]] = [[]]        # the list this daemon last aimed at
+
+    def push_accounts() -> None:
+        """Names first, then chips once the network has answered.
+
+        The names are free and the device needs them immediately; the remaining
+        limits cost one HTTPS round trip per profile, which must not sit in the
+        handshake path. So: send what we know, then send it again enriched.
+        Which account has headroom is the whole basis of the choice, so it is
+        worth the second push."""
+        _last_push[0] = account_profiles()
+        send_accounts(False)
+
+        def enrich() -> None:
+            send_accounts(True)
+
+        threading.Thread(target=enrich, name="acct-usage", daemon=True).start()
+
+    _handshake_extra.append(push_accounts)
+
+    def refresh_accounts() -> None:
+        """Re-push when the saved logins have changed under us.
+
+        The handshake is the only other push, and profiles come and go while the
+        device stays linked -- picking a new name at the wrapper's account prompt
+        creates one. Since the device answers with an INDEX, a list that drifts
+        here and not there does not merely look stale, it decodes to the wrong
+        name. Cheap: one listdir, and a push only on a real difference.
+
+        Compared against what was last SENT AT, not what reached the device.
+        While the device is unplugged nothing reaches it, and a comparison
+        against "what it received" would find a difference every five seconds
+        forever -- each one costing an HTTPS usage call per profile, for a
+        picker nobody can see. A reconnect re-pushes from the handshake anyway."""
+        if account_profiles() != _last_push[0]:
+            push_accounts()
+
     web = None
     if args.web:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -2500,21 +2894,32 @@ def main(argv: Optional[List[str]] = None) -> int:
                 log("device controller mode: %s" % ("ON" if on else "off"))
 
             candidate.on_grab = _controller
-            # ...and re-assert it whenever a device says hello, so one that
-            # connects mid-game lands in controller mode rather than in menu
-            # semantics.
-            screen.on_handshake_extra = (
+            _handshake_extra.append(
                 lambda _b=candidate: _controller(_b.grabbed()))
             if candidate.start():
                 web = candidate
         log(f"  web    : {'on' if web else 'DISABLED'}")
+
+    # Everything the device needs re-asserted when it says hello. A list rather
+    # than one callback because these are independent: the account list must be
+    # pushed whether or not --web is on, and controller mode only exists when it
+    # is. Edge-driven state that is never re-asserted is correct only while
+    # nothing reconnects, which is not a property this device has.
+    def _on_handshake() -> None:
+        for fn in _handshake_extra:
+            try:
+                fn()
+            except Exception as exc:
+                log(f"handshake extra: {exc}")
+
+    screen.on_handshake_extra = _on_handshake
 
     socket_server = SocketServer(args.sock, registry, on_update, on_haptic)
     button_reader = ButtonReader(link, screen)
     button_reader.on_ack = on_ack
     button_reader.bridge = web
     maintainer = SerialMaintainer(link, screen)
-    ticker = Ticker(screen, registry)
+    ticker = Ticker(screen, registry, on_slow_tick=refresh_accounts)
 
     threads: List[threading.Thread] = [
         socket_server,
