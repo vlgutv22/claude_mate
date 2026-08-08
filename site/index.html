@@ -684,11 +684,12 @@ Opus 5 xhigh     5h82%
       <div class="card">
         <span class="tag now">start here · no hardware</span>
         <h3>Draw a level</h3>
-        <p>Twelve milestones are designed; <b>one is built</b>. A level is a plain
-          <b>7 × 108 character grid</b> — <code>.</code> is a day you shipped nothing,
-          <code>1</code>–<code>4</code> are the four greens — and level 1 ships as exactly that.
-          Two measured rules bound anything you draw: a jump clears two tiles across and rises
-          one row, so every raised ledge needs one step per row it climbs.</p>
+        <p>Twelve milestones are designed; <b>two are built</b>. A level is a plain
+          <b>7-row character grid</b> — <code>.</code> is a day you shipped nothing,
+          <code>1</code>–<code>4</code> are the four greens — and levels 1 and 2 ship as exactly
+          that. Two measured rules bound anything you draw: a jump clears two tiles across and
+          rises one row, so every raised ledge needs one step per row it climbs — and CI now
+          BFS-checks both against every level you add.</p>
         <p class="lk">
           <a href="https://github.com/vlgutv22/claude_mate/blob/main/docs/GAME.md#4-the-twelve-levels">docs/GAME.md §4</a>
           <a href="https://github.com/vlgutv22/claude_mate/blob/main/firmware/claude_mate_s3/game/level_01.h">level_01.h</a>
@@ -698,25 +699,27 @@ Opus 5 xhigh     5h82%
       <div class="card">
         <span class="tag done">a weekend · no hardware</span>
         <h3>Write the reachability checker</h3>
-        <p>The design asks for it in so many words: a real breadth-first search from the spawn
-          point over standing positions, not a per-tile sanity check — a ledge always looks fine
-          next to its own neighbours. The first pass at level 1 left <b>all seventeen pull
-          requests unreachable</b>, and only playing it found that. Nothing in
-          <code>tools/</code> does this yet.</p>
+        <p>The design asked for it in so many words, and it exists now:
+          <code>tools/test_levels.py</code> BFS-walks every level from the spawn over standing
+          positions and fails CI if the flag or any pull request is out of reach — the first pass
+          at level 1 left <b>all seventeen pull requests unreachable</b>, and only playing it
+          found that. What the search does not know yet is <b>enemies</b>: a route that crosses
+          three patrols is "reachable" to it and a tax in play.</p>
         <p class="lk">
           <a href="https://github.com/vlgutv22/claude_mate/blob/main/docs/GAME.md#2-deadline-is-health">docs/GAME.md §2</a>
-          <a href="https://github.com/vlgutv22/claude_mate/tree/main/tools">tools/</a>
+          <a href="https://github.com/vlgutv22/claude_mate/blob/main/tools/test_levels.py">tools/test_levels.py</a>
         </p>
       </div>
 
       <div class="card">
         <span class="tag next">harder · C++ or JS</span>
         <h3>Build an enemy that only exists on paper</h3>
-        <p>Five enemy types are specified; two are implemented. The <b>flaky test</b> blinks in and
-          out on a fixed cycle, the <b>merge conflict</b> is static and must be routed around, the
-          <b>regression</b> comes back once, angrier. Each also owes a codex card — every enemy
-          freezes the game to introduce itself, because nobody should learn a rule by losing a day
-          to it.</p>
+        <p>Six enemy types are specified; three are implemented — the <b>product manager</b>
+          (chases on sight, cannot be stomped, the costliest collision in the game) landed with
+          level 2. Still on paper: the <b>flaky test</b> blinks in and out on a fixed cycle, the
+          <b>merge conflict</b> is static and must be routed around, the <b>regression</b> comes
+          back once, angrier. Each also owes a codex card — every enemy freezes the game to
+          introduce itself, because nobody should learn a rule by losing a day to it.</p>
         <p class="lk">
           <a href="https://github.com/vlgutv22/claude_mate/blob/main/docs/GAME.md#5-enemies">docs/GAME.md §5</a>
           <a href="https://github.com/vlgutv22/claude_mate/blob/main/firmware/claude_mate_s3/game/ship_it.h">game/ship_it.h</a>

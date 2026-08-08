@@ -1,9 +1,13 @@
 # SHIP IT — a game on the glass
 
-> **Status: level 1 ships.** The engine, the start screen, the enemy codex, the
-> sound and the saved record all run on the device — see
-> [`ship_it.h`](../firmware/claude_mate_s3/game/ship_it.h). Levels 2–12 are
-> designed here and not built. The browser prototype in
+> **Status: levels 1–2 ship.** The engine, the start screen, the enemy codex,
+> the sound and the saved record all run on the device — see
+> [`ship_it.h`](../firmware/claude_mate_s3/game/ship_it.h) — which plays
+> level 1. The **web edition plays both**, with a MILESTONE selector on its
+> start screen; level 2 ships as data first
+> ([`level_02.h`](../firmware/claude_mate_s3/game/level_02.h)), exactly as
+> level 1 did before the device engine existed, and the firmware port follows.
+> Levels 3–12 are designed here and not built. The browser prototype in
 > [`game/proto`](../firmware/claude_mate_s3/game/proto) stays the place the feel
 > is worked out, and is kept local.
 
@@ -63,6 +67,7 @@ the corner, counting down, and everything in the world is a claim on it.
 | Fall in a hole | **−1 day**, respawn at the last tile you stood on |
 | Stomp a bug | **+½ day** — fixing things buys schedule |
 | A **priority change** reaches you | **−2 days** and shoved four tiles back; cannot be stomped |
+| A **product manager** catches you (L2) | **−4½ days** — the priority-change cost **plus 2½**, on every tier — and shoved six tiles back; cannot be stomped |
 | Merge a pull request | **+1 day**, and the screen says `PR MERGED` |
 | Reach the milestone | level complete; unused days carry over |
 
@@ -227,7 +232,7 @@ changes one thing about the *shape* of the graph, because the graph is the level
 | # | Milestone | The sprint's shape | Introduces |
 |---|---|---|---|
 | 1 | **Kickoff** | dense, flat, forgiving | walking, one gap, one bug |
-| 2 | **Scaffolding** | rising streaks | climbing, longer jumps |
+| 2 | **Scaffolding** | rising streaks | climbing, catwalks, the product manager — **built**, 20% longer than level 1 with ~5% more hazard per tile ([`level_02.h`](../firmware/claude_mate_s3/game/level_02.h) documents the arithmetic) |
 | 3 | **First Light** | first real weekend gaps | run-up jumps |
 | 4 | **Dogfood** | floating platforms | bugs that patrol above you |
 | 5 | **Alpha** | sparse — a thin month | precision, few safe tiles |
@@ -253,6 +258,7 @@ that happens to a sprint.
 |---|---|---|
 | **Bug** | patrols a platform, turns at edges. Stompable, and stomping pays | L1 |
 | **Priority change** | drifts vertically, denying a whole lane. **Cannot be stomped** — you do not fix a re-prioritisation by jumping on it. Rare: three, against eleven bugs | L1 |
+| **Product manager** | patrols its floor at 0.7× the tier's enemy speed and **chases on sight** at 1.35×, capped at 1.2 px/step — below your 1.45 walk, so it is always escapable and never ignorable. **Cannot be stomped** (it is your manager). The costliest collision in the game: the tier's priority-change penalty **plus 2½ days** (4½/4½/5/5½/5½), which on the top two tiers exceeds the whole budget — avoidance is the intended reading there, and the codex card says the number out loud | L2 |
 | **Flaky test** | blinks in and out on a fixed cycle; harmless while absent | L7 |
 | **Regression** | squashing it works — then it comes back once, angrier | L9 |
 | **Merge conflict** | static, blocks a corridor; cannot be squashed, must be routed around | L8 |
@@ -407,6 +413,11 @@ relicensed or commercialised later without going back to every one of them.
 - [`firmware/claude_mate_s3/game/level_01.h`](../firmware/claude_mate_s3/game/level_01.h)
   — level 1 as data, in the format an engine would consume, with the sprites and
   the palette.
+- [`firmware/claude_mate_s3/game/level_02.h`](../firmware/claude_mate_s3/game/level_02.h)
+  — level 2 as data in the same format: 20% longer, ~5% denser with hazards,
+  and home of the product manager's sprite, colour and behaviour spec. The web
+  engine plays it today; the reachability search that §2 demanded now runs in
+  CI for every level (`tools/test_levels.py`).
 - [`firmware/claude_mate_s3/game/proto/index.html`](../firmware/claude_mate_s3/game/proto/index.html)
   — a playable prototype at the device's exact 320×172, kept **local only**. Run
   `python3 -m http.server 8931` in that directory. It exists to be played, which
