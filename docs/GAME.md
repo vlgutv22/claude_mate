@@ -4,7 +4,9 @@
 > the sound and the saved record all run on the device — see
 > [`ship_it.h`](../firmware/claude_mate_s3/game/ship_it.h) — which plays
 > level 1. The **web edition plays both**, with a MILESTONE selector on its
-> start screen; level 2 ships as data first
+> start screen — level 2 unlocks once level 1 has shipped on any tier, because
+> you do not start month two of a project whose first month slipped; level 2
+> ships as data first
 > ([`level_02.h`](../firmware/claude_mate_s3/game/level_02.h)), exactly as
 > level 1 did before the device engine existed, and the firmware port follows.
 > Levels 3–12 are designed here and not built. The browser prototype in

@@ -15,7 +15,9 @@ they are the project's history, not the current behavior (which the
 ### 2026-08-08 — SHIP IT level 2: M2 · SCAFFOLDING, and the product manager
 
 - **Added: level 2 of SHIP IT**, playable in the web edition through a new
-  MILESTONE row on the start screen. The sizing is arithmetic rather than
+  MILESTONE row on the start screen. It unlocks once M1 has shipped on any
+  tier — the row says so, and refuses until then — and the M1 finish screen
+  announces the unlock. The sizing is arithmetic rather than
   taste: the crossing is 126 tiles against level 1's 105 — **20% longer**, so
   the same per-step drain prices a straight run at 1.2× the tier's walk cost
   (the start screen now quotes the real number per level) — and hazard density

@@ -168,6 +168,10 @@ const SFX = {
 let prog = { done: 0, tier: -1, prs: 0, days: 0 };
 try { const raw = localStorage.getItem(PKEY); if (raw) prog = JSON.parse(raw); } catch (e) {}
 const progCount = () => { let n = 0; for (let i = 0; i < LEVELS; i++) if (prog.done & (1 << i)) n++; return n; };
+// A milestone is playable once the one before it has shipped (any tier).
+// Milestones are months of one project: you do not start month two because
+// month one ran out of days.
+const unlockedLvl = i => i === 0 || !!(prog.done & (1 << (i - 1)));
 function progRecord(lvl, tier, prs, days) {
   const done = prog.done | (1 << lvl);
   let best = false;
@@ -419,7 +423,12 @@ function nav(k) {
   if (k === 'left')  { menuRow = (menuRow + 3) % 4; SFX.move(); }
   else if (k === 'right') { menuRow = (menuRow + 1) % 4; SFX.move(); }
   else {
-    if (menuRow === 0)      { setLevel((lvl + 1) % CAMPAIGN.length); SFX.jump(); }
+    if (menuRow === 0) {
+      let n = (lvl + 1) % CAMPAIGN.length;
+      while (!unlockedLvl(n)) n = (n + 1) % CAMPAIGN.length;
+      if (n === lvl) SFX.hit();          // everything else is locked: refuse
+      else { setLevel(n); SFX.jump(); }
+    }
     else if (menuRow === 1) { diff = (diff + 1) % DIFFS.length; Sx.days = DIFFS[diff].days; SFX.jump(); }
     else if (menuRow === 2) { tutorial = !tutorial; SFX.jump(); }
     else                    { reset(); Sx.started = true; SFX.merge(); }
@@ -821,8 +830,10 @@ function drawMenu() {
   txt('walk your contribution graph to the milestone', 60, 176, 21, '#8b949e', 'left', 500);
 
   const d = DIFFS[diff];
+  const lockedNext = lvl + 1 < CAMPAIGN.length && !unlockedLvl(lvl + 1);
   const rows = [
-    ['MILESTONE', LEVEL.name, CAMPAIGN_SUB[lvl]],
+    ['MILESTONE', LEVEL.name, CAMPAIGN_SUB[lvl]
+      + (lockedNext ? ' · ship this to unlock ' + CAMPAIGN[lvl + 1].name : '')],
     ['DIFFICULTY', d.name, d.sub],
     ['TUTORIAL', tutorial ? 'ON' : 'OFF',
       tutorial ? 'freeze and explain each new enemy' : 'no cards, straight in'],
@@ -911,8 +922,10 @@ function drawEnd() {
            + 'd left   ' + DIFFS[diff].name, 292, 21, '#8b949e', 500);
     centre(Sx.newBest ? 'NEW BEST \u2014 PROGRESS SAVED' : 'PROGRESS SAVED', 350, 23,
            Sx.newBest ? P.pr : '#8b949e', 700);
-    centre('milestone ' + progCount() + ' of ' + LEVELS + ' \u2014 the next '
-           + (LEVELS - progCount()) + ' are coming soon', 406, 19, '#8b949e', 500);
+    const nxt = lvl + 1 < CAMPAIGN.length ? CAMPAIGN[lvl + 1].name + ' is unlocked' : null;
+    centre('milestone ' + progCount() + ' of ' + LEVELS + ' \u2014 '
+           + (nxt || 'the next ' + (LEVELS - progCount()) + ' are coming soon'),
+           406, 19, nxt ? P.l2 : '#8b949e', 500);
   } else {
     centre(Sx.merged + '/' + LEVEL.prs.length + ' merged \u2014 ran out of days', 274, 22, '#8b949e', 500);
     centre('the deadline is the fail state, and it is the honest one', 316, 19, '#6e7681', 500);
