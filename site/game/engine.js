@@ -454,8 +454,14 @@ function toast(m, c) { Sx.msg = m; Sx.msgCol = c || P.text; Sx.flash = 52; }
 // and let terrain stop it. Level 2's pyramid made this load-bearing -- a raw
 // `x -= 46` from the prio at col 112 passes THROUGH the pyramid's wall into
 // its sealed hollow, a pit no jump can leave, and the run is over for a
-// reason the player cannot see. On level 1 the swept and unswept shoves land
-// on the same pixel at every priority-change site, so nothing shipped changes.
+// reason the player cannot see.
+//
+// It changes LEVEL 1 as well, which ships -- an earlier draft of this comment
+// claimed otherwise. At the priority changes on cols 31 and 93, 18 of the 172
+// standing positions that register a hit used to land the player INSIDE the
+// staircase block behind them: from x=484 the raw shove landed at 438, buried,
+// where the sweep stops at 447 flush against the wall. Row 5 there is the main
+// walking floor, so that is the ordinary way the hit happens, not a corner.
 function shove(px) {
   while (px-- > 0 && Sx.x > 0 && !hits(Sx.x - 1, Sx.y)) Sx.x -= 1;
 }

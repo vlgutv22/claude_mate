@@ -36,8 +36,12 @@ they are the project's history, not the current behavior (which the
   Knockbacks are now swept against terrain instead of teleporting — the
   review found that a raw 46 px shove from the priority change at level 2's
   col 112 could pass through the pyramid's wall into its sealed hollow, a
-  pit no jump can leave; on level 1 the swept shove lands on the same pixel
-  at every site, so nothing shipped changes.
+  pit no jump can leave. It turns out to fix **level 1** too, which ships:
+  at the priority changes on cols 31 and 93, 18 of the 172 standing positions
+  that register a hit used to shove the player *inside* the staircase block
+  behind them — from x=484 the old shove landed at 438, buried in terrain,
+  where the swept one stops at 447 flush against the wall. That is the main
+  walking floor, so it was the ordinary case rather than a corner of the map.
 - **Added: `tools/test_levels.py`**, the reachability checker the design doc
   demanded after level 1's first draft shipped with all seventeen PRs
   unreachable: a breadth-first search over standing positions using only the
