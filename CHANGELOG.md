@@ -12,6 +12,50 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
+### 2026-08-08 — SHIP IT level 2: M2 · SCAFFOLDING, and the product manager
+
+- **Added: level 2 of SHIP IT**, playable in the web edition through a new
+  MILESTONE row on the start screen. It unlocks once M1 has shipped on any
+  tier — the row says so, and refuses until then — and the M1 finish screen
+  announces the unlock. The sizing is arithmetic rather than
+  taste: the crossing is 126 tiles against level 1's 105 — **20% longer**, so
+  the same per-step drain prices a straight run at 1.2× the tier's walk cost
+  (the start screen now quotes the real number per level) — and hazard density
+  rises about **5%** (18 enemies and 10 gaps over 126 tiles, against 14 and 8
+  over 105). Per-hit costs per tier are unchanged, so a chosen difficulty
+  stays the difficulty chosen. The shape is the one `docs/GAME.md` §4 promised
+  for M2: rising streaks — scaffolds, catwalks, perches and one pyramid that
+  cannot be walked around.
+- **Added: the product manager**, the game's third enemy and its most
+  expensive. It patrols its floor at 0.7× the tier's enemy speed and *chases
+  on sight* at 1.35×, capped at 1.2 px/step — deliberately below the 1.45
+  walk, because a meeting you cannot outrun is not a mechanic, it is a wall.
+  It cannot be stomped, and a collision costs the tier's priority-change
+  penalty **plus 2½ days** (4½/4½/5/5½/5½ across the tiers), a 60 px shove
+  and 90 frames of invulnerability. It gets a codex card like everyone else.
+  Knockbacks are now swept against terrain instead of teleporting — the
+  review found that a raw 46 px shove from the priority change at level 2's
+  col 112 could pass through the pyramid's wall into its sealed hollow, a
+  pit no jump can leave. It turns out to fix **level 1** too, which ships:
+  at the priority changes on cols 31 and 93, 18 of the 172 standing positions
+  that register a hit used to shove the player *inside* the staircase block
+  behind them — from x=484 the old shove landed at 438, buried in terrain,
+  where the swept one stops at 447 flush against the wall. That is the main
+  walking floor, so it was the ordinary case rather than a corner of the map.
+- **Added: `tools/test_levels.py`**, the reachability checker the design doc
+  demanded after level 1's first draft shipped with all seventeen PRs
+  unreachable: a breadth-first search over standing positions using only the
+  measured jump budget, run in CI for every level, failing if the flag or any
+  pull request cannot be reached.
+- **Changed: `tools/gen_level.py` now generates every level**, not just the
+  first. Each firmware header owns its geometry and actors; the palette and
+  sprites are merged game-wide (the character lives in `level_01.h`, the
+  product manager in `level_02.h`) and emitted into every generated module,
+  with a duplicate definition anywhere being a hard error.
+- The device engine is untouched and still plays level 1: level 2 ships as
+  data first (`firmware/claude_mate_s3/game/level_02.h`), exactly as level 1
+  did before `ship_it.h` existed, and the firmware port follows.
+
 ### 2026-07-31 — A battery indicator that stops lying, and a menu that responds
 
 - **Changed: three segments instead of a battery percentage** (3 green, 2 amber,

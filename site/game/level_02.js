@@ -1,6 +1,6 @@
 // GENERATED FILE -- DO NOT EDIT BY HAND.
 //
-// Source:     firmware/claude_mate_s3/game/level_01.h
+// Source:     firmware/claude_mate_s3/game/level_02.h
 // Assets:     palette + sprites merged from every level header
 // Generator:  tools/gen_level.py
 // Regenerate: python3 tools/gen_level.py
@@ -11,72 +11,79 @@
 // generator; anything hand-edited here is lost on the next run, and CI
 // fails in the meantime so the two engines cannot drift apart.
 //
-// content-sha256: fd58adabfa94105fb017798716dabeaa60dbf59e5f4b4541184ab706c73d7557
+// content-sha256: 81a13ef4a5a82ad1307411489ad5922f32aed996a0fabdc78c8d7f5223f58b97
 // (over everything below this comment block -- a changed body with an
 //  unchanged hash means someone edited the output by hand.)
 
 export const LEVEL = {
-  name: "M1 \u00b7 KICKOFF",
+  name: "M2 \u00b7 SCAFFOLDING",
   rows: 7,
-  cols: 108,
+  cols: 129,
   tile: 16,
   start: { col: 1, row: 5 },
-  flagCol: 107,
+  flagCol: 128,
 
   // The terrain IS the collision map: '.' is a day nothing shipped and
   // you fall through it, '1'..'4' are shipping days you can stand on.
   map: [
-    "............................................................................................................",
-    "...........................................................................................................4",
-    ".............................222................................333........................444.............4",
-    ".............222............2............2222......222.........3........22............222.4.........222....4",
-    "............2...........22.2...........333333.....2...........3........222.333.......2...4.........2.......4",
-    "2222222222.222222222..333333333333..333333333..333333333333..22222222..3333333333..333333333333..33333333334",
-    "3333333333.333333333..444444444444..444444444..444444444444..33333333..4444444444..444444444444..44444444444",
+    ".................................................................................................................................",
+    "................................................................................................................................4",
+    "............................333333............2222........................333333333.......................444...................4",
+    "................222........3......3.........2.................333........3.........3.....................4...4..................4",
+    "...............2..........3................2.................2..........3.................4......4......4.....4.................4",
+    "2222222222..22222222222..3333333333333..3333333333333..2222222222222..333333333333333..3333333333333..2222222222222..33..333..334",
+    "3333333333..33333333333..4444444444444..4444444444444..3333333333333..444444444444444..4444444444444..3333333333333..44..444..444",
   ],
 
   // Actors: (col, row) spawn in the grid above. Bugs patrol columns
   // from..to; priority changes drift rows from..to; product managers
   // patrol columns from..to and chase on sight; PRs do not move.
-  bugs: [ // 11 bugs
-    { col:  13, row: 2, from:  13, to:  15 },
-    { col:  18, row: 4, from:  16, to:  19 },
-    { col:  37, row: 4, from:  36, to:  38 },
-    { col:  43, row: 2, from:  41, to:  44 },
-    { col:  51, row: 2, from:  51, to:  53 },
-    { col:  56, row: 4, from:  54, to:  58 },
-    { col:  64, row: 1, from:  64, to:  66 },
-    { col:  79, row: 4, from:  78, to:  80 },
-    { col:  86, row: 2, from:  86, to:  88 },
-    { col: 100, row: 2, from: 100, to: 102 },
-    { col: 105, row: 4, from: 103, to: 106 },
+  bugs: [ // 13 bugs
+    { col:  13, row: 4, from:  12, to:  14 },
+    { col:  20, row: 4, from:  19, to:  22 },
+    { col:  41, row: 4, from:  40, to:  42 },
+    { col:  47, row: 4, from:  45, to:  49 },
+    { col:  51, row: 4, from:  50, to:  52 },
+    { col:  57, row: 4, from:  55, to:  59 },
+    { col:  65, row: 4, from:  63, to:  66 },
+    { col:  79, row: 1, from:  75, to:  81 },
+    { col:  76, row: 4, from:  74, to:  77 },
+    { col:  80, row: 4, from:  78, to:  82 },
+    { col:  89, row: 4, from:  88, to:  89 },
+    { col: 107, row: 1, from: 106, to: 108 },
+    { col: 122, row: 4, from: 121, to: 123 },
   ],
 
   prios: [ // 3 priority changes
-    { col:  31, row: 1, from:   1, to:   4 },
-    { col:  67, row: 0, from:   0, to:   3 },
-    { col:  93, row: 1, from:   1, to:   4 },
+    { col:  47, row: 1, from:   0, to:   3 },
+    { col:  78, row: 0, from:   0, to:   3 },
+    { col: 112, row: 1, from:   1, to:   4 },
   ],
 
-  pms: [ // 0 product managers
+  pms: [ // 2 product managers
+    { col:  30, row: 4, from:  28, to:  34 },
+    { col:  93, row: 4, from:  91, to:  96 },
   ],
 
-  prs: [ // 15 pull requests
-    { col:  14, row: 2, from:   0, to:   0 },
-    { col:  15, row: 2, from:   0, to:   0 },
+  prs: [ // 18 pull requests
+    { col:  16, row: 2, from:   0, to:   0 },
+    { col:  17, row: 2, from:   0, to:   0 },
     { col:  30, row: 1, from:   0, to:   0 },
     { col:  31, row: 1, from:   0, to:   0 },
-    { col:  52, row: 2, from:   0, to:   0 },
-    { col:  53, row: 2, from:   0, to:   0 },
-    { col:  65, row: 1, from:   0, to:   0 },
-    { col:  66, row: 1, from:   0, to:   0 },
-    { col:  72, row: 2, from:   0, to:   0 },
-    { col:  76, row: 3, from:   0, to:   0 },
-    { col:  87, row: 2, from:   0, to:   0 },
-    { col:  92, row: 1, from:   0, to:   0 },
-    { col:  93, row: 1, from:   0, to:   0 },
-    { col: 101, row: 2, from:   0, to:   0 },
-    { col: 102, row: 2, from:   0, to:   0 },
+    { col:  32, row: 1, from:   0, to:   0 },
+    { col:  47, row: 1, from:   0, to:   0 },
+    { col:  48, row: 1, from:   0, to:   0 },
+    { col:  62, row: 2, from:   0, to:   0 },
+    { col:  63, row: 2, from:   0, to:   0 },
+    { col:  64, row: 2, from:   0, to:   0 },
+    { col:  75, row: 1, from:   0, to:   0 },
+    { col:  76, row: 1, from:   0, to:   0 },
+    { col:  80, row: 1, from:   0, to:   0 },
+    { col:  81, row: 1, from:   0, to:   0 },
+    { col:  90, row: 3, from:   0, to:   0 },
+    { col:  97, row: 3, from:   0, to:   0 },
+    { col: 107, row: 0, from:   0, to:   0 },
+    { col: 108, row: 0, from:   0, to:   0 },
   ],
 
   // Palette. The CSS hex below is the EXACT 8-bit argument the header
