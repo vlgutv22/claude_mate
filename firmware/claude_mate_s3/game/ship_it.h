@@ -758,6 +758,10 @@ inline void ShipIt::drawStart(Arduino_GFX *g) {
 
     val[0] = 0; sub[0] = 0;
     if (i == 0) {
+      // The value is right-aligned at size 2, so it eats leftwards into the
+      // label: "MILESTONE" ends at x=118 and "M2 . SCAFFOLDING" starts at 120.
+      // SIXTEEN characters is the whole budget for a level name -- a longer one
+      // collides, silently, and only on the panel.
       snprintf(val, sizeof(val), "%s", _lv->name);
       // When the next milestone is locked, the row says what opens it instead of
       // pitching the one you are already on. The lock is the information.
