@@ -1,15 +1,16 @@
 # SHIP IT — a game on the glass
 
-> **Status: levels 1–2 ship.** The engine, the start screen, the enemy codex,
-> the sound and the saved record all run on the device — see
-> [`ship_it.h`](../firmware/claude_mate_s3/game/ship_it.h) — which plays
-> level 1. The **web edition plays both**, with a MILESTONE selector on its
-> start screen — level 2 unlocks once level 1 has shipped on any tier, because
-> you do not start month two of a project whose first month slipped; level 2
-> ships as data first
-> ([`level_02.h`](../firmware/claude_mate_s3/game/level_02.h)), exactly as
-> level 1 did before the device engine existed, and the firmware port follows.
-> Levels 3–12 are designed here and not built. The browser prototype in
+> **Status: levels 1–2 ship, on both engines.** The engine, the start screen,
+> the enemy codex, the sound and the saved record all run on the device — see
+> [`ship_it.h`](../firmware/claude_mate_s3/game/ship_it.h) — and it plays the
+> campaign, not a level: a MILESTONE row selects the milestone, and level 2
+> unlocks once level 1 has shipped on any tier, because you do not start month
+> two of a project whose first month slipped. The **web edition plays both** the
+> same way. Neither engine knows which level it is drawing; both read a table of
+> level data ([`level_02.h`](../firmware/claude_mate_s3/game/level_02.h) is the
+> new row), which is why level 2 cost a data file and a menu row rather than a
+> second renderer. Levels 3–12 are designed here and not built. The browser
+> prototype in
 > [`game/proto`](../firmware/claude_mate_s3/game/proto) stays the place the feel
 > is worked out, and is kept local.
 

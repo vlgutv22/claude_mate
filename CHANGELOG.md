@@ -52,9 +52,24 @@ they are the project's history, not the current behavior (which the
   sprites are merged game-wide (the character lives in `level_01.h`, the
   product manager in `level_02.h`) and emitted into every generated module,
   with a duplicate definition anywhere being a hard error.
-- The device engine is untouched and still plays level 1: level 2 ships as
-  data first (`firmware/claude_mate_s3/game/level_02.h`), exactly as level 1
-  did before `ship_it.h` existed, and the firmware port follows.
+- **Changed: the device engine plays the campaign too**, not just level 1.
+  `ship_it.h` was bound to level 1 at *compile* time — `LVL1_MAP` inside
+  `solid()`, `LVL1_COLS` in the camera clamp, `LVL1_BUG_COUNT` as an array
+  size — and now reads every level through a campaign table, so nothing in the
+  simulation or the renderer knows which level it is playing and level 3 is a
+  header plus one row. Actor arrays are sized to the worst level at compile
+  time, so switching milestone never allocates; `ROWS` and `TILE` are still
+  shared by every level and now `static_assert` it. The device gets the same
+  MILESTONE row, the same lock, the product manager and its codex card, the
+  per-level walk cost (M2 quotes 6 days where M1 quotes 5, on SPRINT), and the
+  swept knockback. The start screen fits a fourth row by moving the title block
+  up 6 px and tightening the row pitch from 32 to 27.
+- A host harness compiles that device engine and drives it with the panel and
+  NVS stubbed, which is how the layout of a screen CI cannot see is checked at
+  all: 1840 drawn strings across every screen, both levels and all five tiers,
+  none of them off the 320×172 panel and none colliding on its own row. It also
+  pins the two engines to the same pixel — the swept shove lands on 447 on
+  level 1 and 1775 on level 2 in the browser *and* in the firmware.
 
 ### 2026-07-31 — A battery indicator that stops lying, and a menu that responds
 
