@@ -271,9 +271,10 @@ hooks are the zero-dependency feed. Use whichever fits each session.
   Charging is inferred in tiers; the board exposes no charge-status line.
 - **A live terminal mirror** — see [above](#the-terminal-mirror-esp32-s3).
 - **An on-device menu** — double-tap the 4th button. Four items: the triage view,
-  SETTINGS, SHIP IT and long sleep. Settings holds the rest — a **game
-  controller** switch, screen sleep, brightness, alert-LED level including a
-  genuine *off*, Mac sound, flip, the Wi-Fi setup portal, an About readout, and
+  SETTINGS, SHIP IT and long sleep. Settings holds the rest — a **BLE gamepad**
+  switch, a **Link** row that moves the daemon between Wi-Fi and Bluetooth, screen
+  sleep, brightness, alert-LED level including a genuine *off*, Mac sound, flip,
+  the Wi-Fi setup portal, an About readout, and
   factory reset. About and Wi-Fi live there rather than on the top strip because
   neither is a place you go: one is something you read, the other something you
   set. Entirely **firmware-local**: while it is up PREV/GO/NEXT are handled on
@@ -322,9 +323,10 @@ hooks are the zero-dependency feed. Use whichever fits each session.
    │     from its wrapper → M| lines (S3 only)    │
    └──────────────────────────────────────────────┘
              │                              │
-   USB serial 115200 8N1        TCP :8787 (opt-in --tcp), mDNS-discovered,
-   "|"-delimited ASCII          nonce/HMAC handshake — the token never
-             │                  crosses the wire · SAME "|" lines
+   USB serial 115200 8N1        TCP :8787 (--tcp) or BLE GATT (--ble):
+   "|"-delimited ASCII          mDNS-discovered / duty-cycled advertising,
+             │                  the SAME nonce/HMAC handshake and the SAME
+             │                  "|" lines — the token never crosses the wire
              ▼                              ▼
    ┌────────────────────────────┐  ┌──────────────────────────────────┐
    │  Arduino Nano (ATmega328P) │  │  ESP32-S3 (Waveshare -LCD-1.47B) │
@@ -535,11 +537,19 @@ More build photos are in [`assets/photos/`](assets/photos/).
    ```sh
    python3 daemon/claude_mate_daemon.py --mock
    ```
-   For a **wireless** device, opt into the TCP listener. It generates a shared
-   token on first run and prints it — type that into the device's setup portal:
+   For a **wireless** device, opt into a wireless transport. Either generates a
+   shared token on first run and prints it — type that into the device's setup
+   portal:
    ```sh
    python3 daemon/claude_mate_daemon.py --tcp        # port 8787, advertised over mDNS
+   python3 daemon/claude_mate_daemon.py --ble        # Bluetooth LE (pip install bleak)
    ```
+   Wi-Fi reaches the whole home or office and is right when the host is **not on
+   this desk**; BLE is right when it **is**, and lets the device advertise in
+   200 ms bursts four seconds apart instead of holding an association open all
+   day for a device that has almost nothing to say. Pick one on the device at
+   **SETTINGS → Link** — it has a single 2.4 GHz radio, so it is never both. See
+   [docs/POWER.md](docs/POWER.md).
    Add `--sound` to also play a macOS alert sound when the worst unacknowledged
    alert class changes. The device has no speaker of its own — the ESP32-S3 has
    no DAC and the board's rail is a linear LDO, so there is no switching node a
@@ -561,6 +571,7 @@ Step-by-step guides:
 - 🔌 **Wiring (Nano)** — [docs/WIRING.md](docs/WIRING.md)
 - 📶 **Both firmwares, flashing & provisioning** — [firmware/README.md](firmware/README.md)
 - 📡 **Line protocol** — [docs/PROTOCOL.md](docs/PROTOCOL.md)
+- 🔋 **Power, and what the battery build costs** — [docs/POWER.md](docs/POWER.md)
 - ✅ **Testing** — [docs/TESTING.md](docs/TESTING.md)
 
 ### Configuration
@@ -575,7 +586,9 @@ Step-by-step guides:
 | `CLAUDE_MATE_TCP`   | off              | `1` also serves the protocol over TCP for wireless devices (same as `--tcp`) |
 | `CLAUDE_MATE_TCP_PORT` | `8787`        | TCP listener port                         |
 | `CLAUDE_MATE_TCP_BIND` | `0.0.0.0`     | Bind address — a remote device needs a routable one; `127.0.0.1` keeps it on this machine |
-| `CLAUDE_MATE_TOKEN` / `_TOKEN_FILE` | `~/.config/claude-mate/token` | Shared secret wireless devices authenticate with. `--tcp` **generates one** (0600) and prints it if none exists — type that into the device's setup portal. The listener still refuses to start if a token can neither be read nor created |
+| `CLAUDE_MATE_BLE`   | off              | `1` also serves the protocol over **Bluetooth LE** for the battery build (same as `--ble`). Needs the optional `bleak` package; without it the daemon says so and carries on |
+| `CLAUDE_MATE_BLE_ADDRESS` | scan       | Connect to this BLE address instead of scanning for the service. macOS reports its own per-host UUIDs, not MAC addresses — use the string `bleak` printed |
+| `CLAUDE_MATE_TOKEN` / `_TOKEN_FILE` | `~/.config/claude-mate/token` | Shared secret wireless devices authenticate with — **the same one on both radios**. `--tcp`/`--ble` **generate one** (0600) and print it if none exists — type that into the device's setup portal. Either transport still refuses to start if a token can neither be read nor created |
 | `CLAUDE_MATE_SOUND`  | off              | `1` plays a macOS alert sound when the worst unacknowledged alert class changes (same as `--sound`) |
 
 The listener is advertised as `_claudemate._tcp` over mDNS, so a device with no
@@ -788,11 +801,12 @@ claude_mate/
 ├── bin/
 │   └── claude-mate-wrap           # PTY wrapper: live state + terminal FOCUS (pyte)
 ├── daemon/
-│   └── claude_mate_daemon.py      # Python daemon (pyserial; --tcp adds the wireless link)
+│   ├── claude_mate_daemon.py      # Python daemon (pyserial; --tcp adds the wireless link)
+│   └── blelink.py                 # BLE central for --ble (optional: bleak)
 ├── firmware/
 │   ├── README.md                  # both builds: options, wiring, flashing, provisioning
 │   ├── claude_mate/               # Arduino sketch (one-frame OLED renderer + LED)
-│   ├── claude_mate_s3/            # ESP32-S3 sketch (colour UI, Wi-Fi, mirror, battery)
+│   ├── claude_mate_s3/            # ESP32-S3 sketch (colour UI, Wi-Fi/BLE, mirror, battery)
 │   ├── flash_s3.sh                # the only way to flash the S3 board
 │   └── selftest/                  # hardware self-test sketch
 ├── hooks/
@@ -836,10 +850,14 @@ claude_mate/
   tweak — which you can do live, no restart.
 - **The wireless link is authenticated, not encrypted.** The handshake is
   nonce/HMAC and the token never crosses the wire, but the session itself is
-  **plaintext TCP** — so session names, states and, with the mirror open, raw
+  **plaintext** — so session names, states and, with the mirror open, raw
   terminal contents are readable by anyone on the same network. `--tcp` is
   opt-in and refuses to start without a token; treat it as a trusted-LAN
-  feature.
+  feature. **`--ble` is exactly the same trade**, over a different pipe and with
+  a shorter radius: the link is deliberately unpaired and unencrypted, because
+  "Just Works" pairing is what a device with no keypad gets and is
+  unauthenticated by definition — the token handshake, not Bluetooth, is what
+  decides who may drive the device.
 - **`arduino-cli upload` cannot flash the ESP32-S3 board.** Its download mode
   ignores the DTR/RTS straps, the USB link stalls partway through any large
   transfer, and `--after hard-reset` lands back in the bootloader looking

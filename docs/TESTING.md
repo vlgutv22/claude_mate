@@ -93,6 +93,23 @@ python3 tools/test_controller_mode.py # what --web puts on the DEVICE link: G|1 
                                       # unreachable over USB, which is exactly how
                                       # the first attempt at this verb (X|, already
                                       # X|WIPE) failed. Read it before adding one.
+
+python3 tools/test_ble_link.py        # the BLE transport, both halves. Starts with
+                                      # the CONTRACT — the service and characteristic
+                                      # UUIDs live in two files, in two languages, and
+                                      # a typo in one makes the device advertise
+                                      # forever while the daemon scans forever, with
+                                      # nothing on either side saying so. Then drives
+                                      # the real BleLink against a FAKE bleak (a stub
+                                      # module injected before the lazy import): the
+                                      # nonce/HMAC handshake and both ways of failing
+                                      # it, line reassembly (a notification boundary
+                                      # is NOT a line boundary), and that handshake
+                                      # lines never leak up to the dispatcher. Needs
+                                      # no radio and no bleak install. Ends with
+                                      # static checks that the firmware has ONE
+                                      # gamepad row, that it is persisted, and that
+                                      # I| landed on the config side of the verb split
 ```
 
 Each prints a `PASS`/`FAIL` checklist and exits non-zero on failure, so they
