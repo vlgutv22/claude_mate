@@ -199,7 +199,14 @@ class BleLink:
             # Never let this thread's death take the daemon with it. A BLE stack
             # that throws something unexpected must cost the wireless link and
             # nothing else -- the USB device on the same desk keeps working.
-            self._log(f"BLE central stopped: {exc}")
+            #
+            # ...but say nothing when we are the ones stopping it. stop() calls
+            # loop.stop() from another thread, which is the supported door and
+            # which surfaces here as "Event loop stopped before Future
+            # completed" -- the ordinary shutdown path, reported as a fault.
+            # Observed on hardware, on every clean Ctrl-C.
+            if not self._stop_evt.is_set():
+                self._log(f"BLE central stopped: {exc}")
         finally:
             try:
                 self._loop.close()
@@ -227,7 +234,12 @@ class BleLink:
             try:
                 await self._session(found)
             except Exception as exc:                    # noqa: BLE001
-                self._log(f"BLE session ended: {exc}")
+                # Same rule as _run(): a session torn down BY stop() is not a
+                # failure. Killing the loop out from under an awaiting
+                # coroutine surfaces as "coroutine ignored GeneratorExit",
+                # which is alarming, accurate and completely uninteresting.
+                if not self._stop_evt.is_set():
+                    self._log(f"BLE session ended: {exc}")
             finally:
                 with self._lock:
                     self._client, self._linked = None, False
