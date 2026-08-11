@@ -968,21 +968,28 @@ class NetLink:
 
 
 class LinkHub:
-    """One device link made of a USB serial port plus a TCP listener.
+    """One device link made of a USB serial port plus any wireless transports.
 
     Presents exactly the surface the rest of the daemon already used on
     SerialLink (is_open / ensure_open / write_line / read_line / close), so
     Screen, ButtonReader and SerialMaintainer are untouched.
 
-    Frames go to BOTH transports; incoming lines from either arrive on one
+    Frames go to EVERY transport; incoming lines from any of them arrive on one
     queue. A dedicated pump moves serial input onto that queue so a wireless
     button press is never stuck behind a blocking serial read.
+
+    The wireless ones are held as a list rather than as named fields because
+    there are two of them now (a TCP listener and a BLE central) and there is
+    nothing this class needs to know about either beyond has_clients /
+    write_line / stop. Both are optional and either can be absent: --tcp alone,
+    --ble alone, both, or a device on a cable and nothing else.
     """
 
-    def __init__(self, serial_link: SerialLink, net: NetLink,
+    def __init__(self, serial_link: SerialLink,
+                 wireless: List[Any],
                  rx: "queue.Queue[str]") -> None:
         self._serial = serial_link
-        self._net = net
+        self._wireless = [w for w in wireless if w is not None]
         self._rx = rx
         self._stop_evt = threading.Event()
         self._pump = threading.Thread(target=self._pump_serial,
@@ -1000,15 +1007,19 @@ class LinkHub:
 
     # ---- the link surface ------------------------------------------------- #
 
+    def _any_wireless(self) -> bool:
+        return any(w.has_clients() for w in self._wireless)
+
     def is_open(self) -> bool:
         """Is ANY device reachable? A wireless client counts."""
-        return self._serial.is_open() or self._net.has_clients()
+        return self._serial.is_open() or self._any_wireless()
 
     def ensure_open(self) -> bool:
         """Try to (re)open serial; a connected wireless device also counts as
-        up, so startup does not report "no device" when only WiFi is in use."""
+        up, so startup does not report "no device" when only the radio is in
+        use."""
         opened = self._serial.ensure_open()
-        return opened or self._net.has_clients()
+        return opened or self._any_wireless()
 
     # The USB port, asked about on its OWN terms. is_open()/ensure_open() above
     # answer "is anything reachable", which is right for startup but WRONG for
@@ -1023,10 +1034,13 @@ class LinkHub:
 
     def write_line(self, line: str) -> bool:
         # Deliberately not short-circuiting: every connected device must get
-        # every frame, so both writes always run.
-        wired = self._serial.write_line(line)
-        wireless = self._net.write_line(line)
-        return wired or wireless
+        # every frame, so every write runs. A `or` chain would stop at the first
+        # transport that took the bytes and leave a second device showing a
+        # frame from a minute ago.
+        ok = self._serial.write_line(line)
+        for w in self._wireless:
+            ok = w.write_line(line) or ok
+        return ok
 
     def read_line(self) -> Optional[str]:
         try:
@@ -1036,7 +1050,8 @@ class LinkHub:
 
     def close(self) -> None:
         self._stop_evt.set()
-        self._net.stop()
+        for w in self._wireless:
+            w.stop()
         self._serial.close()
 
 
@@ -2695,6 +2710,19 @@ def main(argv: Optional[List[str]] = None) -> int:
              "keep it on this machine)",
     )
     parser.add_argument(
+        "--ble",
+        action="store_true",
+        default=os.environ.get("CLAUDE_MATE_BLE", "") == "1",
+        help="also serve the protocol over Bluetooth LE for battery devices "
+             "(requires a shared token and the 'bleak' package; off by default)",
+    )
+    parser.add_argument(
+        "--ble-address",
+        default=os.environ.get("CLAUDE_MATE_BLE_ADDRESS") or None,
+        help="connect to this BLE address instead of scanning for the service "
+             "(macOS reports its own per-host UUIDs, not MAC addresses)",
+    )
+    parser.add_argument(
         "--web",
         action="store_true",
         default=os.environ.get("CLAUDE_MATE_WEB", "") == "1",
@@ -2737,27 +2765,51 @@ def main(argv: Optional[List[str]] = None) -> int:
     serial_link = SerialLink(args.port, args.baud)
     link: Link = serial_link
     net: Optional[NetLink] = None
+    ble: Optional[Any] = None
     mdns: Optional[MdnsAdvertiser] = None
 
-    # Wireless transport is opt-in AND fails closed: an unauthenticated listener
-    # would let anyone on the network read session names and raise windows, so a
-    # missing token disables it rather than weakening it.
-    if args.tcp:
+    # Both wireless transports are opt-in AND fail closed: an unauthenticated
+    # link would let anyone in range read session names and raise windows, so a
+    # missing token disables it rather than weakening it. They share the token,
+    # the queue and the protocol -- the only difference is which radio.
+    if args.tcp or args.ble:
         token = ensure_token(args.token)
+        rx: "queue.Queue[str]" = queue.Queue()
         if not token:
-            log("ERROR: --tcp needs a shared token and one could not be created. "
-                f"Set CLAUDE_MATE_TOKEN, pass --token, or write one to "
-                f"{DEFAULT_TOKEN_FILE}. Continuing with USB serial only.")
+            flags = " / ".join(f for f, on in (("--tcp", args.tcp),
+                                               ("--ble", args.ble)) if on)
+            log(f"ERROR: {flags} needs a shared token and one could not be "
+                f"created. Set CLAUDE_MATE_TOKEN, pass --token, or write one "
+                f"to {DEFAULT_TOKEN_FILE}. Continuing with USB serial only.")
         else:
-            rx: "queue.Queue[str]" = queue.Queue()
-            candidate = NetLink(args.tcp_bind, args.tcp_port, token, rx)
-            if candidate.start():
-                net = candidate
-                link = LinkHub(serial_link, net, rx)
-                mdns = MdnsAdvertiser(args.tcp_port)
-                mdns.start()
-        log(f"  tcp    : {args.tcp_bind}:{args.tcp_port} "
-            f"({'on' if net else 'DISABLED'})")
+            if args.tcp:
+                candidate = NetLink(args.tcp_bind, args.tcp_port, token, rx)
+                if candidate.start():
+                    net = candidate
+                    mdns = MdnsAdvertiser(args.tcp_port)
+                    mdns.start()
+            if args.ble:
+                # Imported here, not at module scope: bleak is optional, and
+                # tools/test_net_link.py exec_modules this file by path, where a
+                # module-level `from blelink import ...` would need daemon/ on
+                # sys.path. Same reason webbridge is imported lazily below.
+                sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+                try:
+                    from blelink import BleLink
+                    candidate_ble = BleLink(token, rx,
+                                            address=args.ble_address, log=log)
+                    if candidate_ble.start():
+                        ble = candidate_ble
+                except Exception as exc:                # noqa: BLE001
+                    log(f"BLE transport unavailable: {exc}")
+            if net or ble:
+                link = LinkHub(serial_link, [net, ble], rx)
+        if args.tcp:
+            log(f"  tcp    : {args.tcp_bind}:{args.tcp_port} "
+                f"({'on' if net else 'DISABLED'})")
+        if args.ble:
+            log(f"  ble    : {'scanning' if ble else 'DISABLED'}"
+                f"{' for ' + args.ble_address if args.ble_address else ''}")
 
     screen = Screen(link, registry, sound=bool(args.sound))
     log(f"  sound  : {'on' if args.sound else 'off'}")
@@ -2971,7 +3023,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             web.stop()
         if mdns is not None:
             mdns.stop()
-        link.close()      # LinkHub.close() also stops the TCP listener
+        link.close()      # LinkHub.close() also stops every wireless transport
     return 0
 
 

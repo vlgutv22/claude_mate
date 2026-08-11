@@ -482,7 +482,9 @@ class _NetWithClient:
 
 _hub = _cmd.LinkHub.__new__(_cmd.LinkHub)     # bypass __init__'s real sockets
 _hub._serial = _ClosedSerial()
-_hub._net = _NetWithClient()
+# A LIST since the BLE central joined the TCP listener: LinkHub holds whatever
+# wireless transports were asked for and asks each of them the same question.
+_hub._wireless = [_NetWithClient()]
 
 check("LinkHub.is_open() still reports up when only WiFi is connected",
       _hub.is_open() is True)
