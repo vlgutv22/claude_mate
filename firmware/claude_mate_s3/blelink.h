@@ -251,7 +251,11 @@ class MateBle {
     }
     switch (_state) {
       case OFF:         return "ble off - usb only";
-      case ADVERTISING: return "ble: waiting for the daemon";
+      // Name the FLAG, not the situation. "waiting for the daemon" is what the
+      // device is doing and tells you nothing you could act on; the daemon
+      // needs one specific option turned on, and this line is often the only
+      // place anyone will ever be told which.
+      case ADVERTISING: return "ble: start the daemon with --ble";
       case AUTHING:     return "authenticating...";
       case LINKED:      return "ble linked";
     }

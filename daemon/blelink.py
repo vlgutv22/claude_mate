@@ -89,6 +89,7 @@ BLE_AUTH_S = 5.0            # the firmware allows 5 s; so do we
 BLE_RETRY_S = 3.0           # between scan attempts...
 BLE_RETRY_MAX_S = 30.0      # ...doubling on consecutive failures, capped
 BLE_MAX_LINE = 512          # drop over-long lines (the longest real one is ~94B)
+BLE_NOT_FOUND_GAP_S = 120.0  # between "still looking" notes; see _log_not_found
 
 
 class BleLink:
@@ -127,6 +128,7 @@ class BleLink:
         self._lock = threading.Lock()  # guards _client / _linked
         self._buf = bytearray()        # notification reassembly
         self._auth_q: "queue.Queue[str]" = queue.Queue()
+        self._not_found_logged = 0.0   # throttle for _log_not_found
 
     # ---- lifecycle --------------------------------------------------------- #
 
@@ -222,6 +224,16 @@ class BleLink:
                 self._log(f"BLE scan failed: {exc}")
                 found = None
             if found is None:
+                # SAY SO, at least sometimes. Silence here is the single most
+                # confusing state this transport has: the daemon logged
+                # "ble : scanning" once at startup and then nothing, forever,
+                # whether the device was on the wrong transport, out of range,
+                # off, or being a gamepad. From the outside that is
+                # indistinguishable from a daemon that is working, and the one
+                # thing the user needs -- what to check -- was never said.
+                # Throttled, because the scan repeats and a message per attempt
+                # is its own kind of useless.
+                self._log_not_found()
                 # Exponential backoff, capped. A device that is off stays off
                 # for hours -- asleep in a drawer, or being a gamepad -- and
                 # scanning every three seconds for hours is a pointless drain on
@@ -245,6 +257,32 @@ class BleLink:
                     self._client, self._linked = None, False
                 self._buf.clear()
             await self._sleep(1.0)
+
+    def _log_not_found(self) -> None:
+        """"Nothing out there yet", with the two things to check, throttled.
+
+        The first one is immediate, because the commonest time to be staring at
+        this log is the first minute after turning --ble on. After that it is
+        every BLE_NOT_FOUND_GAP_S, which is rare enough to sit under a daemon
+        that runs all day and often enough that a device switched on an hour
+        later is not met with silence.
+        """
+        now = time.monotonic()
+        if self._not_found_logged and \
+                now - self._not_found_logged < BLE_NOT_FOUND_GAP_S:
+            return
+        first = self._not_found_logged == 0.0
+        self._not_found_logged = now
+        if self._address:
+            self._log(f"BLE: no device at {self._address} yet -- still looking")
+            return
+        self._log("BLE: no device found yet -- still looking")
+        if first:
+            # Only once, and only the two things that are actually ever wrong.
+            self._log("    on the device: SETTINGS -> Link must read 'ble' "
+                      "(or send I|BLE over USB)")
+            self._log("    on this Mac: System Settings -> Privacy & Security "
+                      "-> Bluetooth must allow the program running this daemon")
 
     async def _find(self):
         """One scan. Returns a BLEDevice, or None."""

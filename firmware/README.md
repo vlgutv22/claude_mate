@@ -425,6 +425,70 @@ forces the Wi-Fi setup portal whichever transport is stored — that escape hatc
 has to outrank the setting, or a device could be locked out by the very thing
 you were trying to fix.
 
+#### Connecting over BLE, start to finish
+
+There is **no pairing step and no portal**. The device advertises, the daemon
+scans, and the shared token — the same one the Wi-Fi transport uses, which a
+provisioned device already has — is what lets them attach. Four things have to
+be true, and all four are easy to check:
+
+**1. The daemon has `bleak`, in the Python that actually runs it.** This is the
+commonest miss, because the daemon usually runs from a LaunchAgent under a
+different interpreter than the one on your `$PATH`:
+
+```sh
+# which Python is running the daemon?
+ps -o comm= -p "$(pgrep -f claude_mate_daemon.py | head -1)"
+# ...then install into THAT one, e.g.
+/usr/local/bin/python3 -m pip install bleak
+```
+
+Without it the daemon says so and carries on over USB, which is a working
+daemon and an easy thing not to notice.
+
+**2. The daemon is running with `--ble`.** In the foreground that is literally
+`--ble`. Under the **LaunchAgent there are no flags** — `install.sh` writes a
+plist whose `ProgramArguments` you are not meant to hand-edit — so use the
+environment variable instead, exactly as `--tcp` is enabled:
+
+```sh
+PLIST=~/Library/LaunchAgents/com.claudemate.daemon.plist
+/usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:CLAUDE_MATE_BLE string 1" "$PLIST"
+launchctl unload "$PLIST" && launchctl load "$PLIST"
+```
+
+Every `--flag` has a `CLAUDE_MATE_*` twin for this reason; see the table in the
+main [README](../README.md#configuration).
+
+**3. macOS is letting that program use Bluetooth.** **System Settings →
+Privacy & Security → Bluetooth** must list the program running the daemon —
+your terminal, or the Python binary for a LaunchAgent. A LaunchAgent has no
+window to raise a prompt from, so it can be refused *silently*: the daemon scans
+forever and finds a device that is sitting right there advertising. If the log
+says `no device found yet` while the device says it is advertising, check this
+before anything else.
+
+**4. The device's Link row reads `ble`.** SETTINGS → Link, or `I|BLE` over USB.
+
+**Knowing it worked**, from either end:
+
+```
+daemon      BLE device connected: 2A55ED32-...
+            handshake H -> resending full state
+
+device (?)  link  : ble
+            ble   : LINKED  adv 200ms/4000ms  token (set)
+```
+
+**When it does not**, the two ends disagree in a way that names the fault:
+
+| Device says | Daemon says | It is |
+|---|---|---|
+| `ble: start the daemon with --ble` | `no device found yet` | one of 1–3 above — usually the Bluetooth permission |
+| `AUTHING`, then `no handshake - is the daemon on --ble?` | *(nothing)* | something connected that is not the daemon. macOS itself probes new GATT services; harmless, and it recycles after 5 s |
+| `x token rejected` | `BLE: token rejected` | the device and the daemon hold different tokens. `T\|<token>` over USB, from `~/.config/claude-mate/token` |
+| `x no token - set one in the setup portal` | `THE DEVICE HAS NO TOKEN` | exactly what it says |
+
 ### Screen sleep
 
 The backlight is by far the biggest draw on this board — tens of milliamps
