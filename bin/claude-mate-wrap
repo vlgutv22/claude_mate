@@ -1176,7 +1176,12 @@ def select_account(flag_name, interactive):
             print()
             os._exit(130)
         if ans.lower() in ("d", "device"):
-            _run_connect()
+            rc = _run_connect()
+            # Say where we ended up, ON THE LINE ABOVE THE PROMPT. The device
+            # itself now shows a PAIRED receipt, and the terminal that asked for
+            # it should not be the quieter of the two.
+            if rc == 0:
+                print("claude-mate: device is linked.\n")
             continue                     # ...and ask again; nothing was chosen
         break
     if not ans or ans == "0":
@@ -1199,10 +1204,12 @@ def _run_connect():
                         "claude-mate-connect")
     cmd = [sys.executable, here] if os.path.exists(here) else ["claude-mate-connect"]
     try:
-        subprocess.run(cmd, check=False)
+        rc = subprocess.run(cmd, check=False).returncode
     except OSError as e:
         sys.stderr.write(f"[claude-mate-wrap] cannot run claude-mate-connect: {e}\n")
+        rc = 1
     print()
+    return rc
 
 # --------------------------------------------------------------------------- #
 # Account + remaining-limit reporting (shown on the device's r1/r2 right edges)

@@ -711,7 +711,25 @@ check("...is single-use", re.search(r"_pairOk = false;\s+// single use", fw_ble)
 check("...and does not survive the connection it was given in",
       re.search(r"void reAdvertise\(\) \{.*?_pairOk = false;", fw_ble, re.S))
 check("the sketch puts the question on the glass",
-      "drawPairAsk()" in ino and "PAIR?" in ino)
+      "drawPairAsk()" in ino and "PAIR THIS DEVICE?" in ino)
+# ...and says which BUTTON, in the biggest type on the screen. Someone looking up
+# at this having just run a command does not need the situation described, they
+# need to know what to press.
+check("...naming the button rather than describing the situation",
+      re.search(r'gfx->print\("GO = ACCEPT"\);', ino))
+# A RECEIPT ON THE DEVICE. Without it the screen snapped straight back to the
+# conductor view and the only evidence was on the Mac -- reported as "paired but
+# it is not obvious", which for a security decision made with a button press on
+# this device is a fair complaint.
+check("...and a confirmation afterwards, where the button was pressed",
+      "drawPairedOk()" in ino and re.search(r'"PAIRED"', ino))
+check("...which dismisses itself, so it is a receipt and not a mode",
+      re.search(r"pairedNoticeMs && \(now - pairedNoticeMs\) >= "
+                r"PAIRED_NOTICE_MS", ino))
+check("...and any button clears it early",
+      re.search(r"if \(pairedNoticeMs\) \{\s*\n\s*pairedNoticeMs = 0;", ino))
+check("...stamped from `now`, like every other deadline in this loop",
+      re.search(r"pairedNoticeMs = now \? now : 1UL;", ino))
 check("...answers it with a button, GO for yes",
       re.search(r"if \(ev == 'G' \|\| ev == 'K'\) answerPairing\(true\);", ino))
 check("...and lets it expire rather than standing open",

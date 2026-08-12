@@ -312,6 +312,12 @@ static unsigned long resetArmedMs = 0;
 // standing offer to whoever walks past next.
 static unsigned long pairAskedMs = 0;
 #define PAIR_ASK_MS 45000UL
+// ...and the answer, held on the glass afterwards. Without this the screen just
+// snapped back to the conductor view and the only evidence anything had happened
+// was on the Mac -- "paired but it is not obvious", which is a fair description
+// of a security decision that leaves no trace where you made it.
+static unsigned long pairedNoticeMs = 0;
+#define PAIRED_NOTICE_MS 6000UL
 
 // A flip only takes effect through the panel's rotation, which is applied once
 // at begin(). Rather than re-initialising a live display -- the one failure mode
@@ -958,26 +964,54 @@ static void answerPairing(bool yes) {
 }
 
 static void drawPairAsk() {
+  // THE ANSWER GOES FIRST, IN THE BIGGEST TYPE. Someone looks up at this screen
+  // having just run a command; what they need is not a description of the
+  // situation, it is which button to press. The explanation is underneath for
+  // the person who did NOT run the command and should be pressing nothing.
   gfx->setTextSize(2);
   gfx->setTextColor(C_WAIT);
-  gfx->setCursor(PAD_X, 40);
-  gfx->print("PAIR?");
+  drawCentred(SCREEN_W / 2, 34, 2, "PAIR THIS DEVICE?", C_WAIT);
+
+  gfx->setTextSize(2);
+  gfx->setTextColor(C_DONE);
+  gfx->setCursor(PAD_X, 66);
+  gfx->print("GO = ACCEPT");
   gfx->setTextSize(1);
-  gfx->setTextColor(C_TEXT);
-  gfx->setCursor(PAD_X, 76);
-  gfx->print("a daemon on your Mac wants to");
-  gfx->setCursor(PAD_X, 92);
-  gfx->print("give this device its token");
   gfx->setTextColor(C_DIM);
+  gfx->setCursor(PAD_X, 92);
+  gfx->print("any other button = refuse");
+
+  gfx->setTextColor(C_TEXT);
   gfx->setCursor(PAD_X, 116);
-  gfx->print("GO = yes    any other = no");
-  gfx->setCursor(PAD_X, 132);
+  gfx->print("your Mac is offering this");
+  gfx->setCursor(PAD_X, 130);
+  gfx->print("device its access token");
+
   // The countdown is the honest part: this offer is not standing.
   unsigned long left = (millis() - pairAskedMs) < PAIR_ASK_MS
                            ? (PAIR_ASK_MS - (millis() - pairAskedMs)) / 1000
                            : 0;
+  gfx->setTextColor(left <= 10 ? C_ERROR : C_DIM);
+  gfx->setCursor(PAD_X, 148);
   gfx->printf("expires in %lus", left);
   drawFooter(C_WAIT);
+}
+
+// "It worked", on the device where the button was pressed. Auto-dismisses, and
+// any button dismisses it early -- it is a receipt, not a mode, and there must
+// never be a screen on this device you cannot get out of.
+static void drawPairedOk() {
+  drawCentred(SCREEN_W / 2, 44, 2, "PAIRED", C_DONE);
+  gfx->setTextSize(1);
+  gfx->setTextColor(C_TEXT);
+  gfx->setCursor(PAD_X, 84);
+  gfx->print("this device and your Mac now");
+  gfx->setCursor(PAD_X, 98);
+  gfx->print("share a token. connecting...");
+  gfx->setTextColor(C_DIM);
+  gfx->setCursor(PAD_X, 126);
+  gfx->print("any button to carry on");
+  drawFooter(C_DONE);
 }
 
 static void drawLinkLost() {
@@ -1487,6 +1521,8 @@ static void render() {
   // portal can start from paths that do not go through the menu at all.
   if (net.state() == MateNet::SETUP) {
     drawSetup();
+  } else if (pairedNoticeMs) {
+    drawPairedOk();
   } else if (pairAskedMs) {
     // Second only to the portal, and above everything else including the game:
     // it is on screen because somebody asked for it seconds ago, it expires,
@@ -2179,6 +2215,13 @@ static void onButton(char ev) {
     if (ev == 'G' || ev == 'K') answerPairing(true);
     else if (ev == 'N' || ev == 'P' || ev == 'B') answerPairing(false);
     blipUntil = millis() + BLIP_MS;
+    requestRender();
+    return;
+  }
+  // The receipt is dismissible by anything, and the press is SWALLOWED: it was
+  // aimed at "ok, got it", not at whatever screen is behind it.
+  if (pairedNoticeMs) {
+    pairedNoticeMs = 0;
     requestRender();
     return;
   }
@@ -3013,6 +3056,10 @@ void loop() {
     Serial.println("pair: asked");
     requestRender();
   }
+  if (pairedNoticeMs && (now - pairedNoticeMs) >= PAIRED_NOTICE_MS) {
+    pairedNoticeMs = 0;
+    requestRender();
+  }
   if (pairAskedMs) {
     // WITHDRAWN. The peer that asked can vanish -- it drops, or the link times
     // it out -- and blelink clears the request when that happens. Leaving the
@@ -3031,6 +3078,7 @@ void loop() {
     if (ble.takeGrantedToken(granted)) {
       net.setToken(granted);
       Serial.println("paired: token stored");
+      pairedNoticeMs = now ? now : 1UL;   // stamped from `now`; see pairAskedMs
       requestRender();
     }
   }
