@@ -772,15 +772,26 @@ class MateNet {
           "background:#35c4f0;color:#06212b;font-size:16px;font-weight:600}"
           "small{color:#6b7280;display:block;margin-top:6px;font-size:12px}"
           "</style><h1>Claude Mate</h1><p>Point this companion at your daemon.</p>"
-          "<form method=POST action=/save>"
-          "<label>Network</label>");
+          "<form method=POST action=/save>");
+    // Say so when the network is optional. On a device whose link is BLE this
+    // page is only ever visited for the token, and a required-looking field it
+    // will never use is how you end up typing a fake network name.
+    html += _fallbackLink
+                ? F("<label>Network <em>(optional - this device is on BLE)</em></label>")
+                : F("<label>Network</label>");
     if (manual) {
       html += F("<input name=ssid autocomplete=off placeholder='type the network name'>"
                 "<small>No networks were seen in this scan. Type the name - it may "
                 "be hidden, or on 5 GHz, which this radio cannot see. Reload to "
                 "scan again.</small>");
     } else {
-      html += "<select name=ssid>" + opts + "</select>";
+      // ...and give the dropdown a way to say "none", first and selected. A
+      // <select> always submits something, so without this a BLE user setting a
+      // token would silently store whichever network happened to top the scan.
+      html += "<select name=ssid>";
+      if (_fallbackLink)
+        html += F("<option value=''>(none - leave the Wi-Fi config alone)</option>");
+      html += opts + "</select>";
     }
     html += F(
               "<label>Password</label><input name=pass type=password autocomplete=off>"
@@ -817,8 +828,18 @@ class MateNet {
     String token = _web->arg("token");
     String host  = _web->arg("host");
     uint16_t port = (uint16_t)_web->arg("port").toInt();
-    if (ssid.isEmpty()) { _web->send(400, "text/plain", "network required"); return; }
-    setWifi(ssid, pass);
+    // "Network required" is only true when the network is what you came for. On
+    // a device whose link is BLE this page is a TOKEN form and nothing else --
+    // there is no Wi-Fi anywhere in that device's path -- and rejecting an
+    // otherwise complete submission over the one field it will never use made
+    // the no-cable route a 400, leaving "type a fake network name" as the way
+    // through. Refuse only a submission that would save nothing at all.
+    bool clearing = _web->arg("cleartoken") == "1";
+    if (ssid.isEmpty() && token.isEmpty() && !clearing) {
+      _web->send(400, "text/plain", "fill in a network, a token, or both");
+      return;
+    }
+    if (!ssid.isEmpty()) setWifi(ssid, pass);
     // AN EMPTY TOKEN BOX MEANS "KEEP THE ONE I HAVE", NOT "ERASE IT".
     //
     // This used to write unconditionally, and it was the single worst bug in
@@ -831,8 +852,8 @@ class MateNet {
     //
     // Clearing a token is still possible, deliberately and explicitly, via the
     // checkbox or `X|WIPE` over serial.
-    if (_web->arg("cleartoken") == "1") setToken("");
-    else if (!token.isEmpty())          setToken(token);
+    if (clearing)              setToken("");
+    else if (!token.isEmpty()) setToken(token);
     setDaemon(host, port);
     _web->send(200, "text/html",
                F("<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"

@@ -47,6 +47,14 @@ could have seen. `tools/test_ble_link.py` now pins all five statically
   credentials for later would associate immediately, leaving both radios up —
   the exact contention one-transport-at-a-time exists to prevent. They are
   stored either way and applied only when Wi-Fi is the live link.
+- **Fixed: the portal would not save a token without a network.** A blank
+  network box was a `400 network required`, which is the right rule for the
+  Wi-Fi flow and the wrong one on a device whose link is BLE, where the page is
+  only ever opened for the token — it left "type a fake network name" as the way
+  through. It now refuses only a submission that would save nothing, the
+  network field says it is optional, and the dropdown offers **none**: a
+  `<select>` always submits something, so a BLE user setting a token was
+  silently storing whichever network happened to top the scan.
 - **Changed: the screens a fresh board actually shows name the missing token
   first.** `ble: start the daemon with --ble` and `check it is running with
   --ble` are both true and both send you to the wrong half of the daemon's log

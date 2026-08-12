@@ -463,6 +463,19 @@ check("T| over USB hands the token to the live BLE stack, not just to NVS",
 check("...and so does the portal, whose page handler cannot reach the stack",
       re.search(r"if \(_state != OFF\) \{ setToken\(token\); return true; \}",
                 fw_ble))
+# ...and the portal has to ACCEPT a token on its own to be that route at all. It
+# used to 400 on a blank network box, which on a BLE device -- where the page is
+# only ever visited for the token -- left "type a fake network name" as the way
+# through, and a <select> that always submits something silently stored whichever
+# network topped the scan.
+save = fn_body(netcfg, "void serveSave()")
+check("...and the portal saves a token with no network at all",
+      re.search(r"if \(ssid\.isEmpty\(\) && token\.isEmpty\(\) && !clearing\)",
+                save)
+      and re.search(r"if \(!ssid\.isEmpty\(\)\) setWifi\(ssid, pass\);", save))
+check("...and offers 'none' to a device that has another link",
+      re.search(r"if \(_fallbackLink\)\s*\n\s*html \+= F\(\"<option value=''>",
+                fn_body(netcfg, "void serveForm()")))
 
 # A BLE device stores Wi-Fi credentials for later; it must not ASSOCIATE on them.
 # Both radios up at once is the contention one-transport-at-a-time exists to

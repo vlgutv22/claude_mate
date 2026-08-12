@@ -175,9 +175,13 @@ setup portal — hold **BOOT** at power-on, send `Z`, or **SETTINGS → Wi-Fi se
 The portal shows an access point name (`Claude-Mate-XXXX`) and a password that is
 regenerated on every portal start. Join it from a phone, open
 `http://192.168.4.1`, and fill in the network, password, **shared token**, and
-port (8787); leave the host blank to discover the daemon over mDNS. On a device
-whose link is BLE the portal expires after 5 idle minutes and hands the glass
-back, since it is not the only way out of there.
+port (8787); leave the host blank to discover the daemon over mDNS.
+
+On a device whose link is **BLE** the same page is the no-cable way to provision
+a token: the network is optional there (the dropdown offers **none**), and the
+token reaches the running BLE stack, so it takes effect on the next handshake
+without a reboot. That portal also expires after 5 idle minutes and hands the
+glass back, since it is not the only way out of there.
 
 **Where the token comes from.** Run the daemon with `--tcp` or `--ble` once and
 it creates one, prints it, and saves it to `~/.config/claude-mate/token` (mode
@@ -544,7 +548,7 @@ device (?)  link  : ble
 | `ble: start the daemon with --ble` | `no device found yet` | one of 1–3 above — usually the Bluetooth permission |
 | `AUTHING`, then `no handshake - is the daemon on --ble?` | *(nothing)* | something connected that is not the daemon. macOS itself probes new GATT services; harmless, and it recycles after 5 s |
 | `x token rejected` | `BLE: token rejected` | the device and the daemon hold different tokens. `T\|<token>` over USB, from `~/.config/claude-mate/token` |
-| `x no token - send T\|<token> over USB` | `THE DEVICE HAS NO TOKEN` | exactly what it says. This is what a factory-reset board says, and the cable is the answer because a BLE device never opens the portal |
+| `x no token - send T\|<token> over USB` | `THE DEVICE HAS NO TOKEN` | exactly what it says, and it is what a factory-reset board says. The cable is the quickest answer; with no cable to hand, SETTINGS → Wi-Fi setup takes a token too (the network box is optional there) |
 
 ### Screen sleep
 
