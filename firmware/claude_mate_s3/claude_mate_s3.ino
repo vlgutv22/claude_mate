@@ -947,6 +947,12 @@ static void answerPairing(bool yes) {
   if (!pairAskedMs) return;
   pairAskedMs = 0;
   ble.pairAnswer(yes);
+  // Over the cable, because this is the one exchange where the two ends can
+  // disagree about whether anything happened at all -- the daemon sees silence
+  // and cannot tell "never arrived" from "arrived and was refused". Cheap, and
+  // it is what turned the first two hardware failures from guesswork into a
+  // one-line answer.
+  Serial.printf("pair: answered %s\n", yes ? "yes" : "no");
   requestRender();
 }
 
@@ -2996,13 +3002,24 @@ void loop() {
   // answer it (see onButton) and it expires on its own, because an offer left
   // standing on a device nobody is near is an offer to whoever passes next.
   if (ble.pairRequested() && !pairAskedMs) {
-    unsigned long t = millis();
-    pairAskedMs = t ? t : 1UL;      // 0 is the sentinel; never stamp it
+    // STAMPED FROM `now`, NOT A FRESH millis(). `now` was read at the top of
+    // this iteration, so a later reading is a few microseconds AHEAD of it --
+    // and the unsigned `now - pairAskedMs` below then underflows to ~4.29e9,
+    // which is comfortably >= PAIR_ASK_MS. The prompt would answer itself, with
+    // "no", in the same loop pass that raised it. The same trap as the `| 1`
+    // sentinel bugs elsewhere in this file, arrived at from the other side.
+    pairAskedMs = now ? now : 1UL;  // 0 is the sentinel; never stamp it
     wakeScreen();                   // a question nobody can see is a no
+    Serial.println("pair: asked");
     requestRender();
   }
   if (pairAskedMs) {
-    if ((now - pairAskedMs) >= PAIR_ASK_MS) answerPairing(false);
+    // WITHDRAWN. The peer that asked can vanish -- it drops, or the link times
+    // it out -- and blelink clears the request when that happens. Leaving the
+    // question on the glass would mean answering into a connection that no
+    // longer exists, and a GO press landing somewhere the user did not expect.
+    if (!ble.pairRequested()) { pairAskedMs = 0; requestRender(); }
+    else if ((now - pairAskedMs) >= PAIR_ASK_MS) answerPairing(false);
     else requestRender();           // the countdown ticks
   }
   // The token the daemon granted after we said yes. The BLE stack took it live

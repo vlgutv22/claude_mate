@@ -652,6 +652,20 @@ print("\n== the firmware's half of the pairing handshake ==")
 
 check("the device answers E|? rather than ignoring it",
       re.search(r'if \(!strcmp\(line, "E\|\?"\)\)', fw_ble))
+# THE ONE THAT MADE PAIRING IMPOSSIBLE, and that neither end could see: the
+# device answered A|NOTOKEN and hung up in the same breath, so E|? always
+# arrived at a connection that had already gone. The daemon logged that it had
+# asked; the firmware never saw a byte. "I have no token" is precisely the
+# moment to stay on the line -- it is when someone may be about to give you one.
+# Scoped to the answer itself -- from the A|NOTOKEN notify to the return that
+# ends that branch -- rather than to a brace-matched block, which silently ran
+# past its own closing brace and swallowed the code after it.
+# Matching the ASSIGNMENT, not the word: the comment right there explains what
+# used to be on that line, and a check that reads comments fails on prose. Third
+# time this file has been caught by that, hence the note.
+notok = re.search(r'notifyLine\("A\|NOTOKEN"\);(.*?)return;', fw_ble, re.S)
+check("...and stays connected after saying it has no token",
+      notok and not re.search(r"_pendingDisconnect\s*=\s*true", notok.group(1)))
 check("...refuses to be re-enrolled once it HAS a token",
       re.search(r'if \(!_token\.isEmpty\(\)\) \{ notifyLine\("E\|NO"\); return; \}',
                 fw_ble))
@@ -681,8 +695,28 @@ check("the sketch puts the question on the glass",
 check("...answers it with a button, GO for yes",
       re.search(r"if \(ev == 'G' \|\| ev == 'K'\) answerPairing\(true\);", ino))
 check("...and lets it expire rather than standing open",
-      re.search(r"if \(\(now - pairAskedMs\) >= PAIR_ASK_MS\) answerPairing\(false\);",
-                ino))
+      re.search(r"else if \(\(now - pairAskedMs\) >= PAIR_ASK_MS\) "
+                r"answerPairing\(false\);", ino))
+check("...and takes it down when the peer that asked goes away",
+      re.search(r"if \(!ble\.pairRequested\(\)\) \{ pairAskedMs = 0;", ino))
+# Stamped from `now`, which was read at the top of this loop pass. A fresh
+# millis() here is a few microseconds LATER, the unsigned `now - pairAskedMs`
+# underflows to ~4.29e9, and the prompt answers itself with "no" in the same
+# pass that raised it. Same family as the `| 1` sentinel bugs elsewhere.
+check("...and the countdown cannot start in the future",
+      re.search(r"pairAskedMs = now \? now : 1UL;", ino))
+# THE BUG THE HOST TESTS COULD NOT SEE. The fake device has no handshake
+# timeout; the real one hung up 5 s into a 45 s question, ~40 s before anyone
+# could have answered it, and the first pairing attempt on hardware therefore
+# got no reply at all. A handshake is a machine waiting, a pairing question is a
+# person walking over, and one budget cannot serve both.
+pair_to = re.search(r"#define BLE_PAIR_TIMEOUT\s+(\d+)", fw_ble)
+ask_ms = re.search(r"#define PAIR_ASK_MS (\d+)", ino)
+check("the link does not hang up while a human is being asked",
+      re.search(r"unsigned long budget = _pairAsk \? BLE_PAIR_TIMEOUT "
+                r": BLE_AUTH_TIMEOUT;", fw_ble))
+check("...with a window that outlasts the one the glass offers",
+      pair_to and ask_ms and int(pair_to.group(1)) > int(ask_ms.group(1)))
 check("a granted token reaches NVS, not just the live stack",
       re.search(r"ble\.takeGrantedToken\(granted\)\) \{\s*\n\s*net\.setToken\(granted\);",
                 ino))

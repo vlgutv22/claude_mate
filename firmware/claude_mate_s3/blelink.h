@@ -81,6 +81,11 @@
 // slower than the burst is long would mean bursts that emit nothing at all.
 #define BLE_ADV_ITVL      0x30      // 0x30 * 0.625 ms = 30 ms
 #define BLE_AUTH_TIMEOUT  5000UL    // the daemon allows 5 s; so do we
+// ...but a pairing question is answered by a HUMAN, and five seconds is not an
+// offer, it is a flicker. This has to outlast the 45 s the sketch gives someone
+// to notice the screen and press GO, while still bounding a connection that is
+// holding the radio open waiting for a room that turns out to be empty.
+#define BLE_PAIR_TIMEOUT  60000UL
 // The protocol's longest real line is ~94 bytes and the mirror sends 17 of them
 // in one burst. A ring this size holds a whole mirror frame plus the status
 // frame behind it, so a busy moment never truncates a row on the glass.
@@ -253,12 +258,27 @@ class MateBle {
 
     if (!_srvCb.connected) { drop("link closed"); return; }
 
-    if (_state == AUTHING && (now - _stateSince) > BLE_AUTH_TIMEOUT) {
+    // A HANDSHAKE IS A MACHINE WAITING; A PAIRING QUESTION IS A PERSON WALKING
+    // OVER. Five seconds is right for the first and absurd for the second, and
+    // applying it to both is why the first pairing attempt on real hardware got
+    // no answer at all: the device hung up ~40 s before anyone could have
+    // pressed GO, and reAdvertise() then cleared the request that was still on
+    // the glass. The fake device in the host tests has no such timeout, so only
+    // the board could find this.
+    unsigned long budget = _pairAsk ? BLE_PAIR_TIMEOUT : BLE_AUTH_TIMEOUT;
+    if (_state == AUTHING && (now - _stateSince) > budget) {
       // Say why before dropping. A daemon too old to know this service exists
       // will still connect -- macOS caches GATT and opens the link happily --
       // then sit there, and from the glass that is indistinguishable from a
       // wrong token.
-      note("no handshake - is the daemon on --ble?");
+      // ...and do not call a declined pairing a missing daemon. The connection
+      // ends the same way either way, but "no handshake - is the daemon on
+      // --ble?" after someone has just pressed a button to say NO would send
+      // them to check a flag that was never the problem.
+      note(_pairAsk    ? "pairing not answered"
+           : _pairSpoke ? "pairing declined"
+                        : "no handshake - is the daemon on --ble?");
+      _pairAsk = false;
       disconnectPeer();
     }
   }
@@ -318,6 +338,14 @@ class MateBle {
   void pairAnswer(bool yes) {
     _pairAsk = false;
     _pairOk = yes;
+    _pairSpoke = true;
+    // THE HANDSHAKE BUDGET STARTS NOW, and forgetting this broke the accept
+    // path outright: _stateSince is however long ago the peer connected, the
+    // person took thirty seconds to walk over and press GO, and the moment
+    // _pairAsk cleared the budget snapped back to five -- so poll() would drop
+    // the connection before the token could cross it. What follows this line is
+    // an ordinary handshake and gets an ordinary handshake's time.
+    _stateSince = millis();
     notifyLine(yes ? "E|OK" : "E|NO");
     if (!yes) note("pairing declined");
   }
@@ -534,7 +562,17 @@ class MateBle {
         // The daemon's log says the same thing from the other end, and the
         // cable does it with no instruction at all when there is one.
         note("no token - claude-mate-connect");
-        _pendingDisconnect = true;
+        // AND DO NOT HANG UP. This line used to set _pendingDisconnect, which
+        // made enrolment impossible in a way neither end could see: the daemon
+        // logged that it had written E|? and the firmware never received a byte
+        // of it, because the device had already dropped the connection the
+        // offer was addressed to. "I have no token" is the one moment when
+        // staying on the line matters most -- it is exactly when someone may be
+        // about to give you one.
+        //
+        // Still bounded, and by rules that already existed: a daemon that is
+        // not pairing answers A|NO and we drop on that, and one that says
+        // nothing at all is dropped by the handshake timeout in poll().
         return;
       }
       char mac[65];
@@ -546,7 +584,11 @@ class MateBle {
     }
     if (!strcmp(line, "A|OK")) { go(LINKED); return; }
     if (!strcmp(line, "A|NO")) {
-      note("token rejected");
+      // "Rejected" is only true if we offered something. A device with no token
+      // gets A|NO as the ordinary end of the exchange it just started, and
+      // overwriting its own accurate reason with a wrong one would send someone
+      // hunting for a token mismatch that does not exist.
+      if (!_token.isEmpty()) note("token rejected");
       _pendingDisconnect = true;
       return;
     }
@@ -594,6 +636,7 @@ class MateBle {
     // up a token it never asked a human for.
     _pairAsk = false;
     _pairOk = false;
+    _pairSpoke = false;
     go(ADVERTISING);
     startBurst();
   }
@@ -647,6 +690,7 @@ class MateBle {
   // _pairOk is set only by pairAnswer(), on the main loop. See handleAuthLine().
   volatile bool _pairAsk = false;
   volatile bool _pairOk = false;
+  volatile bool _pairSpoke = false;    // a pairing question was answered here
   volatile bool _grantReady = false;   // a token arrived; NVS has not seen it
   // What begin() was asked for, kept so poll() can retry without the caller.
   char          _name[24] = {0};
