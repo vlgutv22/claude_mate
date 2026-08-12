@@ -545,6 +545,16 @@ before anything else.
 that has been moved to Wi-Fi is not advertising at all — the stack is down, so
 the daemon scans forever and the Mac never sees it.
 
+> **The device will never appear in System Settings → Bluetooth, and that is
+> correct.** That pane lists Classic and pairable devices; this is an unpaired
+> GATT peripheral advertising in 200 ms bursts every 4 s, and there is no
+> pairing step by design (see the threat model in `blelink.h` — the token
+> handshake is what decides who may drive the device, not Just Works pairing).
+> Only a CoreBluetooth scan sees it, which is what the daemon does. **The
+> daemon's log is the only place "is it advertising?" is answerable from the
+> Mac** — not the Bluetooth pane, and not a generic scanner app, which will also
+> usually miss a 5 % duty cycle.
+
 **Knowing it worked**, from either end:
 
 ```
