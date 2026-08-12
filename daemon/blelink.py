@@ -373,8 +373,12 @@ class BleLink:
             # The commonest wireless failure by far, because it is exactly what
             # a cleared token looks like -- so it gets the message that says
             # what to do rather than one that says a handshake failed.
-            self._log("BLE: THE DEVICE HAS NO TOKEN. Send T|<token> over USB, "
-                      "or set it in the device's setup portal.")
+            # Both routes, because the cable is not always within reach of the
+            # device -- which is the whole point of this transport.
+            self._log("BLE: THE DEVICE HAS NO TOKEN. On the device: MENU -> "
+                      "SETTINGS -> Set token, then join the AP it shows and "
+                      "paste the token (leave Network as none). With a cable: "
+                      "send T|<token> over USB.")
             await self._write(client, b"A|NO\n")
             return False
         if not reply.startswith("A|"):

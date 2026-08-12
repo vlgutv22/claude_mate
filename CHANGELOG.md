@@ -12,21 +12,44 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
-### 2026-08-12 — The radio switch comes off the glass
+### 2026-08-12 — The radio switch comes off the glass, the token screen moves to the front
 
-- **Changed: no `Link` row and no `Wi-Fi setup` row in SETTINGS.** `Link` was a
-  plain toggle, so **one press moved a cordless board onto Wi-Fi** — and a board
-  with no credentials then reboots into the setup portal, which outranks the
-  menu and does not time out for a Wi-Fi device, so it hides the very row you
-  would use to undo it. One press on the glass, and no way back without a cable.
-  `Wi-Fi setup` was the same door from the other side. Found the way these
+- **Changed: no `Link` row in SETTINGS.** It was a plain toggle, so **one press
+  moved a cordless board onto Wi-Fi** — and a board with no credentials then
+  reboots into the setup portal, which outranks the menu and does not time out
+  for a Wi-Fi device, so it hides the very row you would use to undo it. One
+  press on the glass, and no way back without a cable. Found the way these
   things are always found: a board that had "stopped working over BLE" turned
-  out to be sitting on Wi-Fi with no SSID, because the row had been pressed.
-  Neither is deleted — the transport still compiles, and `I|WIFI` / `I|BLE` and
-  `Z` still work over USB, which keeps the escape hatch somewhere a mistake
-  cannot reach: if you can type `I|WIFI` you have a cable, so you can type
-  `I|BLE` back. Which radio is live, and whether it has found the daemon, is
-  still on the glass in **SETTINGS → About**.
+  out to be sitting on Wi-Fi with no SSID, because the row had been pressed. The
+  transport is not deleted — `I|WIFI` / `I|BLE` still work over USB, which keeps
+  that switch behind a cable you have to actually have: if you can type `I|WIFI`
+  you can type `I|BLE` back. Which radio is live, and whether it has found the
+  daemon, is still on the glass in **SETTINGS → About**, which now colours the
+  link green when the daemon is on the other end — the signal the `Link` row
+  used to carry.
+- **Changed: `Wi-Fi setup` becomes `Set token`, and moves to the top of
+  SETTINGS.** Same portal behind it; a different name, because on a BLE device
+  the only field that matters is the token and a row labelled *Wi-Fi setup* is
+  a row nobody presses when a token is what they need. The value answers before
+  you press it — `none`, in red, *is* the reason a freshly reset board is doing
+  nothing. It is first because it is the row you need when nothing else works,
+  and five rows are visible without scrolling.
+- **Fixed: a factory-reset board with no cable attached could not be given a
+  token at all.** For one commit this row was removed alongside `Link`, on the
+  reasoning that both were Wi-Fi doors. They are not: the `Link` row *changes*
+  the transport, while this one *provisions* the device, and on BLE it is the
+  only on-glass route to a token. What remained was BOOT-held-at-power-on — an
+  incantation nobody discovers, and useless advice to someone holding a cordless
+  board that has just wiped itself. It is also not the trap `Link` was: on a BLE
+  device the portal expires after five idle minutes and hands the glass back,
+  and the token it takes reaches the running stack.
+- **Changed: every "no token" message on the glass names that row** rather than
+  a cable. `send T|<token> over USB` is not an instruction when the board is on
+  its cell across the room; the status line, the NO LINK screen and the
+  `A|NOTOKEN` note now all say `MENU > Set token`, and the daemon's log gives
+  both routes. A test pins the three device-side strings together, because they
+  drifted once already — the glass advertised a USB-only route while the only
+  on-glass route had been deleted.
 - **Fixed: a config write to an unprovisioned Wi-Fi device killed the setup
   portal.** `restart()` stopped the portal, saw no SSID and dropped to `OFF`. An
   unprovisioned Wi-Fi device *is* a device sitting in the portal — that is where

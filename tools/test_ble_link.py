@@ -383,20 +383,32 @@ check("SR_PAD is still there, and is the gamepad row", "SR_PAD" in rows)
 # NO transport row on the glass. `Link` was a plain toggle, so one press moved a
 # cordless board onto Wi-Fi -- which reboots into a portal that outranks the menu
 # and does not time out for a Wi-Fi device, hiding the row you would undo it
-# with. `Wi-Fi setup` was the same door from the other side. The transport still
-# compiles; only the glass cannot reach it, which keeps the escape hatch behind a
-# cable you have to actually have.
+# with. The transport still compiles; only the glass cannot reach it, which keeps
+# that switch behind a cable you have to actually have.
 check("no Link row -- one press must not be able to move a cordless board "
       "onto Wi-Fi", "SR_LINK" not in rows)
-check("...and no Wi-Fi setup row either", "SR_WIFI" not in rows)
-check("...and neither leaves a dangling case in the row painter or the input "
-      "handler",
-      not re.search(r"case SR_(LINK|WIFI)\b", ino))
+check("...and no dangling case for it in the row painter or the input handler",
+      not re.search(r"case SR_LINK\b", ino))
 check("...but the transport is still switchable over the cable",
       re.search(r'strcasecmp\(a, "ble"\)', ino)
       and re.search(r'strcasecmp\(a, "wifi"\)', ino))
-check("...and the portal is still reachable over the cable",
-      "net.startPortalNow();" in ino)
+
+# ...and the OPPOSITE rule for the provisioning row, which was removed alongside
+# it and must not be again: without it a factory-reset board with no cable
+# attached cannot be given a token from anywhere at all. Only BOOT-held-at-
+# power-on remained, which nobody discovers. It is not the door `Link` was --
+# the portal expires on a BLE device and the token reaches the live stack.
+check("there IS a row that provisions a token, or a cordless board cannot be "
+      "set up at all", "SR_SETUP" in rows)
+check("...and it is FIRST, so the row you need when nothing works is on the "
+      "visible page rather than below the scroll", rows[0] == "SR_SETUP")
+check("...and it opens the portal", re.search(
+    r"case SR_SETUP:.*?net\.startPortalNow\(\);", ino, re.S))
+check('...named "Set token" on BLE, where a "Wi-Fi setup" label is a row '
+      "nobody presses when a token is what they need",
+      re.search(r'label = "Set token";', ino))
+check("...and it says whether there is one, before you press it",
+      re.search(r'value = net\.hasToken\(\) \? "set" : "none";', ino))
 check('the row is labelled "BLE gamepad"',
       re.search(r'case SR_PAD:\s*\n\s*label = "BLE gamepad";', ino))
 check('no row is labelled "Game controller" any more',
@@ -524,13 +536,20 @@ check("the BLE status line names the missing token first",
       re.search(r"case ADVERTISING: return _token\.isEmpty\(\)", fw_ble))
 check("...and so does the NO LINK screen",
       re.search(r"gfx->print\(!net\.hasToken\(\)", ino))
-# Matched against the note() STRING, not the file: the comment above that line
-# quotes the wording it replaced, and a check that reads comments would pass or
-# fail on prose.
-check("...and the NOTOKEN answer names the cable, not a portal this device "
-      "never opens",
-      re.search(r'note\("no token - send T\|<token> over USB"\)', fw_ble)
+# Matched against the note() STRING, not the file: the comments around these
+# lines quote the wording they replaced, and a check that reads comments would
+# pass or fail on prose.
+check("...and the NOTOKEN answer names the row, not a cable that may be in "
+      "another room",
+      re.search(r'note\("no token - MENU > Set token"\)', fw_ble)
       and not re.search(r'note\("[^"]*setup portal', fw_ble))
+# The three no-token strings a person can actually see, all pointing at the same
+# place. They drifted once already -- the glass said "over USB" while the only
+# on-glass route had been deleted -- so they are pinned together.
+check("...and all three of them send you to the same row",
+      re.search(r'\? "no token: MENU > Set token"', fw_ble)
+      and re.search(r'\? "no token: MENU > Set token"', ino)
+      and "Set token" in read(os.path.join(DAEMON_DIR, "blelink.py")))
 
 print(f"\n{checks - len(failures)}/{checks} checks passed")
 if failures:

@@ -274,13 +274,15 @@ hooks are the zero-dependency feed. Use whichever fits each session.
 - **An on-device menu** — double-tap the 4th button. Four items: the triage view,
   SETTINGS, SHIP IT and long sleep. Settings holds the rest — a **BLE gamepad**
   switch, screen sleep, brightness, alert-LED level including a genuine *off*,
-  Mac sound, flip, an About readout, and factory reset. **Nothing that changes
-  the radio is on the glass:** one press used to be enough to move a cordless
-  board onto Wi-Fi, and a board with no credentials then reboots into a setup
-  portal that outranks the menu — hiding the row you would use to undo it.
-  `I|WIFI` / `I|BLE` over USB still do it, which puts that switch behind a cable
-  you have to actually have. About lives here rather than on the top strip
-  because it is not a place you go: it is something you read. Entirely
+  Mac sound, flip, an About readout, and factory reset — and, first, **Set
+  token**, which opens the provisioning portal and is how a cordless board is
+  paired with no cable at all. **What is *not* there is the radio switch:** one
+  press used to be enough to move a cordless board onto Wi-Fi, and a board with
+  no credentials then reboots into a portal that outranks the menu — hiding the
+  row you would use to undo it. `I|WIFI` / `I|BLE` over USB still do it, which
+  puts that switch behind a cable you have to actually have. About lives here
+  rather than on the top strip because it is not a place you go: it is something
+  you read. Entirely
   **firmware-local**: while it is up PREV/GO/NEXT are handled on
   the device and never emitted, so the queue cannot move while you are aiming at
   a settings row — and there is **no protocol change and no daemon change** for

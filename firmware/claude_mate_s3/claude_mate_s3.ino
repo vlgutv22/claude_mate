@@ -261,21 +261,30 @@ static uint8_t pageIdx = 0;          // selected row within the page
 // SR_PAD is therefore a stored preference now rather than an action: on means
 // this device IS a Bluetooth controller, across a screen sleep and across a
 // reboot, until you turn it off. Off means it is the conductor it always was.
-// THE TWO WI-FI ROWS ARE GONE FROM THE GLASS, and this is a safety change
-// rather than a tidy-up. `Link` was a plain toggle, so one press moved a
-// cordless board onto Wi-Fi -- and a board with no credentials then reboots
-// into the setup portal, which outranks the menu, does not time out for a Wi-Fi
-// device, and therefore hides the very row you would use to undo it. One press
-// on the glass, no way back without a cable. `Wi-Fi setup` was the same door
-// from the other side.
+// THERE IS NO `Link` ROW, and that is a safety change rather than a tidy-up. It
+// was a plain toggle, so one press moved a cordless board onto Wi-Fi -- and a
+// board with no credentials then reboots into the setup portal, which outranks
+// the menu, does not time out for a Wi-Fi device, and therefore hides the very
+// row you would use to undo it. One press on the glass, no way back without a
+// cable. The transport is not deleted, only off the glass: `I|WIFI` / `I|BLE`
+// still work over USB, which keeps that switch behind a cable you have to
+// actually have -- if you can type I|WIFI you can type I|BLE back. Which radio
+// is live, and whether it has found the daemon, is on the About page.
 //
-// Neither is DELETED, only unreachable from the device: the transport still
-// compiles, and `I|WIFI` / `I|BLE` and `Z` still work over USB. That keeps the
-// escape hatch exactly where a mistake cannot reach it -- if you can type
-// I|WIFI you have a cable, which means you can type I|BLE back. The live link
-// and its state are still on the glass, in SETTINGS -> About.
+// SR_SETUP IS THE OPPOSITE CASE AND HAS TO STAY. Removing it too was a mistake,
+// found within minutes by factory-resetting a board with no cable attached: a
+// device with no token cannot be given one from anywhere. The portal was the
+// only on-glass route, and what remained was BOOT-held-at-power-on, which is an
+// incantation nobody discovers. It is also not the door `Link` was -- on a BLE
+// device the portal times out after five idle minutes and hands the glass back,
+// and the token it takes reaches the running stack. So it stays, named for what
+// it actually does on this transport.
+//
+// FIRST, deliberately: it is the row you need when nothing else works, and the
+// one screen you can still reach when nothing works should not make you scroll
+// to find it. Five rows are visible; this is one of them on every device.
 enum SetRow : uint8_t {
-  SR_PAD, SR_SLEEP, SR_BRIGHT, SR_LED, SR_SOUND, SR_FLIP,
+  SR_SETUP, SR_PAD, SR_SLEEP, SR_BRIGHT, SR_LED, SR_SOUND, SR_FLIP,
   SR_ABOUT, SR_RESET, SR_COUNT
 };
 // Which row is at the top of the visible window. Five rows fit and there are
@@ -940,7 +949,12 @@ static void drawLinkLost() {
   // fail and no amount of daemon flags will get past it. That is the state a
   // factory-reset board is in, so it is the state this screen has to handle
   // best -- it is the first thing anyone sees on a fresh device.
-  gfx->print(!net.hasToken()        ? "send T|<token> over USB to pair"
+  //
+  // And it names a row on THIS device, not a cable. A board that has just been
+  // factory reset is very often a board sitting on its cell across the room;
+  // "send T|<token> over USB" is then not an instruction but a dead end, which
+  // is exactly how it was found.
+  gfx->print(!net.hasToken()        ? "no token: MENU > Set token"
              : transport == LINK_BLE ? "check it is running with --ble"
              : net.configured()      ? "check it is running with --tcp"
                                      : "hold BOOT at power-on to set up wifi");
@@ -1135,6 +1149,30 @@ static void drawSetRow(uint8_t row, int16_t y, bool sel) {
   uint16_t    vcol = C_TEXT;
 
   switch (row) {
+    case SR_SETUP:
+      // NAMED FOR WHAT IT DOES ON THIS TRANSPORT. The page behind it is the
+      // same one either way -- an AP, a form -- but on BLE the only field that
+      // matters is the token, and a row labelled "Wi-Fi setup" on a device with
+      // no Wi-Fi is a row nobody presses when the thing they need is a token.
+      // It is the first row for exactly that reason.
+      if (transport == LINK_BLE) {
+        label = "Set token";
+        // Answers before you press it, which is the whole point on a board that
+        // has just been factory reset: "none" IS the reason nothing is working.
+        value = net.hasToken() ? "set" : "none";
+        vcol  = net.hasToken() ? C_DONE : C_ERROR;
+      } else {
+        label = "Wi-Fi setup";
+        // The live link state, lowercased from the same enum the `?` dump
+        // prints. A second table would be one more thing to forget to update.
+        char *p = buf;
+        for (const char *s = net.stateName(); *s && p < buf + sizeof(buf) - 1; s++)
+          *p++ = (*s >= 'A' && *s <= 'Z') ? (char)(*s - 'A' + 'a') : *s;
+        *p = 0;
+        value = buf;
+        vcol  = net.connected() ? C_DONE : C_WAIT;
+      }
+      break;
     case SR_PAD:
       label = "BLE gamepad";
       // A VALUE, not an arrow. The row used to go somewhere, and a row that
@@ -2425,6 +2463,16 @@ static void menuButton(char ev) {
 
   if (ev == 'G') {                            // short press: change the value
     switch (pageIdx) {
+      case SR_SETUP:  // The portal takes the screen over on its own, via
+                      // net.state() == SETUP in render(), which outranks every
+                      // firmware-local screen -- so hand the glass back first.
+                      // On BLE this is the no-cable way to a token, and it is
+                      // escapable: the portal expires after five idle minutes
+                      // and the sketch starts BLE again with whatever the form
+                      // saved.
+                      uiMode = UI_CONDUCTOR;
+                      net.startPortalNow();
+                      break;
       case SR_PAD:    // The one switch. On: this device is an ordinary
                       // Bluetooth HID gamepad that the Mac pairs with once, and
                       // stays one across a screen sleep and across a reboot.

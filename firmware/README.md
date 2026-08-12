@@ -154,12 +154,14 @@ If automatic entry fails, the script falls back to prompting for a manual
 ### First boot and provisioning
 
 An unprovisioned board comes up **on BLE**, advertising as `Claude Mate` with no
-token, and says so on the glass: `no token: send T|<token> over USB`. Give it one
-over the cable you just flashed with, and start the daemon with `--ble`:
+token, and says so on the glass: `no token: MENU > Set token`. Two ways to give
+it one, and start the daemon with `--ble`:
 
-```
-T|<token>
-```
+- **On the device, no cable needed** — double-tap the 4th button → **SETTINGS →
+  Set token** (it is the first row). The glass shows an AP name and password;
+  join it from a phone, open `http://192.168.4.1`, paste the token and leave
+  **Network** as *none*.
+- **Over the cable you just flashed with** — `T|<token>`.
 
 **That default is a bootstrap fix, not a preference.** A board with empty NVS
 used to default to Wi-Fi, which meant the setup portal — and the portal outranks
@@ -171,8 +173,9 @@ upgrade must not move a working device onto a different radio behind its owner's
 back.
 
 **For Wi-Fi instead**, send `W|<ssid>|<password>` and then `I|WIFI`, or use the
-setup portal — hold **BOOT** at power-on, or send `Z` over the cable. Neither
-lives on the device's menu any more; see **Settings** below for why.
+setup portal — **SETTINGS → Set token** on the device, `Z` over the cable, or
+BOOT held at power-on. Only the *transport* switch is off the menu; see
+**Settings** below for why.
 The portal shows an access point name (`Claude-Mate-XXXX`) and a password that is
 regenerated on every portal start. Join it from a phone, open
 `http://192.168.4.1`, and fill in the network, password, **shared token**, and
@@ -317,29 +320,39 @@ spanning 260.
 | Item | What it does |
 |---|---|
 | **CONDUCTOR** | back to the triage view — the daemon's frame, unchanged since iteration 2 shipped |
-| **SETTINGS** | the eight rows below |
+| **SETTINGS** | the nine rows below |
 | **SHIP IT** | the platformer, played on a contribution graph. Runs on the device itself; the record survives a flat battery |
 | **SLEEP** | the same deep sleep the 2 s hold does, made discoverable |
 
 ### Settings
 
-Eight rows, five visible, so the page scrolls and draws a scrollbar — without
+Nine rows, five visible, so the page scrolls and draws a scrollbar — without
 one a cut list simply looks complete. Everything is computed from the row count,
 so adding a row costs nothing but the row.
 
-**There is no Link row and no Wi-Fi setup row, and that is deliberate.** `Link`
-was a plain toggle, so one press moved a cordless board onto Wi-Fi — and a board
-with no credentials then reboots into the setup portal, which outranks the menu
-and does not time out for a Wi-Fi device, so it hides the very row you would use
-to undo it. One press on the glass, and no way back without a cable. `Wi-Fi
-setup` was the same door from the other side. Neither is deleted: the transport
-still compiles and `I|WIFI` / `I|BLE` and `Z` still work over USB, which puts
-the escape hatch somewhere a mistake cannot reach it — if you can type `I|WIFI`
-you have a cable, so you can type `I|BLE` back. Which radio is live, and whether
-it has found the daemon, is on the **About** page.
+**There is no `Link` row, and that is deliberate.** It was a plain toggle, so
+one press moved a cordless board onto Wi-Fi — and a board with no credentials
+then reboots into the setup portal, which outranks the menu and does not time
+out for a Wi-Fi device, so it hides the very row you would use to undo it. One
+press on the glass, and no way back without a cable. The transport is not
+deleted, only off the glass: `I|WIFI` / `I|BLE` still work over USB, which puts
+that switch behind a cable you have to actually have — if you can type `I|WIFI`
+you can type `I|BLE` back. Which radio is live, and whether it has found the
+daemon, is on the **About** page.
+
+**The provisioning row stays, and is first.** It was removed alongside `Link`
+for one commit, and that was a mistake found within minutes: factory-reset a
+board with no cable attached and there is then *no way to give it a token from
+anywhere*. What remained was BOOT-held-at-power-on, which is an incantation
+nobody discovers. It is also not the door `Link` was — on a BLE device the
+portal expires after five idle minutes and hands the glass back, and the token
+it takes reaches the running stack. It sits first because it is the row you need
+when nothing else works, and the one screen you can still reach then should not
+make you scroll to find it.
 
 | Row | Values | Notes |
 |---|---|---|
+| **Set token** *(BLE)* / **Wi-Fi setup** *(Wi-Fi)* | set / none, or the link state | Opens the setup portal: an AP whose name and per-start password are on the glass, and a form at `http://192.168.4.1`. **On BLE this is the token screen** — the network box is optional and the dropdown offers *none* — and it is the only way to provision a board with no cable attached, which is why it is named for the token rather than for Wi-Fi. The value answers before you press it: `none` in red *is* the reason nothing is working on a board you just reset. Escapable on BLE — the portal expires after 5 idle minutes and the glass comes back |
 | **BLE gamepad** | on / off | The device as an **ordinary Bluetooth HID gamepad** — pair "Claude Mate" once in System Settings and macOS presents it as a system controller. **On means the device *is* a gamepad**, across a screen sleep and across a reboot, until you turn it off; off means it is the conductor again and the daemon link comes back. This is the only input path the **public site** can use: the daemon path needs `http://127.0.0.1`, which an https page cannot reach. It also skips Wi-Fi, mDNS, the TCP dial, the daemon and SSE entirely, which is the chain that was making the controller lurch. Four buttons, no axes, physical order (1 = PREV, 2 = GO, 3 = NEXT, 4 = 4th). Leave with a 2 s hold of the 4th button, which turns the switch off too. See the radio policy below |
 | **Sleep screen** | off · 1m · 2m · 5m · 10m · 30m | One row, not a toggle plus a duration — the two can never disagree, and it costs one row on a screen that has five. Defaults to **off**: nobody's screen should start going dark because they took an update |
 | **Brightness** | 5 steps | Non-linear in duty (20/60/120/200/255). Equal duty steps feel like one enormous jump at the bottom and four identical ones at the top. Applied live, so the step you are on is the step you can see |
@@ -453,8 +466,9 @@ of flash and 2,848 bytes of RAM** against the same sketch without it. It is that
 cheap because the BLE stack was already linked in for the HID gamepad — the
 ~290 KB was paid for once, and this is the second thing to use it.
 
-Select it with `I|BLE` over the cable — it is deliberately not on the device's
-menu, for the reason given under **Settings**. It is a stored
+Select it with `I|BLE` over the cable — the *transport* is deliberately not on
+the device's menu, for the reason given under **Settings** (provisioning is).
+It is a stored
 byte rather than a compile-time `#define` on purpose: moving a device on a desk
 between the two should not need a toolchain. Holding BOOT at power-on still
 forces the Wi-Fi setup portal whichever transport is stored — that escape hatch
@@ -572,7 +586,7 @@ device (?)  link  : ble
 | `ble: start the daemon with --ble` | `no device found yet` | one of 1–3 above — usually the Bluetooth permission |
 | `AUTHING`, then `no handshake - is the daemon on --ble?` | *(nothing)* | something connected that is not the daemon. macOS itself probes new GATT services; harmless, and it recycles after 5 s |
 | `x token rejected` | `BLE: token rejected` | the device and the daemon hold different tokens. `T\|<token>` over USB, from `~/.config/claude-mate/token` |
-| `x no token - send T\|<token> over USB` | `THE DEVICE HAS NO TOKEN` | exactly what it says, and it is what a factory-reset board says. The cable is the answer; with no cable to hand, the portal takes a token too (`Z`, or BOOT held at power-on — the network box is optional on a BLE device) |
+| `x no token - MENU > Set token` | `THE DEVICE HAS NO TOKEN` | exactly what it says, and it is what a factory-reset board says. On the device: **MENU → SETTINGS → Set token**, join the AP it shows and paste the token, leaving Network as *none*. With a cable: `T\|<token>` over USB |
 
 ### Screen sleep
 

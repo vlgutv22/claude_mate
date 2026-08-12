@@ -349,8 +349,12 @@ class MateBle {
       // will fail and saying anything else sends you to look at the daemon. A
       // factory-reset device is exactly this device, so this is the line a
       // fresh board shows: it has to be the one that gets you moving.
+      //
+      // It names the MENU, not the cable. This line is read off the glass, and
+      // the board it appears on is very often cordless -- telling someone with
+      // no cable to go and use a cable is not an instruction, it is a dead end.
       case ADVERTISING: return _token.isEmpty()
-                                   ? "no token: send T|<token> over USB"
+                                   ? "no token: MENU > Set token"
                                    : "ble: start the daemon with --ble";
       case AUTHING:     return "authenticating...";
       case LINKED:      return "ble linked";
@@ -449,10 +453,11 @@ class MateBle {
         // bad handshake, which is indistinguishable from a crashed device or a
         // dropped packet -- and this device knew the exact reason all along.
         notifyLine("A|NOTOKEN");
-        // NOT "set one in the setup portal": on BLE there is no portal in the
-        // path, and a factory-reset device never opens one. The cable is the
-        // answer, and it is already in your hand -- you just flashed with it.
-        note("no token - send T|<token> over USB");
+        // Names the row that fixes it, for the same reason statusText() does:
+        // this is read off the glass of a board that may have no cable within
+        // reach. `T|<token>` over USB does the same job when there is one, and
+        // the daemon's own log says so from the other end.
+        note("no token - MENU > Set token");
         _pendingDisconnect = true;
         return;
       }
