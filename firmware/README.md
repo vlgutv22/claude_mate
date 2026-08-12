@@ -479,6 +479,18 @@ the glass back. Without that, holding BOOT on a cordless BLE board — which is
 also how you enter download mode, so it happens by accident — was a one-way
 door into a portal that device had no reason to fill in.
 
+> **GO does it too, and on an assembled device that is the one that matters.**
+> `setup()` accepts either (`digitalRead(PIN_BTN_BOOT) || digitalRead(PIN_BTN_GO)`),
+> and BOOT is an onboard button the printed enclosure covers — so the documented
+> gesture is one you cannot perform on the finished object. **Hold GO through a
+> power-on**, or, with no cable and no reachable RESET: hold the 4th button 2 s
+> to sleep the board, then hold **GO** and tap the 4th button to wake it. Waking
+> from deep sleep runs `setup()` from the top, so the same check runs and the
+> portal comes up. Keep GO down until the screen lights.
+>
+> This is a fallback, not the route: **SETTINGS → Set token** is the route. It
+> exists because a board whose menu you cannot reach still has to be reachable.
+
 #### Why changing the link reboots the device
 
 **BLE does not come back in the same boot.** `BLEDevice::deinit(true)` does not
