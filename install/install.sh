@@ -156,10 +156,37 @@ else
     launchctl bootstrap "gui/${uid}" "${PLIST_DST}" 2>/dev/null || true
 fi
 
+# --- 6. Put the command-line tools on PATH ----------------------------------
+# WHY THIS STEP EXISTS. `claude` is normally an alias straight into bin/, so
+# nothing in this repo ever needed to be on PATH -- and the day a tool started
+# telling people to run `claude-mate-connect --pair`, that instruction failed
+# with "command not found" for the person who had followed every other
+# instruction correctly. Symlinks, not copies, so a `git pull` updates them.
+TOOL_DIR=""
+for cand in /usr/local/bin "${HOME}/.local/bin"; do
+    if [ -d "$cand" ] && [ -w "$cand" ]; then TOOL_DIR="$cand"; break; fi
+done
+if [ -n "$TOOL_DIR" ]; then
+    for tool in claude-mate claude-mate-connect claude-mate-switch; do
+        if [ -x "${REPO_DIR}/bin/${tool}" ]; then
+            ln -sf "${REPO_DIR}/bin/${tool}" "${TOOL_DIR}/${tool}"
+            ok "Linked ${tool} -> ${TOOL_DIR}"
+        fi
+    done
+    case ":${PATH}:" in
+        *":${TOOL_DIR}:"*) ;;
+        *) warn "${TOOL_DIR} is not on your PATH; add it to use these by name" ;;
+    esac
+else
+    warn "No writable dir on PATH (/usr/local/bin, ~/.local/bin) -- run the"
+    warn "tools by path: ${REPO_DIR}/bin/claude-mate-connect"
+fi
+
 echo
 ok "Claude Mate installed."
 info "Daemon logs:"
 info "  out: ${LOG_DIR}/claude-mate.out.log"
 info "  err: ${LOG_DIR}/claude-mate.err.log"
 info "Check status:  launchctl list | grep ${PLIST_LABEL}"
+info "Device not linked? claude-mate-connect  (or press \`d\` at the account picker)"
 info "Uninstall:     ${SCRIPT_DIR}/uninstall.sh"

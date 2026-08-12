@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""claude-mate -- do what the device does, from a terminal.
+
+WHY THIS EXISTS. The device is the good interface: one screen, four buttons, and
+it is looking at you. But it is one device, it is sometimes across the room, and
+sometimes it is flat. Everything it can do is a line on the daemon's socket, so
+none of that needed to be exclusive to the hardware -- it just never had a way
+in from a terminal.
+
+IT PRESSES THE SAME BUTTONS. `claude-mate go` sends `press|G`, which the daemon
+hands to the SAME ButtonReader that handles `B|G` off the wire. So GO means
+exactly one thing on this project: the mirror closes first, a double press
+inside the window toggles FOLLOW, the raised window is the one whose name was on
+the glass. There is no second implementation to drift.
+
+  claude-mate                 the queue, as the device shows it
+  claude-mate watch           ...and keep showing it
+  claude-mate next|prev       step the selection (or scroll the mirror)
+  claude-mate go              ack + raise that session's terminal
+  claude-mate ack             ack only, leave the window alone
+  claude-mate follow          toggle FOLLOW (PREV/NEXT also raise)
+  claude-mate mirror          toggle the terminal mirror
+  claude-mate continue        type "continue" into that session
+  claude-mate new-terminal    open a terminal in that session's directory
+  claude-mate select <n|name> point at a row instead of stepping to it
+  claude-mate accounts        the saved logins
+  claude-mate accounts rm <name>   delete one, after saying its name back
+
+WHAT IT DELIBERATELY DOES NOT DO OVER THE SOCKET. That socket is chmod 0666 --
+hooks in any of your shells post session updates to it -- so every local process
+can write to it. Reading state and pressing buttons survive a stray write;
+deleting an account does not. `accounts rm` therefore does the deletion HERE, in
+your own process under your own uid, and only asks the daemon to re-read
+afterwards.
+"""
+import json
+import os
+import shutil
+import socket
+import sys
+import time
+
+SOCK = os.environ.get("CLAUDE_MATE_SOCK", "/tmp/claude-mate.sock")
+
+B, D, OFF = "\033[1m", "\033[2m", "\033[0m"
+COLOUR = {
+    "error":   "\033[31m",
+    "waiting": "\033[33m",
+    "working": "\033[36m",
+    "done":    "\033[32m",
+    "idle":    "\033[2m",
+}
+if not sys.stdout.isatty():
+    B = D = OFF = ""
+    COLOUR = {k: "" for k in COLOUR}
+
+# The device's own vocabulary, so the mapping is visible in one place rather than
+# spread through the argument parser. See ButtonReader._dispatch.
+PRESSES = {
+    "prev": "P", "next": "N", "go": "G", "ack": "K", "follow": "F",
+    "mirror": "M", "continue": "C", "new-terminal": "T",
+}
+
+
+def talk(line, timeout=6.0):
+    """One command, one reply. None means the daemon could not be reached."""
+    try:
+        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        c.settimeout(timeout)
+        c.connect(SOCK)
+        c.sendall((line + "\n").encode())
+        c.shutdown(socket.SHUT_WR)
+        buf = b""
+        while True:
+            chunk = c.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        c.close()
+        return buf.decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def die(msg, code=1):
+    print(msg, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def need(line):
+    reply = talk(line)
+    if reply is None:
+        die(f"claude-mate: no daemon on {SOCK}\n"
+            f"  start it:  launchctl bootstrap gui/{os.getuid()} "
+            f"~/Library/LaunchAgents/com.claudemate.daemon.plist")
+    if reply.startswith("error:"):
+        die(f"claude-mate: {reply.strip()[7:]}")
+    return reply
+
+
+def mmss(secs):
+    return f"{int(secs) // 60}:{int(secs) % 60:02d}"
+
+
+def render(snap):
+    """The queue, laid out like the glass: the shown row marked, alerts loud."""
+    q = snap.get("queue", [])
+    if not q:
+        print(f"{D}no sessions. start one with `claude` in a project.{OFF}")
+        return
+    width = max(len(s["name"]) for s in q)
+    for s in q:
+        col = COLOUR.get(s["state"], "")
+        # The two things the device says with a box and a flash: which row is on
+        # the glass, and which rows are shouting.
+        here = f"{B}>{OFF}" if s["shown"] else " "
+        flag = "" if s["acked"] else f" {col}{B}<-- needs you{OFF}"
+        right = "  ".join(x for x in (s["model"], s["effort"],
+                                      s["account"], s["limit"]) if x)
+        print(f" {here} {s['i']}  {col}{s['name']:<{width}}  "
+              f"{s['state']:<7}{OFF} {mmss(s['secs']):>6}  {D}{right}{OFF}{flag}")
+    if snap.get("follow"):
+        print(f"\n {D}FOLLOW is on: prev/next also raise the terminal{OFF}")
+
+
+def cmd_status(watch=False):
+    while True:
+        snap = json.loads(need("queue"))
+        if watch:
+            # Full clear, not a scroll: this is a dashboard, and a screen that
+            # accumulates history is one you have to read the bottom of.
+            sys.stdout.write("\033[2J\033[H")
+            print(f"{B}claude-mate{OFF}  {D}{time.strftime('%H:%M:%S')} "
+                  f"· ctrl-c to stop{OFF}\n")
+        render(snap)
+        if not watch:
+            return 0
+        time.sleep(1.0)
+
+
+def cmd_press(name):
+    need(f"press|{PRESSES[name]}")
+    # Show the result rather than announcing the action: what matters after a
+    # `next` is which session is now under the cursor.
+    if name in ("prev", "next", "select", "follow"):
+        render(json.loads(need("queue")))
+    return 0
+
+
+def cmd_select(want):
+    reply = need(f"select|{want}")
+    print(f"{D}{reply.strip()[3:]}{OFF}" if reply.startswith("ok ") else reply.strip())
+    render(json.loads(need("queue")))
+    return 0
+
+
+def cmd_accounts(argv):
+    snap = json.loads(need("accounts"))
+    accts = snap["accounts"]
+    if not argv:
+        for i, a in enumerate(accts):
+            email = read_email(a["name"], a["dir"])
+            mark = "" if a["exists"] else f"  {D}(missing){OFF}"
+            print(f"  {i}  {show_name(a['name']):<14} "
+                  f"{D}{email or '(not logged in)'}{OFF}{mark}")
+        print(f"\n{D}dir: {snap['accounts_dir']}{OFF}")
+        print(f"{D}limits + switching: claude-mate-switch{OFF}")
+        return 0
+    if argv[0] not in ("rm", "remove", "delete"):
+        die(f"claude-mate accounts: unknown subcommand {argv[0]!r}")
+    if len(argv) < 2:
+        die("claude-mate accounts rm: which account?")
+    want = argv[1]
+    match = [a for a in accts if a["name"] == want]
+    if not match and want.isdigit() and 0 <= int(want) < len(accts):
+        # BY INDEX TOO, because a name is not always typeable: a profile called
+        # `\033` exists on a real machine and cannot be entered at a prompt.
+        match = [accts[int(want)]]
+    if not match:
+        die(f"claude-mate: no account named {want!r} (see `claude-mate accounts`)")
+    a = match[0]
+    name = a["name"]
+    if not a["removable"]:
+        die("claude-mate: 'default' is your ~/.claude login, not a profile — "
+            "this command will not delete it")
+    email = read_email(name, a["dir"])
+    print(f"\n{B}This deletes an account profile and everything in it.{OFF}")
+    print(f"  name   {show_name(name)}")
+    print(f"  email  {email or '(not logged in)'}")
+    print(f"  dir    {a['dir']}")
+    print(f"\n{D}That includes its login and every transcript under it. There is"
+          f" no undo.{OFF}")
+    # TYPE THE NAME. A y/n on a destructive action is a reflex; typing the name
+    # is a decision, and it also proves you are deleting the one you think.
+    token = name if show_name(name) == name else "delete"
+    try:
+        typed = input(f"\ntype {B}{token}{OFF} to confirm: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return 130
+    if typed != token:
+        print("not deleted.")
+        return 1
+    if email:
+        # Say it once more, because "not logged in" is the case where this is
+        # cheap and "logged in" is the case where it is not.
+        print(f"{D}note: {email} will have to log in again if you recreate "
+              f"this profile.{OFF}")
+    try:
+        shutil.rmtree(a["dir"])
+    except OSError as e:
+        die(f"claude-mate: could not delete {a['dir']}: {e}")
+    print(f"deleted {name}.")
+    talk("accounts-refresh")      # so the device's picker stops offering it
+    return 0
+
+
+def read_email(name, cfg_dir):
+    """The login an account profile holds, from its own config.
+
+    THE DEFAULT PROFILE'S STATE FILE IS ~/.claude.json, NOT ~/.claude/.claude.json
+    -- claude writes it beside the directory, and only writes it INSIDE when
+    CLAUDE_CONFIG_DIR is set. Reading the same path for both reported your main
+    account as "(not logged in)" while the picker two lines away had its email.
+    Same rule as account_email() in the wrapper.
+
+    Read here rather than asked of the daemon: it is one small JSON file, and
+    keeping it out of the daemon means the daemon never grows a reason to open
+    files it does not otherwise need.
+    """
+    path = (os.path.expanduser("~/.claude.json") if name == "default"
+            else os.path.join(cfg_dir, ".claude.json"))
+    try:
+        with open(path) as fh:
+            return (json.load(fh).get("oauthAccount") or {}).get("emailAddress")
+    except (OSError, ValueError):
+        return None
+
+
+def show_name(name):
+    """A profile name you can actually see.
+
+    Profile names come from whatever was typed at the picker, and an arrow key
+    types an ESCAPE SEQUENCE -- so a real accounts dir can contain a directory
+    called `\033`, which prints as nothing at all and leaves a row that looks
+    like a blank line with an email next to it. Anything not plainly printable
+    is shown as a repr so it is at least identifiable.
+    """
+    if name and all(32 <= ord(c) < 127 for c in name):
+        return name
+    return repr(name)
+
+
+def main(argv):
+    if not argv or argv[0] in ("status", "queue", "ls", "list"):
+        return cmd_status()
+    cmd, rest = argv[0], argv[1:]
+    if cmd in ("watch", "-w", "--watch"):
+        try:
+            return cmd_status(watch=True)
+        except KeyboardInterrupt:
+            print()
+            return 0
+    if cmd in PRESSES:
+        return cmd_press(cmd)
+    if cmd == "select":
+        if not rest:
+            die("claude-mate select: which session? (index or name)")
+        return cmd_select(rest[0])
+    if cmd in ("accounts", "account"):
+        return cmd_accounts(rest)
+    if cmd in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    die(f"claude-mate: unknown command {cmd!r}. Try --help.")
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

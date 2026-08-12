@@ -74,6 +74,7 @@ from __future__ import annotations
 import argparse
 import glob
 import hmac
+import json
 import os
 import queue
 import secrets
@@ -87,7 +88,7 @@ import time
 import urllib.parse
 import wave
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 try:
     import serial  # pyserial
@@ -1346,6 +1347,48 @@ class Screen:
             self._sel_key = nxt.key
         self.refresh()
 
+    def select_by(self, want: str) -> Optional[str]:
+        """Select a session by queue index or by name. Returns the name, or None.
+
+        The device has no equivalent -- it walks there with PREV/NEXT -- but a
+        terminal that can print the whole queue at once should be able to point
+        at a row instead of stepping to it. The index is into the SAME queue the
+        snapshot prints, so what you read is what you get.
+
+        Name matching is exact-first, then unique prefix, then unique substring.
+        AMBIGUITY IS A REFUSAL rather than a guess: this moves what GO acts on,
+        and picking the wrong session is the one mistake that costs you the
+        window you were trying to raise.
+        """
+        want = want.strip()
+        if not want:
+            return None
+        queue = self._reg.queue()
+        if not queue:
+            return None
+        pick = None
+        if want.isdigit():
+            i = int(want)
+            if 0 <= i < len(queue):
+                pick = queue[i]
+        if pick is None:
+            for pred in (lambda s: s.name == want,
+                         lambda s: s.name.lower() == want.lower(),
+                         lambda s: s.name.lower().startswith(want.lower()),
+                         lambda s: want.lower() in s.name.lower()):
+                hits = [s for s in queue if pred(s)]
+                if len(hits) == 1:
+                    pick = hits[0]
+                    break
+                if len(hits) > 1:
+                    return None            # ambiguous: refuse, do not guess
+        if pick is None:
+            return None
+        with self._lock:
+            self._sel_key = pick.key
+        self.refresh()
+        return pick.name
+
     def stay_on(self, sess: Optional[Session]) -> None:
         """After a GO/ACK: pin the selection to the session the press acted on
         (and redraw, e.g. so its flash stops) -- the device stays on it."""
@@ -1966,9 +2009,13 @@ class SocketServer(threading.Thread):
         self._on_update = on_update
         self._on_haptic = on_haptic   # called with a LED kind on session events
         # Set by main() when there is something to command. See _process_line:
-        # this socket carries session updates, and now the one control that has
-        # to come from a terminal rather than from a hook.
+        # this socket carries session updates, and now the controls that have to
+        # come from a terminal rather than from a hook.
         self.on_pair_request = None
+        self.on_press = None              # inject a device button code
+        self.on_select = None             # move the selection; returns the name
+        self.on_accounts_refresh = None   # re-read ~/.claude-accounts
+        self.screen = None                # for queue_snapshot()
         self._stop_evt = threading.Event()  # NOT `_stop`: Thread.join() calls its own _stop()
         self._srv: Optional[socket.socket] = None
 
@@ -2024,10 +2071,25 @@ class SocketServer(threading.Thread):
                 buf += chunk
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
-                    self._process_line(line)
+                    self._reply(conn, self._process_line(line))
             # Process any trailing line without a newline.
             if buf:
-                self._process_line(buf)
+                self._reply(conn, self._process_line(buf))
+        except OSError:
+            pass
+
+    @staticmethod
+    def _reply(conn: socket.socket, body: Optional[str]) -> None:
+        """Write a command's answer back, if it had one.
+
+        Session updates from hooks answer nothing and must keep costing nothing:
+        they are fire-and-forget, the writer usually closes immediately, and a
+        write into that closed socket is an ordinary EPIPE rather than a fault.
+        """
+        if not body:
+            return
+        try:
+            conn.sendall(body.encode("utf-8", errors="replace"))
         except OSError:
             pass
 
@@ -2050,10 +2112,48 @@ class SocketServer(threading.Thread):
             if self.on_pair_request:
                 self.on_pair_request()
                 log("pairing armed from the terminal")
-            else:
-                log("pairing requested, but BLE is not running "
-                    "(start the daemon with --ble)")
-            return
+                return "ok\n"
+            log("pairing requested, but BLE is not running "
+                "(start the daemon with --ble)")
+            return "error: BLE is not running (start the daemon with --ble)\n"
+
+        # ---- the CLI's command surface ------------------------------------- #
+        # A terminal can now do what the device does, and does it by the SAME
+        # route: `press|G` is dispatched through the ButtonReader that handles
+        # `B|G` off the wire, so the CLI cannot drift into a second, subtly
+        # different implementation of GO.
+        #
+        # NOTHING DESTRUCTIVE LIVES HERE. This socket is chmod 0666 so that
+        # hooks running in any of the user's shells can post updates, which
+        # means every local process can write to it. Reading state and pressing
+        # buttons are things a stray write can at worst make untidy; deleting an
+        # account is not, so that stays in the CLI's own process, under the
+        # user's own uid, and the daemon is only asked to re-read afterwards.
+        if line == "queue":
+            return self._json(self.queue_snapshot())
+        if line == "accounts":
+            return self._json(self.accounts_snapshot())
+        if line == "accounts-refresh":
+            if self.on_accounts_refresh:
+                self.on_accounts_refresh()
+                return "ok\n"
+            return "error: no account reporter\n"
+        if line.startswith("press|"):
+            code = line[6:].strip()
+            if not code:
+                return "error: press| needs a button code\n"
+            if not self.on_press:
+                return "error: no button reader\n"
+            log(f"press {code!r} from the terminal")
+            self.on_press(code)
+            return "ok\n"
+        if line.startswith("select|"):
+            want = line[7:].strip()
+            if not self.on_select:
+                return "error: no screen\n"
+            got = self.on_select(want)
+            return f"ok {got}\n" if got else f"error: no session matching {want!r}\n"
+
         # Expected: "<state>|<session_id>|<name>|<ctrl_sock?>|<model?>|<effort?>
         # |<account?>|<limit?>". The hook path sends only the first three
         # fields; the PTY wrapper adds the control socket, the scraped model +
@@ -2086,6 +2186,68 @@ class SocketServer(threading.Thread):
         if haptic and self._on_haptic:
             log(f"LED: {haptic} transition for {name or sid} ({state})")
             self._on_haptic(haptic)
+
+    # ---- what the CLI reads ------------------------------------------------ #
+
+    @staticmethod
+    def _json(obj: Any) -> str:
+        return json.dumps(obj) + "\n"
+
+    def queue_snapshot(self) -> Dict[str, Any]:
+        """The device's screen, as data.
+
+        Built from the SAME Registry.queue() the frame is drawn from, so the
+        order a terminal prints is the order PREV/NEXT steps through. A CLI that
+        sorted its own way would make `select 3` mean two different things
+        depending on which surface you happened to be looking at.
+        """
+        sel = shown = None
+        follow = False
+        scr = self.screen
+        if scr is not None:
+            sel_s = scr.resolve_press_target()
+            shown_s = scr.current_shown()
+            sel = sel_s.key if sel_s else None
+            shown = shown_s.key if shown_s else None
+            follow = scr.is_follow()
+        out = []
+        for i, sess in enumerate(self._reg.queue()):
+            out.append({
+                "i": i,
+                "key": sess.key,
+                "name": sess.name,
+                "state": sess.state,
+                "secs": round(sess.display_seconds()),
+                "model": sess.model,
+                "effort": sess.effort,
+                "account": sess.account,
+                "limit": sess.limit,
+                "cwd": sess.cwd,
+                "acked": sess.acked,
+                "shown": sess.key == shown,
+            })
+        return {"queue": out, "follow": follow, "shown": shown, "selected": sel}
+
+    @staticmethod
+    def accounts_snapshot() -> Dict[str, Any]:
+        """The saved logins, in the order the device is shown them.
+
+        `dir` is included because the CLI is what deletes one, and it should
+        delete the path the daemon MEANS rather than one it rebuilt from a name
+        and an assumption -- 'default' is ~/.claude and not under the profiles
+        root at all, which is exactly the assumption that would go wrong.
+
+        No limit chips: reading one costs a Keychain lookup and an HTTP call per
+        account, fine on the device's slow poll and wrong for a command someone
+        runs to see a list. claude-mate-switch already prints them.
+        """
+        out = []
+        for name in account_profiles(limit=0):
+            cfg = account_dir(name)
+            out.append({"name": name, "dir": cfg,
+                        "exists": os.path.isdir(cfg),
+                        "removable": name != "default"})
+        return {"accounts": out, "accounts_dir": ACCOUNTS_DIR}
 
     def stop(self) -> None:
         self._stop_evt.set()
@@ -2139,6 +2301,18 @@ class ButtonReader(threading.Thread):
             if not line:
                 continue
             self._dispatch(line)
+
+    def press(self, code: str) -> None:
+        """Act on a button code as though the device had sent it.
+
+        Through _dispatch rather than by calling the handlers directly, and that
+        is the whole point: every rule that applies to a real press applies here
+        too -- PREV scrolling the mirror instead of moving the selection, GO
+        closing the mirror first, a browser holding the grab swallowing the lot.
+        A CLI that called _go_pressed() itself would be a second implementation
+        of GO, and the two would drift the first time either changed.
+        """
+        self._dispatch(f"B|{code}")
 
     def _dispatch(self, line: str) -> None:
         # Tolerate garbled / partial lines: only act on exact, known shapes.
@@ -3038,6 +3212,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     # doing nothing -- the failure a terminal cannot otherwise see.
     if ble is not None:
         socket_server.on_pair_request = ble.arm_pairing
+    # The CLI's hooks. `press` goes through the SAME _dispatch that handles a
+    # B| line off the wire, so `claude-mate go` and pressing GO on the device
+    # cannot mean two different things -- there is one implementation of GO and
+    # the terminal is just another way to reach it.
+    socket_server.screen = screen
+    socket_server.on_press = lambda code: button_reader.press(code)
+    socket_server.on_select = screen.select_by
+    socket_server.on_accounts_refresh = refresh_accounts
     button_reader = ButtonReader(link, screen)
     button_reader.on_ack = on_ack
     button_reader.bridge = web

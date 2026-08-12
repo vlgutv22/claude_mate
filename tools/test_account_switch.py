@@ -548,7 +548,21 @@ connect_calls = []
 W._run_connect = lambda: connect_calls.append(1)
 
 answers = iter(["d", "0"])
-W.input = lambda prompt="": next(answers)
+
+
+def fake_input(prompt=""):
+    """Answer the prompt, and ECHO it.
+
+    The real input() writes its prompt to stdout; a fake that swallows it makes
+    every "does it ASK before doing this" check silently unprovable -- which is
+    how the first version of the new-profile test failed while the behaviour it
+    tested was correct.
+    """
+    print(prompt, end="")
+    return next(answers)
+
+
+W.input = fake_input
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     W.select_account(None, True)
@@ -566,10 +580,45 @@ check("...and no profile named 'd' was created",
 check("...and the choice made afterwards is honoured (0 = default)",
       not os.environ.get("CLAUDE_CONFIG_DIR"))
 
+# A NEW NAME CREATES A DIRECTORY, SO IT HAS TO BE ASKED FOR. Anything typed here
+# used to become a profile -- and an ARROW KEY types an escape sequence, so a
+# real accounts dir ended up holding a directory named `\033` (which prints as a
+# blank row with somebody's email beside it) and another named `в` from a
+# keyboard left in the wrong layout. Both were then logged into, because the
+# picker had already committed and claude asked for a login.
+os.environ.pop("CLAUDE_CONFIG_DIR", None)
+for junk in ("\x1b", "\x1b[A", "\x01", "../evil", "a" * 40, "with/slash"):
+    answers = iter([junk])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        W.select_account(None, True)
+    made = os.path.isdir(os.path.join(tmp, "accounts", junk))
+    check(f"a stray {junk!r} at the picker creates no profile",
+          not made and not os.environ.get("CLAUDE_CONFIG_DIR")
+          and "ignoring" in buf.getvalue())
+
+# ...while a name someone plainly meant is offered, not assumed.
+answers = iter(["brand-new", "n"])
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    W.select_account(None, True)
+check("a plausible new name is OFFERED rather than created silently",
+      "is new" in buf.getvalue()
+      and not os.path.isdir(os.path.join(tmp, "accounts", "brand-new")))
+check("...and declining leaves you on the default",
+      not os.environ.get("CLAUDE_CONFIG_DIR"))
+
+answers = iter(["brand-new", "y"])
+with contextlib.redirect_stdout(io.StringIO()):
+    W.select_account(None, True)
+check("...and accepting creates it",
+      os.environ.get("CLAUDE_CONFIG_DIR", "").endswith("brand-new"))
+
+os.environ.pop("CLAUDE_CONFIG_DIR", None)
 answers = iter(["acct-b"])
 with contextlib.redirect_stdout(io.StringIO()):    # the menu again; not output
     W.select_account(None, True)
-check("a plain account name still selects that account",
+check("an EXISTING account name still selects it with no extra question",
       os.environ.get("CLAUDE_CONFIG_DIR", "").endswith("acct-b"))
 del W.input
 

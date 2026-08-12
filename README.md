@@ -631,6 +631,35 @@ selects a profile non-interactively, and an already-exported
 prompts `/login` there on first run — and keeps its own settings, history, and
 MCP config. With no profile dirs, nothing changes.
 
+**The same thing from a terminal** — `claude-mate`. The device is the good
+interface, but it is one device, sometimes across the room, and sometimes flat.
+Everything it does is a line on the daemon's socket, so none of it needed to be
+exclusive to the hardware:
+
+```sh
+claude-mate                  # the queue, as the device shows it
+claude-mate watch            # ...and keep showing it
+claude-mate next / prev      # step the selection
+claude-mate go               # ack + raise that session's terminal
+claude-mate ack / follow     # ack only · toggle FOLLOW
+claude-mate mirror           # toggle the terminal mirror
+claude-mate select api       # point at a row instead of stepping to it
+claude-mate accounts         # the saved logins
+claude-mate accounts rm old  # delete one, after typing its name back
+```
+
+**It presses the same buttons.** `claude-mate go` sends `press|G`, which the
+daemon hands to the *same* `ButtonReader` that handles `B|G` off the wire — so GO
+means one thing on this project (mirror closes first, a double press toggles
+FOLLOW, the raised window is the one whose name was on the glass) and there is no
+second implementation to drift. `claude-mate select` is the only thing the device
+has no equivalent for; it walks there with PREV/NEXT instead.
+
+**Deleting an account happens in the CLI's own process, never over the socket.**
+That socket is `chmod 0666` so hooks in any of your shells can post updates,
+which means every local process can write to it — reading state and pressing
+buttons survive a stray write, and deleting a login does not.
+
 **Device will not connect?** — press `d` at the account picker, or run
 `claude-mate-connect`. It reports every link — daemon, token, cable, BLE — and
 prints the shortest fix for whichever one is down.

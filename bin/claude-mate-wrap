@@ -1188,8 +1188,42 @@ def select_account(flag_name, interactive):
         return
     if ans.isdigit() and 1 <= int(ans) <= len(profiles):
         use_profile(profiles[int(ans) - 1])
-    else:
-        use_profile(ans)   # a name: existing profile or a new one to create
+        return
+    if ans in profiles:
+        use_profile(ans)
+        return
+    # A NEW NAME CREATES A PROFILE, SO IT HAS TO BE ASKED FOR. Anything typed
+    # here used to become one, and an arrow key types an ESCAPE SEQUENCE -- so a
+    # real accounts dir ended up with a directory named `\033`, which prints as
+    # a blank row with somebody's email beside it, and another named `в` from a
+    # keyboard left in the wrong layout. Both were logged into afterwards,
+    # because the picker had already committed and claude asked for a login.
+    if not _plausible_profile(ans):
+        print(f"  ignoring {ans!r} — that does not look like an account name.")
+        return
+    try:
+        yn = input(f'  "{ans}" is new. Create a profile for it? [y/N] ').strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        os._exit(130)
+    if yn.lower() not in ("y", "yes"):
+        print("  staying on the default account.")
+        return
+    use_profile(ans)
+
+
+def _plausible_profile(name):
+    """Could this be a profile name someone meant to type?
+
+    Deliberately narrow: printable, no path separators (a name becomes a
+    DIRECTORY under ~/.claude-accounts, so `../` there is not a naming choice),
+    and short enough to be a name rather than a paste.
+    """
+    return (name
+            and len(name) <= 32
+            and all(32 <= ord(c) < 127 for c in name)
+            and "/" not in name and "\\" not in name
+            and name not in (".", ".."))
 
 
 def _run_connect():

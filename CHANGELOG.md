@@ -12,6 +12,43 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
+### 2026-08-12 — `claude-mate`: the device's interface, in a terminal
+
+- **Added: `claude-mate`.** The queue, the selection, GO, ACK, FOLLOW, the
+  mirror, "continue", a new terminal — everything the device does, from a
+  terminal. The device is the better interface, but it is one device, sometimes
+  across the room and sometimes flat, and all of this was already a line on the
+  daemon's socket.
+- **It presses the same buttons.** `claude-mate go` sends `press|G`, which the
+  daemon hands to the **same `ButtonReader`** that handles `B|G` off the wire. So
+  every rule that applies to a real press applies here: PREV scrolls the mirror
+  instead of moving the selection when the mirror is open, GO closes the mirror
+  first, a browser holding the grab swallows the lot. A CLI that called
+  `_go_pressed()` itself would be a second implementation of GO, and the two
+  would drift the first time either changed. `select` is the one addition — the
+  device walks there with PREV/NEXT, and a terminal that prints the whole queue
+  should be able to point at a row. Ambiguous names are **refused rather than
+  guessed**, because this moves what GO acts on.
+- **Added: `claude-mate accounts`, and `accounts rm`.** Deletion runs in the
+  CLI's own process, never over the socket: that socket is `chmod 0666` so hooks
+  in any shell can post updates, so everything on it is reachable by every local
+  process. Reading state and pressing buttons survive a stray write; removing a
+  login does not. Confirmation is **typing the name back**, not a y/n — a y/n on
+  a destructive action is a reflex, and typing the name also proves you are
+  deleting the one you think you are.
+- **Fixed: a stray keystroke at the account picker created an account.** Anything
+  typed there became a profile, and an arrow key types an *escape sequence* — so
+  a real accounts dir held a directory named `\033`, which prints as a blank row
+  with somebody's email beside it, and another named `в` from a keyboard left in
+  the wrong layout. Both had been logged into, because the picker committed and
+  claude then asked for a login. A new name is now **offered** rather than
+  assumed, and implausible ones (unprintable, over 32 chars, containing a path
+  separator — `../` under the profiles root was never a naming choice) are
+  ignored outright. `claude-mate accounts` shows such names as reprs so they can
+  be identified, and `accounts rm` takes an index, because `\033` cannot be typed
+  at a prompt.
+
+
 ### 2026-08-12 — No Wi-Fi on the device's menu at all
 
 - **Removed: the setup-portal row.** It existed for exactly one reason — a
