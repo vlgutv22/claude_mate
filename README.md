@@ -274,9 +274,11 @@ hooks are the zero-dependency feed. Use whichever fits each session.
 - **An on-device menu** — double-tap the 4th button. Four items: the triage view,
   SETTINGS, SHIP IT and long sleep. Settings holds the rest — a **BLE gamepad**
   switch, screen sleep, brightness, alert-LED level including a genuine *off*,
-  Mac sound, flip, an About readout, and factory reset — and, first, **Set
-  token**, which opens the provisioning portal and is how a cordless board is
-  paired with no cable at all. **What is *not* there is the radio switch:** one
+  Mac sound, flip, an About readout, and factory reset. **Nothing to do with
+  Wi-Fi is on it at all** — not the radio switch, not the setup portal. Pairing
+  a cordless board is `claude-mate-connect --pair` plus one press of GO, so the
+  portal stopped being the only way in and stopped earning a row. **On the radio
+  switch specifically:** one
   press used to be enough to move a cordless board onto Wi-Fi, and a board with
   no credentials then reboots into a portal that outranks the menu — hiding the
   row you would use to undo it. `I|WIFI` / `I|BLE` over USB still do it, which

@@ -491,22 +491,24 @@ check("...but the transport is still switchable over the cable",
       re.search(r'strcasecmp\(a, "ble"\)', ino)
       and re.search(r'strcasecmp\(a, "wifi"\)', ino))
 
-# ...and the OPPOSITE rule for the provisioning row, which was removed alongside
-# it and must not be again: without it a factory-reset board with no cable
-# attached cannot be given a token from anywhere at all. Only BOOT-held-at-
-# power-on remained, which nobody discovers. It is not the door `Link` was --
-# the portal expires on a BLE device and the token reaches the live stack.
-check("there IS a row that provisions a token, or a cordless board cannot be "
-      "set up at all", "SR_SETUP" in rows)
-check("...and it is FIRST, so the row you need when nothing works is on the "
-      "visible page rather than below the scroll", rows[0] == "SR_SETUP")
-check("...and it opens the portal", re.search(
-    r"case SR_SETUP:.*?net\.startPortalNow\(\);", ino, re.S))
-check('...named "Set token" on BLE, where a "Wi-Fi setup" label is a row '
-      "nobody presses when a token is what they need",
-      re.search(r'label = "Set token";', ino))
-check("...and it says whether there is one, before you press it",
-      re.search(r'value = net\.hasToken\(\) \? "set" : "none";', ino))
+# NO SETUP-PORTAL ROW EITHER: there is no Wi-Fi anywhere on this menu.
+#
+# It existed for exactly one reason -- a factory-reset board with no cable had no
+# way to be given a token -- and BLE ENROLMENT replaced that reason outright. The
+# check is worth keeping in this order: removing the row BEFORE pairing existed
+# stranded a real board within minutes, so what makes it safe now is not taste,
+# it is that `E|?` is implemented and tested above.
+check("no setup-portal row -- pairing replaced the only reason it existed",
+      "SR_SETUP" not in rows and "SR_WIFI" not in rows)
+check("...and no row paints or opens one",
+      not re.search(r"case SR_(SETUP|WIFI)\b", ino)
+      and not re.search(r'label = "Wi-Fi setup";', ino))
+# What makes the removal safe, asserted rather than assumed.
+check("...because the device can be given a token over BLE instead",
+      re.search(r'if \(!strcmp\(line, "E\|\?"\)\)', fw_ble))
+check("...and the portal is still reachable where a mistake cannot reach it",
+      "net.startPortalNow();" in ino          # `Z` over USB
+      and re.search(r"digitalRead\(PIN_BTN_BOOT\) == LOW", ino))
 check('the row is labelled "BLE gamepad"',
       re.search(r'case SR_PAD:\s*\n\s*label = "BLE gamepad";', ino))
 check('no row is labelled "Game controller" any more',

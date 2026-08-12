@@ -12,6 +12,23 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
+### 2026-08-12 — No Wi-Fi on the device's menu at all
+
+- **Removed: the setup-portal row.** It existed for exactly one reason — a
+  factory-reset board with no cable had no way to be given a token — and
+  enrolment removed that reason. What was left was a Wi-Fi flow wearing a label
+  that said *Set token*: press it and you get an access point, a phone and a
+  secret to transcribe, on a device whose whole point is that it does not need
+  any of that. `SETTINGS` is now eight rows and none of them touches Wi-Fi.
+- **The order mattered and was learned the hard way.** Removing this row
+  *before* pairing existed stranded a real board within minutes, and putting it
+  back was the right call at the time. `tools/test_ble_link.py` now asserts the
+  `E|?` handler exists in the same breath as asserting the row does not, so the
+  removal cannot be repeated without the replacement.
+- The portal is still reachable where a mistake cannot reach it: `Z` over USB,
+  or **BOOT**/**GO** held at power-on. A board whose BLE will not start needs
+  something, and both of those require physical access the menu does not.
+
 ### 2026-08-12 — Pairing: one command, one button, no Wi-Fi anywhere
 
 - **Added: `E|`, an enrolment handshake over BLE, and `claude-mate-connect
