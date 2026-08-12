@@ -279,6 +279,61 @@ class MateBle {
   // needed.
   void setToken(const String &token) { _token = token; }
 
+  // ---- enrolment (E|), the way a cordless board gets its first token --------
+  //
+  // Every other way to provision this device needs something it is not: a cable
+  // it may be nowhere near, or a Wi-Fi access point and a phone -- on a BLE
+  // board, over a link that is already connected and talking. This is the verb
+  // that was missing. The daemon asks, the DEVICE asks its human, and only then
+  // does a secret move.
+  //
+  //   daemon -> device   E|?          may I enrol you?
+  //   device -> daemon   E|OK         (a human pressed GO on the glass)
+  //                      E|NO         (declined, already provisioned, or
+  //                                    nobody was there)
+  //   daemon -> device   E|<token>    ...only after E|OK
+  //   device -> daemon   E|SET        adopted; challenge me again
+  //
+  // WHY A BUTTON RATHER THAN A CODE TO TYPE. Both prove the same thing -- that
+  // whoever is enrolling can see the device -- and the button proves it without
+  // anyone transcribing a secret between two machines. Nothing is granted by
+  // the radio alone: a stranger in range can send E|? all day and gets a prompt
+  // on a screen they cannot reach, which times out saying no.
+  //
+  // WHAT IT COSTS, said plainly because it is a real cost: the token crosses
+  // the air once, in the clear, inside that window. The link is unencrypted by
+  // design already (see the threat model at the top of this file), so this adds
+  // no plaintext that was not there -- but a sniffer listening at the second
+  // you press GO does learn the secret. Pair away from hostile radio, or use
+  // the cable, which the daemon provisions over automatically.
+  bool pairRequested() const { return _pairAsk; }
+
+  // The human's answer, from the sketch, on the main loop.
+  //
+  // _pairOk is the ONLY thing that lets a token in, and nothing else sets it.
+  // Without it, "has no token yet" would itself be permission, and a freshly
+  // reset board would belong to whoever is in range first. The approval is also
+  // single-use and dies with the connection (see reAdvertise): the peer that
+  // asked is the only one that may send, and only once.
+  void pairAnswer(bool yes) {
+    _pairAsk = false;
+    _pairOk = yes;
+    notifyLine(yes ? "E|OK" : "E|NO");
+    if (!yes) note("pairing declined");
+  }
+
+  // A token granted over the air, for the sketch to put in NVS. False when
+  // there is nothing waiting. The LIVE stack already has it -- adopting it is
+  // what lets the challenge straight afterwards succeed -- so this is only the
+  // durable half, and losing power between the two costs one more pairing
+  // rather than anything worse.
+  bool takeGrantedToken(String &out) {
+    if (!_grantReady) return false;
+    _grantReady = false;
+    out = _token;
+    return true;
+  }
+
   // "I was asked to be up, I have tried as many times as is worth trying, and I
   // am not up." The sketch's only real answer is a reboot -- see begin(). Kept
   // as a QUESTION rather than acted on here: a transport header that reboots the
@@ -350,11 +405,13 @@ class MateBle {
       // factory-reset device is exactly this device, so this is the line a
       // fresh board shows: it has to be the one that gets you moving.
       //
-      // It names the MENU, not the cable. This line is read off the glass, and
-      // the board it appears on is very often cordless -- telling someone with
-      // no cable to go and use a cable is not an instruction, it is a dead end.
+      // It names the command on the MAC, because that is where the shortest
+      // route starts: one command, then one button on this device. Naming a
+      // cable would be a dead end on a board that is cordless by design, and
+      // naming the local menu row sends you the long way round -- an access
+      // point, a phone, and a secret typed by hand.
       case ADVERTISING: return _token.isEmpty()
-                                   ? "no token: MENU > Set token"
+                                   ? "no token: claude-mate-connect"
                                    : "ble: start the daemon with --ble";
       case AUTHING:     return "authenticating...";
       case LINKED:      return "ble linked";
@@ -447,17 +504,36 @@ class MateBle {
   }
 
   void handleAuthLine(const char *line) {
+    if (!strcmp(line, "E|?")) {
+      // Already provisioned: nothing to enrol, and answering NO tells the
+      // daemon to stop asking rather than leaving it waiting on a prompt this
+      // device is never going to show.
+      if (!_token.isEmpty()) { notifyLine("E|NO"); return; }
+      _pairAsk = true;                  // the sketch draws the prompt and asks
+      return;
+    }
+    if (!strncmp(line, "E|", 2)) {
+      // A token -- accepted ONLY against a live approval a human just gave on
+      // the glass. "The device has no token" must never be permission by
+      // itself, or a freshly reset board belongs to whoever is in range first.
+      if (!_pairOk || !_token.isEmpty()) { notifyLine("E|NO"); return; }
+      _pairOk = false;                  // single use
+      _token = line + 2;                // live at once; the next C| will pass
+      _grantReady = true;               // ...and the sketch writes it to NVS
+      notifyLine("E|SET");
+      note("paired");
+      return;
+    }
     if (!strncmp(line, "C|", 2)) {
       if (_token.isEmpty()) {
         // Answer before hanging up. A silent disconnect makes the daemon log a
         // bad handshake, which is indistinguishable from a crashed device or a
         // dropped packet -- and this device knew the exact reason all along.
         notifyLine("A|NOTOKEN");
-        // Names the row that fixes it, for the same reason statusText() does:
-        // this is read off the glass of a board that may have no cable within
-        // reach. `T|<token>` over USB does the same job when there is one, and
-        // the daemon's own log says so from the other end.
-        note("no token - MENU > Set token");
+        // Names the shortest route, for the same reason statusText() does.
+        // The daemon's log says the same thing from the other end, and the
+        // cable does it with no instruction at all when there is one.
+        note("no token - claude-mate-connect");
         _pendingDisconnect = true;
         return;
       }
@@ -513,6 +589,11 @@ class MateBle {
   void reAdvertise() {
     _lineLen = 0;
     _rxHead = _rxTail = 0;
+    // An approval belongs to the connection it was given in. Carrying it across
+    // would mean pressing GO for one peer and handing the next one that turns
+    // up a token it never asked a human for.
+    _pairAsk = false;
+    _pairOk = false;
     go(ADVERTISING);
     startBurst();
   }
@@ -562,6 +643,11 @@ class MateBle {
   uint8_t       _out[200];            // one outbound line + its newline
   // Set on the BLE task, cleared in poll(). One flag, one writer each way.
   volatile bool _pendingDisconnect = false;
+  // Enrolment. _pairAsk is set on the BLE task and cleared by the sketch;
+  // _pairOk is set only by pairAnswer(), on the main loop. See handleAuthLine().
+  volatile bool _pairAsk = false;
+  volatile bool _pairOk = false;
+  volatile bool _grantReady = false;   // a token arrived; NVS has not seen it
   // What begin() was asked for, kept so poll() can retry without the caller.
   char          _name[24] = {0};
   bool          _wantUp = false;

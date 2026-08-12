@@ -252,6 +252,36 @@ the setup portal used to cause), so it gets a line of its own and a daemon
 message that says what to do about it. A daemon too old to recognise it reports
 a rejected token, which is still more use than silence.
 
+### 1d-bis. Enrolment (`E|`, BLE only) {#enrolment}
+
+The handshake above assumes both ends already share a token. Getting one *onto*
+a cordless device used to mean a cable it may be nowhere near, or a Wi-Fi access
+point and a phone — for a BLE board, over a link that is already connected and
+talking. `E|` is the verb that closes that gap.
+
+| Direction | Line | Meaning |
+|---|---|---|
+| daemon → device | `E\|?` | may I enrol you? |
+| device → daemon | `E\|OK` | a human pressed **GO** on the device |
+| device → daemon | `E\|NO` | declined, already provisioned, or nobody was there |
+| daemon → device | `E\|<token>` | the secret — **only ever after `E\|OK`** |
+| device → daemon | `E\|SET` | adopted; challenge me again |
+
+**The device asks its own human**, and that is the whole security argument. It
+puts `PAIR?` on its screen and waits up to 45 s for a button; the daemon's side
+is *armed*, never on, for three minutes at a time and disarmed by success or by
+a refusal. So being in radio range gets an attacker a prompt on a screen they
+cannot reach, and nothing else — and `E|<token>` is refused outright unless a
+button was pressed in that same connection, because "has no token yet" must
+never be permission by itself.
+
+**What it costs**, stated plainly: the token crosses the air once, in the clear,
+inside that window. The link is unencrypted by design (see the threat model
+above), so this introduces no plaintext that was not already there — but a
+sniffer listening at the second you press GO does learn the secret. Pair away
+from hostile radio, or use a cable, which the daemon provisions over
+automatically and with no window at all.
+
 ### 1e. Which pipe carries it
 
 Three, and the bytes above are identical on all of them. Nothing in the protocol

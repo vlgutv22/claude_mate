@@ -86,6 +86,12 @@ BLE_DEVICE_NAME = "Claude Mate"
 # makes a miss a coincidence rather than a coin flip.
 BLE_SCAN_S = 8.0
 BLE_AUTH_S = 5.0            # the firmware allows 5 s; so do we
+# Pairing waits on a person, not a radio. The device gives its human 45 s to
+# answer the prompt on its screen, so allow a little more than that before
+# giving up on them -- and keep the ARMED window short, because it is a standing
+# permission to give away a secret.
+BLE_PAIR_CONFIRM_S = 50.0
+BLE_PAIR_ARM_S = 180.0
 BLE_RETRY_S = 3.0           # between scan attempts...
 BLE_RETRY_MAX_S = 30.0      # ...doubling on consecutive failures, capped
 BLE_MAX_LINE = 512          # drop over-long lines (the longest real one is ~94B)
@@ -131,6 +137,10 @@ class BleLink:
         self._auth_q: "queue.Queue[str]" = queue.Queue()
         self._not_found_logged = 0.0   # throttle for _log_not_found
         self._write_fails = 0          # consecutive failed GATT writes
+        # Pairing is ARMED, never on. An unprovisioned device in range is not
+        # consent to hand it this daemon's secret -- somebody has to ask, at the
+        # terminal, and then press a button on the device. See _enrol().
+        self._pair_until = 0.0
 
     # ---- lifecycle --------------------------------------------------------- #
 
@@ -370,15 +380,19 @@ class BleLink:
             self._log("BLE: handshake timed out")
             return False
         if reply.strip().upper() == "A|NOTOKEN":
-            # The commonest wireless failure by far, because it is exactly what
-            # a cleared token looks like -- so it gets the message that says
-            # what to do rather than one that says a handshake failed.
-            # Both routes, because the cable is not always within reach of the
-            # device -- which is the whole point of this transport.
-            self._log("BLE: THE DEVICE HAS NO TOKEN. On the device: MENU -> "
-                      "SETTINGS -> Set token, then join the AP it shows and "
-                      "paste the token (leave Network as none). With a cable: "
-                      "send T|<token> over USB.")
+            # An unprovisioned device. If somebody armed pairing at the terminal
+            # in the last few minutes, this is the moment it was armed for.
+            if self._pair_armed():
+                if await self._enrol(client):
+                    return await self._handshake(client)   # now it has a token
+                return False
+            # Otherwise say what to do about it. Pairing FIRST, because it is
+            # the only route that needs neither a cable the device may be
+            # nowhere near nor a Wi-Fi access point and a phone.
+            self._log("BLE: THE DEVICE HAS NO TOKEN. Pair it: run "
+                      "`claude-mate-connect --pair` (or press `d` at the "
+                      "account picker) and press GO on the device. With a "
+                      "cable, plugging it in is enough.")
             await self._write(client, b"A|NO\n")
             return False
         if not reply.startswith("A|"):
@@ -394,9 +408,61 @@ class BleLink:
         await self._write(client, b"A|OK\n")
         return True
 
-    async def _await_auth_line(self) -> Optional[str]:
-        """The device's one handshake line, or None if it never came."""
-        deadline = time.monotonic() + BLE_AUTH_S
+    # ---- pairing ----------------------------------------------------------- #
+
+    def arm_pairing(self, seconds: float = BLE_PAIR_ARM_S) -> None:
+        """Allow the next unprovisioned device to be enrolled, for a while.
+
+        A window rather than a switch: whoever asked for this is standing at the
+        device right now, and an arming that outlived them would hand the token
+        to the next unprovisioned board that wandered into range.
+        """
+        self._pair_until = time.monotonic() + seconds
+
+    def _pair_armed(self) -> bool:
+        return time.monotonic() < self._pair_until
+
+    async def _enrol(self, client) -> bool:
+        """Give an unprovisioned device this daemon's token, if a human agrees.
+
+        The device is the one that asks the human -- it puts PAIR? on its own
+        screen and waits for a button. That is what makes this safe to expose to
+        the radio at all: being in range gets you a prompt on a screen you
+        cannot reach, and nothing else. See the E| protocol note in blelink.h.
+        """
+        self._log("BLE: pairing — press GO on the device to accept "
+                  f"(waiting up to {int(BLE_PAIR_CONFIRM_S)}s)")
+        await self._write(client, b"E|?\n")
+        reply = await self._await_auth_line(BLE_PAIR_CONFIRM_S)
+        if reply is None:
+            self._log("BLE: pairing timed out — nobody pressed GO")
+            self._pair_until = 0.0
+            return False
+        if reply.strip().upper() != "E|OK":
+            # A refusal is a decision, so it disarms. Re-asking a device whose
+            # owner just said no would be the wrong kind of persistent.
+            self._log(f"BLE: pairing declined by the device ({reply.strip()})")
+            self._pair_until = 0.0
+            return False
+        await self._write(client, b"E|" + self._token + b"\n")
+        confirm = await self._await_auth_line()
+        if confirm is None or confirm.strip().upper() != "E|SET":
+            self._log(f"BLE: the device did not take the token ({confirm!r})")
+            return False
+        # Disarm on SUCCESS as well: this window existed for one device, and it
+        # has been paired.
+        self._pair_until = 0.0
+        self._log("BLE: paired — the device now has this daemon's token")
+        return True
+
+    async def _await_auth_line(self, timeout: float = BLE_AUTH_S) -> Optional[str]:
+        """The device's one handshake line, or None if it never came.
+
+        The timeout is a parameter because pairing waits on a HUMAN pressing a
+        button, and five seconds is the right budget for a handshake and the
+        wrong one for a person noticing their device has lit up.
+        """
+        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
                 return self._auth_q.get_nowait()

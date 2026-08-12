@@ -305,6 +305,12 @@ static_assert(PAGE_ROWS_VIS >= 1, "the settings window needs at least one row");
 // way into wiping the token by accident. It disarms itself if you walk away.
 #define RESET_ARM_MS 6000UL
 static unsigned long resetArmedMs = 0;
+// A daemon has asked to enrol this device (BLE E|?); the glass is showing the
+// question and the buttons are answering it. 0 = nothing pending. Times out on
+// its own, because a prompt left standing on a device nobody is near would be a
+// standing offer to whoever walks past next.
+static unsigned long pairAskedMs = 0;
+#define PAIR_ASK_MS 45000UL
 
 // A flip only takes effect through the panel's rotation, which is applied once
 // at begin(). Rather than re-initialising a live display -- the one failure mode
@@ -931,6 +937,42 @@ static void drawFrame() {
 
 // Firmware-local: nothing heard for LINK_WATCHDOG_MS. An honest state instead
 // of a silently stale frame.
+// "The Mac is asking to pair with me." The one screen on this device that is a
+// QUESTION rather than a report, so it says who is asking, what saying yes
+// means, and which button does which -- there is no undo behind it.
+// Answer the pending question and take the prompt down. One place, because the
+// three ways to answer -- GO, any other button, and the timeout -- must leave
+// exactly the same state behind.
+static void answerPairing(bool yes) {
+  if (!pairAskedMs) return;
+  pairAskedMs = 0;
+  ble.pairAnswer(yes);
+  requestRender();
+}
+
+static void drawPairAsk() {
+  gfx->setTextSize(2);
+  gfx->setTextColor(C_WAIT);
+  gfx->setCursor(PAD_X, 40);
+  gfx->print("PAIR?");
+  gfx->setTextSize(1);
+  gfx->setTextColor(C_TEXT);
+  gfx->setCursor(PAD_X, 76);
+  gfx->print("a daemon on your Mac wants to");
+  gfx->setCursor(PAD_X, 92);
+  gfx->print("give this device its token");
+  gfx->setTextColor(C_DIM);
+  gfx->setCursor(PAD_X, 116);
+  gfx->print("GO = yes    any other = no");
+  gfx->setCursor(PAD_X, 132);
+  // The countdown is the honest part: this offer is not standing.
+  unsigned long left = (millis() - pairAskedMs) < PAIR_ASK_MS
+                           ? (PAIR_ASK_MS - (millis() - pairAskedMs)) / 1000
+                           : 0;
+  gfx->printf("expires in %lus", left);
+  drawFooter(C_WAIT);
+}
+
 static void drawLinkLost() {
   gfx->setTextSize(3);
   gfx->setTextColor(C_BAD);
@@ -950,11 +992,11 @@ static void drawLinkLost() {
   // factory-reset board is in, so it is the state this screen has to handle
   // best -- it is the first thing anyone sees on a fresh device.
   //
-  // And it names a row on THIS device, not a cable. A board that has just been
-  // factory reset is very often a board sitting on its cell across the room;
-  // "send T|<token> over USB" is then not an instruction but a dead end, which
-  // is exactly how it was found.
-  gfx->print(!net.hasToken()        ? "no token: MENU > Set token"
+  // And it names the one command that fixes it from the Mac, which is the
+  // shortest route from here: run it, then press GO on this device. A cable is
+  // a dead end on a board sitting on its cell across the room, and the local
+  // menu row is the long way -- an access point, a phone, a typed secret.
+  gfx->print(!net.hasToken()        ? "no token: claude-mate-connect"
              : transport == LINK_BLE ? "check it is running with --ble"
              : net.configured()      ? "check it is running with --tcp"
                                      : "hold BOOT at power-on to set up wifi");
@@ -1462,6 +1504,14 @@ static void render() {
   // portal can start from paths that do not go through the menu at all.
   if (net.state() == MateNet::SETUP) {
     drawSetup();
+  } else if (pairAskedMs) {
+    // Second only to the portal, and above everything else including the game:
+    // it is on screen because somebody asked for it seconds ago, it expires,
+    // and it cannot be answered from any other screen. It does NOT outrank the
+    // portal, whose AP password exists nowhere but the glass -- covering that
+    // would strand someone mid-setup to ask them a question the daemon will
+    // happily ask again.
+    drawPairAsk();
   } else if (uiMode == UI_ACTIONS) {
     drawActions();
   } else if (uiMode == UI_ACCOUNTS) {
@@ -2113,6 +2163,18 @@ static void notePoke();
 static void onButton(char ev) {
   if (!screenOn) { wakeScreen(); return; }
   notePoke();
+  // A PAIRING REQUEST TAKES THE BUTTONS, wherever you were. It is a question
+  // only the person holding the device can answer, it is on screen because
+  // somebody at the Mac just asked for it, and it expires on its own -- so
+  // swallowing one press of GO or NEXT costs nothing and leaving the prompt
+  // answerable only from one screen would be a trap.
+  if (pairAskedMs) {
+    if (ev == 'G' || ev == 'K') answerPairing(true);
+    else if (ev == 'N' || ev == 'P' || ev == 'B') answerPairing(false);
+    blipUntil = millis() + BLIP_MS;
+    requestRender();
+    return;
+  }
   if (uiMode == UI_CONDUCTOR) { emitBtn(ev); return; }
   menuButton(ev);
   blipUntil = millis() + BLIP_MS;
@@ -2927,6 +2989,33 @@ void loop() {
   if (resetArmedMs && (now - resetArmedMs) >= RESET_ARM_MS) {
     resetArmedMs = 0;
     requestRender();
+  }
+
+  // ---- pairing ------------------------------------------------------------
+  // A daemon asked to enrol us. Raise the question on the glass; the buttons
+  // answer it (see onButton) and it expires on its own, because an offer left
+  // standing on a device nobody is near is an offer to whoever passes next.
+  if (ble.pairRequested() && !pairAskedMs) {
+    unsigned long t = millis();
+    pairAskedMs = t ? t : 1UL;      // 0 is the sentinel; never stamp it
+    wakeScreen();                   // a question nobody can see is a no
+    requestRender();
+  }
+  if (pairAskedMs) {
+    if ((now - pairAskedMs) >= PAIR_ASK_MS) answerPairing(false);
+    else requestRender();           // the countdown ticks
+  }
+  // The token the daemon granted after we said yes. The BLE stack took it live
+  // already -- that is what let the handshake straight after it succeed -- so
+  // this is only the durable half. Doing it here rather than on the BLE task
+  // keeps every NVS write on the main loop, where the rest of them are.
+  {
+    String granted;
+    if (ble.takeGrantedToken(granted)) {
+      net.setToken(granted);
+      Serial.println("paired: token stored");
+      requestRender();
+    }
   }
 
   // A freshly authenticated link needs the same kick a Nano's reset gives: H

@@ -25,6 +25,7 @@ not connect it to the daemon in any case. (The GAMEPAD mode is a real HID
 device and does appear -- that is a different role of the same board.)
 
   claude-mate-connect            # report every link and what to do next
+  claude-mate-connect --pair     # enrol an unprovisioned device over BLE
   claude-mate-connect --token    # print the shared token, for typing into the
                                  # device's portal from a phone
 """
@@ -104,6 +105,69 @@ def ble_state(lines):
     return "unknown", ""
 
 
+def arm_pairing():
+    """Ask the daemon to enrol the next unprovisioned device it connects to.
+
+    Through the daemon rather than from here, because the daemon owns the radio:
+    a second CoreBluetooth scanner on the same Mac fights the first, and the
+    connection this needs is one the daemon already has open.
+    """
+    import socket
+    # Same default as the daemon's DEFAULT_SOCK, and the same env var, so the
+    # two cannot drift into looking for each other in different places.
+    path = os.environ.get("CLAUDE_MATE_SOCK", "/tmp/claude-mate.sock")
+    try:
+        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        c.settimeout(5)
+        c.connect(path)
+        c.send(b"pair\n")
+        c.close()
+        return True, path
+    except OSError as e:
+        return False, f"{path}: {e}"
+
+
+def pair():
+    """Drive an enrolment and report what happened, by watching the log."""
+    if daemon_pid() is None:
+        print(f"{RED}The daemon is not running.{OFF}  launchctl bootstrap "
+              f"gui/{os.getuid()} {PLIST}")
+        return 1
+    where = len(tail(2000))          # only judge lines written from here on
+    ok, detail = arm_pairing()
+    if not ok:
+        print(f"{RED}Could not reach the daemon's socket.{OFF}  {detail}")
+        return 1
+
+    print(f"\n{BOLD}Look at the device: it is asking whether to pair.{OFF}")
+    print(f"  {DIM}press GO to accept — any other button, or 45s, declines{OFF}\n")
+
+    # Poll the log rather than the device: the daemon is the only thing holding
+    # a connection to it, so the daemon's account is the only one there is.
+    deadline = time.time() + 75
+    while time.time() < deadline:
+        for ln in tail(2000)[where:]:
+            if "paired — the device now has" in ln:
+                print(f"{GREEN}Paired.{OFF} The device has the token and is "
+                      "linking now.")
+                return 0
+            if "pairing timed out" in ln:
+                print(f"{RED}Nobody pressed GO{OFF} — the device declined by "
+                      "timing out. Run this again when you are next to it.")
+                return 1
+            if "pairing declined" in ln:
+                print(f"{RED}Declined on the device.{OFF}")
+                return 1
+            if "did not take the token" in ln:
+                print(f"{RED}The device refused the token.{OFF} {DIM}{ln.strip()}{OFF}")
+                return 1
+        time.sleep(0.5)
+    print(f"{YELLOW}No answer within 75s.{OFF} If the device never lit up, it "
+          "may be out of range\nor already provisioned — run "
+          "`claude-mate-connect` to see where it stands.")
+    return 1
+
+
 def say(ok, label, detail=""):
     mark = f"{GREEN}ok{OFF}" if ok is True else (
         f"{RED}no{OFF}" if ok is False else f"{YELLOW}??{OFF}")
@@ -111,6 +175,8 @@ def say(ok, label, detail=""):
 
 
 def main():
+    if "--pair" in sys.argv[1:]:
+        return pair()
     if "--token" in sys.argv[1:]:
         tok = read_token()
         if not tok:
@@ -165,16 +231,30 @@ def main():
         print("\nThen give it a few seconds and run this again.")
         return 0
 
-    print(f"{BOLD}No cable, so the device has to be told its token from its own "
-          f"screen.{OFF}\n")
-    print("  On the device   double-tap the 4th button → SETTINGS → Set token")
-    print("                  (it is the first row; it reads 'none' when unset)")
-    print("  On your phone   join the AP shown on the glass, open "
-          "http://192.168.4.1")
-    print("                  paste the token, leave Network as (none), Save")
-    if token:
-        print(f"\n  the token       {BOLD}{token}{OFF}")
-    print("\nThe board returns to BLE on its own and links within a few seconds.")
+    # No cable. PAIRING is the answer here, and it is offered rather than
+    # explained: the fallback below involves an access point, a phone and
+    # transcribing a secret, and nobody should be sent down that road first.
+    if state == "notoken":
+        print(f"{BOLD}It needs pairing.{OFF} That is one button on the device — "
+              "no cable, no Wi-Fi,\nno typing.\n")
+        try:
+            ans = input("  pair it now? [Y/n] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 1
+        if ans in ("", "y", "yes"):
+            return pair()
+        print("\nOr, the long way round: SETTINGS → Set token on the device "
+              "raises an access\npoint; join it from a phone, open "
+              "http://192.168.4.1, paste the token below,\nand leave Network "
+              "as (none).")
+        if token:
+            print(f"\n  the token       {BOLD}{token}{OFF}")
+        return 0
+
+    print(f"{BOLD}Plug it in, or pair it.{OFF}\n")
+    print("  claude-mate-connect --pair    then press GO on the device")
+    print("  (or plug in the cable — the daemon provisions it on its own)")
     return 0
 
 

@@ -631,12 +631,21 @@ MCP config. With no profile dirs, nothing changes.
 
 **Device will not connect?** — press `d` at the account picker, or run
 `claude-mate-connect`. It reports every link — daemon, token, cable, BLE — and
-prints the shortest fix for whichever one is down. It usually has nothing to do:
-**the daemon hands its token to any device that appears on the USB cable**, so a
-board that has just been factory reset links itself a few seconds after being
-plugged in, with nobody typing anything. The command matters for the case that
-cannot be automated — a cordless board out of reach of any cable, which has to
-be told its token through the setup portal it raises on its own.
+prints the shortest fix for whichever one is down.
+
+With a cable it has nothing to do: **the daemon hands its token to any device
+that appears on USB**, so a board that has just been factory reset links itself
+a few seconds after being plugged in, with nobody typing anything. Cordless,
+**pair it over BLE** — one command and one button:
+
+```sh
+claude-mate-connect --pair     # the device shows PAIR? — press GO on it
+```
+
+The device is the one that asks its human, which is what makes it safe to expose
+to the radio: being in range gets you a prompt on a screen you cannot reach, and
+nothing else. The token is sent only after the button, and once — see
+[`docs/PROTOCOL.md`](docs/PROTOCOL.md#enrolment).
 
 > **It will never appear in System Settings → Bluetooth**, and that is correct,
 > not a fault. The status link is an unpaired GATT peripheral advertising in

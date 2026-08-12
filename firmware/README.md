@@ -154,21 +154,26 @@ If automatic entry fails, the script falls back to prompting for a manual
 ### First boot and provisioning
 
 An unprovisioned board comes up **on BLE**, advertising as `Claude Mate` with no
-token, and says so on the glass: `no token: MENU > Set token`.
+token, and says so on the glass: `no token: claude-mate-connect`.
 
-**Usually you do nothing.** With the daemon running, plugging the board into USB
-is enough: it hands its token to whatever appears on the cable, so a
-factory-reset board provisions itself and links a few seconds later. Run
-`claude-mate-connect` (or press `d` at the account picker) to watch that happen,
-or to be told which link is down if it does not.
+**With a cable, you do nothing.** The daemon hands its token to whatever appears
+on the USB port, so a factory-reset board provisions itself and links a few
+seconds after being plugged in.
 
-The two manual routes, for a board that is nowhere near a cable:
+**Without one, pair it — one command and one button:**
 
-- **On the device, no cable needed** — double-tap the 4th button → **SETTINGS →
-  Set token** (it is the first row). The glass shows an AP name and password;
-  join it from a phone, open `http://192.168.4.1`, paste the token and leave
-  **Network** as *none*.
-- **Over the cable you just flashed with** — `T|<token>`.
+```sh
+claude-mate-connect --pair      # or press `d` at the account picker
+```
+
+The device puts **PAIR?** on its screen; press **GO** on the device and it is
+done. No access point, no phone, no secret typed by hand. The `E|` exchange
+behind it is described under [BLE as the link itself](#ble-as-the-link-itself).
+
+The long way round is still there for a board with no working BLE: **SETTINGS →
+Set token** raises an access point (name and password on the glass), which you
+join from a phone at `http://192.168.4.1` — paste the token, leave **Network**
+as *none*. Or `T|<token>` down the cable.
 
 **That default is a bootstrap fix, not a preference.** A board with empty NVS
 used to default to Wi-Fi, which meant the setup portal — and the portal outranks

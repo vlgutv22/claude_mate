@@ -1965,6 +1965,10 @@ class SocketServer(threading.Thread):
         self._reg = registry
         self._on_update = on_update
         self._on_haptic = on_haptic   # called with a LED kind on session events
+        # Set by main() when there is something to command. See _process_line:
+        # this socket carries session updates, and now the one control that has
+        # to come from a terminal rather than from a hook.
+        self.on_pair_request = None
         self._stop_evt = threading.Event()  # NOT `_stop`: Thread.join() calls its own _stop()
         self._srv: Optional[socket.socket] = None
 
@@ -2033,6 +2037,22 @@ class SocketServer(threading.Thread):
         except Exception:
             return
         if not line:
+            return
+        # A COMMAND, not a session update. `pair` arms BLE enrolment for a few
+        # minutes: the daemon owns the radio, so a separate process cannot do
+        # this itself, and this socket is the one channel that already exists
+        # between a terminal and the daemon. It is deliberately the ONLY command
+        # here -- a hook can write to this socket, so anything that arrives on it
+        # must be something a hook doing it by accident could not hurt, and the
+        # worst an unwanted arming does is put a prompt on the device's screen
+        # that nobody presses.
+        if line == "pair":
+            if self.on_pair_request:
+                self.on_pair_request()
+                log("pairing armed from the terminal")
+            else:
+                log("pairing requested, but BLE is not running "
+                    "(start the daemon with --ble)")
             return
         # Expected: "<state>|<session_id>|<name>|<ctrl_sock?>|<model?>|<effort?>
         # |<account?>|<limit?>". The hook path sends only the first three
@@ -3013,6 +3033,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     screen.on_handshake_extra = _on_handshake
 
     socket_server = SocketServer(args.sock, registry, on_update, on_haptic)
+    # `pair` over the socket reaches the radio. Left unset when BLE is not
+    # running, so the command answers "BLE is not running" rather than silently
+    # doing nothing -- the failure a terminal cannot otherwise see.
+    if ble is not None:
+        socket_server.on_pair_request = ble.arm_pairing
     button_reader = ButtonReader(link, screen)
     button_reader.on_ack = on_ack
     button_reader.bridge = web

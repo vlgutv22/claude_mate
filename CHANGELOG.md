@@ -12,6 +12,30 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
+### 2026-08-12 — Pairing: one command, one button, no Wi-Fi anywhere
+
+- **Added: `E|`, an enrolment handshake over BLE, and `claude-mate-connect
+  --pair`.** Provisioning a cordless board meant a cable it was nowhere near, or
+  a Wi-Fi access point, a phone and a 32-character secret typed by hand — over a
+  BLE link that was *already connected and talking to the daemon*. Now: run the
+  command (or press `d` at the account picker), the device puts **PAIR?** on its
+  screen, press **GO**, done.
+- **The device is the one that asks its human**, which is the whole security
+  argument. Being in radio range gets an attacker a prompt on a screen they
+  cannot reach and nothing else; `E|<token>` is refused outright unless a button
+  was pressed in that same connection, because *"has no token yet"* must never
+  be permission by itself. Approval is single-use and dies with the connection,
+  the daemon's side is **armed for three minutes** rather than on, and a refusal
+  disarms it so a declined device is not asked again on a loop. The cost is
+  stated in `docs/PROTOCOL.md` rather than glossed: the token crosses the air
+  once, in the clear, inside that window — the link is already unencrypted by
+  design, but a sniffer listening at that second learns it.
+- **Changed: every "no token" message names that route.** Two screens and the
+  daemon's log had been pointing at the Wi-Fi portal, which is the long way
+  round, and before that at a cable a cordless board may not have. They now all
+  say `claude-mate-connect`, pinned together by a test — they had already
+  drifted twice.
+
 ### 2026-08-12 — The cable provisions the radio, and the picker can say why it did not
 
 - **Added: the daemon hands its token to any device that appears on USB.** *"How

@@ -157,6 +157,7 @@ class FakeClient:
     """
     token = TOKEN
     mode = "normal"            # or "notoken"
+    pair_answer = "ok"         # "ok" | "no" | "silent" (nobody pressed anything)
     written = []               # every line the daemon sent us
     instances = []
 
@@ -193,6 +194,20 @@ class FakeClient:
             if not raw:
                 continue
             FakeClient.written.append(raw)
+            # Enrolment. The real device puts PAIR? on its screen here and waits
+            # for a thumb; `pair_answer` stands in for what the thumb did, with
+            # "silent" for the case that matters most -- nobody was there.
+            if raw == "E|?":
+                if FakeClient.pair_answer == "ok":
+                    self.notify("E|OK")
+                elif FakeClient.pair_answer == "no":
+                    self.notify("E|NO")
+                continue
+            if raw.startswith("E|"):
+                FakeClient.token = raw[2:]      # adopted, exactly as the board
+                FakeClient.mode = "normal"      # does: live, before NVS
+                self.notify("E|SET")
+                continue
             if raw.startswith("C|"):
                 if FakeClient.mode == "notoken":
                     self.notify("A|NOTOKEN")
@@ -340,6 +355,89 @@ try:
           not link.has_clients() and not FakeClient.written)
 finally:
     link.stop()
+
+# --------------------------------------------------------------------------- #
+print("\n== pairing: a token crosses the air only when a human says so ==")
+# The point of the whole exchange is that being in radio range buys you nothing.
+# An unprovisioned device is not consent, and the daemon must not hand out the
+# secret because it found something willing to take one.
+blelink.BLE_PAIR_CONFIRM_S = 0.6      # the tests are not waiting on a human
+
+
+def pairing_phase(answer):
+    """A fresh unprovisioned device, advertising OUR service.
+
+    install_fake_bleak also clears `written`, which each phase below reads as
+    'everything this daemon said to this device' -- and it puts the advertised
+    UUID back, which the foreign-service test above deliberately left wrong.
+    """
+    install_fake_bleak(py_const("BLE_SVC_UUID"))
+    FakeClient.mode = "notoken"
+    FakeClient.token = "not-the-daemons-token"
+    FakeClient.pair_answer = answer
+    return new_link()
+
+
+link, rx, logs = pairing_phase("ok")
+try:
+    link.start()                      # NOT armed
+    time.sleep(1.2)
+    check("an unprovisioned device is NOT enrolled just for being there",
+          not any(l.startswith("E|") for l in FakeClient.written))
+    check("...and the log says how to pair it rather than nothing",
+          any("--pair" in l for l in logs))
+finally:
+    link.stop()
+
+link, rx, logs = pairing_phase("silent")
+try:
+    link.arm_pairing(30)
+    link.start()
+    time.sleep(2.0)
+    check("arming asks the device first, and asks with E|?",
+          "E|?" in FakeClient.written)
+    check("...and nobody pressing anything sends NO token at all",
+          not any(l.startswith("E|") and l != "E|?" for l in FakeClient.written))
+    check("...which is reported as the timeout it is",
+          any("nobody pressed" in l or "timed out" in l for l in logs))
+finally:
+    link.stop()
+
+link, rx, logs = pairing_phase("no")
+try:
+    link.arm_pairing(30)
+    link.start()
+    time.sleep(1.5)
+    check("a device that DECLINES is not sent the token either",
+          not any(l.startswith("E|") and l != "E|?" for l in FakeClient.written))
+    check("...and one refusal disarms, so it is not asked again on a loop",
+          not link._pair_armed())
+finally:
+    link.stop()
+
+# And the happy path, which has to end LINKED without anyone touching a cable.
+link, rx, logs = pairing_phase("ok")
+try:
+    link.arm_pairing(30)
+    link.start()
+    ok = wait_for(lambda: link.has_clients(), 8.0)
+    check("a device whose human presses GO is enrolled and ends up LINKED",
+          bool(ok))
+    check("...having been sent the daemon's real token, once",
+          [l for l in FakeClient.written if l.startswith("E|") and l != "E|?"]
+          == [f"E|{TOKEN}"])
+    check("...and it authenticated with it afterwards, so the token took",
+          FakeClient.token == TOKEN)
+    check("...and pairing disarmed itself, rather than staying open",
+          not link._pair_armed())
+    check("...and the handshake lines never leaked to the daemon as verbs",
+          rx.empty() or all(not l.startswith(("E|", "A|", "C|"))
+                            for l in list(rx.queue)))
+finally:
+    link.stop()
+FakeClient.pair_answer = "ok"
+FakeClient.token = TOKEN
+FakeClient.mode = "normal"
 
 # --------------------------------------------------------------------------- #
 print("\n== bleak missing costs the BLE link and nothing else ==")
@@ -539,17 +637,66 @@ check("...and so does the NO LINK screen",
 # Matched against the note() STRING, not the file: the comments around these
 # lines quote the wording they replaced, and a check that reads comments would
 # pass or fail on prose.
-check("...and the NOTOKEN answer names the row, not a cable that may be in "
-      "another room",
-      re.search(r'note\("no token - MENU > Set token"\)', fw_ble)
-      and not re.search(r'note\("[^"]*setup portal', fw_ble))
+check("...and the NOTOKEN answer names neither a cable nor a portal, which a "
+      "cordless board may have neither of",
+      not re.search(r'note\("[^"]*setup portal', fw_ble)
+      and not re.search(r'note\("[^"]*over USB', fw_ble))
 # The three no-token strings a person can actually see, all pointing at the same
 # place. They drifted once already -- the glass said "over USB" while the only
 # on-glass route had been deleted -- so they are pinned together.
-check("...and all three of them send you to the same row",
-      re.search(r'\? "no token: MENU > Set token"', fw_ble)
-      and re.search(r'\? "no token: MENU > Set token"', ino)
-      and "Set token" in read(os.path.join(DAEMON_DIR, "blelink.py")))
+# --------------------------------------------------------------------------- #
+# The other half of the pairing contract, which lives in C++ and cannot be
+# driven from here. The daemon's side is exercised above against a fake device;
+# these check the real device would answer it the same way.
+print("\n== the firmware's half of the pairing handshake ==")
+
+check("the device answers E|? rather than ignoring it",
+      re.search(r'if \(!strcmp\(line, "E\|\?"\)\)', fw_ble))
+check("...refuses to be re-enrolled once it HAS a token",
+      re.search(r'if \(!_token\.isEmpty\(\)\) \{ notifyLine\("E\|NO"\); return; \}',
+                fw_ble))
+# The one that matters: without it, "no token yet" is itself permission and a
+# freshly reset board belongs to whoever is in radio range first.
+check("...and takes a token ONLY against an approval a human just gave",
+      re.search(r'if \(!_pairOk \|\| !_token\.isEmpty\(\)\) \{ notifyLine\("E\|NO"\)',
+                fw_ble))
+# Every other assignment in the file clears it; exactly one grants it, and that
+# one is the human's answer. Written as "count the grants" rather than "count the
+# assignments" so that adding another place that CLEARS approval -- which is
+# always safe -- does not fail a test about who may give it.
+# Counting the GRANTS, not the assignments: adding another place that clears
+# approval is always safe, and a negative lookahead here would be defeated by
+# backtracking over the whitespace anyway (`\s*` can match nothing, and " false"
+# does not start with "false").
+check("...where that approval is granted in exactly one place, pairAnswer()",
+      [v for v in re.findall(r"_pairOk\s*=\s*(\w+)", fw_ble) if v != "false"]
+      == ["yes"]
+      and re.search(r"void pairAnswer\(bool yes\) \{\s*\n\s*_pairAsk = false;"
+                    r"\s*\n\s*_pairOk = yes;", fw_ble))
+check("...is single-use", re.search(r"_pairOk = false;\s+// single use", fw_ble))
+check("...and does not survive the connection it was given in",
+      re.search(r"void reAdvertise\(\) \{.*?_pairOk = false;", fw_ble, re.S))
+check("the sketch puts the question on the glass",
+      "drawPairAsk()" in ino and "PAIR?" in ino)
+check("...answers it with a button, GO for yes",
+      re.search(r"if \(ev == 'G' \|\| ev == 'K'\) answerPairing\(true\);", ino))
+check("...and lets it expire rather than standing open",
+      re.search(r"if \(\(now - pairAskedMs\) >= PAIR_ASK_MS\) answerPairing\(false\);",
+                ino))
+check("a granted token reaches NVS, not just the live stack",
+      re.search(r"ble\.takeGrantedToken\(granted\)\) \{\s*\n\s*net\.setToken\(granted\);",
+                ino))
+
+print("\n== the no-token guidance still agrees with itself ==")
+# These have drifted twice: once when the glass said "over USB" after the only
+# on-glass route had been deleted, and once when the daemon learned to pair while
+# both screens went on naming the long way round. Pinned together since.
+check("every no-token message names the same route",
+      re.search(r'\? "no token: claude-mate-connect"', fw_ble)
+      and re.search(r'\? "no token: claude-mate-connect"', ino)
+      and re.search(r'note\("no token - claude-mate-connect"\)', fw_ble)
+      and "claude-mate-connect --pair" in read(
+          os.path.join(DAEMON_DIR, "blelink.py")))
 
 print(f"\n{checks - len(failures)}/{checks} checks passed")
 if failures:
