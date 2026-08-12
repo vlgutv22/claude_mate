@@ -1637,7 +1637,13 @@ static void restartWithNotice(const char *title, const char *detail) {
 }
 
 static void setTransport(MateTransport t) {
-  if (t == transport) return;
+  // NO EARLY RETURN ON "no change". Commit 1cb2855 claimed to have removed one
+  // and did not, so `I|BLE` -- which three places document as the way to revive
+  // a BLE stack that is down -- stored nothing, rebooted nothing, and printed
+  // success. A stack that has been shut down cannot come back in the same boot,
+  // and ble.stuck() cannot fire for it either, because shutdown() clears the
+  // very flag stuck() tests. The reboot IS the repair, and storing a value the
+  // device already holds is idempotent.
   MateNet::storeTransport(t);
   restartWithNotice("SWITCHING LINK", MateNet::transportName(t));
 }
@@ -1700,6 +1706,17 @@ static void leavePad() {
     // keeping is in NVS, including the now-off pad switch written just above,
     // so the device comes back as a conductor on BLE, which is exactly what
     // turning the gamepad off asked for.
+    // THE SWITCH GOES OFF BEFORE ANYTHING THAT MIGHT NOT RETURN, and the order
+    // is the whole fix. This write used to sit BELOW the branch, and
+    // restartWithNotice() ends in ESP.restart() -- so on BLE the 2 s hold that
+    // means "leave the gamepad" rebooted with pad=true still in NVS and setup()
+    // put the device straight back into the pad. There is no way out of that
+    // from the glass: UI_PAD routes all four buttons to the pad poller, the menu
+    // is unreachable from the pad face, and the Mac's G|0 is gated on the very
+    // switch that is still on. The comment above already claimed the write had
+    // happened; now it has. setPad() writes NVS eagerly, so it is durable before
+    // the reboot rather than after it.
+    cfg.setPad(false);
     if (transport == LINK_BLE) {
       padVia = PAD_LINK;                   // so the reboot notice is not drawn
       restartWithNotice("GAMEPAD OFF", nullptr);   // over the pad face
@@ -1707,12 +1724,6 @@ static void leavePad() {
     // On Wi-Fi the two stacks are genuinely separate, so it is just a restart,
     // and only if the radio policy had actually parked it.
     if (padWifiParked) linkStart();
-    // The switch and the world must agree. Leaving by the 2 s hold is a real
-    // "turn this off" -- the same gesture as the settings row, made from the
-    // pad face -- and a device that came back from a reboot as a gamepad you
-    // had already left would be the exact failure setPad() writes eagerly to
-    // avoid.
-    cfg.setPad(false);
   }
   padVia    = PAD_LINK;
   padWifiParked = false;

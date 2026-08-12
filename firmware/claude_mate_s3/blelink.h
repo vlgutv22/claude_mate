@@ -544,7 +544,16 @@ class MateBle {
       // A token -- accepted ONLY against a live approval a human just gave on
       // the glass. "The device has no token" must never be permission by
       // itself, or a freshly reset board belongs to whoever is in range first.
-      if (!_pairOk || !_token.isEmpty()) { notifyLine("E|NO"); return; }
+      // An EMPTY payload is not a token. Without the length check a bare `E|`
+      // spent the single-use approval, stored "" as the live token, and reported
+      // E|SET and "paired" -- both ends calling it a success while the next C|
+      // answers A|NOTOKEN. Worse on one real path: the portal can set a token in
+      // NVS while this stack still holds none, and a bare `E|` then wiped the
+      // token that had just been typed.
+      if (!_pairOk || !_token.isEmpty() || line[2] == 0) {
+        notifyLine("E|NO");
+        return;
+      }
       _pairOk = false;                  // single use
       _token = line + 2;                // live at once; the next C| will pass
       _grantReady = true;               // ...and the sketch writes it to NVS

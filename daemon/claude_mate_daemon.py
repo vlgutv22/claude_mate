@@ -548,6 +548,7 @@ class SerialLink:
         self._ser: Optional[serial.Serial] = None
         self._lock = threading.Lock()  # guards writes + (re)connect
         self._provision_token: Optional[str] = None
+        self._pending_provision = False   # armed on open, spent on the first K/H
 
     def set_provision_token(self, token: Optional[str]) -> None:
         """The secret to hand a device that arrives on the cable. See _provision().
@@ -604,15 +605,44 @@ class SerialLink:
                 log(f"serial opened on {port} @ {self._baud} 8N1")
                 # Opening the port resets the Nano (~1.5s); it will emit H when
                 # ready, prompting a full state resend. We do not block here.
-                self._provision_locked()
+                #
+                # The token is NOT sent yet -- see provision_if_ours(). A `P`
+                # asks whoever is on this port to identify itself; a Claude Mate
+                # answers `K` (or `H` on boot), and only then does a secret go
+                # down the wire.
+                self._pending_provision = True
+                self._write_locked("P")
                 return True
             except (serial.SerialException, OSError) as exc:
                 log(f"serial open failed on {port}: {exc}")
                 self._close_locked()
                 return False
 
+    def provision_if_ours(self) -> None:
+        """The device answered the protocol, so it is safe to give it the token.
+
+        Called by the reader when a `K` or `H` arrives. THE HANDSHAKE IS THE
+        POINT: autodetect() takes the first match of a glob, and PORT_GLOBS tries
+        `/dev/cu.usbserial*` BEFORE the `/dev/cu.usbmodem*` the S3 actually
+        enumerates as -- so any FTDI or CH340 dongle on the desk outranked the
+        real device and was handed the shared secret, on every reconnect. It
+        cannot answer `K`, so it no longer gets one.
+        """
+        with self._lock:
+            if not self._pending_provision:
+                return
+            self._pending_provision = False
+            self._provision_locked()
+
+    def _write_locked(self, line: str) -> None:
+        """Write with the lock already held. Failures are the caller's problem."""
+        try:
+            self._ser.write((line + "\n").encode("ascii", errors="replace"))
+        except (serial.SerialException, OSError):
+            pass
+
     def _provision_locked(self) -> None:
-        """Give the device on the cable this daemon's token, every time we open.
+        """Give the device on the cable this daemon's token, once per open.
 
         THE CABLE IS THE ANSWER TO "how do I connect it after a factory reset",
         and it should not involve the human at all. A wiped board comes up on
@@ -1071,6 +1101,16 @@ class LinkHub:
     # the maintainer: with a wireless device connected they return True while
     # the serial port is shut, so a Nano that drops -- or is plugged in later --
     # would never be reopened and would sit on NO LINK forever.
+    def provision_if_ours(self) -> None:
+        """Forward to the serial link. See SerialLink.provision_if_ours().
+
+        The ButtonReader holds whatever `link` main() built -- this hub whenever
+        a radio is enabled -- so a serial-only method that is not forwarded here
+        is simply never called, silently. That is what happened: the token push
+        waited for a `K` that reached a hub with no way to pass it on.
+        """
+        self._serial.provision_if_ours()
+
     def serial_is_open(self) -> bool:
         return self._serial.is_open()
 
@@ -2030,7 +2070,17 @@ class SocketServer(threading.Thread):
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             srv.bind(self._sock_path)
-            os.chmod(self._sock_path, 0o666)  # let hooks (any user session) write
+            # 0600, NOT 0666. Hooks run in the user's own shells -- same uid --
+            # so owner-only has always been enough for them, and 0666 was
+            # over-permission that cost nothing while this socket only carried
+            # session updates. It stopped being free the moment it grew commands:
+            # at 0666, ANY local account could `press|C` to type into the user's
+            # live Claude session, `press|A0` to SIGTERM it, `pair` to arm an
+            # over-the-air handout of the shared token, or `queue` to read every
+            # session's working directory. The PTY wrapper's own control socket is
+            # 0600 for exactly that reason, and this one was quietly undoing it by
+            # proxy -- the daemon runs as the user and holds that 0600 socket.
+            os.chmod(self._sock_path, 0o600)
             srv.listen(16)
             srv.settimeout(0.5)
         except OSError as exc:
@@ -2123,12 +2173,17 @@ class SocketServer(threading.Thread):
         # `B|G` off the wire, so the CLI cannot drift into a second, subtly
         # different implementation of GO.
         #
-        # NOTHING DESTRUCTIVE LIVES HERE. This socket is chmod 0666 so that
-        # hooks running in any of the user's shells can post updates, which
-        # means every local process can write to it. Reading state and pressing
-        # buttons are things a stray write can at worst make untidy; deleting an
-        # account is not, so that stays in the CLI's own process, under the
-        # user's own uid, and the daemon is only asked to re-read afterwards.
+        # WHAT MAY LIVE HERE. These verbs can type into the user's session
+        # (`press|C`), stop it (`press|A<n>`), hand this daemon's token to a
+        # peripheral over the air (`pair`), and read every session's working
+        # directory (`queue`). That is not a surface to expose to every local
+        # process, which is what the socket's old 0666 mode did -- it is 0600
+        # now (see run()), so this is the user talking to their own daemon.
+        #
+        # Even so, DELETION IS NOT HERE. A hook in any of the user's shells can
+        # write to this socket, and a hook firing a malformed line should not be
+        # able to remove a login. `accounts rm` therefore deletes in the CLI's
+        # own process and only asks the daemon to re-read afterwards.
         if line == "queue":
             return self._json(self.queue_snapshot())
         if line == "accounts":
@@ -2316,6 +2371,13 @@ class ButtonReader(threading.Thread):
 
     def _dispatch(self, line: str) -> None:
         # Tolerate garbled / partial lines: only act on exact, known shapes.
+        # EITHER of these is proof that a Claude Mate is on the other end of the
+        # cable, which is what the token push waits for. Cheap and idempotent:
+        # the flag is armed once per serial open and spent on the first answer.
+        if line in ("H", "K"):
+            prov = getattr(self._link, "provision_if_ours", None)
+            if prov:
+                prov()
         if line == "H":
             self._screen.resend_full_state()
             return

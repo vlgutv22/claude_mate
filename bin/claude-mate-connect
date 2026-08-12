@@ -147,8 +147,23 @@ def arm_pairing():
         c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         c.settimeout(5)
         c.connect(path)
-        c.send(b"pair\n")
+        c.sendall(b"pair\n")
+        # READ THE ANSWER. Closing here threw away the daemon's
+        # "error: BLE is not running" as an EPIPE, so a daemon with no radio was
+        # reported as a device out of range -- 75 seconds of waiting for a prompt
+        # that was never going to appear, and neither cause named. The reply
+        # exists precisely to surface the failure a terminal cannot otherwise see.
+        c.shutdown(socket.SHUT_WR)
+        reply = b""
+        while True:
+            chunk = c.recv(4096)
+            if not chunk:
+                break
+            reply += chunk
         c.close()
+        reply = reply.decode("utf-8", errors="replace").strip()
+        if reply.startswith("error:"):
+            return False, reply[7:].strip()
         return True, path
     except OSError as e:
         return False, f"{path}: {e}"
@@ -163,7 +178,7 @@ def pair():
     where = log_size()               # only judge lines written from here on
     ok, detail = arm_pairing()
     if not ok:
-        print(f"{RED}Could not reach the daemon's socket.{OFF}  {detail}")
+        print(f"{RED}Cannot pair:{OFF} {detail}")
         return 1
 
     print(f"\n{BOLD}Look at the device: it is asking whether to pair.{OFF}")

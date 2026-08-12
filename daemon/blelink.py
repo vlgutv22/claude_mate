@@ -384,7 +384,16 @@ class BleLink:
             # in the last few minutes, this is the moment it was armed for.
             if self._pair_armed():
                 if await self._enrol(client):
-                    return await self._handshake(client)   # now it has a token
+                    # _authenticate, not _handshake -- there is no _handshake on
+                    # this class. The first cut called one, so every SUCCESSFUL
+                    # pairing logged "paired" and then raised AttributeError one
+                    # statement later; _connect_forever swallowed it as "session
+                    # ended" and disconnected the device it had just paired.
+                    # Nothing noticed: the host test's 8 s wait absorbed the
+                    # reconnect, and the CLI greps for the log line written just
+                    # BEFORE the crash. Recursion is bounded -- the device now
+                    # has a token, so it cannot answer A|NOTOKEN again.
+                    return await self._authenticate(client)
                 return False
             # Otherwise say what to do about it. Pairing FIRST, because it is
             # the only route that needs neither a cable the device may be

@@ -177,6 +177,22 @@ else
     launchctl bootstrap "gui/${uid}" "${PLIST_DST}" 2>/dev/null || true
 fi
 
+# --- 5b. Python dependencies -------------------------------------------------
+# pyserial is required for a USB device; bleak is required for BLE, which the
+# plist above enables because every documented way to connect a device needs it.
+# BEST EFFORT, never fatal: a managed or externally-managed Python will refuse
+# the install, and a daemon without these still runs -- it just reports which
+# transport it cannot offer. Saying so here beats a working install that
+# silently cannot do the thing its last line tells you to do.
+info "Python dependencies (pyserial, bleak)..."
+if "${PYTHON_BIN}" -m pip install --user --quiet --disable-pip-version-check \
+        pyserial bleak 2>/dev/null; then
+    ok "Installed pyserial + bleak"
+else
+    warn "Could not install them automatically. If a device does not link:"
+    warn "  ${PYTHON_BIN} -m pip install pyserial bleak"
+fi
+
 # --- 6. Put the command-line tools on PATH ----------------------------------
 # WHY THIS STEP EXISTS. `claude` is normally an alias straight into bin/, so
 # nothing in this repo ever needed to be on PATH -- and the day a tool started

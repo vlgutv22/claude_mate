@@ -692,8 +692,13 @@ check("...refuses to be re-enrolled once it HAS a token",
 # The one that matters: without it, "no token yet" is itself permission and a
 # freshly reset board belongs to whoever is in radio range first.
 check("...and takes a token ONLY against an approval a human just gave",
-      re.search(r'if \(!_pairOk \|\| !_token\.isEmpty\(\)\) \{ notifyLine\("E\|NO"\)',
-                fw_ble))
+      re.search(r"if \(!_pairOk \|\| !_token\.isEmpty\(\)", fw_ble))
+# An EMPTY payload is not a token. Without this, a bare `E|` spent the one-shot
+# approval, stored "" as the live token and reported E|SET and "paired" -- and on
+# the path where the portal had just written a real token to NVS while this stack
+# still held none, it wiped it.
+check("...and an empty E| is not one",
+      re.search(r"\|\| line\[2\] == 0", fw_ble))
 # Every other assignment in the file clears it; exactly one grants it, and that
 # one is the human's answer. Written as "count the grants" rather than "count the
 # assignments" so that adding another place that CLEARS approval -- which is

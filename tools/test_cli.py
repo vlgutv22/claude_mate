@@ -215,8 +215,12 @@ try:
           == ["accounts", "accounts-refresh", "pair", "queue"]
           and sorted(re.findall(r'line\.startswith\("([a-z-]+)\|"\)', body))
           == ["press", "select"])
-    check("...while the socket stays writable, because hooks post to it",
-          (os.stat(SOCK).st_mode & 0o666) == 0o666)
+    # 0600, and this check used to assert 0666 -- it pinned the over-permission
+    # as though it were a requirement. Hooks run in the user's own shells, same
+    # uid, so owner-only always sufficed; 0666 only stopped being free when this
+    # surface grew verbs that can type into a live session.
+    check("...and the socket is owner-only, not world-writable",
+          (os.stat(SOCK).st_mode & 0o777) == 0o600)
 
     # --- the CLI itself ----------------------------------------------------- #
     print("\n== the command a person actually types ==")

@@ -361,6 +361,14 @@ class MateNet {
     // served. Getting that backwards leaves a SETUP screen advertising an AP
     // that no longer exists.
     if (_ssid.isEmpty()) {
+      // ...unless this device has a link that is not Wi-Fi. A BLE board that
+      // saved a token through the portal and no network -- the route this
+      // firmware added and advertises -- came straight back to a REGENERATED
+      // portal: _state never left SETUP, so the sketch's "SETUP ended, start
+      // BLE" handoff never fired, the phone was kicked off an AP whose password
+      // had changed, and resubmitting just repeated it. pollPortal() consults
+      // _fallbackLink for exactly this device; this path did not.
+      if (_fallbackLink) { stopPortal(); radioOff(); return; }
       if (!_web) startPortal();
       return;
     }
