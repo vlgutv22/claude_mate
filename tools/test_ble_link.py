@@ -69,6 +69,7 @@ print("== the firmware and the daemon agree on the service ==")
 fw_ble = read(os.path.join(FW, "blelink.h"))
 py_ble = read(os.path.join(DAEMON_DIR, "blelink.py"))
 ino = read(INO)
+netcfg = read(os.path.join(FW, "netcfg.h"))
 
 
 def fw_define(name, src=None):
@@ -509,6 +510,24 @@ check("...because the device can be given a token over BLE instead",
 check("...and the portal is still reachable where a mistake cannot reach it",
       "net.startPortalNow();" in ino          # `Z` over USB
       and re.search(r"digitalRead\(PIN_BTN_BOOT\) == LOW", ino))
+# GO MUST NOT ARM A WI-FI FLOW. Factory reset is confirmed with a long press of
+# GO and reboots at once, so GO was still down when setup() read the buttons:
+# every menu factory reset came back up in the Wi-Fi setup portal, on a BLE
+# device, reliably. Two independent fixes, because either alone leaves a trap.
+check("a held GO cannot raise the setup portal at boot",
+      not re.search(r"digitalRead\(PIN_BTN_GO\) == LOW\)",
+                    re.search(r"bool forcePortal = .*?;", ino, re.S).group(0)))
+check("...and a reboot waits for the button that asked for it to come up",
+      re.search(r"static void rebootAfterRelease\(\)", ino)
+      and not re.search(r"cfg\.factoryResetAll\(\);\s*\n\s*ESP\.restart", ino))
+check("...bounded, so a stuck button cannot block a decided reboot",
+      re.search(r"millis\(\) < until &&", ino))
+# And the radio is OFF on a build that will never use it -- said plainly in the
+# firmware as "certainty, not the reason the battery lasts".
+check("a BLE build powers the Wi-Fi radio down explicitly",
+      "net.radioOff();" in ino
+      and re.search(r"void radioOff\(\) \{\s*\n\s*WiFi\.mode\(WIFI_OFF\);",
+                    netcfg))
 check('the row is labelled "BLE gamepad"',
       re.search(r'case SR_PAD:\s*\n\s*label = "BLE gamepad";', ino))
 check('no row is labelled "Game controller" any more',
@@ -564,7 +583,6 @@ check("...and is not claimed by the protocol as well", "I" not in proto)
 # there is no behavioural test that would catch a regression, only these.
 print("\n== a device with nothing in NVS can bootstrap itself ==")
 
-netcfg = read(os.path.join(FW, "netcfg.h"))
 stored = fn_body(netcfg, "static MateTransport storedTransport()")
 # The portal outranks every screen in render() and blocks the menu, and it only
 # ever timed out on a device that had credentials to fall back to. So a

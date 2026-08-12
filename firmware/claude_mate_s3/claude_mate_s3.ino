@@ -1560,6 +1560,30 @@ static void requestRender() {
 // with no explanation reads as a crash caused by the button you just pressed --
 // which, on a device whose whole job is telling you what is going on, is the
 // one thing it must not do.
+// REBOOT ONLY ONCE THE BUTTON THAT ASKED FOR IT IS BACK UP.
+//
+// Every reboot on this device is confirmed by a LONG PRESS, so the button is
+// still down at the moment ESP.restart() runs -- and setup() reads the buttons
+// within milliseconds of coming back. A factory reset confirmed with GO
+// therefore came up with GO apparently "held at power-on", which used to mean
+// the Wi-Fi setup portal: wipe the device and land in the exact flow the wipe
+// was meant to escape, every single time. powerOff() already waits for release
+// for the same reason (a level-triggered wake fires instantly otherwise); this
+// is that lesson applied to the other half of the file.
+//
+// Bounded, because a stuck button must not stop a reboot that has already been
+// decided: after RELEASE_WAIT_MS we go anyway.
+#define RELEASE_WAIT_MS 3000UL
+static void rebootAfterRelease() {
+  unsigned long until = millis() + RELEASE_WAIT_MS;
+  while (millis() < until &&
+         (digitalRead(PIN_BTN_GO) == LOW || digitalRead(PIN_BTN_BOOT) == LOW ||
+          digitalRead(PIN_BTN_MIRROR) == LOW))
+    delay(10);
+  delay(80);                                  // let the release settle
+  ESP.restart();                              // never returns
+}
+
 static void restartWithNotice(const char *title, const char *detail) {
   if (gfx) {
     gfx->fillScreen(C_BG);
@@ -1573,7 +1597,7 @@ static void restartWithNotice(const char *title, const char *detail) {
   ble.shutdown();                           // one was actually up
   cfg.flush();                              // the deferred commit will not run
   delay(700);                               // long enough to read
-  ESP.restart();                            // never returns
+  rebootAfterRelease();                     // ...and for the button to come up
 }
 
 static void setTransport(MateTransport t) {
@@ -2553,11 +2577,11 @@ static void menuButton(char ev) {
   if (ev == 'K') {                            // long press: confirm / commit
     if (pageIdx == SR_RESET && resetArmedMs) {
       cfg.factoryResetAll();
-      ESP.restart();                          // never returns
+      rebootAfterRelease();                   // never returns
     }
     if (pageIdx == SR_FLIP && flipNeedsRestart) {
       cfg.flush();
-      ESP.restart();                          // never returns
+      rebootAfterRelease();                   // never returns
     }
   }
 }
@@ -2859,10 +2883,18 @@ void setup() {
   gfx->fillScreen(C_BG);
   if (buffered) canvas->flush();
 
-  // Holding BOOT (or GO) through power-on forces the WiFi setup portal: that is
-  // how the device is moved to a new network with no serial console around.
-  bool forcePortal = (digitalRead(PIN_BTN_BOOT) == LOW) ||
-                     (digitalRead(PIN_BTN_GO) == LOW);
+  // Holding BOOT through power-on forces the WiFi setup portal: the escape
+  // hatch for a board whose BLE will not start at all.
+  //
+  // BOOT ONLY -- GO USED TO COUNT AND THAT WAS A TRAP. Factory reset is
+  // confirmed with a LONG PRESS OF GO and reboots immediately, so GO was still
+  // down when setup() read it: every menu factory reset came back up in the
+  // Wi-Fi setup portal, on a BLE device, reliably. rebootAfterRelease() below
+  // fixes the timing, but GO has no business arming a Wi-Fi flow either way --
+  // it is the most-pressed button on the device, and with pairing and USB
+  // provisioning the portal is a last resort rather than a route. BOOT is on
+  // the board, under the enclosure, which is the right amount of deliberate.
+  bool forcePortal = (digitalRead(PIN_BTN_BOOT) == LOW);
 
   // Which radio this boot is going to be. Read before either stack is touched,
   // because starting one and then discovering it was the wrong one means the
@@ -2881,6 +2913,7 @@ void setup() {
     net.begin(forcePortal);
   } else {
     net.loadConfigOnly();                   // the token, and what `?` prints
+    net.radioOff();                         // and nothing else about Wi-Fi
     ble.begin(DEVICE_BLE_NAME, net.token());
   }
 

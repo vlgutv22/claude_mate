@@ -250,6 +250,23 @@ class MateNet {
     WiFi.persistent(false);
   }
 
+  // Put the Wi-Fi radio down and leave it down, for a build that is never going
+  // to use it.
+  //
+  // BE HONEST ABOUT WHAT THIS SAVES. Nothing here starts the Wi-Fi driver on a
+  // BLE build -- loadConfigOnly() only reads NVS and sets a flag -- so on a
+  // clean boot this is close to a no-op, and it is NOT the reason the battery
+  // lasts (the backlight is, by an order of magnitude; see the hibernate note).
+  // What it buys is certainty and one less thing to reason about: the radio is
+  // off because something turned it off, not because we believe nobody turned
+  // it on. It also matters on the path that HAS started it -- a BOOT-held
+  // portal that timed out, or a transport switched at runtime -- where the
+  // driver is genuinely up and holding the shared 2.4 GHz radio that BLE wants.
+  void radioOff() {
+    WiFi.mode(WIFI_OFF);
+    _state = OFF;
+  }
+
   // ---- transport selection -------------------------------------------------
   // Static, because they are read in setup() BEFORE anything decides whether
   // this instance is going to be started at all.
