@@ -249,6 +249,28 @@ try:
                        capture_output=True, text=True, timeout=30)
     check("...and deletes it when the name is typed back",
           not os.path.exists(os.path.join(ACCTS, "spare")))
+    # --- the manual, pinned to the code ------------------------------------ #
+    # Docs rot silently, and this set in particular: a command added to the CLI
+    # and not to the manual is a command nobody finds, and one removed from the
+    # CLI but left in the manual is worse -- someone types it and it fails.
+    print("\n== the manual still describes what exists ==")
+    using = open(os.path.join(ROOT, "docs", "USING.md"), encoding="utf-8").read()
+    cli_src = open(CLI, encoding="utf-8").read()
+    verbs = sorted(re.findall(r'"([a-z-]+)": "[PNGKFMCT]"', cli_src))
+    missing = [v for v in verbs if f"`{v}`" not in using and f" {v} " not in using]
+    check(f"every button command is in docs/USING.md ({len(verbs)} of them)",
+          not missing)
+    for extra in ("select", "accounts", "watch"):
+        check(f"...and `{extra}`", extra in using)
+    check("...as is the one-command install, verbatim",
+          "./install/install.sh --yes" in using)
+    check("...and the installer really takes that flag",
+          "--yes" in open(os.path.join(ROOT, "install", "install.sh"),
+                          encoding="utf-8").read())
+    # The claim the whole design rests on, in the docs as well as the code.
+    check("...and the manual says a press is the same press",
+          "same" in using and "ButtonReader" in using)
+
 finally:
     # TEARDOWN IS BEST-EFFORT AND MUST NOT BE ABLE TO HANG. Every check above can
     # pass and the run still never finish: the daemon is being asked to stop

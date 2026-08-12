@@ -518,6 +518,44 @@ More build photos are in [`assets/photos/`](assets/photos/).
 
 ## Quick start
 
+**One command.** Clone it and run the installer:
+
+```sh
+git clone https://github.com/vlgutv22/claude_mate.git && cd claude_mate
+./install/install.sh --yes
+```
+
+That installs the status hook, merges the hooks block into
+`~/.claude/settings.json` (backing it up first), installs and **starts the
+LaunchAgent** so the daemon runs at login, and puts `claude-mate`,
+`claude-mate-connect` and `claude-mate-switch` on your `PATH`. Drop `--yes` and it
+asks before touching `settings.json` — that is the only question it has. Re-run it
+any time; it is idempotent.
+
+Then point `claude` at the PTY wrapper, which is what puts model, effort, account
+and remaining limit on the screen:
+
+```sh
+echo 'alias claude="'"$PWD"'/bin/claude-mate-wrap"' >> ~/.zshrc && exec zsh
+```
+
+Check it with `claude-mate` (your sessions) and `claude-mate-connect` (every
+link, with a verdict). **No hardware needed to try it** — `claude-mate` is the
+same interface as the device:
+
+```sh
+claude-mate watch
+```
+
+📖 **[docs/USING.md](docs/USING.md) is the manual** — the daemon, every CLI
+command, every button and screen on the device, and what to do when something is
+wrong. The rest of this section is the manual way, and what to flash.
+
+---
+
+<details>
+<summary><b>The manual way, and flashing a device</b></summary>
+
 1. **Build & flash the firmware** — pick your device (or do both; they coexist):
 
    - **Arduino Nano** (`firmware/claude_mate/claude_mate.ino`). Install
@@ -535,10 +573,10 @@ More build photos are in [`assets/photos/`](assets/photos/).
      ```sh
      ./firmware/flash_s3.sh
      ```
-     On first boot an unprovisioned board comes up on **BLE** with no token:
-     send it `T|<token>` over the same cable and run the daemon with `--ble`.
-     For Wi-Fi instead, hold **BOOT** at power-on for a setup portal
-     (`Claude-Mate-XXXX`); join it from a phone and point it at your Mac.
+     On first boot an unprovisioned board comes up on **BLE** with no token —
+     and with the daemon running you do nothing: it hands its token to any
+     device that appears on the cable. Cordless, pair it in one command:
+     `claude-mate-connect --pair`, then press **GO** on the device.
 2. **Run the daemon** on your Mac:
    ```sh
    python3 daemon/claude_mate_daemon.py
@@ -575,8 +613,11 @@ More build photos are in [`assets/photos/`](assets/photos/).
      (`claude -p …`, pipes, CI) execs the real binary, and it locates the real
      `claude` even when every `claude` on `PATH` is your own shim.
 
+</details>
+
 Step-by-step guides:
 
+- 📖 **The manual — daemon, CLI and device** — [docs/USING.md](docs/USING.md)
 - 📦 **Install** — [docs/INSTALL.md](docs/INSTALL.md)
 - 🔌 **Wiring (Nano)** — [docs/WIRING.md](docs/WIRING.md)
 - 📶 **Both firmwares, flashing & provisioning** — [firmware/README.md](firmware/README.md)

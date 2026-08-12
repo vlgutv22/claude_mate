@@ -12,6 +12,24 @@ set -euo pipefail
 
 # --- Resolve paths ----------------------------------------------------------
 # Directory of this script (install/), and the repo root one level up.
+# --yes / -y (or CLAUDE_MATE_ASSUME_YES=1) answers the one question this script
+# asks, which is the difference between "one command" and "one command, then keep
+# an eye out for a prompt". Opt-in on purpose: the question is whether to edit
+# ~/.claude/settings.json, and a script that rewrites your editor config without
+# being asked is not one to trust twice. It backs the file up either way.
+ASSUME_YES="${CLAUDE_MATE_ASSUME_YES:-0}"
+for arg in "$@"; do
+    case "$arg" in
+        -y|--yes) ASSUME_YES=1 ;;
+        -h|--help)
+            echo "usage: install.sh [--yes]"
+            echo "  --yes   merge the hooks snippet into ~/.claude/settings.json"
+            echo "          without asking (the file is backed up first)"
+            exit 0 ;;
+        *) echo "install.sh: unknown option $arg" >&2; exit 2 ;;
+    esac
+done
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
@@ -77,37 +95,40 @@ if [[ -f "${SNIPPET_SRC}" ]]; then
 
     if command -v jq >/dev/null 2>&1; then
         # jq is available -> offer to merge automatically.
-        if [[ ! -t 0 ]]; then
-            # Non-interactive run (e.g. piped). Don't touch settings; just instruct.
+        reply="n"
+        if [[ "${ASSUME_YES}" = "1" ]]; then
+            reply="y"
+        elif [[ ! -t 0 ]]; then
+            # Piped, and not told to assume yes. Touch nothing; just instruct.
             warn "Non-interactive shell: skipping automatic merge."
-            warn "Run install.sh in a terminal to merge automatically, or merge the snippet above by hand."
+            warn "Re-run with --yes to merge it, or add the snippet above by hand."
         else
             read -r -p "Merge this snippet into ${CLAUDE_SETTINGS} now with jq? [y/N] " reply
-            case "${reply}" in
-                [yY]|[yY][eE][sS])
-                    if [[ -f "${CLAUDE_SETTINGS}" ]]; then
-                        backup="${CLAUDE_SETTINGS}.bak.$(date +%Y%m%d%H%M%S)"
-                        cp "${CLAUDE_SETTINGS}" "${backup}"
-                        ok "Backed up existing settings -> ${backup}"
-                    else
-                        echo '{}' > "${CLAUDE_SETTINGS}"
-                    fi
-                    tmp="$(mktemp)"
-                    # Deep-merge: snippet's hooks take precedence on key collisions.
-                    if jq -s '.[0] * .[1]' "${CLAUDE_SETTINGS}" "${SNIPPET_SRC}" > "${tmp}"; then
-                        mv "${tmp}" "${CLAUDE_SETTINGS}"
-                        ok "Merged hooks into ${CLAUDE_SETTINGS}"
-                    else
-                        rm -f "${tmp}"
-                        err "jq merge failed; your settings.json was NOT modified."
-                        warn "Merge the snippet above into ${CLAUDE_SETTINGS} manually."
-                    fi
-                    ;;
-                *)
-                    info "Skipping automatic merge. Add the snippet above manually."
-                    ;;
-            esac
         fi
+        case "${reply}" in
+            [yY]|[yY][eE][sS])
+                if [[ -f "${CLAUDE_SETTINGS}" ]]; then
+                    backup="${CLAUDE_SETTINGS}.bak.$(date +%Y%m%d%H%M%S)"
+                    cp "${CLAUDE_SETTINGS}" "${backup}"
+                    ok "Backed up existing settings -> ${backup}"
+                else
+                    echo '{}' > "${CLAUDE_SETTINGS}"
+                fi
+                tmp="$(mktemp)"
+                # Deep-merge: snippet's hooks take precedence on key collisions.
+                if jq -s '.[0] * .[1]' "${CLAUDE_SETTINGS}" "${SNIPPET_SRC}" > "${tmp}"; then
+                    mv "${tmp}" "${CLAUDE_SETTINGS}"
+                    ok "Merged hooks into ${CLAUDE_SETTINGS}"
+                else
+                    rm -f "${tmp}"
+                    err "jq merge failed; your settings.json was NOT modified."
+                    warn "Merge the snippet above into ${CLAUDE_SETTINGS} manually."
+                fi
+                ;;
+            *)
+                info "Skipping automatic merge. Add the snippet above manually."
+                ;;
+        esac
     else
         warn "jq not found. Add the snippet above into ${CLAUDE_SETTINGS} manually."
         warn "Tip: 'brew install jq' to enable automatic merging next time."

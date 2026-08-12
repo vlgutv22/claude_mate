@@ -12,6 +12,33 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
+### 2026-08-12 — One command to install it, and a manual for both ways to drive it
+
+- **Changed: the install is one command.** `./install/install.sh --yes` does all
+  of it — hook, the `settings.json` merge (backed up first), the LaunchAgent
+  started, and the three CLI tools on `PATH`. It had exactly one interactive
+  prompt, which is the difference between "one command" and "one command, then
+  watch for a question". `--yes` is opt-in rather than the default on purpose:
+  the question is whether to edit `~/.claude/settings.json`, and a script that
+  rewrites your editor config without being asked is not one to trust twice.
+- **Added: [`docs/USING.md`](docs/USING.md), the manual.** The daemon (what it
+  is, how to check and restart it, the five states and which three need you), the
+  CLI (every command, each **paired with the device button it presses**), the
+  device (four buttons, three gestures, the screen, the LED, all eight SETTINGS
+  rows), connecting a device, and a symptom-to-cause table for when it is not
+  working. One page, because there are two ways to drive one thing and
+  documenting them apart would invite them to drift.
+- **Fixed: `docs/INSTALL.md` described a project two iterations old.** Nano only,
+  Arduino IDE, no ESP32-S3, no BLE, no LaunchAgent, no CLI. It leads with the one
+  command now and hands S3 flashing to `firmware/README.md`, where the reasons
+  `arduino-cli upload` cannot do it are already written down.
+- **Added: a docs-drift guard.** `tools/test_cli.py` asserts that every button
+  command the CLI implements appears in the manual, that the install one-liner
+  printed in the docs is verbatim what the installer accepts, and that the manual
+  states the same-press claim the design rests on. Docs rot silently; a command
+  documented but removed is worse than one undocumented, because someone types it.
+
+
 ### 2026-08-12 — `claude-mate`: the device's interface, in a terminal
 
 - **Added: `claude-mate`.** The queue, the selection, GO, ACK, FOLLOW, the

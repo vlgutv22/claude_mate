@@ -1,18 +1,54 @@
 # Claude Mate — Install
 
-End-to-end setup, in order:
+## The short version
 
-1. [Flash the firmware](#1-flash-the-firmware-arduino-ide)
-2. [Run the daemon](#2-run-the-daemon)
-3. [Merge the hooks snippet](#3-merge-the-hooks-snippet)
-4. [Install the LaunchAgent](#4-install-the-launchagent-auto-start)
+```sh
+git clone https://github.com/vlgutv22/claude_mate.git && cd claude_mate
+./install/install.sh --yes
+```
 
-Prerequisites: a Mac, **Python 3.9+**, the **Arduino IDE**, and your assembled
-hardware (see [WIRING.md](WIRING.md)). The only third-party Python dependency is
-**pyserial**.
+Steps 2, 3 and 4 below are what that does: it installs the status hook, merges
+the hooks block into `~/.claude/settings.json` (backing it up first), installs
+and starts the **LaunchAgent** so the daemon runs at login, and puts
+`claude-mate`, `claude-mate-connect` and `claude-mate-switch` on your `PATH`.
+Drop `--yes` and it asks before editing `settings.json`, which is the only
+question it has. It is idempotent — re-run it after a `git pull`.
+
+Then alias `claude` to the PTY wrapper (this is what gets model, effort, account
+and remaining limit onto the screen):
+
+```sh
+echo 'alias claude="'"$PWD"'/bin/claude-mate-wrap"' >> ~/.zshrc && exec zsh
+```
+
+**You do not need hardware.** `claude-mate` in a terminal is the same interface
+as the device — see [USING.md](USING.md), which is the manual for both.
+
+Undo it all with `./install/uninstall.sh`.
+
+The rest of this page is the **manual** route, and the firmware. Read it if you
+are flashing a board, or if you want to know exactly what the installer touched.
+
+---
+
+## Prerequisites
+
+A Mac, **Python 3.9+**, and — only if you are building hardware — `arduino-cli`
+or the Arduino IDE plus your assembled device ([WIRING.md](WIRING.md)).
+
+Python dependencies, all optional in the sense that the daemon degrades rather
+than fails without them: **pyserial** (a USB device), **pyte** (the terminal
+mirror and the PTY wrapper's state scraping), **bleak** (the BLE transport).
 
 Put the project wherever you like — this guide refers to its root as `$REPO`
 (e.g. `~/src/claude_mate`).
+
+> **Two devices, and this page's step 1 is the Nano.** For the **ESP32-S3** —
+> the cordless colour build — flashing is `./firmware/flash_s3.sh` and is
+> documented in [`firmware/README.md`](../firmware/README.md), because
+> `arduino-cli upload` cannot flash that board and the reasons are specific.
+> Provisioning it needs nothing typed: plug it in and the daemon hands it a
+> token, or run `claude-mate-connect --pair` and press GO.
 
 ---
 
