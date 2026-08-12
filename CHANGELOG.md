@@ -12,6 +12,29 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
+### 2026-08-12 — The radio switch comes off the glass
+
+- **Changed: no `Link` row and no `Wi-Fi setup` row in SETTINGS.** `Link` was a
+  plain toggle, so **one press moved a cordless board onto Wi-Fi** — and a board
+  with no credentials then reboots into the setup portal, which outranks the
+  menu and does not time out for a Wi-Fi device, so it hides the very row you
+  would use to undo it. One press on the glass, and no way back without a cable.
+  `Wi-Fi setup` was the same door from the other side. Found the way these
+  things are always found: a board that had "stopped working over BLE" turned
+  out to be sitting on Wi-Fi with no SSID, because the row had been pressed.
+  Neither is deleted — the transport still compiles, and `I|WIFI` / `I|BLE` and
+  `Z` still work over USB, which keeps the escape hatch somewhere a mistake
+  cannot reach: if you can type `I|WIFI` you have a cable, so you can type
+  `I|BLE` back. Which radio is live, and whether it has found the daemon, is
+  still on the glass in **SETTINGS → About**.
+- **Fixed: a config write to an unprovisioned Wi-Fi device killed the setup
+  portal.** `restart()` stopped the portal, saw no SSID and dropped to `OFF`. An
+  unprovisioned Wi-Fi device *is* a device sitting in the portal — that is where
+  `begin()` puts it — so `T|<token>`, typed at exactly the device that needs a
+  token, tore down the only screen that could finish the job and left no link,
+  no portal, and no way back but a reboot. It now does what `begin()` does:
+  nothing to join means the portal.
+
 ### 2026-08-12 — A board with nothing in NVS can get itself a token
 
 Five ways a factory-reset ESP32-S3 could not be provisioned at all, found by

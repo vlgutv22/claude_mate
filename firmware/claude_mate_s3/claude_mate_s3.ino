@@ -261,13 +261,27 @@ static uint8_t pageIdx = 0;          // selected row within the page
 // SR_PAD is therefore a stored preference now rather than an action: on means
 // this device IS a Bluetooth controller, across a screen sleep and across a
 // reboot, until you turn it off. Off means it is the conductor it always was.
+// THE TWO WI-FI ROWS ARE GONE FROM THE GLASS, and this is a safety change
+// rather than a tidy-up. `Link` was a plain toggle, so one press moved a
+// cordless board onto Wi-Fi -- and a board with no credentials then reboots
+// into the setup portal, which outranks the menu, does not time out for a Wi-Fi
+// device, and therefore hides the very row you would use to undo it. One press
+// on the glass, no way back without a cable. `Wi-Fi setup` was the same door
+// from the other side.
+//
+// Neither is DELETED, only unreachable from the device: the transport still
+// compiles, and `I|WIFI` / `I|BLE` and `Z` still work over USB. That keeps the
+// escape hatch exactly where a mistake cannot reach it -- if you can type
+// I|WIFI you have a cable, which means you can type I|BLE back. The live link
+// and its state are still on the glass, in SETTINGS -> About.
 enum SetRow : uint8_t {
-  SR_PAD, SR_LINK, SR_SLEEP, SR_BRIGHT, SR_LED, SR_SOUND, SR_FLIP,
-  SR_WIFI, SR_ABOUT, SR_RESET, SR_COUNT
+  SR_PAD, SR_SLEEP, SR_BRIGHT, SR_LED, SR_SOUND, SR_FLIP,
+  SR_ABOUT, SR_RESET, SR_COUNT
 };
 // Which row is at the top of the visible window. Five rows fit and there are
-// ten, so the page scrolls -- and the scrollbar in drawSettingsPage() is what
-// says the other five exist, since a cut list otherwise just looks complete.
+// more than five, so the page scrolls -- and the scrollbar in
+// drawSettingsPage() is what says the rest exist, since a cut list otherwise
+// just looks complete.
 // Everything here is computed from SR_COUNT, so rows can be added without
 // touching the geometry; that is the whole reason absorbing ABOUT and WI-FI
 // from the top-level strip cost nothing but their two cases.
@@ -1131,15 +1145,6 @@ static void drawSetRow(uint8_t row, int16_t y, bool sel) {
       value = cfg.pad() ? "on" : "off";
       vcol  = cfg.pad() ? C_DONE : C_DIM;
       break;
-    case SR_LINK:
-      label = "Link";
-      // Which radio carries the daemon. Never both -- one 2.4 GHz radio, and
-      // sharing it costs the link that matters. Green when that radio has
-      // actually found the daemon, because "ble" and "ble, and it is working"
-      // are the two different things you come to this row to tell apart.
-      value = MateNet::transportName(transport);
-      vcol  = linkConnected() ? C_DONE : C_TEXT;
-      break;
     case SR_SLEEP:
       label = "Sleep screen";
       value = cfg.hibLabel();
@@ -1178,21 +1183,6 @@ static void drawSetRow(uint8_t row, int16_t y, bool sel) {
         vcol  = cfg.flipped() ? C_DONE : C_DIM;
       }
       break;
-    case SR_WIFI: {
-      label = "Wi-Fi setup";
-      // The one row that answers before you press it. This is where you come
-      // when the device is not linked, so "joining" or "linked" settles the
-      // question you walked in with. Lowercased from stateName() rather than
-      // mapped again here: a second table would be one more thing to forget to
-      // update, and this one cannot fall out of step with the enum.
-      char *p = buf;
-      for (const char *s = net.stateName(); *s && p < buf + sizeof(buf) - 1; s++)
-        *p++ = (*s >= 'A' && *s <= 'Z') ? (char)(*s - 'A' + 'a') : *s;
-      *p = 0;
-      value = buf;
-      vcol  = net.connected() ? C_DONE : C_WAIT;
-      break;
-    }
     case SR_ABOUT:
       label = "About";
       value = "\x10";
@@ -1288,7 +1278,12 @@ static void drawAboutPage() {
     gfx->setTextColor(C_DIM);
     gfx->setCursor(PAD_X, y);
     gfx->print(k[i]);
-    gfx->setTextColor(C_TEXT);
+    // The link row goes GREEN when the daemon is actually on the other end.
+    // That signal used to live on the Link row in SETTINGS, which is gone, and
+    // it is the difference between the two things you come to this page to tell
+    // apart: "ble", and "ble, and it is working". Nothing else here has a
+    // working/not-working state, so nothing else is coloured.
+    gfx->setTextColor(i == 0 && linkConnected() ? C_DONE : C_TEXT);
     gfx->setCursor(PAD_X + 6 * GLYPH_W, y);
     gfx->print(v[i]);
     y += PAGE_INFO_LH;
@@ -2439,18 +2434,6 @@ static void menuButton(char ev) {
                       // the 4th button drops you back on this row rather than
                       // somewhere you did not come from.
                       padSet(!cfg.pad());
-                      break;
-      case SR_LINK:   // Which radio carries the daemon. Live, both ways: the
-                      // whole point of storing it rather than compiling it in
-                      // is that a device on a desk can be moved between them
-                      // with a thumb.
-                      setTransport(transport == LINK_BLE ? LINK_WIFI : LINK_BLE);
-                      break;
-      case SR_WIFI:   // The portal takes the screen over on its own, via
-                      // net.state() == SETUP in render(), which outranks every
-                      // firmware-local screen -- so hand the glass back first.
-                      uiMode = UI_CONDUCTOR;
-                      net.startPortalNow();
                       break;
       case SR_ABOUT:  pageId = PG_ABOUT; break;
       case SR_SLEEP:  cfg.cycleHib(); break;

@@ -327,8 +327,27 @@ class MateNet {
   // Restart the link from the top (after a config change).
   void restart() {
     _client.stop();
+    // NOTHING TO JOIN MEANS THE PORTAL, not silence -- the same rule begin()
+    // follows, and it has to be the same or the two disagree about what an
+    // unprovisioned device does.
+    //
+    // This used to stop the portal, see no SSID and drop to OFF. An
+    // unprovisioned Wi-Fi device is a device sitting IN the portal, because
+    // that is where begin() put it, so any config write -- `T|<token>` typed at
+    // exactly the device that needs one -- tore down the only screen that could
+    // finish the job and left no link, no portal and no way back but a reboot.
+    // Found by doing it to a real board.
+    //
+    // Tested on _web rather than on SETUP because applyPendingConfig() calls
+    // stopPortal() before this and stopPortal() does not touch the state: the
+    // state is the intent, the pointer is whether a portal is actually being
+    // served. Getting that backwards leaves a SETUP screen advertising an AP
+    // that no longer exists.
+    if (_ssid.isEmpty()) {
+      if (!_web) startPortal();
+      return;
+    }
     if (_state == SETUP) stopPortal();
-    if (_ssid.isEmpty()) { _state = OFF; return; }
     WiFi.disconnect();
     startJoin();
   }

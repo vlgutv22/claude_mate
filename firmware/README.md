@@ -7,11 +7,11 @@ apart, and **both can be connected at once**.
 |---|---|---|
 | Board | Arduino Nano | Waveshare ESP32-S3-LCD-1.47**B** |
 | Display | 128×32 mono OLED (SSD1306) | 172×320 colour IPS (ST7789) |
-| Transport | USB serial | **Wi-Fi (TCP) or BLE**, selectable on the device; USB as fallback |
+| Transport | USB serial | **BLE or Wi-Fi (TCP)**, stored in NVS and switched over USB (`I\|BLE`); USB as fallback |
 | Buttons | 3 — PREV / GO / NEXT | 4 — PREV / GO / NEXT / **MENU**, Kailh Choc (1350) |
 | Alert LED | one LED, rhythm only | WS2812, rhythm **+ colour**, adjustable (incl. off) |
 | Power | USB | USB or a 14500 Li-ion cell, with a battery gauge |
-| On-device UI | — | a menu: settings, about, Wi-Fi setup, sleep |
+| On-device UI | — | a menu: settings, about, the game, sleep |
 | Screen sleep | — | off after 1–30 min when nothing needs you |
 | Flash with | `arduino-cli upload` | **`./flash_s3.sh`** (see below) |
 
@@ -163,15 +163,16 @@ T|<token>
 
 **That default is a bootstrap fix, not a preference.** A board with empty NVS
 used to default to Wi-Fi, which meant the setup portal — and the portal outranks
-every screen on the device, including the **SETTINGS → Link** row that would have
-moved it to BLE. A factory-reset cordless board was therefore held in a portal it
+every screen on the device — including, at the time, the only row that could
+have moved it to BLE. A factory-reset cordless board was therefore held in a portal it
 had no credentials to satisfy, with the way out visible from nowhere. A board
 that has an SSID stored is not affected: it still comes up on Wi-Fi, because an
 upgrade must not move a working device onto a different radio behind its owner's
 back.
 
 **For Wi-Fi instead**, send `W|<ssid>|<password>` and then `I|WIFI`, or use the
-setup portal — hold **BOOT** at power-on, send `Z`, or **SETTINGS → Wi-Fi setup**.
+setup portal — hold **BOOT** at power-on, or send `Z` over the cable. Neither
+lives on the device's menu any more; see **Settings** below for why.
 The portal shows an access point name (`Claude-Mate-XXXX`) and a password that is
 regenerated on every portal start. Join it from a phone, open
 `http://192.168.4.1`, and fill in the network, password, **shared token**, and
@@ -316,26 +317,35 @@ spanning 260.
 | Item | What it does |
 |---|---|
 | **CONDUCTOR** | back to the triage view — the daemon's frame, unchanged since iteration 2 shipped |
-| **SETTINGS** | the ten rows below |
+| **SETTINGS** | the eight rows below |
 | **SHIP IT** | the platformer, played on a contribution graph. Runs on the device itself; the record survives a flat battery |
 | **SLEEP** | the same deep sleep the 2 s hold does, made discoverable |
 
 ### Settings
 
-Ten rows, five visible, so the page scrolls and draws a scrollbar — without one
-a cut list simply looks complete. Everything is computed from the row count, so
-adding a row costs nothing but the row.
+Eight rows, five visible, so the page scrolls and draws a scrollbar — without
+one a cut list simply looks complete. Everything is computed from the row count,
+so adding a row costs nothing but the row.
+
+**There is no Link row and no Wi-Fi setup row, and that is deliberate.** `Link`
+was a plain toggle, so one press moved a cordless board onto Wi-Fi — and a board
+with no credentials then reboots into the setup portal, which outranks the menu
+and does not time out for a Wi-Fi device, so it hides the very row you would use
+to undo it. One press on the glass, and no way back without a cable. `Wi-Fi
+setup` was the same door from the other side. Neither is deleted: the transport
+still compiles and `I|WIFI` / `I|BLE` and `Z` still work over USB, which puts
+the escape hatch somewhere a mistake cannot reach it — if you can type `I|WIFI`
+you have a cable, so you can type `I|BLE` back. Which radio is live, and whether
+it has found the daemon, is on the **About** page.
 
 | Row | Values | Notes |
 |---|---|---|
 | **BLE gamepad** | on / off | The device as an **ordinary Bluetooth HID gamepad** — pair "Claude Mate" once in System Settings and macOS presents it as a system controller. **On means the device *is* a gamepad**, across a screen sleep and across a reboot, until you turn it off; off means it is the conductor again and the daemon link comes back. This is the only input path the **public site** can use: the daemon path needs `http://127.0.0.1`, which an https page cannot reach. It also skips Wi-Fi, mDNS, the TCP dial, the daemon and SSE entirely, which is the chain that was making the controller lurch. Four buttons, no axes, physical order (1 = PREV, 2 = GO, 3 = NEXT, 4 = 4th). Leave with a 2 s hold of the 4th button, which turns the switch off too. See the radio policy below |
-| **Link** | wi-fi / ble | Which radio carries the daemon — **never both**, since there is one 2.4 GHz radio and sharing it costs the link that matters. **Changing it restarts the device** (~3 s, with a screen that says so); see below for why that is the only option rather than a shortcut. Green when that radio has actually found the daemon, because *"ble"* and *"ble, and it is working"* are the two things you came to this row to tell apart. Stored in the **network** namespace, next to the SSID and the token it is useless without |
 | **Sleep screen** | off · 1m · 2m · 5m · 10m · 30m | One row, not a toggle plus a duration — the two can never disagree, and it costs one row on a screen that has five. Defaults to **off**: nobody's screen should start going dark because they took an update |
 | **Brightness** | 5 steps | Non-linear in duty (20/60/120/200/255). Equal duty steps feel like one enormous jump at the bottom and four identical ones at the top. Applied live, so the step you are on is the step you can see |
 | **Alert LED** | off · low · med · high | **off is genuinely dark.** A 7 Hz red strobe is the right answer to a failed turn at a desk and the wrong one in a bedroom — and the alert still arrives, through the flashing name row and fleet letter |
 | **Mac sound** | on / off | Named for **where it happens**. "Sound: on" on a device with no speaker would be a promise the hardware cannot keep. Crosses the link at once (`O\|SND\|`) — a toggle that only reached NVS would do nothing until the next reconnect and read as a dead row |
 | **Flip screen** | on / off | Applies **on restart**; the row says so and a long GO does it. Rotation is set once after `begin()`, and re-rotating a live panel is the one failure in this firmware that looks exactly like dead hardware |
-| **Wi-Fi setup** | *state* → | Starts the setup portal. The value is the live link state, lowercased from the same enum the `?` dump prints, so the row answers "am I linked?" before you press it — which is the question you walked in with. Previously this was a top-level item, and before that it needed BOOT held through power-on, or `Z` over serial |
 | **About** | → | Link, RSSI (or, on BLE, which radio and whether the pad has it), battery % + raw mV, boot cause, firmware version. The serial `?` output, on the glass — the only place it can be read on a cordless device with no console attached. The 4th button backs out to **this page**, not to the top strip: one level at a time |
 | **Factory reset** | hold GO to confirm | Wipes Wi-Fi, token **and** settings. Asks twice, and the second gesture is a **long** press rather than another tap — you cannot double-tap your way into wiping the token. Disarms itself after 6 s |
 
@@ -443,7 +453,8 @@ of flash and 2,848 bytes of RAM** against the same sketch without it. It is that
 cheap because the BLE stack was already linked in for the HID gamepad — the
 ~290 KB was paid for once, and this is the second thing to use it.
 
-Select it with **SETTINGS → Link**, or `I|BLE` over the cable. It is a stored
+Select it with `I|BLE` over the cable — it is deliberately not on the device's
+menu, for the reason given under **Settings**. It is a stored
 byte rather than a compile-time `#define` on purpose: moving a device on a desk
 between the two should not need a toolchain. Holding BOOT at power-on still
 forces the Wi-Fi setup portal whichever transport is stored — that escape hatch
@@ -529,7 +540,10 @@ forever and finds a device that is sitting right there advertising. If the log
 says `no device found yet` while the device says it is advertising, check this
 before anything else.
 
-**4. The device's Link row reads `ble`.** SETTINGS → Link, or `I|BLE` over USB.
+**4. The device is actually on BLE.** `I|BLE` over USB sets it (and reboots);
+`?` prints `link : ble`, and **SETTINGS → About** shows it on the glass. A board
+that has been moved to Wi-Fi is not advertising at all — the stack is down, so
+the daemon scans forever and the Mac never sees it.
 
 **Knowing it worked**, from either end:
 
@@ -548,7 +562,7 @@ device (?)  link  : ble
 | `ble: start the daemon with --ble` | `no device found yet` | one of 1–3 above — usually the Bluetooth permission |
 | `AUTHING`, then `no handshake - is the daemon on --ble?` | *(nothing)* | something connected that is not the daemon. macOS itself probes new GATT services; harmless, and it recycles after 5 s |
 | `x token rejected` | `BLE: token rejected` | the device and the daemon hold different tokens. `T\|<token>` over USB, from `~/.config/claude-mate/token` |
-| `x no token - send T\|<token> over USB` | `THE DEVICE HAS NO TOKEN` | exactly what it says, and it is what a factory-reset board says. The cable is the quickest answer; with no cable to hand, SETTINGS → Wi-Fi setup takes a token too (the network box is optional there) |
+| `x no token - send T\|<token> over USB` | `THE DEVICE HAS NO TOKEN` | exactly what it says, and it is what a factory-reset board says. The cable is the answer; with no cable to hand, the portal takes a token too (`Z`, or BOOT held at power-on — the network box is optional on a BLE device) |
 
 ### Screen sleep
 

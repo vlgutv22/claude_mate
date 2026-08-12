@@ -112,7 +112,7 @@ daemon on your Mac. Build it either way — or both, at the same time:
 |---|---|---|
 | Board | Arduino Nano (ATmega328P) | Waveshare ESP32-S3-LCD-1.47**B** |
 | Display | 0.91" 128×32 mono OLED (SSD1306) | 1.47" 172×320 colour IPS (ST7789) |
-| Transport | USB serial | **Wi-Fi (TCP)**, USB as fallback |
+| Transport | USB serial | **BLE** or **Wi-Fi (TCP)**, USB as fallback |
 | Buttons | 3 — PREV / GO / NEXT | 4 — + **MENU** (Kailh Choc low-profile) |
 | Alert light | one LED, rhythm only | WS2812, rhythm **+ colour** |
 | Power | USB | USB **or** a 14500 cell, with a gauge |
@@ -273,12 +273,15 @@ hooks are the zero-dependency feed. Use whichever fits each session.
 - **A live terminal mirror** — see [above](#the-terminal-mirror-esp32-s3).
 - **An on-device menu** — double-tap the 4th button. Four items: the triage view,
   SETTINGS, SHIP IT and long sleep. Settings holds the rest — a **BLE gamepad**
-  switch, a **Link** row that moves the daemon between Wi-Fi and Bluetooth, screen
-  sleep, brightness, alert-LED level including a genuine *off*, Mac sound, flip,
-  the Wi-Fi setup portal, an About readout, and
-  factory reset. About and Wi-Fi live there rather than on the top strip because
-  neither is a place you go: one is something you read, the other something you
-  set. Entirely **firmware-local**: while it is up PREV/GO/NEXT are handled on
+  switch, screen sleep, brightness, alert-LED level including a genuine *off*,
+  Mac sound, flip, an About readout, and factory reset. **Nothing that changes
+  the radio is on the glass:** one press used to be enough to move a cordless
+  board onto Wi-Fi, and a board with no credentials then reboots into a setup
+  portal that outranks the menu — hiding the row you would use to undo it.
+  `I|WIFI` / `I|BLE` over USB still do it, which puts that switch behind a cable
+  you have to actually have. About lives here rather than on the top strip
+  because it is not a place you go: it is something you read. Entirely
+  **firmware-local**: while it is up PREV/GO/NEXT are handled on
   the device and never emitted, so the queue cannot move while you are aiming at
   a settings row — and there is **no protocol change and no daemon change** for
   any of it.
@@ -551,7 +554,7 @@ More build photos are in [`assets/photos/`](assets/photos/).
    this desk**; BLE is right when it **is**, and lets the device advertise in
    200 ms bursts four seconds apart instead of holding an association open all
    day for a device that has almost nothing to say. Pick one on the device at
-   **SETTINGS → Link** — it has a single 2.4 GHz radio, so it is never both. See
+   `I|BLE` over USB — it has a single 2.4 GHz radio, so it is never both. See
    [docs/POWER.md](docs/POWER.md).
    Add `--sound` to also play a macOS alert sound when the worst unacknowledged
    alert class changes. The device has no speaker of its own — the ESP32-S3 has

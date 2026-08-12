@@ -380,7 +380,23 @@ rows = [r.strip() for r in re.split(r"[,\s]+", m.group(1)) if r.strip()]
 check("SR_BLE is gone -- the two rows became one",
       "SR_BLE" not in rows)
 check("SR_PAD is still there, and is the gamepad row", "SR_PAD" in rows)
-check("...and a Link row chooses the transport", "SR_LINK" in rows)
+# NO transport row on the glass. `Link` was a plain toggle, so one press moved a
+# cordless board onto Wi-Fi -- which reboots into a portal that outranks the menu
+# and does not time out for a Wi-Fi device, hiding the row you would undo it
+# with. `Wi-Fi setup` was the same door from the other side. The transport still
+# compiles; only the glass cannot reach it, which keeps the escape hatch behind a
+# cable you have to actually have.
+check("no Link row -- one press must not be able to move a cordless board "
+      "onto Wi-Fi", "SR_LINK" not in rows)
+check("...and no Wi-Fi setup row either", "SR_WIFI" not in rows)
+check("...and neither leaves a dangling case in the row painter or the input "
+      "handler",
+      not re.search(r"case SR_(LINK|WIFI)\b", ino))
+check("...but the transport is still switchable over the cable",
+      re.search(r'strcasecmp\(a, "ble"\)', ino)
+      and re.search(r'strcasecmp\(a, "wifi"\)', ino))
+check("...and the portal is still reachable over the cable",
+      "net.startPortalNow();" in ino)
 check('the row is labelled "BLE gamepad"',
       re.search(r'case SR_PAD:\s*\n\s*label = "BLE gamepad";', ino))
 check('no row is labelled "Game controller" any more',
