@@ -534,6 +534,45 @@ r = run(["--dry-run", "acct-c"], ctx=ctx_live)
 check("a cross-organisation move is called out by domain",
       "other-org.test" in r.stdout and "different" in r.stdout.lower())
 
+# --------------------------------------------------------------------------- #
+# The picker offers more than accounts.
+# --------------------------------------------------------------------------- #
+# This prompt is the only Claude Mate UI on the Mac, so it is where "my device
+# will not connect" has to be answerable. It was not: the device said what was
+# wrong on its own glass and the daemon said it in a log file, neither of which
+# is in front of the person sitting here.
+print("\n== the account picker can also connect a device ==")
+
+os.environ.pop("CLAUDE_CONFIG_DIR", None)
+connect_calls = []
+W._run_connect = lambda: connect_calls.append(1)
+
+answers = iter(["d", "0"])
+W.input = lambda prompt="": next(answers)
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    W.select_account(None, True)
+out = buf.getvalue()
+
+check("the picker offers a device entry alongside the accounts",
+      "d) device" in out)
+check("...and `d` runs the connect tool", connect_calls == [1])
+# The bug this guards is a picker that treats `d` as an account NAME and creates
+# a profile called "d" -- which is what the first cut did, silently.
+check("...without selecting anything, so the prompt comes back",
+      out.count("select account") == 2)
+check("...and no profile named 'd' was created",
+      not os.path.isdir(os.path.join(tmp, "accounts", "d")))
+check("...and the choice made afterwards is honoured (0 = default)",
+      not os.environ.get("CLAUDE_CONFIG_DIR"))
+
+answers = iter(["acct-b"])
+with contextlib.redirect_stdout(io.StringIO()):    # the menu again; not output
+    W.select_account(None, True)
+check("a plain account name still selects that account",
+      os.environ.get("CLAUDE_CONFIG_DIR", "").endswith("acct-b"))
+del W.input
+
 print(f"\n{checks - len(failures)}/{checks} checks passed")
 shutil.rmtree(tmp, ignore_errors=True)
 if failures:

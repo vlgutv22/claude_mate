@@ -12,6 +12,32 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
+### 2026-08-12 — The cable provisions the radio, and the picker can say why it did not
+
+- **Added: the daemon hands its token to any device that appears on USB.** *"How
+  do I connect it after a factory reset"* had two honest answers — raise a portal
+  from a phone, or type `T|<token>` down the cable — and both are work nobody
+  should be asked to do, because the wiped device and the daemon that knows the
+  secret are *already joined by a cable over which provisioning is the trusted
+  path*. Every serial open now pushes the token. Measured on hardware: `no token`
+  → `serial: handed the device this daemon's token` → `BLE device connected`, in
+  **four seconds**, with nothing typed. Unconditional rather than conditional on
+  "does it need one", because USB has no handshake to ask over (it is trusted by
+  being physical) and the daemon's token is the authority — a device holding a
+  different one cannot link, so overwriting is the repair. NVS skips a write
+  whose value is unchanged, so the steady state costs nothing.
+  `CLAUDE_MATE_NO_USB_PROVISION=1` turns it off.
+- **Added: `claude-mate-connect`, and a `d) device` entry in the account
+  picker.** That prompt is the only Claude Mate UI on the Mac, and until now it
+  could only choose an account — so a device that would not link had its
+  explanation in two places nobody at that prompt was looking: the device's own
+  glass, and a log file. The command reports every link (daemon, token, cable,
+  BLE) and prints the shortest fix for whichever is down, then the picker comes
+  back. It also states the thing that reads as a fault and is not: **the device
+  never appears in System Settings → Bluetooth**, because the status link is an
+  unpaired GATT peripheral and the token handshake, not pairing, is what decides
+  who may drive it.
+
 ### 2026-08-12 — The radio switch comes off the glass, the token screen moves to the front
 
 - **Changed: no `Link` row in SETTINGS.** It was a plain toggle, so **one press

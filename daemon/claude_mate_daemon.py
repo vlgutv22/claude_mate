@@ -546,6 +546,16 @@ class SerialLink:
         self._baud = baud
         self._ser: Optional[serial.Serial] = None
         self._lock = threading.Lock()  # guards writes + (re)connect
+        self._provision_token: Optional[str] = None
+
+    def set_provision_token(self, token: Optional[str]) -> None:
+        """The secret to hand a device that arrives on the cable. See _provision().
+
+        Set only when a wireless transport is up, because that is the only time
+        there is a shared secret to share -- a USB-only daemon has nothing to
+        provision the device FOR.
+        """
+        self._provision_token = token
 
     @staticmethod
     def autodetect() -> Optional[str]:
@@ -593,11 +603,45 @@ class SerialLink:
                 log(f"serial opened on {port} @ {self._baud} 8N1")
                 # Opening the port resets the Nano (~1.5s); it will emit H when
                 # ready, prompting a full state resend. We do not block here.
+                self._provision_locked()
                 return True
             except (serial.SerialException, OSError) as exc:
                 log(f"serial open failed on {port}: {exc}")
                 self._close_locked()
                 return False
+
+    def _provision_locked(self) -> None:
+        """Give the device on the cable this daemon's token, every time we open.
+
+        THE CABLE IS THE ANSWER TO "how do I connect it after a factory reset",
+        and it should not involve the human at all. A wiped board comes up on
+        BLE with no token; the daemon connects, gets A|NOTOKEN, and both ends
+        then sit there knowing exactly what is wrong and doing nothing about it
+        -- while a USB cable, over which provisioning is already the documented
+        and trusted path, is plugged into the same two devices.
+
+        Unconditional rather than conditional on "does it need one", because
+        there is no way to ask over this link (USB has no handshake -- it is
+        trusted by being physical) and because the daemon's token is the
+        authority: a device holding a different one is a device that cannot
+        link, so overwriting is the repair, not a side effect. NVS skips a write
+        whose value is unchanged, so the steady state costs nothing.
+
+        T| is a CONFIG verb, handled before the protocol on the firmware side,
+        and the Nano ignores it as an unknown line -- so this is safe to send to
+        whatever happens to be on the port.
+        """
+        token = self._provision_token
+        if not token or os.environ.get("CLAUDE_MATE_NO_USB_PROVISION") == "1":
+            return
+        try:
+            self._ser.write(f"T|{token}\n".encode("ascii", errors="replace"))
+        except (serial.SerialException, OSError) as exc:
+            # Not fatal and not worth closing the port over: the link still
+            # works, it just may not be able to authenticate over the radio.
+            log(f"serial: could not hand the device a token: {exc}")
+            return
+        log("serial: handed the device this daemon's token (USB provisioning)")
 
     def _close_locked(self) -> None:
         if self._ser is not None:
@@ -2782,6 +2826,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 f"created. Set CLAUDE_MATE_TOKEN, pass --token, or write one "
                 f"to {DEFAULT_TOKEN_FILE}. Continuing with USB serial only.")
         else:
+            # The cable can now provision the radio. See SerialLink._provision().
+            serial_link.set_provision_token(token)
             if args.tcp:
                 candidate = NetLink(args.tcp_bind, args.tcp_port, token, rx)
                 if candidate.start():

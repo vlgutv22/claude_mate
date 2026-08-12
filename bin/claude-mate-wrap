@@ -1157,22 +1157,52 @@ def select_account(flag_name, interactive):
     profiles = list_profiles()
     if not interactive or not profiles:
         return
-    print("claude-mate — select account (Enter = default, or type a new name):")
-    print(f"  0) default   {account_email() or '(not logged in)'}")
-    for i, p in enumerate(profiles, 1):
-        email = account_email(os.path.join(ACCOUNTS_DIR, p))
-        print(f"  {i}) {p:<10} {email or '(not logged in)'}")
-    try:
-        ans = input("account> ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        os._exit(130)
+    # `d` IS HERE BECAUSE THIS PROMPT IS THE ONLY CLAUDE MATE UI ON THE MAC.
+    # A device that will not link says so on its own glass and in the daemon's
+    # log, and neither is anywhere the person at this prompt is looking -- so
+    # "how do I connect the device" had no answer reachable from the one screen
+    # they always see. It does not select anything: it prints the state of every
+    # link and the shortest fix, then comes back here.
+    while True:
+        print("claude-mate — select account (Enter = default, or type a new name):")
+        print(f"  0) default   {account_email() or '(not logged in)'}")
+        for i, p in enumerate(profiles, 1):
+            email = account_email(os.path.join(ACCOUNTS_DIR, p))
+            print(f"  {i}) {p:<10} {email or '(not logged in)'}")
+        print("  d) device     connect a Claude Mate, or see why it is not linked")
+        try:
+            ans = input("account> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            os._exit(130)
+        if ans.lower() in ("d", "device"):
+            _run_connect()
+            continue                     # ...and ask again; nothing was chosen
+        break
     if not ans or ans == "0":
         return
     if ans.isdigit() and 1 <= int(ans) <= len(profiles):
         use_profile(profiles[int(ans) - 1])
     else:
         use_profile(ans)   # a name: existing profile or a new one to create
+
+
+def _run_connect():
+    """Hand over to claude-mate-connect, which owns everything about linking.
+
+    A subprocess rather than an import: the tool is a hyphenated script with no
+    module name, it is useful on its own, and keeping the knowledge of transports
+    out of the wrapper is the whole reason it is a separate file. Beside this one
+    first, so a repo checkout runs its own copy rather than an older installed
+    one."""
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "claude-mate-connect")
+    cmd = [sys.executable, here] if os.path.exists(here) else ["claude-mate-connect"]
+    try:
+        subprocess.run(cmd, check=False)
+    except OSError as e:
+        sys.stderr.write(f"[claude-mate-wrap] cannot run claude-mate-connect: {e}\n")
+    print()
 
 # --------------------------------------------------------------------------- #
 # Account + remaining-limit reporting (shown on the device's r1/r2 right edges)

@@ -154,8 +154,15 @@ If automatic entry fails, the script falls back to prompting for a manual
 ### First boot and provisioning
 
 An unprovisioned board comes up **on BLE**, advertising as `Claude Mate` with no
-token, and says so on the glass: `no token: MENU > Set token`. Two ways to give
-it one, and start the daemon with `--ble`:
+token, and says so on the glass: `no token: MENU > Set token`.
+
+**Usually you do nothing.** With the daemon running, plugging the board into USB
+is enough: it hands its token to whatever appears on the cable, so a
+factory-reset board provisions itself and links a few seconds later. Run
+`claude-mate-connect` (or press `d` at the account picker) to watch that happen,
+or to be told which link is down if it does not.
+
+The two manual routes, for a board that is nowhere near a cable:
 
 - **On the device, no cable needed** — double-tap the 4th button → **SETTINGS →
   Set token** (it is the first row). The glass shows an AP name and password;

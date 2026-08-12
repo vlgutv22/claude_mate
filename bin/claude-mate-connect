@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""claude-mate-connect -- get a device talking to the daemon, and say why not.
+
+WHY THIS EXISTS. "How do I connect the device after a factory reset" had no
+answer you could find from the Mac. The device knew (its glass says
+`no token: MENU > Set token`), the daemon knew (`THE DEVICE HAS NO TOKEN`), and
+neither was anywhere the person sitting at a terminal would look -- the only
+Claude Mate prompt they ever see is the account picker. So this is that missing
+screen: one command that reports every link, and tells you the shortest way to
+fix whichever one is down.
+
+IT USUALLY HAS NOTHING TO DO. A device on the cable is provisioned by the daemon
+automatically the moment the port opens, so the common case here is confirming
+that it worked. The command exists for the case where it cannot: a cordless
+board, out of reach of any cable, which has to be told its token through the
+setup portal it can raise on its own.
+
+WHY THE DEVICE IS NOT IN THE BLUETOOTH PANE, since that is the first place
+everyone looks and its absence reads as a fault: the status link is an unpaired
+GATT peripheral advertising in short bursts, deliberately -- there is no pairing
+step because a Just Works pairing authenticates nobody, and the token handshake
+is what actually decides who may drive the device. macOS lists Classic and
+pairable devices there, so it will never appear, and connecting it there would
+not connect it to the daemon in any case. (The GAMEPAD mode is a real HID
+device and does appear -- that is a different role of the same board.)
+
+  claude-mate-connect            # report every link and what to do next
+  claude-mate-connect --token    # print the shared token, for typing into the
+                                 # device's portal from a phone
+"""
+import glob
+import os
+import re
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+LOG = os.path.join(HOME, "Library/Logs/claude-mate.err.log")
+PLIST = os.path.join(HOME, "Library/LaunchAgents/com.claudemate.daemon.plist")
+TOKEN_FILE = os.path.expanduser(
+    os.environ.get("CLAUDE_MATE_TOKEN_FILE", "~/.config/claude-mate/token"))
+PORT_GLOBS = ("/dev/cu.usbmodem*", "/dev/cu.usbserial*", "/dev/cu.wchusbserial*")
+
+BOLD, DIM, GREEN, RED, YELLOW, OFF = (
+    "\033[1m", "\033[2m", "\033[32m", "\033[31m", "\033[33m", "\033[0m")
+if not sys.stdout.isatty():
+    BOLD = DIM = GREEN = RED = YELLOW = OFF = ""
+
+
+def usb_ports():
+    return sorted(p for g in PORT_GLOBS for p in glob.glob(g))
+
+
+def read_token():
+    try:
+        with open(TOKEN_FILE) as fh:
+            return fh.read().strip()
+    except OSError:
+        return None
+
+
+def daemon_pid():
+    """The LaunchAgent's pid, or None. `launchctl list` prints pid<TAB>status."""
+    try:
+        out = subprocess.run(["launchctl", "list"], capture_output=True,
+                             text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for ln in out.splitlines():
+        if "com.claudemate.daemon" in ln:
+            pid = ln.split("\t")[0].strip()
+            return int(pid) if pid.isdigit() else None
+    return None
+
+
+def tail(n=400):
+    try:
+        with open(LOG, errors="replace") as fh:
+            return fh.read().splitlines()[-n:]
+    except OSError:
+        return []
+
+
+def ble_state(lines):
+    """The last thing the daemon said about BLE, as (state, detail).
+
+    Read backwards from the log rather than by scanning ourselves: two
+    CoreBluetooth scans on one Mac fight, and the daemon's is the one that
+    matters. Its log is also the ONLY place the Mac can answer "is the device
+    advertising" -- see the note about the Bluetooth pane above.
+    """
+    for ln in reversed(lines):
+        if "BLE device connected" in ln:
+            return "linked", ln.split("BLE device connected:")[-1].strip()
+        if "THE DEVICE HAS NO TOKEN" in ln:
+            return "notoken", ""
+        if "token rejected" in ln:
+            return "rejected", ""
+        if "no device found yet" in ln:
+            return "searching", ""
+        if "bleak" in ln and "install" in ln:
+            return "nobleak", ln.strip()
+    return "unknown", ""
+
+
+def say(ok, label, detail=""):
+    mark = f"{GREEN}ok{OFF}" if ok is True else (
+        f"{RED}no{OFF}" if ok is False else f"{YELLOW}??{OFF}")
+    print(f"  [{mark}] {label}" + (f"  {DIM}{detail}{OFF}" if detail else ""))
+
+
+def main():
+    if "--token" in sys.argv[1:]:
+        tok = read_token()
+        if not tok:
+            print(f"no token at {TOKEN_FILE}", file=sys.stderr)
+            return 1
+        print(tok)
+        return 0
+
+    print(f"\n{BOLD}claude-mate — device connection{OFF}\n")
+
+    pid = daemon_pid()
+    say(pid is not None, "daemon running",
+        f"pid {pid}" if pid else "start it: launchctl bootstrap "
+                                 f"gui/{os.getuid()} {PLIST}")
+
+    token = read_token()
+    say(token is not None, "shared token exists",
+        TOKEN_FILE if token else f"none at {TOKEN_FILE}")
+
+    ports = usb_ports()
+    say(bool(ports), "device on the cable",
+        ports[0] if ports else "not plugged in (that is fine — see below)")
+
+    lines = tail()
+    state, detail = ble_state(lines)
+    say({"linked": True, "searching": None, "unknown": None}.get(state, False),
+        "BLE link",
+        {"linked": f"connected {detail}",
+         "notoken": "the device has no token yet",
+         "rejected": "the device holds a DIFFERENT token",
+         "searching": "scanning — nothing found yet",
+         "nobleak": detail,
+         "unknown": "nothing in the log yet"}[state])
+
+    print()
+    if state == "linked":
+        print(f"{GREEN}Connected.{OFF} Nothing to do.")
+        return 0
+
+    if ports:
+        # The daemon hands its token to whatever opens on the cable, so this is
+        # already in flight or already done; the only thing left is to make sure
+        # the daemon actually has the port.
+        print(f"{BOLD}The cable does this for you.{OFF} The daemon gives its "
+              f"token to any device that\nappears on {ports[0]} the moment it "
+              "opens the port. If the link is still down:\n")
+        if pid is None:
+            print(f"  launchctl bootstrap gui/{os.getuid()} {PLIST}")
+        else:
+            print("  # something else may be holding the port — bounce the daemon")
+            print(f"  launchctl kickstart -k gui/{os.getuid()}/com.claudemate.daemon")
+        print("\nThen give it a few seconds and run this again.")
+        return 0
+
+    print(f"{BOLD}No cable, so the device has to be told its token from its own "
+          f"screen.{OFF}\n")
+    print("  On the device   double-tap the 4th button → SETTINGS → Set token")
+    print("                  (it is the first row; it reads 'none' when unset)")
+    print("  On your phone   join the AP shown on the glass, open "
+          "http://192.168.4.1")
+    print("                  paste the token, leave Network as (none), Save")
+    if token:
+        print(f"\n  the token       {BOLD}{token}{OFF}")
+    print("\nThe board returns to BLE on its own and links within a few seconds.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

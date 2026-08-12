@@ -307,6 +307,20 @@ ok = wait_for(lambda: any("TCP listening" in l for l in daemon_err), 10.0)
 check("--tcp with a token file opens the listener", bool(ok))
 
 # --------------------------------------------------------------------------- #
+# The cable provisions the radio, with nobody typing anything.
+# --------------------------------------------------------------------------- #
+# "How do I connect it after a factory reset" had one honest answer -- open a
+# portal from a phone, or type T|<token> down the cable -- and both are work the
+# user should never have been asked to do, since the daemon and the wiped device
+# are already joined by a cable over which provisioning is the trusted path. So
+# every serial open now hands the device this daemon's token. A device that
+# never needed one is unaffected: NVS skips a write whose value is unchanged.
+ok = wait_for(lambda: usb_seen(lambda l: l == f"T|{TOKEN}"), 10.0)
+check("the daemon hands its token to whatever arrives on the cable", bool(ok))
+check("...which is exactly the line the firmware's config console takes",
+      bool(usb_seen(lambda l: l.startswith("T|"))))
+
+# --------------------------------------------------------------------------- #
 # Phase 1: a wrong token is rejected
 # --------------------------------------------------------------------------- #
 print("\n-- phase 1: a wrong token is rejected --")

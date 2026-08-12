@@ -598,6 +598,7 @@ Step-by-step guides:
 | `CLAUDE_MATE_BLE_ADDRESS` | scan       | Connect to this BLE address instead of scanning for the service. macOS reports its own per-host UUIDs, not MAC addresses — use the string `bleak` printed |
 | `CLAUDE_MATE_TOKEN` / `_TOKEN_FILE` | `~/.config/claude-mate/token` | Shared secret wireless devices authenticate with — **the same one on both radios**. `--tcp`/`--ble` **generate one** (0600) and print it if none exists — send that to the device as `T\|<token>` over USB, or type it into the setup portal. Either transport still refuses to start if a token can neither be read nor created |
 | `CLAUDE_MATE_SOUND`  | off              | `1` plays a macOS alert sound when the worst unacknowledged alert class changes (same as `--sound`) |
+| `CLAUDE_MATE_NO_USB_PROVISION` | off | `1` stops the daemon handing its token to a device that appears on the USB cable. On by default because *"how do I connect it after a factory reset"* should not be a question: provisioning over USB is already the trusted path, so the cable does it with nobody typing anything |
 
 The listener is advertised as `_claudemate._tcp` over mDNS, so a device with no
 host configured finds the daemon on its own.
@@ -627,6 +628,24 @@ selects a profile non-interactively, and an already-exported
 `CLAUDE_CONFIG_DIR` always wins. A fresh profile starts logged out — claude
 prompts `/login` there on first run — and keeps its own settings, history, and
 MCP config. With no profile dirs, nothing changes.
+
+**Device will not connect?** — press `d` at the account picker, or run
+`claude-mate-connect`. It reports every link — daemon, token, cable, BLE — and
+prints the shortest fix for whichever one is down. It usually has nothing to do:
+**the daemon hands its token to any device that appears on the USB cable**, so a
+board that has just been factory reset links itself a few seconds after being
+plugged in, with nobody typing anything. The command matters for the case that
+cannot be automated — a cordless board out of reach of any cable, which has to
+be told its token through the setup portal it raises on its own.
+
+> **It will never appear in System Settings → Bluetooth**, and that is correct,
+> not a fault. The status link is an unpaired GATT peripheral advertising in
+> short bursts; there is no pairing step by design, because Just Works pairing
+> authenticates nobody and the token handshake is what decides who may drive the
+> device. Only a CoreBluetooth scan sees it, which is what the daemon does — its
+> log is the one place the Mac can answer *"is it advertising?"*. (The **gamepad**
+> mode is a genuine HID device and does appear there; that is a different role of
+> the same board.)
 
 **Hit the limit? Carry the conversation across** — `claude-mate-switch`
 continues *this terminal's* conversation on another account. An account is a
