@@ -1470,22 +1470,44 @@ static void requestRender() {
   }
 }
 
+// CHANGING THE LINK REBOOTS THE DEVICE, and there is no cleverer option.
+//
+// The first cut swapped the stacks in place, and it worked exactly once per
+// boot in each direction. BLE cannot be brought back up after it has been torn
+// down -- BLEDevice::deinit(true) does not fully release the controller, so
+// every later init() fails (see blelink.h). So wifi -> ble -> wifi -> ble left
+// the device with NO link at all, silently, until someone power-cycled it. That
+// is much worse than a reboot, and it was found by flipping the row twice on
+// real hardware, which is a thing anyone would do while looking at the setting.
+//
+// The transport is in NVS, so the reboot is not a loss of anything: the device
+// comes back as precisely what you just asked for, in about three seconds. The
+// firmware already reboots for Flip screen and for a factory reset, so the
+// gesture is not new here either.
+// Announce a restart on the glass, then take it. Three seconds of dark panel
+// with no explanation reads as a crash caused by the button you just pressed --
+// which, on a device whose whole job is telling you what is going on, is the
+// one thing it must not do.
+static void restartWithNotice(const char *title, const char *detail) {
+  if (gfx) {
+    gfx->fillScreen(C_BG);
+    drawCentred(SCREEN_W / 2, SCREEN_H / 2 - 20, 2, title, C_TEXT);
+    if (detail)
+      drawCentred(SCREEN_W / 2, SCREEN_H / 2 + 6, 2, detail, C_WORK);
+    drawCentred(SCREEN_W / 2, SCREEN_H / 2 + 34, 1, "restarting...", C_DIM);
+    if (buffered) canvas->flush();
+  }
+  net.shutdown();                           // leave both politely, whichever
+  ble.shutdown();                           // one was actually up
+  cfg.flush();                              // the deferred commit will not run
+  delay(700);                               // long enough to read
+  ESP.restart();                            // never returns
+}
+
 static void setTransport(MateTransport t) {
   if (t == transport) return;
-  if (transport == LINK_BLE) ble.shutdown();
-  else                       net.shutdown();
-  transport = t;
   MateNet::storeTransport(t);
-  // Not while the gamepad has the radio. The pad is what the device IS right
-  // now; the new transport comes up when you turn it off, which linkStart() in
-  // leavePad() already does.
-  if (uiMode != UI_PAD) linkStart();
-  // Do not let the switch itself trip the liveness watchdog. The new transport
-  // needs seconds to associate or to be discovered, and a NO LINK screen thrown
-  // up by the act of changing the link reads as the change having broken it.
-  lastRxMs = millis();
-  linkLost = false;
-  requestRender();
+  restartWithNotice("SWITCHING LINK", MateNet::transportName(t));
 }
 
 // Controller mode is entered from two directions -- the daemon's G|1 when a
@@ -1537,9 +1559,22 @@ static void leavePad() {
   if (uiMode != UI_PAD) return;
   if (padVia == PAD_BLE) {
     blepad.end();                          // frees the controller, not just idle
-    // Give the radio back. On Wi-Fi only if the policy had actually parked it;
-    // on BLE always, because entering took the link down unconditionally.
-    if (padWifiParked || transport == LINK_BLE) linkStart();
+    // Give the radio back.
+    //
+    // On a BLE build that means REBOOTING, not restarting a stack: the pad and
+    // the link are two roles on one controller, and once that controller has
+    // been deinit'd it will not init again this boot (see blelink.h). Trying
+    // anyway is what left the device with no link at all. Everything worth
+    // keeping is in NVS, including the now-off pad switch written just above,
+    // so the device comes back as a conductor on BLE, which is exactly what
+    // turning the gamepad off asked for.
+    if (transport == LINK_BLE) {
+      padVia = PAD_LINK;                   // so the reboot notice is not drawn
+      restartWithNotice("GAMEPAD OFF", nullptr);   // over the pad face
+    }
+    // On Wi-Fi the two stacks are genuinely separate, so it is just a restart,
+    // and only if the radio policy had actually parked it.
+    if (padWifiParked) linkStart();
     // The switch and the world must agree. Leaving by the 2 s hold is a real
     // "turn this off" -- the same gesture as the settings row, made from the
     // pad face -- and a device that came back from a reboot as a gamepad you
@@ -2812,6 +2847,13 @@ void loop() {
   net.poll();
   net.applyPendingConfig();
   ble.poll();
+  // The backstop. ble.poll() retries a start that did not take, and stuck()
+  // means it has run out of tries -- which on this chip means the controller is
+  // not coming back without a reboot. Doing nothing here is what the first cut
+  // did, and it presented as a device that had quietly stopped having a link at
+  // all, with `ble : OFF` visible only over a cable it was probably not
+  // attached to. A reboot is three seconds and the transport is in NVS.
+  if (ble.stuck()) restartWithNotice("LINK RESTART", "ble");
   pumpUsb();
   pumpNet();
   pumpBle();

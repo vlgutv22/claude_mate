@@ -304,7 +304,7 @@ adding a row costs nothing but the row.
 | Row | Values | Notes |
 |---|---|---|
 | **BLE gamepad** | on / off | The device as an **ordinary Bluetooth HID gamepad** — pair "Claude Mate" once in System Settings and macOS presents it as a system controller. **On means the device *is* a gamepad**, across a screen sleep and across a reboot, until you turn it off; off means it is the conductor again and the daemon link comes back. This is the only input path the **public site** can use: the daemon path needs `http://127.0.0.1`, which an https page cannot reach. It also skips Wi-Fi, mDNS, the TCP dial, the daemon and SSE entirely, which is the chain that was making the controller lurch. Four buttons, no axes, physical order (1 = PREV, 2 = GO, 3 = NEXT, 4 = 4th). Leave with a 2 s hold of the 4th button, which turns the switch off too. See the radio policy below |
-| **Link** | wi-fi / ble | Which radio carries the daemon — **never both**, since there is one 2.4 GHz radio and sharing it costs the link that matters. Live in both directions, no restart: the old stack goes down before the new one comes up. Green when that radio has actually found the daemon, because *"ble"* and *"ble, and it is working"* are the two things you came to this row to tell apart. Stored in the **network** namespace, next to the SSID and the token it is useless without |
+| **Link** | wi-fi / ble | Which radio carries the daemon — **never both**, since there is one 2.4 GHz radio and sharing it costs the link that matters. **Changing it restarts the device** (~3 s, with a screen that says so); see below for why that is the only option rather than a shortcut. Green when that radio has actually found the daemon, because *"ble"* and *"ble, and it is working"* are the two things you came to this row to tell apart. Stored in the **network** namespace, next to the SSID and the token it is useless without |
 | **Sleep screen** | off · 1m · 2m · 5m · 10m · 30m | One row, not a toggle plus a duration — the two can never disagree, and it costs one row on a screen that has five. Defaults to **off**: nobody's screen should start going dark because they took an update |
 | **Brightness** | 5 steps | Non-linear in duty (20/60/120/200/255). Equal duty steps feel like one enormous jump at the bottom and four identical ones at the top. Applied live, so the step you are on is the step you can see |
 | **Alert LED** | off · low · med · high | **off is genuinely dark.** A 7 Hz red strobe is the right answer to a failed turn at a desk and the wrong one in a bedroom — and the alert still arrives, through the flashing name row and fleet letter |
@@ -424,6 +424,38 @@ between the two should not need a toolchain. Holding BOOT at power-on still
 forces the Wi-Fi setup portal whichever transport is stored — that escape hatch
 has to outrank the setting, or a device could be locked out by the very thing
 you were trying to fix.
+
+#### Why changing the link reboots the device
+
+**BLE does not come back in the same boot.** `BLEDevice::deinit(true)` does not
+fully release the controller, and every `BLEDevice::init()` after it fails —
+deterministically, silently, forever. Measured on hardware, not assumed:
+
+| | Result |
+|---|---|
+| Fresh boot → `ble` | `ADVERTISING` ✓ |
+| `ble` → `wifi` → `ble` in one boot, swapping stacks in place | `ble : OFF`, permanently |
+| ...and `I|BLE` again to force it | still `OFF` — a no-op, since the transport had not changed |
+| Reboot | `ADVERTISING` ✓ |
+
+The first cut swapped the stacks in place and worked exactly once per boot in
+each direction. Flipping the row twice — which is what anyone does while looking
+at a new setting — left the device with **no link at all**, no advertising, no
+Wi-Fi, no retry and no way to force one. `ble : OFF` was visible only over a
+cable a cordless device is probably not attached to.
+
+So the rule is: **anything that takes the BLE stack down reboots to bring it
+back.** The transport is in NVS, so the reboot loses nothing — the device comes
+up as exactly what you asked for, in about three seconds, behind a screen that
+says which link it is switching to. The same applies to turning the **BLE
+gamepad off** on a BLE build, for the same reason: the pad and the link are two
+roles on one controller.
+
+There is a backstop underneath that. `blelink.h` remembers that it was asked to
+be up and retries a failed start a few times; when those are spent, `stuck()`
+tells the sketch and the sketch reboots. Rebooting is genuinely the only way
+back, so the only real choice is between doing it deliberately and pretending
+the problem is not there.
 
 #### Connecting over BLE, start to finish
 

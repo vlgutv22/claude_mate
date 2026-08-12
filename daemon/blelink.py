@@ -90,6 +90,7 @@ BLE_RETRY_S = 3.0           # between scan attempts...
 BLE_RETRY_MAX_S = 30.0      # ...doubling on consecutive failures, capped
 BLE_MAX_LINE = 512          # drop over-long lines (the longest real one is ~94B)
 BLE_NOT_FOUND_GAP_S = 120.0  # between "still looking" notes; see _log_not_found
+BLE_WRITE_FAIL_LIMIT = 3     # consecutive failed writes that end a session
 
 
 class BleLink:
@@ -129,6 +130,7 @@ class BleLink:
         self._buf = bytearray()        # notification reassembly
         self._auth_q: "queue.Queue[str]" = queue.Queue()
         self._not_found_logged = 0.0   # throttle for _log_not_found
+        self._write_fails = 0          # consecutive failed GATT writes
 
     # ---- lifecycle --------------------------------------------------------- #
 
@@ -311,6 +313,7 @@ class BleLink:
 
         async with BleakClient(device,
                                disconnected_callback=on_disconnect) as client:
+            self._write_fails = 0
             await client.start_notify(BLE_TX_UUID, self._on_notify)
             if not await self._authenticate(client):
                 return
@@ -319,8 +322,22 @@ class BleLink:
             self._log(f"BLE device connected: {device.address}")
             try:
                 while not self._stop_evt.is_set() and not disconnected.is_set():
-                    # Nothing to poll: notifications arrive on their own. This
-                    # is purely how the coroutine notices it should stop.
+                    # DO NOT TRUST THE DISCONNECT CALLBACK ALONE. Observed on
+                    # hardware: the device rebooted three times and this daemon
+                    # went on believing it was connected for an hour and a half
+                    # -- has_clients() true, frames written into nothing, and no
+                    # scan ever started again, because the callback that was
+                    # supposed to end the session never fired. A transport whose
+                    # recovery depends on one notification it does not control
+                    # has no recovery.
+                    #
+                    # So ask, every tick, as well as being told. The TCP
+                    # transport learned the same lesson from the other
+                    # direction: NetLink reaps a client the first time a write
+                    # to it fails, rather than waiting to be informed.
+                    if not client.is_connected or \
+                            self._write_fails >= BLE_WRITE_FAIL_LIMIT:
+                        break
                     try:
                         await asyncio.wait_for(disconnected.wait(), timeout=0.5)
                     except asyncio.TimeoutError:
@@ -413,19 +430,25 @@ class BleLink:
         if len(self._buf) > BLE_MAX_LINE:
             self._buf.clear()
 
-    @staticmethod
-    async def _write(client, data: bytes) -> None:
+    async def _write(self, client, data: bytes) -> None:
         """One GATT write, without response.
 
         Without response deliberately: the protocol is idempotent -- every frame
         is the whole screen, so a lost one is corrected by the next one a second
         later -- and waiting for an ATT acknowledgement on every frame would
         double the radio time for a guarantee this link does not need.
+
+        A write that RAISES is a second, independent way of learning the device
+        has gone -- the one NetLink relies on entirely. It used to be swallowed
+        here on the theory that the disconnect callback would end the session;
+        hardware disagreed. One failure is a glitch, three in a row is a device
+        that is not there.
         """
         try:
             await client.write_gatt_char(BLE_RX_UUID, data, response=False)
+            self._write_fails = 0
         except Exception:                               # noqa: BLE001
-            pass        # the disconnect callback is what actually ends a session
+            self._write_fails += 1
 
     async def _sleep(self, secs: float) -> None:
         """Sleep, but wake early when stop() is called."""

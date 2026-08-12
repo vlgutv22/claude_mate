@@ -160,7 +160,20 @@ class FakeClient:
         self.device = device
         self._on_disc = disconnected_callback
         self._notify = None
+        # The real client has this, and the session loop now asks it every tick
+        # rather than trusting the disconnect callback -- see `vanish()`.
+        self.is_connected = True
         FakeClient.instances.append(self)
+
+    def vanish(self):
+        """The device goes away WITHOUT the callback firing.
+
+        Not a hypothetical: observed on hardware, where the board rebooted three
+        times and the daemon went on believing it was connected for an hour and
+        a half, writing frames into nothing and never scanning again. The
+        callback is simply not something a transport can depend on.
+        """
+        self.is_connected = False
 
     async def __aenter__(self):
         return self
@@ -263,6 +276,20 @@ try:
     dev.raw(b"G\n")
     check("one line split across two notifications arrives whole",
           wait_for(lambda: not rx.empty()) and rx.get() == "B|+G")
+
+    print("\n== a device that vanishes WITHOUT the callback is still noticed ==")
+    # The bug this guards: bleak's disconnected_callback did not fire when the
+    # board rebooted, so the daemon believed it was connected for 90 minutes --
+    # has_clients() true, frames written into nothing, and no scan ever started
+    # again. Recovery cannot depend on one notification the transport does not
+    # control, so the session loop asks is_connected every tick as well.
+    dev.vanish()
+    check("has_clients() goes false without any disconnect callback",
+          wait_for(lambda: not link.has_clients(), 5.0))
+    check("...and write_line() stops claiming to have sent anything",
+          link.write_line("F|0|-1|x|y|z|w") is False)
+    check("...and it goes back to scanning rather than sitting on a dead link",
+          wait_for(lambda: len(FakeClient.instances) > 1, 8.0))
 finally:
     link.stop()
 
@@ -312,12 +339,21 @@ finally:
 
 # --------------------------------------------------------------------------- #
 print("\n== bleak missing costs the BLE link and nothing else ==")
-saved = sys.modules.pop("bleak")
+# `sys.modules["bleak"] = None` makes `import bleak` raise ImportError outright.
+# Merely POPPING the stub is not enough and quietly stopped testing anything the
+# day bleak got installed on the machine running this: the import fell straight
+# through to the real package and start() succeeded. A test that passes because
+# of what happens to be installed is not a test.
+saved = sys.modules.get("bleak")
+sys.modules["bleak"] = None
 link, rx, logs = new_link()
 check("start() returns False rather than raising", link.start() is False)
 check("...and says how to fix it",
       any("pip install bleak" in l for l in logs))
-sys.modules["bleak"] = saved
+if saved is not None:
+    sys.modules["bleak"] = saved
+else:
+    del sys.modules["bleak"]
 
 # --------------------------------------------------------------------------- #
 print("\n== the daemon accepts --ble and survives having no token ==")

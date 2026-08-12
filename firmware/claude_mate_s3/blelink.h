@@ -85,6 +85,12 @@
 // in one burst. A ring this size holds a whole mirror frame plus the status
 // frame behind it, so a busy moment never truncates a row on the glass.
 #define BLE_RX_RING       2048
+// How hard to try before admitting the stack is not coming up this boot. Three
+// is not timidity: on this chip a re-init after a deinit fails deterministically
+// (see begin()), so the retries exist to distinguish that from a transient, not
+// to grind away at something that will never work.
+#define BLE_START_TRIES   3
+#define BLE_START_RETRY_MS 2000UL
 
 // 128-bit UUIDs, this project's own. A 16-bit UUID would have to come from the
 // SIG's assigned list and none of them means "a triage companion's line
@@ -112,28 +118,50 @@ class MateBle {
   // "there is no link", not as "it will be along shortly" -- a transport that
   // silently never connects is the hardest possible thing to diagnose from
   // across a room.
+  // THE STACK DOES NOT COME BACK IN THE SAME BOOT. Measured on hardware, not
+  // assumed: BLEDevice::deinit(true) does not fully release the controller, and
+  // every BLEDevice::init() after it fails. A fresh boot advertises; a boot that
+  // has already torn BLE down once never gets it back, however many times you
+  // ask. So begin() remembers what it was asked for and poll() retries -- and
+  // when the retries are spent, stuck() tells the sketch, whose only real answer
+  // is to reboot. That is not a workaround dressed up as a policy: rebooting is
+  // genuinely the only way back, and the transport is in NVS so the device comes
+  // up as exactly what it was.
+  //
+  // Before this, a failed start was SILENT and permanent: `ble : OFF`, no
+  // advertising, no link, no retry, and no way to force one -- found by flashing
+  // a board and wondering why the daemon had stopped seeing it.
   bool begin(const char *name, const String &token) {
     if (_state != OFF) return true;
+    snprintf(_name, sizeof(_name), "%s", name ? name : "Claude Mate");
     _token = token;
-    if (!BLEDevice::getInitialized()) BLEDevice::init(name);
+    _wantUp = true;
+    _fails = 0;
+    return start();
+  }
+
+ private:
+  bool start() {
+    _lastTry = millis();
+    if (!BLEDevice::getInitialized()) BLEDevice::init(_name);
     // 185 leaves the whole longest line in one ATT write. At the default 23 the
     // daemon would have to split every frame across four writes, and a split
     // that lands mid-line is fine (we reassemble on newlines) but pointless.
     BLEDevice::setMTU(185);
 
     _server = BLEDevice::createServer();
-    if (!_server) { shutdown(); return false; }
+    if (!_server) return startFailed();
     _server->setCallbacks(&_srvCb);
 
     BLEService *svc = _server->createService(BLEUUID(BLE_SVC_UUID));
-    if (!svc) { shutdown(); return false; }
+    if (!svc) return startFailed();
 
     _rx = svc->createCharacteristic(BLE_RX_UUID,
                                     BLECharacteristic::PROPERTY_WRITE |
                                     BLECharacteristic::PROPERTY_WRITE_NR);
     _tx = svc->createCharacteristic(BLE_TX_UUID,
                                     BLECharacteristic::PROPERTY_NOTIFY);
-    if (!_rx || !_tx) { shutdown(); return false; }
+    if (!_rx || !_tx) return startFailed();
     _rxCb.owner = this;
     _rx->setCallbacks(&_rxCb);
     // The client-characteristic-configuration descriptor: without it Bluedroid
@@ -152,17 +180,39 @@ class MateBle {
     adv->setMinInterval(BLE_ADV_ITVL);
     adv->setMaxInterval(BLE_ADV_ITVL);
 
+    _fails = 0;
     go(ADVERTISING);
     startBurst();
     return true;
   }
 
+  // A start that did not take. Tears the pieces down WITHOUT clearing _wantUp,
+  // so poll() keeps trying -- the difference between "we gave up" and "the
+  // caller asked us to stop", which shutdown() means and this does not.
+  bool startFailed() {
+    teardown();
+    if (_fails < 250) _fails++;
+    note("ble would not start");
+    return false;
+  }
+
+ public:
   // Advance the duty cycle and time the handshake out. Never blocks -- which is
   // the quiet advantage over the Wi-Fi path, where MDNS.queryService() and the
   // TCP dial both stop the loop (and therefore the button poll) for most of a
   // second every retry.
   void poll() {
-    if (_state == OFF) return;
+    if (_state == OFF) {
+      // Down but wanted: keep trying. On this chip the retry is very unlikely
+      // to succeed (see begin()), but it costs nothing, it covers a start that
+      // failed for some other reason at boot, and it is what makes stuck()
+      // meaningful -- "we asked BLE_START_TRIES times" rather than "we asked
+      // once and gave up", which is not a basis for rebooting a device.
+      if (!_wantUp || _fails >= BLE_START_TRIES) return;
+      if ((millis() - _lastTry) < BLE_START_RETRY_MS) return;
+      start();
+      return;
+    }
 
     // A handshake the callback rejected hangs up HERE, not there. Tearing the
     // connection down from inside a GATT write callback means calling into the
@@ -207,6 +257,15 @@ class MateBle {
   bool connected() const { return _state == LINKED; }
   State state() const { return _state; }
 
+  // "I was asked to be up, I have tried as many times as is worth trying, and I
+  // am not up." The sketch's only real answer is a reboot -- see begin(). Kept
+  // as a QUESTION rather than acted on here: a transport header that reboots the
+  // device on its own is not something the rest of the firmware could reason
+  // about, and the sketch has a flush to do first.
+  bool stuck() const {
+    return _wantUp && _state == OFF && _fails >= BLE_START_TRIES;
+  }
+
   bool write(const char *line) {
     if (_state != LINKED) return false;
     return notifyLine(line);
@@ -226,6 +285,14 @@ class MateBle {
   // that is parked but resident keeps contending for the one 2.4 GHz radio,
   // which is the entire reason the sketch ever asks for this.
   void shutdown() {
+    _wantUp = false;      // deliberate: poll() must not resurrect it
+    _fails = 0;
+    teardown();
+  }
+
+  // The pieces, without the intent. Used both by shutdown() and by a start that
+  // did not take.
+  void teardown() {
     if (BLEDevice::getInitialized()) BLEDevice::deinit(true);
     _server = nullptr;
     _rx = _tx = nullptr;
@@ -458,6 +525,11 @@ class MateBle {
   uint8_t       _out[200];            // one outbound line + its newline
   // Set on the BLE task, cleared in poll(). One flag, one writer each way.
   volatile bool _pendingDisconnect = false;
+  // What begin() was asked for, kept so poll() can retry without the caller.
+  char          _name[24] = {0};
+  bool          _wantUp = false;
+  uint8_t       _fails = 0;
+  unsigned long _lastTry = 0;
   bool          _advOn = false;
   unsigned long _advSince = 0;
   unsigned long _stateSince = 0;

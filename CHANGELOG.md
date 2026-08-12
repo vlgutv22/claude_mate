@@ -99,6 +99,39 @@ they are the project's history, not the current behavior (which the
   at once and every one of them gets every frame — the fan-out deliberately does
   not short-circuit, since an `or` chain would stop at the first transport that
   took the bytes and leave the second device showing a frame from a minute ago.
+- **Fixed, on hardware, four ways the link could die and stay dead.** All four
+  were invisible to the test suite and to CI, and all four were found by
+  flashing a board and using it:
+  - **BLE does not come back in the same boot.** `BLEDevice::deinit(true)` does
+    not fully release the controller and every `init()` after it fails —
+    deterministically. The first cut swapped the stacks in place, which worked
+    exactly once per boot in each direction, so flipping SETTINGS → Link twice
+    (what anyone does while looking at a new setting) left the device with **no
+    link at all**: no advertising, no Wi-Fi, no retry, and `ble : OFF` visible
+    only over a cable a cordless device is probably not attached to. Anything
+    that takes the BLE stack down now **reboots** to bring it back, behind a
+    screen that says which link it is switching to. The transport is in NVS, so
+    three seconds is the whole cost. The same applies to turning the gamepad off
+    on a BLE build — the pad and the link are two roles on one controller.
+  - **A failed start was silent and permanent.** `blelink.h` now remembers it
+    was asked to be up, retries, and when the retries are spent says so
+    (`stuck()`) so the sketch can reboot rather than sit there being nothing.
+  - **`I|BLE` could not restart a dead stack**, because `setTransport()`
+    returned early when the value had not changed — so the one command that
+    looked like it should fix it was a no-op.
+  - **The daemon never noticed a device that vanished.** bleak's
+    `disconnected_callback` did not fire when the board rebooted, and the daemon
+    went on believing it was connected **for ninety minutes** — `has_clients()`
+    true, frames written into nothing, and no scan ever started again. A
+    transport whose recovery depends on one notification it does not control has
+    no recovery, so the session loop now asks `is_connected` every tick and
+    counts consecutive failed writes, which is the same thing `NetLink` has
+    always done from the other direction. Recovery measured at ~6 s.
+  `tools/test_ble_link.py` gained a regression test for the last of those, which
+  also meant giving the fake client an `is_connected` the real one has. One of
+  its own checks turned out to be environment-dependent — "bleak missing" passed
+  only because bleak happened not to be installed, and quietly stopped testing
+  anything the day it was; it now blocks the import outright.
 
 ### 2026-08-08 — SHIP IT level 2: M2 · SCAFFOLDING, and the product manager
 
