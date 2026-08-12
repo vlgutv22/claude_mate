@@ -12,6 +12,48 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
+### 2026-08-12 — A board with nothing in NVS can get itself a token
+
+Five ways a factory-reset ESP32-S3 could not be provisioned at all, found by
+wiping one and trying. Every one of them ends the same way: a device advertising
+nothing and answering nothing, which no test on either side of the protocol
+could have seen. `tools/test_ble_link.py` now pins all five statically
+(43 → 57 checks).
+
+- **Fixed: an unprovisioned board came up in a portal it could not satisfy.**
+  Empty NVS defaulted the transport to Wi-Fi, so `begin()` found no SSID and
+  raised the setup portal — which outranks every screen in `render()` and blocks
+  the menu, including the **SETTINGS → Link** row that would have moved the
+  device to BLE. The way out was reachable only from behind the thing blocking
+  it. A board with nothing stored now comes up **on BLE**, the radio that needs
+  nothing stored to work. A board with an SSID still comes up on Wi-Fi: an
+  upgrade must not move a working device onto a different radio behind its
+  owner's back.
+- **Fixed: `T|<token>` reached NVS but not the running BLE stack.** The device
+  went on answering `A|NOTOKEN` with the correct secret in flash beside it —
+  indistinguishable, from either end, from a daemon rejecting a token that is
+  right. Since BLE cannot be restarted in the same boot, the stack now takes the
+  token live. The same hole existed on the **portal** path, where the page
+  handler writes to NVS and has never heard of the stack, and that was the worse
+  one: it is the only way a cordless board can be given a token with no cable.
+- **Fixed: holding BOOT on a BLE board was a one-way door.** The portal only ever
+  timed out on a device with credentials to fall back to, because for an
+  unprovisioned Wi-Fi device the portal is all there is. A BLE device has a
+  working link and no use for the screen, so it now expires after five idle
+  minutes and hands the glass back — and expiring with no SSID powers the radio
+  down rather than dialling an empty one, which would put the STA back up on the
+  one radio the other transport is trying to use.
+- **Fixed: `W|`, `S|` and `T|` restarted Wi-Fi on a BLE device.** Provisioning
+  credentials for later would associate immediately, leaving both radios up —
+  the exact contention one-transport-at-a-time exists to prevent. They are
+  stored either way and applied only when Wi-Fi is the live link.
+- **Changed: the screens a fresh board actually shows name the missing token
+  first.** `ble: start the daemon with --ble` and `check it is running with
+  --ble` are both true and both send you to the wrong half of the daemon's log
+  when the real answer is that this device has no secret yet. The status line and
+  the NO LINK screen now say `send T|<token> over USB`, and the `A|NOTOKEN` note
+  no longer points a BLE user at a portal it never opens.
+
 ### 2026-08-11 — BLE as a transport, and one gamepad switch instead of two rows
 
 - **Added: the line protocol over Bluetooth LE** (`firmware/claude_mate_s3/blelink.h`,

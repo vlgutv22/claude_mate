@@ -255,8 +255,9 @@ hooks are the zero-dependency feed. Use whichever fits each session.
 - **Cordless, on a cell** — Wi-Fi (TCP) instead of USB, discovered over mDNS
   and authenticated with a nonce/HMAC handshake in which the token never
   crosses the wire. Wi-Fi credentials, daemon address and token live in **NVS**,
-  a separate partition, so they **survive a reflash**; an unprovisioned board
-  raises a setup portal you join from a phone.
+  a separate partition, so they **survive a reflash**. An unprovisioned board
+  comes up on BLE and asks for a token over the cable; hold **BOOT** at power-on
+  for a Wi-Fi setup portal you join from a phone.
 - **Colour as a second channel** — the WS2812 plays the same rhythm *and* the
   alert class's colour, and every fleet letter is drawn in its own state colour.
   The colours differ in **brightness** as well as hue, so they stay distinct for
@@ -527,7 +528,9 @@ More build photos are in [`assets/photos/`](assets/photos/).
      ```sh
      ./firmware/flash_s3.sh
      ```
-     On first boot an unprovisioned board raises a Wi-Fi setup portal
+     On first boot an unprovisioned board comes up on **BLE** with no token:
+     send it `T|<token>` over the same cable and run the daemon with `--ble`.
+     For Wi-Fi instead, hold **BOOT** at power-on for a setup portal
      (`Claude-Mate-XXXX`); join it from a phone and point it at your Mac.
 2. **Run the daemon** on your Mac:
    ```sh
@@ -588,7 +591,7 @@ Step-by-step guides:
 | `CLAUDE_MATE_TCP_BIND` | `0.0.0.0`     | Bind address — a remote device needs a routable one; `127.0.0.1` keeps it on this machine |
 | `CLAUDE_MATE_BLE`   | off              | `1` also serves the protocol over **Bluetooth LE** for the battery build (same as `--ble`). Needs the optional `bleak` package; without it the daemon says so and carries on |
 | `CLAUDE_MATE_BLE_ADDRESS` | scan       | Connect to this BLE address instead of scanning for the service. macOS reports its own per-host UUIDs, not MAC addresses — use the string `bleak` printed |
-| `CLAUDE_MATE_TOKEN` / `_TOKEN_FILE` | `~/.config/claude-mate/token` | Shared secret wireless devices authenticate with — **the same one on both radios**. `--tcp`/`--ble` **generate one** (0600) and print it if none exists — type that into the device's setup portal. Either transport still refuses to start if a token can neither be read nor created |
+| `CLAUDE_MATE_TOKEN` / `_TOKEN_FILE` | `~/.config/claude-mate/token` | Shared secret wireless devices authenticate with — **the same one on both radios**. `--tcp`/`--ble` **generate one** (0600) and print it if none exists — send that to the device as `T\|<token>` over USB, or type it into the setup portal. Either transport still refuses to start if a token can neither be read nor created |
 | `CLAUDE_MATE_SOUND`  | off              | `1` plays a macOS alert sound when the worst unacknowledged alert class changes (same as `--sound`) |
 
 The listener is advertised as `_claudemate._tcp` over mDNS, so a device with no

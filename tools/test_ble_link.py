@@ -21,9 +21,13 @@ testing are the parts that are not about radios:
   * that handshake lines are consumed by the handshake and never leak up to the
     daemon's ButtonReader as unknown verbs.
 
-Finally a few static assertions about the firmware, guarding the invariants that
-the menu rework depends on: ONE gamepad row, persisted, and a config verb that
-does not collide with the protocol's.
+Finally two sets of static assertions about the firmware. One guards the
+invariants the menu rework depends on: ONE gamepad row, persisted, and a config
+verb that does not collide with the protocol's. The other guards the bootstrap --
+every state a device with EMPTY NVS was found stuck in, unable to be given a
+token at all without a reflash. Those are static of necessity: a stranded device
+advertises nothing and answers nothing, so there is no behaviour on either side
+of the protocol for a test to drive.
 """
 import hmac
 import os
@@ -398,7 +402,8 @@ check("boot restores the gamepad", re.search(
 # silently unreachable over the cable -- the exact bug X| once was.
 # test_controller_mode.py asserts the two sets are disjoint; this asserts the
 # new verb landed on the right side of that line.
-def case_labels(src, signature):
+def fn_body(src, signature):
+    """The braced body of one function, so a check cannot match the whole file."""
     start = src.index(signature)
     i = src.index("{", start)
     depth, j = 0, i
@@ -410,13 +415,93 @@ def case_labels(src, signature):
             if depth == 0:
                 break
         j += 1
-    return set(re.findall(r"case\s+'(.)'\s*:", src[i:j]))
+    return src[i:j]
+
+
+def case_labels(src, signature):
+    return set(re.findall(r"case\s+'(.)'\s*:", fn_body(src, signature)))
 
 
 proto = case_labels(ino, "static void handleLine(char *line)")
 config = case_labels(ino, "static bool handleConfigLine(char *line)")
 check("I| is a config-console verb", "I" in config)
 check("...and is not claimed by the protocol as well", "I" not in proto)
+
+# --------------------------------------------------------------------------- #
+# 4. A factory-reset device can get itself a token.
+# --------------------------------------------------------------------------- #
+# Every check here stands for a state a device with EMPTY NVS was found in and
+# could not leave without a reflash. None of them is visible from either side of
+# the protocol -- a stranded device advertises nothing and says nothing -- so
+# there is no behavioural test that would catch a regression, only these.
+print("\n== a device with nothing in NVS can bootstrap itself ==")
+
+netcfg = read(os.path.join(FW, "netcfg.h"))
+stored = fn_body(netcfg, "static MateTransport storedTransport()")
+# The portal outranks every screen in render() and blocks the menu, and it only
+# ever timed out on a device that had credentials to fall back to. So a
+# factory-reset device that defaulted to Wi-Fi was locked in the Wi-Fi portal,
+# with the Link row that would have got it out visible to nobody.
+check("nothing in NVS at all comes up on BLE, not in the Wi-Fi portal",
+      re.search(r"if \(!p\.begin\(NET_NS, true\)\) return LINK_BLE", stored))
+check("...and so does a wiped namespace with no SSID in it",
+      re.search(r"return haveSsid \? LINK_WIFI : LINK_BLE", stored))
+# The other half of that: an upgrade must not move a working device onto a
+# different radio behind its owner's back.
+check("...but a stored SSID still means Wi-Fi", 'p.getString("ssid"' in stored)
+check("...and an explicit setting outranks both",
+      re.search(r"if \(v == LINK_BLE\)\s+return LINK_BLE;", stored)
+      and re.search(r"if \(v == LINK_WIFI\) return LINK_WIFI;", stored))
+
+# The two ways a token reaches a device that is ALREADY advertising. Both were
+# broken, both in the same way -- the secret landed in NVS and the running stack
+# never heard about it -- and both present as the daemon rejecting a token that
+# is right.
+check("T| over USB hands the token to the live BLE stack, not just to NVS",
+      re.search(r"net\.setToken\(a \+ 1\);.*?ble\.setToken\(a \+ 1\);",
+                fn_body(ino, "static bool handleConfigLine(char *line)"), re.S))
+check("...and so does the portal, whose page handler cannot reach the stack",
+      re.search(r"if \(_state != OFF\) \{ setToken\(token\); return true; \}",
+                fw_ble))
+
+# A BLE device stores Wi-Fi credentials for later; it must not ASSOCIATE on them.
+# Both radios up at once is the contention one-transport-at-a-time exists to
+# prevent, and net.restart() on a BLE build with an SSID stored does exactly it.
+check("no config verb restarts Wi-Fi without checking it is the live transport",
+      not re.search(r"^\s*net\.restart\(\);",
+                    fn_body(ino, "static bool handleConfigLine(char *line)"),
+                    re.M))
+
+# The escape hatch has to be an escape hatch in both directions: BOOT held at
+# power-on on a cordless BLE board opens a Wi-Fi portal it can never fill in.
+check("a device with another link says so, so the portal is allowed to expire",
+      "net.setFallbackLink(transport == LINK_BLE);" in ino)
+check("...and the portal timeout honours it",
+      re.search(r"if \(\(configured\(\) \|\| _fallbackLink\) &&",
+                netcfg))
+check("...and expiring with no SSID powers the radio down rather than "
+      "dialling an empty one",
+      re.search(r"\} else \{\s*\n\s*note\(\"setup timed out\"\);\s*\n\s*"
+                r"shutdown\(\);", fn_body(netcfg, "void pollPortal()")))
+# ...which strands the device unless the sketch notices SETUP ending and starts
+# the transport the Link row claims this device is on.
+check("...and the sketch hands the glass back to BLE afterwards",
+      re.search(r"transport == LINK_BLE && lastNetState == MateNet::SETUP.*?"
+                r"net\.shutdown\(\);\s*\n\s*ble\.begin\(", ino, re.S))
+
+# Last: the screens a fresh board actually shows. A device with no token that
+# says "check the daemon is running with --ble" sends you to read the wrong log.
+check("the BLE status line names the missing token first",
+      re.search(r"case ADVERTISING: return _token\.isEmpty\(\)", fw_ble))
+check("...and so does the NO LINK screen",
+      re.search(r"gfx->print\(!net\.hasToken\(\)", ino))
+# Matched against the note() STRING, not the file: the comment above that line
+# quotes the wording it replaced, and a check that reads comments would pass or
+# fail on prose.
+check("...and the NOTOKEN answer names the cable, not a portal this device "
+      "never opens",
+      re.search(r'note\("no token - send T\|<token> over USB"\)', fw_ble)
+      and not re.search(r'note\("[^"]*setup portal', fw_ble))
 
 print(f"\n{checks - len(failures)}/{checks} checks passed")
 if failures:

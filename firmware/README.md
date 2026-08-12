@@ -153,15 +153,36 @@ If automatic entry fails, the script falls back to prompting for a manual
 
 ### First boot and provisioning
 
-An unprovisioned board comes up in a **Wi-Fi setup portal** and shows an access
-point name (`Claude-Mate-XXXX`) and a password that is regenerated on every
-portal start. Join it from a phone, open `http://192.168.4.1`, and fill in the
-network, password, **shared token**, and port (8787); leave the host blank to
-discover the daemon over mDNS.
+An unprovisioned board comes up **on BLE**, advertising as `Claude Mate` with no
+token, and says so on the glass: `no token: send T|<token> over USB`. Give it one
+over the cable you just flashed with, and start the daemon with `--ble`:
 
-**Where the token comes from.** Run the daemon with `--tcp` once and it creates
-one, prints it, and saves it to `~/.config/claude-mate/token` (mode 0600). Copy
-that string into the portal's **Shared token** box. It used to refuse to start
+```
+T|<token>
+```
+
+**That default is a bootstrap fix, not a preference.** A board with empty NVS
+used to default to Wi-Fi, which meant the setup portal — and the portal outranks
+every screen on the device, including the **SETTINGS → Link** row that would have
+moved it to BLE. A factory-reset cordless board was therefore held in a portal it
+had no credentials to satisfy, with the way out visible from nowhere. A board
+that has an SSID stored is not affected: it still comes up on Wi-Fi, because an
+upgrade must not move a working device onto a different radio behind its owner's
+back.
+
+**For Wi-Fi instead**, send `W|<ssid>|<password>` and then `I|WIFI`, or use the
+setup portal — hold **BOOT** at power-on, send `Z`, or **SETTINGS → Wi-Fi setup**.
+The portal shows an access point name (`Claude-Mate-XXXX`) and a password that is
+regenerated on every portal start. Join it from a phone, open
+`http://192.168.4.1`, and fill in the network, password, **shared token**, and
+port (8787); leave the host blank to discover the daemon over mDNS. On a device
+whose link is BLE the portal expires after 5 idle minutes and hands the glass
+back, since it is not the only way out of there.
+
+**Where the token comes from.** Run the daemon with `--tcp` or `--ble` once and
+it creates one, prints it, and saves it to `~/.config/claude-mate/token` (mode
+0600). Send that string as `T|<token>`, or paste it into the portal's **Shared
+token** box. It used to refuse to start
 without one, which left you having to know to create the file by hand before the
 portal would ever be satisfiable.
 
@@ -423,7 +444,11 @@ byte rather than a compile-time `#define` on purpose: moving a device on a desk
 between the two should not need a toolchain. Holding BOOT at power-on still
 forces the Wi-Fi setup portal whichever transport is stored — that escape hatch
 has to outrank the setting, or a device could be locked out by the very thing
-you were trying to fix.
+you were trying to fix. On a BLE device it outranks it only for as long as it is
+up: five idle minutes and the portal expires, the radio goes off, and BLE gets
+the glass back. Without that, holding BOOT on a cordless BLE board — which is
+also how you enter download mode, so it happens by accident — was a one-way
+door into a portal that device had no reason to fill in.
 
 #### Why changing the link reboots the device
 
@@ -519,7 +544,7 @@ device (?)  link  : ble
 | `ble: start the daemon with --ble` | `no device found yet` | one of 1–3 above — usually the Bluetooth permission |
 | `AUTHING`, then `no handshake - is the daemon on --ble?` | *(nothing)* | something connected that is not the daemon. macOS itself probes new GATT services; harmless, and it recycles after 5 s |
 | `x token rejected` | `BLE: token rejected` | the device and the daemon hold different tokens. `T\|<token>` over USB, from `~/.config/claude-mate/token` |
-| `x no token - set one in the setup portal` | `THE DEVICE HAS NO TOKEN` | exactly what it says |
+| `x no token - send T\|<token> over USB` | `THE DEVICE HAS NO TOKEN` | exactly what it says. This is what a factory-reset board says, and the cable is the answer because a BLE device never opens the portal |
 
 ### Screen sleep
 

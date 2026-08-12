@@ -187,6 +187,7 @@ if [ "$booted" != yes ]; then
 fi
 
 echo
-echo "Flashed. An unprovisioned board comes up in the WiFi setup portal;"
-echo "send 'W|<ssid>|<pass>' and 'T|<token>' over $PORT, or hold BOOT at"
-echo "power-on for the portal. '?' prints the current config."
+echo "Flashed. An unprovisioned board comes up on BLE with no token: send"
+echo "'T|<token>' over $PORT and start the daemon with --ble. For WiFi"
+echo "instead, send 'W|<ssid>|<pass>' then 'I|WIFI', or hold BOOT at"
+echo "power-on for the setup portal. '?' prints the current config."

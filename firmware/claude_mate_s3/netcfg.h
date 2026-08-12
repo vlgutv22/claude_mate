@@ -227,6 +227,10 @@ class MateNet {
   }
   void setToken(const String &token) { _token = token; save("token", _token); }
 
+  // "There is another transport that works, so this portal is not the only way
+  // out of here." Set by the sketch, because only the sketch knows.
+  void setFallbackLink(bool has) { _fallbackLink = has; }
+
   // The shared secret, for the transport that is not this one. Both radios
   // authenticate the same way against the same token, so there is exactly one
   // to provision and exactly one to get wrong.
@@ -249,12 +253,33 @@ class MateNet {
   // ---- transport selection -------------------------------------------------
   // Static, because they are read in setup() BEFORE anything decides whether
   // this instance is going to be started at all.
+  // AN UNPROVISIONED DEVICE DEFAULTS TO BLE, and that is a bootstrap fix, not a
+  // preference.
+  //
+  // A factory reset wipes this namespace: no SSID, no token, and no stored
+  // transport. Defaulting that to Wi-Fi meant begin() found no SSID and opened
+  // the setup portal -- which outranks every screen in render(), blocks the menu
+  // in fourthDoubleTap(), and only ever times out on a device that HAS
+  // credentials to fall back to. A factory-reset device was therefore locked in
+  // the Wi-Fi portal permanently, with SETTINGS -> Link visible to nobody. You
+  // could not choose BLE because choosing anything required getting past a
+  // screen that existed only to configure Wi-Fi.
+  //
+  // So: if there is nothing to join, come up on the radio that needs nothing to
+  // join. If an SSID IS stored, this device was provisioned for Wi-Fi by someone
+  // and keeps behaving as it always did -- an upgrade must never move a working
+  // device onto a different radio behind its owner's back. An explicit setting
+  // always wins over both.
   static MateTransport storedTransport() {
     Preferences p;
-    uint8_t v = LINK_WIFI;
-    if (p.begin(NET_NS, true)) { v = p.getUChar("link", LINK_WIFI); p.end(); }
-    return v == LINK_BLE ? LINK_BLE : LINK_WIFI;   // a value from a future
-  }                                                // build reads as Wi-Fi
+    if (!p.begin(NET_NS, true)) return LINK_BLE;   // nothing written ever
+    uint8_t v = p.getUChar("link", 0xFF);          // 0xFF = never set
+    bool haveSsid = !p.getString("ssid", "").isEmpty();
+    p.end();
+    if (v == LINK_BLE)  return LINK_BLE;
+    if (v == LINK_WIFI) return LINK_WIFI;
+    return haveSsid ? LINK_WIFI : LINK_BLE;        // a value from a future
+  }                                                // build falls here too
   static void storeTransport(MateTransport t) {
     Preferences p;
     if (p.begin(NET_NS, false)) { p.putUChar("link", (uint8_t)t); p.end(); }
@@ -381,6 +406,7 @@ class MateNet {
   char          _dropWhy[48] = {0};   // why the last connection attempt failed
   unsigned long _dropAt = 0;          // ...and when (0 = nothing has failed)
   unsigned long _portalTouched = 0;   // last portal page load, for the timeout
+  bool          _fallbackLink = false;  // see setFallbackLink()
   uint8_t       _fails = 0;           // consecutive dial/discover failures
   bool          _holdReconnect = false;  // UI is busy; do not block the loop
   char          _line[192];        // handshake line assembly
@@ -686,10 +712,29 @@ class MateNet {
     // way it will ever be configured. The clock is reset by every page load, so
     // a user who is mid-setup with the form open is never timed out from under
     // them -- only a portal nobody is looking at expires.
-    if (configured() && (millis() - _portalTouched) > NET_PORTAL_TIMEOUT) {
-      note("setup timed out - rejoining");
-      stopPortal();
-      startJoin();
+    // ...or a device that has a DIFFERENT link to fall back to. The original
+    // rule was "only time out if credentials are stored", because for an
+    // unprovisioned Wi-Fi device the portal is the only thing there is. A BLE
+    // device breaks that assumption: it has a working link and no need of this
+    // screen, so leaving the portal up forever would strand it exactly the way
+    // the rule was written to prevent.
+    if ((configured() || _fallbackLink) &&
+        (millis() - _portalTouched) > NET_PORTAL_TIMEOUT) {
+      // Two endings, because "rejoining" is only true when there is something to
+      // rejoin. The fallback-link device that lands here has no SSID at all: it
+      // is on BLE and got here by holding BOOT at power-on. startJoin() would
+      // hand WiFi.begin() an empty string, put the STA back up on the one radio
+      // the other transport wants, and leave a status line naming a network that
+      // does not exist. The radio goes OFF instead, and the sketch sees SETUP
+      // end and hands the glass back to BLE.
+      if (configured()) {
+        note("setup timed out - rejoining");
+        stopPortal();
+        startJoin();
+      } else {
+        note("setup timed out");
+        shutdown();
+      }
     }
   }
 

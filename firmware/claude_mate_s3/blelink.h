@@ -132,7 +132,18 @@ class MateBle {
   // advertising, no link, no retry, and no way to force one -- found by flashing
   // a board and wondering why the daemon had stopped seeing it.
   bool begin(const char *name, const String &token) {
-    if (_state != OFF) return true;
+    // Already up: take the token and stay up.
+    //
+    // The early return is not a no-op, and getting that wrong broke the ONLY
+    // path a cordless device has to a token. `Z` over serial and SETTINGS ->
+    // WiFi setup both open the portal with this stack still running; the token
+    // is written to NVS by a page handler that has never heard of this object,
+    // and the sketch's hand-back afterwards arrives here. Returning without
+    // reading it left the live stack answering A|NOTOKEN with the right secret
+    // in flash beside it -- indistinguishable from a daemon rejecting a token
+    // that is correct. Restarting to pick it up is not available: the stack does
+    // not come back in the same boot (see below).
+    if (_state != OFF) { setToken(token); return true; }
     snprintf(_name, sizeof(_name), "%s", name ? name : "Claude Mate");
     _token = token;
     _wantUp = true;
@@ -257,6 +268,17 @@ class MateBle {
   bool connected() const { return _state == LINKED; }
   State state() const { return _state; }
 
+  // Take a token set AFTER the stack came up, without restarting anything.
+  //
+  // This is the whole bootstrap path on a fresh board and it has to work while
+  // advertising: the device comes out of a factory reset with no token, you
+  // send T|<token> over the cable you just flashed with, and the very next
+  // handshake has to succeed. Re-begin()ing to pick it up is not an option --
+  // BLE does not come back in the same boot -- and the token is only ever read
+  // inside handleAuthLine(), so replacing it live is safe and is all that is
+  // needed.
+  void setToken(const String &token) { _token = token; }
+
   // "I was asked to be up, I have tried as many times as is worth trying, and I
   // am not up." The sketch's only real answer is a reboot -- see begin(). Kept
   // as a QUESTION rather than acted on here: a transport header that reboots the
@@ -322,7 +344,14 @@ class MateBle {
       // device is doing and tells you nothing you could act on; the daemon
       // needs one specific option turned on, and this line is often the only
       // place anyone will ever be told which.
-      case ADVERTISING: return "ble: start the daemon with --ble";
+      //
+      // ...unless there is no token, in which case that is the FIRST thing that
+      // will fail and saying anything else sends you to look at the daemon. A
+      // factory-reset device is exactly this device, so this is the line a
+      // fresh board shows: it has to be the one that gets you moving.
+      case ADVERTISING: return _token.isEmpty()
+                                   ? "no token: send T|<token> over USB"
+                                   : "ble: start the daemon with --ble";
       case AUTHING:     return "authenticating...";
       case LINKED:      return "ble linked";
     }
@@ -420,7 +449,10 @@ class MateBle {
         // bad handshake, which is indistinguishable from a crashed device or a
         // dropped packet -- and this device knew the exact reason all along.
         notifyLine("A|NOTOKEN");
-        note("no token - set one in the setup portal");
+        // NOT "set one in the setup portal": on BLE there is no portal in the
+        // path, and a factory-reset device never opens one. The cable is the
+        // answer, and it is already in your hand -- you just flashed with it.
+        note("no token - send T|<token> over USB");
         _pendingDisconnect = true;
         return;
       }

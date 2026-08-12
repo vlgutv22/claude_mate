@@ -921,9 +921,15 @@ static void drawLinkLost() {
   // Name the flag for the transport this device is actually on. Telling someone
   // to check for --tcp on a BLE build sends them to look at the wrong half of
   // the daemon's log, which is worse than saying nothing.
-  gfx->print(transport == LINK_BLE  ? "check it is running with --ble"
-             : net.configured()     ? "check it is running with --tcp"
-                                    : "hold BOOT at power-on to set up wifi");
+  //
+  // A missing TOKEN outranks all of it, because it is the first thing that will
+  // fail and no amount of daemon flags will get past it. That is the state a
+  // factory-reset board is in, so it is the state this screen has to handle
+  // best -- it is the first thing anyone sees on a fresh device.
+  gfx->print(!net.hasToken()        ? "send T|<token> over USB to pair"
+             : transport == LINK_BLE ? "check it is running with --ble"
+             : net.configured()      ? "check it is running with --tcp"
+                                     : "hold BOOT at power-on to set up wifi");
   drawFooter(C_BAD);
 }
 
@@ -1855,7 +1861,10 @@ static bool handleConfigLine(char *line) {
       if (b) *b++ = 0;
       net.setWifi(a, b ? b : "");
       Serial.printf("wifi set: %s\n", a);
-      net.restart();
+      // Stored either way, applied only if Wi-Fi is the live transport: on a
+      // BLE device this is provisioning for later (I|WIFI, or the API build),
+      // and associating now would put both radios up at once.
+      if (transport == LINK_WIFI) net.restart();
       requestRender();
       return true;
     }
@@ -1868,7 +1877,7 @@ static bool handleConfigLine(char *line) {
       if (b) *b++ = 0;
       net.setDaemon(a, b ? (uint16_t)atoi(b) : 0);
       Serial.printf("daemon set: %s\n", a[0] ? a : "(mDNS discovery)");
-      net.restart();
+      if (transport == LINK_WIFI) net.restart();   // see W| above
       return true;
     }
 
@@ -1876,8 +1885,19 @@ static bool handleConfigLine(char *line) {
       char *a = strchr(line, '|');
       if (!a) return false;
       net.setToken(a + 1);
-      Serial.println("token set");
-      net.restart();
+      // Hand it to the LIVE BLE stack as well as to NVS. This is the whole
+      // bootstrap path on a factory-reset board -- flash, send the token down
+      // the same cable, watch it link -- and without this the running stack
+      // keeps answering A|NOTOKEN with the token sitting in flash beside it,
+      // which looks exactly like the daemon rejecting a token that is right.
+      ble.setToken(a + 1);
+      Serial.printf("token set (link: %s)\n",
+                    MateNet::transportName(transport));
+      // Only kick Wi-Fi if Wi-Fi is what carries this device. restart() on a
+      // BLE build with an SSID stored would associate, and then both radios
+      // would be up -- the exact contention one-transport-at-a-time exists to
+      // prevent.
+      if (transport == LINK_WIFI) net.restart();
       return true;
     }
 
@@ -2787,6 +2807,10 @@ void setup() {
   // reconfigured because of the setting you were trying to fix would be bricked
   // in every sense that matters to the person holding it.
   transport = MateNet::storedTransport();
+  // The portal is not the only way out of here on a BLE device, so it is
+  // allowed to time out and hand the glass back. Without this a BOOT-held
+  // portal on a cordless BLE board is a one-way door.
+  net.setFallbackLink(transport == LINK_BLE);
   if (forcePortal || transport == LINK_WIFI) {
     net.begin(forcePortal);
   } else {
