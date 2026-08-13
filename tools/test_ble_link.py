@@ -531,8 +531,11 @@ check("a held GO cannot raise the setup portal at boot",
 check("...and a reboot waits for the button that asked for it to come up",
       re.search(r"static void rebootAfterRelease\(\)", ino)
       and not re.search(r"cfg\.factoryResetAll\(\);\s*\n\s*ESP\.restart", ino))
+# Pinned as a SUBTRACTION, because that is the rollover-safe form. The first
+# version of this check pinned `millis() < until`, which is the bug -- the test
+# would have defended it.
 check("...bounded, so a stuck button cannot block a decided reboot",
-      re.search(r"millis\(\) < until &&", ino))
+      re.search(r"\(millis\(\) - began\) < RELEASE_WAIT_MS", ino))
 # And the radio is OFF on a build that will never use it -- said plainly in the
 # firmware as "certainty, not the reason the battery lasts".
 check("a BLE build powers the Wi-Fi radio down explicitly",
@@ -774,6 +777,47 @@ check("...with a window that outlasts the one the glass offers",
 check("a granted token reaches NVS, not just the live stack",
       re.search(r"ble\.takeGrantedToken\(granted\)\) \{\s*\n\s*net\.setToken\(granted\);",
                 ino))
+
+# --------------------------------------------------------------------------- #
+print("\n== the gamepad and the link never fight for the controller ==")
+# One stack, one controller, and no init after a deinit in the same boot. setup()
+# used to bring the LINK up and then tear it down for the pad three lines later,
+# which meant the pad could never start on a BLE board in any boot -- and failing
+# took the link with it, so flipping the switch rebooted the device and came back
+# with the switch off.
+check("boot does not start the link when the gamepad is on",
+      re.search(r"if \(!cfg\.pad\(\)\) ble\.begin\(DEVICE_BLE_NAME", ino))
+check("...and turning it ON at runtime reboots on BLE, as turning it off does",
+      re.search(r'if \(transport == LINK_BLE\) restartWithNotice\("GAMEPAD ON"',
+                ino))
+check("...so the switch is durable before either reboot",
+      re.search(r"cfg\.setPad\(on\);", ino)
+      and re.search(r"cfg\.setPad\(false\);\s*\n\s*if \(transport == LINK_BLE\)",
+                    ino))
+
+print("\n== the PAIR? prompt is answerable wherever it is drawn ==")
+# It is drawn OVER the game, and both nav pollers used to return before any edge
+# detection in UI_GAME -- so GO started a run behind the prompt and the firmware
+# auto-refused 45 s later. The 4th button never reached onButton() at all, which
+# made "any other button = refuse" simply untrue.
+check("the game does not swallow the buttons while a question is up",
+      len(re.findall(r"if \(uiMode == UI_GAME && !pairAskedMs\)", ino)) == 2)
+check("...and the 4th button answers it rather than changing screens",
+      re.search(r"static bool pairPromptTookPress\(\)", ino)
+      and len(re.findall(r"pairPromptTookPress\(\)\) return;", ino)) == 2)
+
+print("\n== the two ends of a pairing wait are ordered ==")
+# The device answers for its human at 45 s, drops the link at 60 s, and the
+# daemon gives up at 65 s. Ordered the other way (50 s daemon vs 45 s device) the
+# daemon's "nobody pressed GO" branch was unreachable for its own case and every
+# unanswered offer was reported as though somebody had refused.
+ask = int(re.search(r"#define PAIR_ASK_MS (\d+)", ino).group(1))
+drop = int(re.search(r"#define BLE_PAIR_TIMEOUT\s+(\d+)", fw_ble).group(1))
+give_up = float(re.search(r"^BLE_PAIR_CONFIRM_S = ([\d.]+)", py_ble, re.M).group(1))
+check(f"device answers ({ask/1000:.0f}s) before it drops the link ({drop/1000:.0f}s)",
+      ask < drop)
+check(f"...and the daemon waits ({give_up:.0f}s) longer than both",
+      give_up > drop / 1000.0)
 
 print("\n== the no-token guidance still agrees with itself ==")
 # These have drifted twice: once when the glass said "over USB" after the only

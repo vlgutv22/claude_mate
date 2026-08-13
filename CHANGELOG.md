@@ -12,6 +12,59 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
+### 2026-08-13 — The rest of the review, including two features that could not work
+
+- **Fixed: the gamepad could never start on a BLE board.** `setup()` brought the
+  link up and then tore it down for the pad three lines later — the
+  init-after-deinit this chip does not survive — so the pad failed in *every*
+  boot, and failing took the link with it: flipping the switch rebooted the
+  device and came back with the switch off, while `setup()`'s own comment
+  promised "THE GAMEPAD SURVIVES THE REBOOT". The link is no longer started when
+  the switch is on, and turning it on at runtime reboots, mirroring the exit that
+  already did.
+- **Fixed: the PAIR? prompt was unanswerable from the game screen, and the 4th
+  button never answered it anywhere.** The prompt is drawn *over* the game, but
+  both nav pollers returned before edge detection in `UI_GAME`, so GO started a
+  run behind it and the firmware auto-refused 45 s later. The 4th button is
+  dispatched by its own poller and never reached `onButton()`, so *"any other
+  button = refuse"* was untrue: a tap changed screens behind the prompt, a
+  double-tap opened the menu and emitted `B|M`, and a 2 s hold slept the board
+  mid-offer. All three gestures answer it now.
+- **Fixed: the three pairing timeouts were ordered wrong** — 50 s daemon against
+  45 s device, so the device always spoke first and the daemon's *"nobody pressed
+  GO"* branch was unreachable for its own case: every unanswered offer was
+  reported as though somebody had refused. Now 45 s (device answers) → 60 s
+  (device drops the link) → 65 s (daemon gives up), pinned by a test that reads
+  all three out of two languages and three files.
+- **Fixed: a successful pairing could report itself as declined.** The flag meant
+  "a question was answered" rather than "it was refused", so a slow handshake
+  after GO told the person who had just pressed it that they had said no.
+- **Fixed: the daemon waited out the clock on a device that had gone.**
+  `_await_auth_line` checked neither the connection nor the disconnect event, so
+  a board carried out of range mid-pairing pinned the daemon inside the client
+  context for ~51 s — not scanning, not recovering.
+- **Fixed: BLE dropped the farewell frames on shutdown** (7 of 10 runs measured).
+  `V|OFF` and the "daemon stopped" frame are coroutines *scheduled* on the BLE
+  loop, and stopping the loop in the same batch discarded them, so a battery
+  device sat on a stale frame flashing an alert for up to 30 s — exactly what
+  those two writes exist to prevent.
+- **Fixed: the setup portal erased a configured daemon address.** The host input
+  had no prefill and the port carried a literal `8787`, so a visit that only
+  re-entered a token — the expected visit on a BLE device now — silently reset
+  both and dropped the device back to the mDNS discovery an explicit host exists
+  to avoid. The form round-trips them, like the token box already explained
+  itself.
+- **Fixed: `rebootAfterRelease()` used `millis() + X`**, the one non-rollover-safe
+  idiom left in a file that fixes that arithmetic in three other places — **and
+  the test pinned the buggy form**, so it would have defended it.
+- Also: `PORT_GLOBS` in `claude-mate-connect` claimed a `wchusbserial` pattern the
+  daemon never looks for, so a CH340 board got a promise it could not keep *and*
+  the pairing advice that would have worked was short-circuited; a `select` check
+  written as `A or B` covered every possible reply and could not fail; and the
+  docs still named the deleted **Set token** row, GO-at-power-on after
+  `forcePortal` became BOOT-only, and `pyserial` as the only permitted dependency.
+
+
 ### 2026-08-12 — One command to install it, and a manual for both ways to drive it
 
 - **Changed: the install is one command.** `./install/install.sh --yes` does all

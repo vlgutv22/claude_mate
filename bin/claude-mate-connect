@@ -3,7 +3,7 @@
 
 WHY THIS EXISTS. "How do I connect the device after a factory reset" had no
 answer you could find from the Mac. The device knew (its glass says
-`no token: MENU > Set token`), the daemon knew (`THE DEVICE HAS NO TOKEN`), and
+`no token: claude-mate-connect`), the daemon knew (`THE DEVICE HAS NO TOKEN`), and
 neither was anywhere the person sitting at a terminal would look -- the only
 Claude Mate prompt they ever see is the account picker. So this is that missing
 screen: one command that reports every link, and tells you the shortest way to
@@ -41,7 +41,12 @@ LOG = os.path.join(HOME, "Library/Logs/claude-mate.err.log")
 PLIST = os.path.join(HOME, "Library/LaunchAgents/com.claudemate.daemon.plist")
 TOKEN_FILE = os.path.expanduser(
     os.environ.get("CLAUDE_MATE_TOKEN_FILE", "~/.config/claude-mate/token"))
-PORT_GLOBS = ("/dev/cu.usbmodem*", "/dev/cu.usbserial*", "/dev/cu.wchusbserial*")
+# THE DAEMON'S LIST, IN THE DAEMON'S ORDER. This had a `wchusbserial` pattern the
+# daemon does not look for, so a CH340 board got `[ok] device on the cable` and a
+# promise the daemon could never keep -- and worse, it short-circuited the pairing
+# advice that WOULD have worked. If these two disagree, this file is wrong by
+# definition: the daemon is the one that opens the port.
+PORT_GLOBS = ("/dev/cu.usbserial*", "/dev/cu.usbmodem*")
 
 BOLD, DIM, GREEN, RED, YELLOW, OFF = (
     "\033[1m", "\033[2m", "\033[32m", "\033[31m", "\033[33m", "\033[0m")
@@ -305,10 +310,13 @@ def main():
             return 1
         if ans in ("", "y", "yes"):
             return pair()
-        print("\nOr, the long way round: SETTINGS → Set token on the device "
-              "raises an access\npoint; join it from a phone, open "
-              "http://192.168.4.1, paste the token below,\nand leave Network "
-              "as (none).")
+        # NOT "SETTINGS -> Set token": that row was removed from the device
+        # when pairing replaced the only reason it existed. What is left needs
+        # physical access, which is the point.
+        print("\nOr, the long way round, for a board whose BLE will not start:"
+              "\nhold BOOT at power-on (or send Z over USB) to raise the setup"
+              "\nportal, join it from a phone at http://192.168.4.1, paste the"
+              "\ntoken below and leave Network as (none).")
         if token:
             print(f"\n  the token       {BOLD}{token}{OFF}")
         return 0

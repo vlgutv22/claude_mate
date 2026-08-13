@@ -276,7 +276,7 @@ class MateBle {
       // --ble?" after someone has just pressed a button to say NO would send
       // them to check a flag that was never the problem.
       note(_pairAsk    ? "pairing not answered"
-           : _pairSpoke ? "pairing declined"
+           : _pairRefused ? "pairing declined"
                         : "no handshake - is the daemon on --ble?");
       _pairAsk = false;
       disconnectPeer();
@@ -338,7 +338,11 @@ class MateBle {
   void pairAnswer(bool yes) {
     _pairAsk = false;
     _pairOk = yes;
-    _pairSpoke = true;
+    // Only a REFUSAL is remembered. Setting this on accept too meant the note
+    // below called a successful pairing "declined" whenever the handshake that
+    // follows was slow -- telling the person who had just pressed GO that they
+    // had said no.
+    _pairRefused = !yes;
     // THE HANDSHAKE BUDGET STARTS NOW, and forgetting this broke the accept
     // path outright: _stateSince is however long ago the peer connected, the
     // person took thirty seconds to walk over and press GO, and the moment
@@ -645,7 +649,7 @@ class MateBle {
     // up a token it never asked a human for.
     _pairAsk = false;
     _pairOk = false;
-    _pairSpoke = false;
+    _pairRefused = false;
     go(ADVERTISING);
     startBurst();
   }
@@ -699,7 +703,7 @@ class MateBle {
   // _pairOk is set only by pairAnswer(), on the main loop. See handleAuthLine().
   volatile bool _pairAsk = false;
   volatile bool _pairOk = false;
-  volatile bool _pairSpoke = false;    // a pairing question was answered here
+  volatile bool _pairRefused = false;  // a pairing question was answered NO
   volatile bool _grantReady = false;   // a token arrived; NVS has not seen it
   // What begin() was asked for, kept so poll() can retry without the caller.
   char          _name[24] = {0};

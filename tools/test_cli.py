@@ -177,9 +177,14 @@ try:
     # window is the one mistake the feature must not make.
     feed("idle|s-alpha2|alpha-two")
     wait_for(lambda: len(json.loads(talk("queue"))["queue"]) == 3)
-    check("...and an ambiguous one is refused rather than guessed",
-          talk("select|alpha").startswith("error:")
-          or talk("select|alpha").strip() == "ok alpha")   # exact match wins
+    # "alpha" is an EXACT name, so it must resolve -- that is not the ambiguous
+    # case. As first written this check accepted either answer, which made it
+    # unfailable: an `or` between "refused" and "resolved" covers every possible
+    # reply. The ambiguous case needs a prefix that matches BOTH sessions.
+    check("...an exact name still wins over a longer one sharing its prefix",
+          talk("select|alpha").strip() == "ok alpha")
+    check("...and a prefix matching two sessions is refused, not guessed",
+          talk("select|alph").startswith("error:"))
 
     # --- accounts ----------------------------------------------------------- #
     print("\n== accounts ==")

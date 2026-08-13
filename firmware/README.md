@@ -171,7 +171,7 @@ done. No access point, no phone, no secret typed by hand. The `E|` exchange
 behind it is described under [BLE as the link itself](#ble-as-the-link-itself).
 
 The long way round is still there for a board whose BLE will not start: hold
-**GO** at power-on (or send `Z`) to raise the setup portal — an access point
+**BOOT** at power-on (or send `Z` over USB) to raise the setup portal — an access point
 whose name and password are on the glass — join it from a phone at
 `http://192.168.4.1`, paste the token and leave **Network** as *none*. Or
 `T|<token>` down the cable.
@@ -494,17 +494,20 @@ the glass back. Without that, holding BOOT on a cordless BLE board — which is
 also how you enter download mode, so it happens by accident — was a one-way
 door into a portal that device had no reason to fill in.
 
-> **GO does it too, and on an assembled device that is the one that matters.**
-> `setup()` accepts either (`digitalRead(PIN_BTN_BOOT) || digitalRead(PIN_BTN_GO)`),
-> and BOOT is an onboard button the printed enclosure covers — so the documented
-> gesture is one you cannot perform on the finished object. **Hold GO through a
-> power-on**, or, with no cable and no reachable RESET: hold the 4th button 2 s
-> to sleep the board, then hold **GO** and tap the 4th button to wake it. Waking
-> from deep sleep runs `setup()` from the top, so the same check runs and the
-> portal comes up. Keep GO down until the screen lights.
+> **BOOT only — GO used to count and no longer does.** Factory reset is confirmed
+> with a long press of **GO** and reboots at once, so GO was still held when
+> `setup()` read the buttons a few milliseconds later: **every menu factory reset
+> came back up in the Wi-Fi setup portal**, on a BLE device, reliably. Two fixes
+> went in — `rebootAfterRelease()` waits for the button to come up, and
+> `forcePortal` stopped accepting GO at all — because GO is the most-pressed
+> button on this device and has no business arming a Wi-Fi flow.
 >
-> This is the fallback for a board whose BLE will not start. The route is
-> `claude-mate-connect --pair`, which needs no access point at all.
+> That does mean this gesture needs **BOOT**, which the printed enclosure covers.
+> Deliberate: with pairing and USB provisioning, the portal is a last resort for a
+> board whose BLE will not start, and a last resort should take deliberate
+> physical access. The routes you actually want are `claude-mate-connect --pair`
+> or plugging the cable in; `Z` over USB raises the portal without opening
+> anything.
 
 #### Why changing the link reboots the device
 

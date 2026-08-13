@@ -90,7 +90,13 @@ BLE_AUTH_S = 5.0            # the firmware allows 5 s; so do we
 # answer the prompt on its screen, so allow a little more than that before
 # giving up on them -- and keep the ARMED window short, because it is a standing
 # permission to give away a secret.
-BLE_PAIR_CONFIRM_S = 50.0
+# ...and it must OUTLAST the firmware's own 45 s prompt, not undercut it. At 50 s
+# against 45 s the device always answered E|NO first, so "nobody pressed GO" was
+# unreachable for the case it describes and every unanswered offer was reported
+# as "declined on the device" -- which reads as somebody having refused. 65 s
+# leaves room for the device to speak for itself, and the branch only fires when
+# the device really has gone quiet.
+BLE_PAIR_CONFIRM_S = 65.0
 BLE_PAIR_ARM_S = 180.0
 # Between scan attempts, doubling on consecutive failures, capped -- and the cap
 # is LOW on purpose, which is the opposite of the Wi-Fi transport's reasoning.
@@ -185,12 +191,33 @@ class BleLink:
         self._stop_evt.set()
         loop = self._loop
         if loop is not None:
+            # LET THE LAST WRITES GO OUT FIRST. main() writes `V|OFF` and a
+            # "daemon stopped" frame immediately before calling this, and on this
+            # transport those are coroutines SCHEDULED onto the loop rather than
+            # completed calls. Stopping the loop in the same batch of callbacks
+            # discarded them -- measured 7 of 10 shutdowns delivering nothing,
+            # with "Task was destroyed but it is pending" on stderr, while
+            # write_line() had returned True to a caller that believed it. The
+            # firmware's watchdog is 30 s, so the device sat on a stale frame
+            # flashing an alert for half a minute, which is exactly what those
+            # two writes exist to prevent.
+            async def _drain_then_stop() -> None:
+                for _ in range(20):            # ~200 ms, bounded
+                    if not [t for t in asyncio.all_tasks(loop)
+                            if t is not asyncio.current_task()]:
+                        break
+                    await asyncio.sleep(0.01)
+                loop.stop()
+
             # The loop is running on another thread; poking it any other way is
-            # a race. call_soon_threadsafe is the one supported door.
+            # a race. These two are the supported doors.
             try:
-                loop.call_soon_threadsafe(loop.stop)
+                asyncio.run_coroutine_threadsafe(_drain_then_stop(), loop)
             except RuntimeError:
-                pass
+                try:
+                    loop.call_soon_threadsafe(loop.stop)
+                except RuntimeError:
+                    pass
         thread = self._thread
         if thread is not None:
             thread.join(timeout=3.0)
@@ -482,7 +509,7 @@ class BleLink:
         self._log("BLE: pairing — press GO on the device to accept "
                   f"(waiting up to {int(BLE_PAIR_CONFIRM_S)}s)")
         await self._write(client, b"E|?\n")
-        reply = await self._await_auth_line(BLE_PAIR_CONFIRM_S)
+        reply = await self._await_auth_line(BLE_PAIR_CONFIRM_S, client)
         if reply is None:
             self._log("BLE: pairing timed out — nobody pressed GO")
             self._pair_until = 0.0
@@ -494,7 +521,7 @@ class BleLink:
             self._pair_until = 0.0
             return False
         await self._write(client, b"E|" + self._token + b"\n")
-        confirm = await self._await_auth_line()
+        confirm = await self._await_auth_line(client=client)
         if confirm is None or confirm.strip().upper() != "E|SET":
             self._log(f"BLE: the device did not take the token ({confirm!r})")
             return False
@@ -504,15 +531,24 @@ class BleLink:
         self._log("BLE: paired — the device now has this daemon's token")
         return True
 
-    async def _await_auth_line(self, timeout: float = BLE_AUTH_S) -> Optional[str]:
+    async def _await_auth_line(self, timeout: float = BLE_AUTH_S,
+                               client=None) -> Optional[str]:
         """The device's one handshake line, or None if it never came.
 
         The timeout is a parameter because pairing waits on a HUMAN pressing a
         button, and five seconds is the right budget for a handshake and the
         wrong one for a person noticing their device has lit up.
+
+        `client` lets it give up the moment the peer goes away instead of waiting
+        out the clock. That matters most on the long pairing wait: a device
+        carried out of range mid-offer used to pin the daemon inside the
+        BleakClient context for the full fifty seconds -- not scanning, not
+        recovering, with nothing to show for it.
         """
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            if client is not None and not client.is_connected:
+                return None
             try:
                 return self._auth_q.get_nowait()
             except queue.Empty:

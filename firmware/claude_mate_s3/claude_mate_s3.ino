@@ -1611,8 +1611,12 @@ static void requestRender() {
 // decided: after RELEASE_WAIT_MS we go anyway.
 #define RELEASE_WAIT_MS 3000UL
 static void rebootAfterRelease() {
-  unsigned long until = millis() + RELEASE_WAIT_MS;
-  while (millis() < until &&
+  // SUBTRACT, DO NOT COMPARE. `millis() + X` wraps every ~49 days and
+  // `millis() < until` then reads as already-expired for the whole window --
+  // this file fixes that same arithmetic in three other places and had grown one
+  // more. The unsigned difference is correct across the wrap.
+  unsigned long began = millis();
+  while ((millis() - began) < RELEASE_WAIT_MS &&
          (digitalRead(PIN_BTN_GO) == LOW || digitalRead(PIN_BTN_BOOT) == LOW ||
           digitalRead(PIN_BTN_MIRROR) == LOW))
     delay(10);
@@ -1746,8 +1750,18 @@ static void leavePad() {
 // browns out between the two comes back as what the switch says.
 static void padSet(bool on) {
   cfg.setPad(on);
-  if (on) { enterPad(true, PAD_BLE); return; }   // puts the setting back itself
-                                                 // if the stack will not start
+  if (on) {
+    // ON A BLE BOARD, TURNING IT ON REBOOTS -- the mirror image of turning it
+    // off, and for the identical reason. The link stack is up (it is this
+    // device's transport), the pad needs the controller the link is holding, and
+    // an init after a deinit never succeeds on this chip. Rebooting is the only
+    // way the pad gets a fresh controller, and setup() now leaves the link
+    // alone when the switch is on, so it comes up as a gamepad and stays one.
+    // The switch is already in NVS, written eagerly one line above.
+    if (transport == LINK_BLE) restartWithNotice("GAMEPAD ON", nullptr);
+    enterPad(true, PAD_BLE);                     // Wi-Fi: puts the setting back
+    return;                                      // itself if it will not start
+  }
   if (uiMode == UI_PAD) { leavePad(); return; }
   // Switched off from somewhere that is not the pad face -- which means a
   // previous entry left the HID stack up without the UI following it. Take it
@@ -2249,8 +2263,15 @@ static void pollNavBtn(Btn &b, char ev) {
   // needs "is it held down NOW" and this poller deals in events with a 400/200
   // ms auto-repeat. Track the level so that leaving the game does not deliver
   // the release of a press the menu never saw as an event.
-  if (uiMode == UI_GAME) { b.pressed = raw; b.changeMs = now; b.longFired = true;
-                           return; }
+  // A PAIRING QUESTION OUTRANKS THE GAME, because it is already drawn OVER the
+  // game (see render()) and told the user which button to press. Without this
+  // the prompt was unanswerable from the SHIP IT screen: both pollers returned
+  // here before any edge detection, so GO started a run behind the prompt and
+  // the firmware auto-refused for the user 45 s later.
+  if (uiMode == UI_GAME && !pairAskedMs) {
+    b.pressed = raw; b.changeMs = now; b.longFired = true;
+    return;
+  }
   if (raw != b.pressed && (now - b.changeMs) >= DEBOUNCE_MS) {
     b.pressed  = raw;
     b.changeMs = now;
@@ -2283,8 +2304,10 @@ static void pollNavBtn(Btn &b, char ev) {
 static void pollGoBtn(Btn &b) {
   bool raw = (digitalRead(b.pin) == LOW);
   unsigned long now = millis();
-  if (uiMode == UI_GAME) { b.pressed = raw; b.changeMs = now; b.longFired = true;
-                           return; }
+  if (uiMode == UI_GAME && !pairAskedMs) {    // see pollNavBtn
+    b.pressed = raw; b.changeMs = now; b.longFired = true;
+    return;
+  }
   if (raw != b.pressed && (now - b.changeMs) >= DEBOUNCE_MS) {
     b.pressed  = raw;
     b.changeMs = now;
@@ -2688,6 +2711,17 @@ static void fourthTap() {
   requestRender();
 }
 
+// The 2 s hold. Guarded for the same reason the tap is: sleeping the device
+// mid-offer leaves the daemon waiting out its full timeout on a screen nobody
+// can see, and "any other button = refuse" has to include this one.
+static bool pairPromptTookPress() {
+  if (!pairAskedMs) return false;
+  answerPairing(false);
+  clickPending = false;
+  blipUntil = millis() + BLIP_MS;
+  return true;
+}
+
 static void fourthDoubleTap() {
   // NOT over the WiFi setup portal. That screen shows an AP name and a password
   // that is regenerated on every portal start, and the glass is the only place
@@ -2715,6 +2749,15 @@ static void pollTapBtn(Btn &b) {
       // otherwise waking the device would open the mirror or the menu.
       if (!screenOn) { wakeScreen(); return; }
       notePoke();
+      // THE 4th BUTTON ANSWERS THE PAIRING QUESTION TOO, and it has to: the
+      // prompt says "any other button = refuse", and this button never reaches
+      // onButton() -- it is dispatched here, to the mirror, the menu and sleep.
+      // So a tap during an offer used to change uiMode BEHIND the prompt (the
+      // ACTIONS sheet appearing later with nobody having asked for it), a
+      // double-tap opened the menu and emitted B|M to the daemon, and a 2 s
+      // hold slept the board mid-offer, leaving the daemon to burn its whole
+      // 60 s timeout. Answering "no" is what the screen promised.
+      if (pairPromptTookPress()) return;
       if (clickPending && (now - clickMs) <= DBLCLICK_MS) {
         clickPending = false;
         fourthDoubleTap();
@@ -2732,6 +2775,10 @@ static void pollTapBtn(Btn &b) {
     // thumb that rests on it for two seconds while thinking about a jump would
     // switch the device off mid-run. Holding it leaves the game instead.
     if (uiMode == UI_GAME) { uiMode = UI_MENU; requestRender(); return; }
+    // ...and NOT out from under a pairing offer. Sleeping mid-question leaves
+    // the daemon waiting out its whole timeout against a dark screen, and the
+    // prompt said any other button refuses -- so this one refuses.
+    if (pairPromptTookPress()) return;
     cfg.flush();                              // deferred commit will not run
     powerOff();                               // never returns
   }
@@ -2968,7 +3015,15 @@ void setup() {
   } else {
     net.loadConfigOnly();                   // the token, and what `?` prints
     net.radioOff();                         // and nothing else about Wi-Fi
-    ble.begin(DEVICE_BLE_NAME, net.token());
+    // ...but NOT the link if the gamepad is about to take the radio. The pad and
+    // the link are two roles on one stack, and this chip cannot re-init BLE
+    // after a deinit in the same boot -- so bringing the link up here and then
+    // tearing it down for the pad three lines later GUARANTEED the pad never
+    // started. It would fail, clear its own switch, try to bring the link back,
+    // fail at that too, and loop()'s stuck() backstop would reboot ~6 s later:
+    // flipping the gamepad on a BLE board rebooted it and came back with the
+    // switch off. Nothing needs the link up first when the pad is on.
+    if (!cfg.pad()) ble.begin(DEVICE_BLE_NAME, net.token());
   }
 
   render();                                 // splash until the daemon talks

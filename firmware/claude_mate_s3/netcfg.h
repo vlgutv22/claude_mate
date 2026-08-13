@@ -858,10 +858,18 @@ class MateNet {
                 "Or read it with<br><code>cat ~/.config/claude-mate/token</code>"
                 "</small>");
     }
-    html += F("<label>Daemon host <em>(optional)</em></label><input name=host placeholder='found automatically'>"
-              "<small>Leave empty to discover it over mDNS.</small>"
-              "<label>Port</label><input name=port value='8787'>"
-              "<button type=submit>Save &amp; connect</button></form>");
+    // PREFILLED FROM WHAT IS STORED, both of them. A form that shows blanks for
+    // fields it is about to overwrite is a form that erases whatever you do not
+    // retype -- and the commonest visit here re-enters one field and leaves the
+    // rest alone. The token box is the exception and says so, because a secret
+    // should not be echoed back into a page.
+    html += F("<label>Daemon host <em>(optional)</em></label><input name=host "
+              "placeholder='found automatically' value='");
+    html += _host;
+    html += F("'><small>Leave empty to discover it over mDNS.</small>"
+              "<label>Port</label><input name=port value='");
+    html += String(_port);
+    html += F("'><button type=submit>Save &amp; connect</button></form>");
     _web->send(200, "text/html", html);
   }
 
@@ -898,6 +906,13 @@ class MateNet {
     // checkbox or `X|WIPE` over serial.
     if (clearing)              setToken("");
     else if (!token.isEmpty()) setToken(token);
+    // Safe to write unconditionally ONLY because the form now round-trips both
+    // fields -- see serveForm(). It did not: the host input had no prefill and
+    // the port input carried a literal 8787, so a visit that only re-entered a
+    // token (the expected visit on a BLE device, now that an empty network box
+    // is no longer a 400) submitted an empty host and the default port. That
+    // silently erased an explicitly configured daemon address and dropped the
+    // device back to the mDNS discovery it had been configured to avoid.
     setDaemon(host, port);
     _web->send(200, "text/html",
                F("<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
