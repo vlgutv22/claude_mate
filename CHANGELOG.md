@@ -12,6 +12,139 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
+### 2026-08-13 — Sleep that stays asleep, and a gauge that does not vanish when it matters
+
+Reported after the BLE release: *the device wakes the instant you put it to
+sleep, and the cell is going down faster than it did on Wi-Fi.* Three unrelated
+faults, found by auditing the whole power path rather than the transport.
+
+**Sleep**
+
+- **Fixed: one failed power-off broke every power-off after it, permanently.**
+  `powerOff()` arms two GPIO latches that live in the RTC domain and survive
+  every reset except a true power-on, and `setup()` released them only when the
+  boot was a deep-sleep *wake*. But `esp_deep_sleep_start()`'s own failure path
+  is `abort()` — a **panic reset**, not a wake — so a single sleep that did not
+  take came back with the backlight pinned LOW (a running device with a screen
+  that cannot light) and the wake pad stuck in RTC function, where
+  `digitalRead()` reads it as permanently pressed. From then on the device could
+  never sleep again and nothing on the glass could say why; only pulling the cell
+  cleared it. The release is unconditional now, and `rtc_gpio_hold_dis()` comes
+  **before** the `rtc_gpio_deinit()` it was silently defeating — a held pad
+  ignores the mux write, so that line only ever *looked* like it handed the pin
+  back.
+- **Fixed: the wait-for-release before sleeping was unbounded.** It runs after
+  the panel, the backlight and both radios are already down, so a wake pin
+  reading LOW for any reason parked the board awake, dark and at full clock
+  until the cell was flat — indistinguishable from dead hardware.
+  `rebootAfterRelease()` had already learned this and even names `powerOff()` as
+  its precedent; the lesson never came back the other way.
+- **The device can now say which of these happened.** `?` and the About page
+  report `esp_reset_reason()` and the ext1 wake mask, so a spurious wake and a
+  crash-reboot — identical from across a room, and completely different bugs —
+  are one line apart. Brownout and watchdog resets say so by name.
+
+**Where the battery was actually going**
+
+- **Fixed: `loop()` never yielded.** Nothing on the loop blocks any more, so
+  `loopTask` was always ready, `IDLE1` never ran, and core 1 never reached
+  `waiti`: a 240 MHz core at 100% duty doing five `digitalRead`s per pass. On
+  the datasheet's own figures that is on the order of 10–15 mA — **comparable to
+  the entire radio budget the BLE migration was undertaken to reduce**. One
+  `delay(1)`.
+- **Fixed: the game pinned the backlight on forever.** `UI_GAME` re-armed the
+  hibernate timer on every pass with no test of `game.idle()`, so an abandoned
+  START screen, codex card or finish screen held the largest load on the board
+  at full duty until the cell died. The screen now blanks in place, and because
+  the three nav buttons never reach `onButton()` in this mode, the game branch
+  reads their pins itself — both to count a thumb as presence on the screens
+  where no level is running (picking a milestone, reading a codex card) and to
+  wake the panel, swallowing the press that did it so it cannot also start a
+  sprint nobody can see.
+- **Fixed: a lit panel hibernate could never turn off again.** `enterPad()` and
+  `leavePad()` wrote the backlight directly while `screenOn` stayed false, and
+  `sleepScreen()` early-returns on `!screenOn`. Both are reachable with nobody
+  touching the device — `G|1` from the daemon, or an alert leaving the pad — and
+  one of them writes *full* brightness onto a screen that is then never
+  repainted. `wakeScreen()`/`sleepScreen()` own the pin in every mode now.
+- **Fixed: the ADC's power domain was taken on the first battery poll and held
+  for the rest of the boot** (~1 mA, by Espressif's own note) because the core
+  only drops the oneshot unit when the pin changes bus. Released once per poll.
+- **Fixed: a pairing prompt rendered the full 110 KB canvas ~35 times a second
+  for 45 s** to animate a countdown that changes once a second — and any peer in
+  radio range can re-arm it on an unprovisioned board.
+- **Fixed (daemon): a device saying hello was dragged back into a terminal view
+  it never opened.** The mirror is a daemon-side 1 s timer torn down by three
+  things, none of which was the device going away — so after any reboot or
+  reconnect the Mac pushed 19 lines a second into a device that had not asked,
+  and the view sits in front of the status bar, hiding the battery and the link
+  glyph. Closed on `H`, with the fetch race behind it closed too — and because
+  "said hello" means *rebooted* only most of the time, a device whose view
+  survived the drop (a BLE flap shorter than the 30 s watchdog) answers its own
+  `H` with `B|M` to put it straight back. The device is the authority on what is
+  on its glass; the daemon asks rather than assumes, using verbs both ends
+  already speak.
+
+- **Fixed (test): `tools/test_account_switch.py` failed for anyone who actually
+  uses account switching.** `select_account()` consults `CLAUDE_MATE_ACCOUNT`
+  before it offers the picker, and the test never cleared it — so fourteen
+  checks failed on a developer's machine and none of them in CI, which is the
+  worst possible place for that asymmetry to be.
+- **Fixed (daemon): an unprovisioned board was re-dialled every few seconds
+  forever.** The backoff counter was cleared when a device was *found*, before
+  the session was tried, so a handshake that failed instantly retried against a
+  flat 1 s sleep — and every cycle drags the peripheral out of its advertising
+  duty cycle. A board with no stored SSID defaults to BLE, so this was every
+  factory-reset device. The Wi-Fi path already backed the same failure off to
+  30 s.
+
+**The gauge**
+
+- **Fixed: a nearly-flat cell reported itself as *absent* and erased the
+  indicator.** The "nothing is wired to the divider" threshold was 3000 mV — a
+  reading only a real, nearly-empty 14500 can produce on this board, since the
+  charger rail holds the sense node at ~4.2 V when nothing is fitted. So the
+  chip vanished and both readouts printed `no cell` at exactly the moment the
+  cell was empty, and the same branch forced `charging` false, so putting it on
+  the charger showed no bolt either. It is 2400 mV now — below where the 3V3
+  regulator gives up, so it means what it says.
+- **A `LOW` warning that blinks**, from `BATT_LOW_MV` (3300 mV, the percent
+  curve's own zero). One red segment covers 3.7 V down to 3.0 V — about half the
+  usable capacity — so the chip looked identical at *"soon"* and at *"now"*. It
+  blinks on its own clock rather than the daemon's, because a cell going flat
+  while the link is down is exactly when it has to still work.
+- **The battery is on the screens that did not have it**: the gamepad face
+  (which the device can boot straight into, and the most power-hungry standing
+  configuration it has), the ACTIONS sheet, the account picker, the Wi-Fi setup
+  portal (AP mode, the heaviest radio state there is) and the terminal mirror.
+- **macOS gets the real charge.** The BLE gamepad already advertised a standard
+  Battery Service that macOS reads — and was feeding it a hard-coded `100`
+  forever. It carries `battPercent` now.
+- **"Charging" is only claimed when a voltage says so.** `HWCDC::isPlugged()` is
+  "a host is sending SOF frames", which is equally true in constant-current, in
+  constant-voltage, and hours after termination. This board cannot detect
+  termination at all — the sense divider sits on the charger rail — so the
+  readouts say **on USB** for that case and keep *charging* for the voltage
+  tests. See [#26](https://github.com/vlgutv22/claude_mate/issues/26) for the
+  cutoff this still does not have.
+- **The gauge's arithmetic moved to `battery.h` so a host can run it**, and
+  `tools/test_battery.py` does — in CI, beside the game engine's harness, which
+  was split out for the same reason. It immediately caught one more: the level
+  hold stamped its clock `now ? now : 1UL`, which at `millis() == 0` is a time
+  in the *future*, and the unsigned compare underflowed straight past the 45 s
+  hold. That sentinel has been unpicked three times in this firmware; it is a
+  `bool` now and cannot come back.
+
+**Not changed, on purpose**
+
+The two radio-level reasons BLE may not beat Wi-Fi on this board — the S3's BT
+controller ships with modem sleep compiled *off*, and the duty cycle only runs
+while advertising while the daemon holds the link open all day — are documented
+in [`docs/POWER.md`](docs/POWER.md) and tracked in
+[#25](https://github.com/vlgutv22/claude_mate/issues/25). Both are radio
+behaviour changes whose only justification is a measurement nobody has taken
+yet, and that table is still the thing owed.
+
 ### 2026-08-13 — The rest of the review, including two features that could not work
 
 - **Fixed: the gamepad could never start on a BLE board.** `setup()` brought the

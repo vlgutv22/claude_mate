@@ -506,7 +506,7 @@ firmware stops the loop on its own after ~30 s of serial silence and shows the
 
 > ⚠️ **The cell must be 3.7 V Li-ion.** The board's onboard charger is a 4.2 V
 > Li-ion charger and the firmware's gauge curve and charge detection are
-> calibrated for that chemistry (`CHARGE_FULL_MV 4150`, `BATT_MIN_MV 3000` in
+> calibrated for that chemistry (`CHARGE_FULL_MV 4150`, `BATT_LOW_MV 3300` in
 > [`board_s3.h`](firmware/claude_mate_s3/board_s3.h)). A 3.2 V LiFePO4 cell would
 > be over-charged by it *and* read as flat.
 

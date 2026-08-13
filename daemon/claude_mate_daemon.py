@@ -2379,7 +2379,40 @@ class ButtonReader(threading.Thread):
             if prov:
                 prov()
         if line == "H":
-            self._screen.resend_full_state()
+            # A DEVICE THAT JUST SAID HELLO HAS NO TERMINAL VIEW OPEN.
+            #
+            # The mirror is a daemon-side 1 s timer, and it was torn down by
+            # exactly three things: another B|M, a B|G, or the shown session
+            # disappearing. A device going away was not one of them. So any
+            # restart that did not go through the device's own power-off --
+            # a link restart, a gamepad toggle, a screen flip, `R`, a brownout,
+            # or simply a BLE drop and reconnect -- left this timer running, and
+            # the moment the link came back it pushed a title, seventeen rows
+            # and M|END every second into a device that had never asked. The
+            # firmware takes M|END as permission to show the view, and the view
+            # sits in front of the status bar, so the device woke up in a
+            # terminal nobody opened, with the battery chip and link glyph
+            # hidden behind it, repainting the whole screen once a second and
+            # holding the radio busy. On a battery build that is the single most
+            # expensive thing the daemon can do to a device by accident.
+            #
+            # Fixed here rather than in the firmware deliberately: a device-side
+            # "ignore mirrors I did not ask for" would leave the Mac polling a
+            # wrapper and pushing nineteen lines a second into something that
+            # throws them away, which costs the same radio and saves nothing.
+            # ...and if it really did still have one open, it will say so
+            # immediately: the device answers its own H with B|M when the view
+            # survived on its side (a link flap rather than a reboot), which
+            # re-opens this for the session on the glass. Closing first is what
+            # makes that toggle unambiguous.
+            #
+            # _mirror_close_locked() resends the frame itself, so only push one
+            # when there was nothing to hand the glass back from. Doing both
+            # cost two full resends, two L| account bursts and two rounds of
+            # per-profile HTTPS lookups on every reconnect -- self-inflicted, on
+            # the very path this handler exists to make cheaper.
+            if not self.mirror_close():
+                self._screen.resend_full_state()
             return
         if line == "K":                          # keepalive ack to our P: no-op
             return
@@ -2549,10 +2582,18 @@ class ButtonReader(threading.Thread):
         self._link.write_line("M|OFF")            # hand the glass back to the
         self._screen.resend_full_state()          # normal frame
 
-    def mirror_close(self) -> None:
+    def mirror_close(self) -> bool:
+        """Close any open view. True if there was one.
+
+        The return value exists for the handshake path: _mirror_close_locked()
+        ends with its own resend_full_state(), so a caller that would otherwise
+        resend needs to know whether that has already happened.
+        """
         with self._mirror_lock:
-            if self._mirror_key is not None:
-                self._mirror_close_locked()
+            if self._mirror_key is None:
+                return False
+            self._mirror_close_locked()
+            return True
 
     def _mirror_scroll_by(self, delta: int) -> None:
         """PREV/NEXT scroll the view instead of moving the selection."""
@@ -2622,6 +2663,15 @@ class ButtonReader(threading.Thread):
             self._mirror_warned = True
             log(f"MIRROR: sending {len(body)} rows for {sess.name} "
                 f"(fetched {'-' if rows is None else len(rows)})")
+        # LAST LOOK BEFORE WRITING. wrapper_ctrl_screen() above is a round trip
+        # to another process, and a close landing during it -- the device's
+        # M|OFF, or the H handler above -- would otherwise be overtaken by the
+        # rows this tick already fetched. The device would set mirrorOn on the
+        # M|END that followed the M|OFF and then sit on a frozen view with
+        # nothing left to close it, because this tick does not re-arm.
+        with self._mirror_lock:
+            if self._mirror_key != key:
+                return
         self._link.write_line(f"M|T|{title}")
         for i in range(MIRROR_ROWS):
             text = body[i] if i < len(body) else ""

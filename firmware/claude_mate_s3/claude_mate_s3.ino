@@ -115,8 +115,12 @@
 
 #include <Arduino_GFX_Library.h>
 #include <esp_sleep.h>
+#include <esp_system.h>        // esp_reset_reason(): a crash-reboot and a wake
+                               // from deep sleep are indistinguishable without
+                               // it, and they are different bugs
 #include <driver/rtc_io.h>
 #include "board_s3.h"
+#include "battery.h"       // the gauge's arithmetic, so a host can test it
 #include "netcfg.h"
 #include "settings.h"
 #include "blelink.h"
@@ -389,6 +393,20 @@ static unsigned long lastBattMs = 0;
 // EXT1 is a wake from powerOff(). Surfaced in `?` because a device that woke
 // unexpectedly and one that browned out and rebooted look identical otherwise.
 static esp_sleep_wakeup_cause_t wakeCause = ESP_SLEEP_WAKEUP_UNDEFINED;
+// ...and the two things that turn "it woke up on its own" from a mystery into a
+// sentence. A spurious wake and a crash-reboot look identical from across a
+// room -- the screen was dark and now it is not -- and until these were
+// recorded there was nothing on the device that could tell them apart.
+//
+//   resetReason   ESP_RST_DEEPSLEEP is a real wake; ESP_RST_PANIC or
+//                 ESP_RST_BROWNOUT means the sleep never happened and the
+//                 device rebooted, which is a completely different bug.
+//   wakeExt1Mask  WHICH pad pulled the chip out of sleep. With one wake source
+//                 the only honest answers are "GPIO 6" and "nothing" -- and
+//                 "nothing" alongside ESP_RST_DEEPSLEEP would mean the wake
+//                 fired with no pin low, which is worth knowing.
+static uint64_t          wakeExt1Mask = 0;
+static esp_reset_reason_t resetReason = ESP_RST_UNKNOWN;
 
 static bool mirrorOn = false;
 static char mirrorTitle[MIRROR_COLS + 1] = {0};
@@ -398,12 +416,26 @@ static char mirrorRow[MIRROR_ROWS][MIRROR_COLS + 1] = {{0}};
 // battPercent, which stays exact for the `?` readout and the About page --
 // diagnosis wants the number, the glance wants the shape.
 static int8_t   battLevel     = -1;
-static int8_t   battLevelCand = -1;    // level the raw voltage is asking for...
-static unsigned long battLevelSince = 0;  // ...and how long it has asked
+// The candidate + clock behind that number. In battery.h so the hold can be
+// driven through a whole discharge on a host; battLevel stays here because the
+// renderer reads it on every frame.
+static BattLevelHold battHold;
 
 static uint32_t battRawMv    = 0;      // this poll's median, before the EMA
 static uint32_t battFiltMv   = 0;      // EMA state (0 = not yet seeded)
 static bool     battCharging = false;  // inferred, not read from a status pin
+// Where that verdict came from, because the two sources mean different things
+// and the readouts were reporting both as "charging".
+//
+// HWCDC::isPlugged() is "the USB Serial/JTAG peripheral is receiving SOF
+// frames" -- i.e. a computer is on the other end of the cable. That is equally
+// true in constant-current, in constant-voltage, and hours after the charger
+// terminated, and it says nothing at all about the cell. This board cannot
+// detect termination: the sense divider sits on the charger rail, which reads
+// ~4.2 V during CV and after it alike. So the firmware stops claiming to know.
+// "on USB" is what SOF actually proves; "charging" is reserved for the voltage
+// tests, which are at least looking at the cell.
+static bool     battUsbHost  = false;
 static uint32_t battTrendMv  = 0;      // baseline the trend is measured against
 static unsigned long battTrendMs = 0;  // ...and when it was taken (0 = none)
 
@@ -431,6 +463,34 @@ static unsigned long ledPhaseMs   = 0;
 static uint8_t       ledR = 0, ledG = 0, ledB = 0;              // driven
 static uint8_t       ledBaseR = 0, ledBaseG = 0, ledBaseB = 0;  // before the cap
 static char          ledKindCode  = 0;   // first letter of the active LOOP kind
+
+// Why this boot happened, in the fewest words that stay true. Shared by the
+// About page and the serial `?` so the two can never drift.
+//
+// Deliberately the FIRST function defined in this file, and it has to stay
+// below `struct LedStep` above: the .ino preprocessor hoists every generated
+// prototype to just before the first definition, so a function placed any
+// higher would push those prototypes above a type they mention. That is the
+// same trap the note by `struct Btn` in board_s3.h describes, arrived at from
+// the other end -- and it costs a build with a bewildering error message.
+static const char *bootReasonText() {
+  switch (resetReason) {
+    case ESP_RST_DEEPSLEEP:
+      // The ext1 mask is the interesting half: it says the wake came from the
+      // pin someone pressed rather than from a pad that drifted low.
+      return wakeExt1Mask ? "woke from sleep (4th button)"
+                          : "woke from sleep (no pin?)";
+    case ESP_RST_POWERON:  return "power-on";
+    case ESP_RST_SW:       return "restarted by the firmware";
+    case ESP_RST_PANIC:    return "CRASHED - see the serial log";
+    case ESP_RST_BROWNOUT: return "BROWNED OUT - cell too flat?";
+    case ESP_RST_EXT:      return "reset button";
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_INT_WDT:
+    case ESP_RST_WDT:      return "WATCHDOG reset";
+    default:               return "reset";
+  }
+}
 
 // Re-derive the driven colour from the pattern's own colour and the configured
 // cap. Separated out so the Alert LED setting can take effect on a pattern that
@@ -540,26 +600,9 @@ static void ledForKind(const char *k) {
 // -----------------------------------------------------------------------------
 // Battery gauge
 // -----------------------------------------------------------------------------
-// A LiPo's voltage/charge curve is famously non-linear -- treating it as a
-// straight line reads "50%" for most of the discharge and then falls off a
-// cliff. This piecewise table is still an approximation, but an honest one.
-static int battPercentFromMv(uint32_t mv) {
-  static const uint16_t curve[][2] = {
-      {4200, 100}, {4100, 92}, {4000, 84}, {3900, 74}, {3800, 62},
-      {3700, 48},  {3600, 30}, {3500, 16}, {3400, 8},  {3300, 0},
-  };
-  if (mv >= curve[0][0]) return 100;
-  const size_t n = sizeof(curve) / sizeof(curve[0]);
-  if (mv <= curve[n - 1][0]) return 0;
-  for (size_t i = 1; i < n; i++) {
-    if (mv >= curve[i][0]) {
-      uint16_t hiMv = curve[i - 1][0], loMv = curve[i][0];
-      uint16_t hiPc = curve[i - 1][1], loPc = curve[i][1];
-      return loPc + (int)((long)(mv - loMv) * (hiPc - loPc) / (hiMv - loMv));
-    }
-  }
-  return 0;
-}
+// The curve, the level thresholds and the hold now live in battery.h, where a
+// host compiler can reach them -- see the note at the top of that file for why
+// this arithmetic in particular earned a test.
 
 // Median of BATT_SAMPLES readings taken BATT_SAMPLE_US apart. See the note by
 // BATT_SAMPLES in board_s3.h for why a median of spaced samples beats a mean of
@@ -576,7 +619,22 @@ static uint32_t battMedianMv() {
     while (j >= 0 && s[j] > v) { s[j + 1] = s[j]; j--; }
     s[j + 1] = v;
   }
-  return s[BATT_SAMPLES / 2];
+  uint32_t m = s[BATT_SAMPLES / 2];
+  // GIVE THE SAR BACK. analogReadMilliVolts() lazily creates an adc_oneshot unit
+  // on its first call, and that acquires the ADC power domain -- but the core
+  // only ever deletes the unit when the pin is reassigned to a different bus,
+  // which this firmware never does. So the analog bias was taken once, at the
+  // first poll, and held for the rest of the boot. Espressif's own header puts
+  // that at about 1 mA, which is a real slice of a budget whose whole point is
+  // the screen being off, and it is invisible from the sketch.
+  //
+  // pinMode(ANALOG) routes to adcDetachBus -> adc_oneshot_del_unit -> the
+  // matching power release. Deliberately here rather than inside the sample
+  // loop, so the unit is created and dropped once per BATT_POLL_MS rather than
+  // fifteen times. NOT a direct call to the release function: that would
+  // unbalance the driver's own refcount.
+  pinMode(PIN_BATT_ADC, ANALOG);
+  return m;
 }
 
 static void pollBattery() {
@@ -598,39 +656,25 @@ static void pollBattery() {
                              (int32_t)raw + W / 2) / W);
   }
   uint32_t mv = battFiltMv;
-  // Nothing wired to the divider reads as a floating near-zero: report "no
-  // gauge" rather than a permanent 0% that would look like a dying cell.
-  int pc = (mv < BATT_MIN_MV) ? -1 : battPercentFromMv(mv);
+  // A reading this low means nothing sane is on the divider -- NOT a flat cell,
+  // which is what the old 3000 mV threshold made it mean. See BATT_ABSENT_MV.
+  int pc = battCellPresent(mv) ? battPercentFromMv(mv) : -1;
   battMv = mv;
   battPercent = pc;
 
   // ---- the displayed level: hysteresis, then a hold ----------------------
-  // Two independent guards, because they stop different things. Hysteresis
-  // stops a voltage sitting exactly on a threshold from flickering between two
-  // levels. The hold stops a genuine but BRIEF excursion -- a WiFi TX burst, a
-  // backlight step, the sag as the screen wakes -- from moving the display at
-  // all. Neither alone is enough: hysteresis lets a long sag through, and a
-  // hold alone would still flicker once it expired.
-  int8_t want;
-  if (pc < 0) {
-    want = -1;                                  // no cell wired
-  } else {
-    // Fall only after crossing the threshold by BATT_HYST_MV; rise on touch.
-    int8_t cur = battLevel > 0 ? battLevel : 0;
-    uint32_t l3 = BATT_L3_MV - (cur >= 3 ? BATT_HYST_MV : 0);
-    uint32_t l2 = BATT_L2_MV - (cur >= 2 ? BATT_HYST_MV : 0);
-    want = (mv >= l3) ? 3 : (mv >= l2) ? 2 : 1;
-  }
-  if (want != battLevelCand) {                  // a new candidate: restart the
-    battLevelCand  = want;                      // clock rather than accumulate
-    battLevelSince = now ? now : 1UL;
-  }
-  bool settled = battLevelSince &&
-                 (now - battLevelSince) >= BATT_LEVEL_HOLD_MS;
-  // First reading after boot shows immediately -- making someone stare at a
-  // blank corner for 45 s to prove a point would be its own kind of wrong.
-  if (battLevel < 0 || settled) {
-    if (want != battLevel) { battLevel = want; needRender = true; }
+  // Both live in battery.h now; see the note there for why the two guards are
+  // needed together rather than either alone.
+  int8_t want = (pc < 0) ? -1 : battLevelFor(mv, battLevel);
+  if (battHold.update(want, now)) {
+    battLevel = battHold.level;
+    needRender = true;
+    // padDirty too: the pad face is a still image and loop() drops every
+    // redraw request that is not the pad's own, so without this the chip on
+    // that screen would freeze at whatever level was drawn on the last button
+    // edge -- and the gamepad is both the mode with the worst battery story and
+    // the one the device can boot straight into.
+    padDirty = true;
   }
 
   // Charging: no status line exists on this board, so infer it. See the long
@@ -645,30 +689,38 @@ static void pollBattery() {
   // tethered case outright and leaves the charger case to the voltage tests.
   usbHost = HWCDC::isPlugged();
 #endif
+  // battUsbHost is set alongside every verdict, so the readouts can say which
+  // of the two questions was actually answered -- see its declaration.
   if (pc < 0) {                             // no cell: nothing to charge
     chg = false;
+    battUsbHost = false;
     battTrendMs = 0;
   } else if (usbHost) {
     chg = true;
+    battUsbHost = true;
     battTrendMv = mv;
     battTrendMs = now;
   } else if (mv >= CHARGE_FULL_MV) {
     chg = true;
+    battUsbHost = false;
     battTrendMv = mv;                       // rebase, so dropping back below
     battTrendMs = now;                      // this starts a clean trend window
   } else if (!battTrendMs) {
+    battUsbHost = false;
     battTrendMv = mv;
     battTrendMs = now;
   } else if (now - battTrendMs >= CHARGE_TREND_MS) {
     long d = (long)mv - (long)battTrendMv;
     if      (d >=  CHARGE_TREND_MV) chg = true;   // climbing: on the charger
     else if (d <= -CHARGE_TREND_MV) chg = false;  // sinking: on the cell
+    battUsbHost = false;
     battTrendMv = mv;                       // ...otherwise flat: keep the last
     battTrendMs = now;                      // verdict rather than flapping
   }
   if (chg != battCharging) {
     battCharging = chg;
     needRender = true;
+    padDirty    = true;                     // see the level change above
   }
 #endif
 }
@@ -804,6 +856,13 @@ static void drawBolt(int16_t x, int16_t y, uint16_t col) {
 // Three segments, filled from the left, coloured by how many are lit: 3 green,
 // 2 amber, 1 red. No number -- see the note at BATT_L3_MV in board_s3.h for why
 // a percentage was actively misleading here.
+// "This cell is nearly empty", asked in one place so the chip and the blink
+// clock cannot disagree about it. Not while charging: a flat cell that is ON
+// the charger is good news, and flashing LOW at it would say the opposite.
+static bool battLowWarn() {
+  return battIsLow(battMv, battLevel, battCharging);
+}
+
 static void drawBatteryChip(int16_t right, int16_t y) {
   if (battLevel < 0) {
     // No cell wired: fall back to the Wi-Fi signal so the corner is not dead
@@ -830,10 +889,39 @@ static void drawBatteryChip(int16_t right, int16_t y) {
                  : battLevel >= 3 ? C_DONE
                  : battLevel == 2 ? C_WAIT : C_ERROR;
 
+  // NEARLY EMPTY GETS A WORD, not just a colour. One red segment already
+  // covers 3.7 V down to 3.0 V -- about half the usable capacity by this
+  // firmware's own curve -- so the chip looks the same at "get to a charger
+  // soon" as it does at "this is about to die". The device has no cutoff, and a
+  // 14500 taken below ~3 V loses capacity for good, so the last few per cent
+  // are worth being loud about.
+  //
+  // The blink is the loud part: a static red chip is what the eye has already
+  // stopped reading by then.
+  bool low = battLowWarn();
+  // THE PAD FACE CANNOT BLINK, so on it the warning is drawn steady.
+  //
+  // UI_PAD is a still image on purpose -- loop() drops every redraw request
+  // that is not the pad's own, because a full flush is 110 KB of SPI and
+  // nobody is looking at the glass while they play. The blink clock is exactly
+  // such a request, so a blinking chip there would be painted once, in
+  // whichever phase happened to be current, and then frozen -- and half the
+  // time that is the OFF phase, leaving a battery chip with no lit segments at
+  // all. An unlit chip reads as "dead", which is a worse lie than a steady
+  // warning is a weak one.
+  bool phase = (uiMode == UI_PAD) ? true : blinkOn;
+  if (low) {
+    gfx->setTextSize(1);
+    gfx->setTextColor(phase ? C_ERROR : C_DIMMER);
+    gfx->setCursor(bx - 4 * GLYPH_W - 4, y + 5);
+    gfx->print("LOW");
+  }
+
   for (int8_t i = 0; i < 3; i++) {
     int16_t sx = bx + i * (segW + gap);
-    if (i < battLevel) gfx->fillRect(sx, by, segW, segH, col);
-    else               gfx->drawRect(sx, by, segW, segH, C_DIMMER);
+    bool lit = i < battLevel && !(low && !phase);
+    if (lit) gfx->fillRect(sx, by, segW, segH, col);
+    else     gfx->drawRect(sx, by, segW, segH, low ? C_ERROR : C_DIMMER);
   }
   // The bolt sits ON the segments in the background colour, so it reads at
   // three lit segments and at one alike -- drawn in the accent colour it would
@@ -1064,6 +1152,10 @@ static void drawSetup() {
   gfx->setTextColor(C_WORK);
   gfx->setCursor(PAD_X, 30);
   gfx->print("WIFI SETUP");
+  // AP mode is the heaviest radio state this firmware has, and the portal can
+  // sit here for its whole timeout. The one screen where the cell is most at
+  // risk was the one with nothing to say about it.
+  drawBatteryChip(SCREEN_W - PAD_X, 4);
   gfx->setTextSize(1);
   gfx->setTextColor(C_DIM);
   gfx->setCursor(PAD_X, 58);
@@ -1095,7 +1187,15 @@ static void drawMirror() {
   gfx->setTextSize(1);
   gfx->setTextColor(C_WORK);
   gfx->setCursor(PAD_X, 7);
-  gfx->print(mirrorTitle);
+  // Clipped at PRINT time, not in the buffer: mirrorTitle is the live copy the
+  // daemon refreshes on every M|T, and truncating it there would be permanent.
+  // 40 chars ends at x=246, which clears the chip at 281 AND the LOW warning
+  // that sits 28 px to its left when the cell is nearly empty.
+  char t[41];
+  snprintf(t, sizeof(t), "%s", mirrorTitle);
+  gfx->print(t);
+  drawBatteryChip(SCREEN_W - PAD_X, 4);   // the mirror is indefinite and the
+                                          // daemon repaints it once a second
   gfx->fillRect(0, BAR_RULE_Y, SCREEN_W, 1, C_DIMMER);
   gfx->setTextColor(C_TEXT);
   for (uint8_t r = 0; r < MIRROR_ROWS; r++) {
@@ -1350,7 +1450,8 @@ static void drawAboutPage() {
   else
     snprintf(battBuf, sizeof(battBuf), "%d/3  %d%%  %u mV  %s", (int)battLevel,
              battPercent, (unsigned)battMv,
-             battCharging ? "charging" : "on battery");
+             battCharging ? (battUsbHost ? "on USB" : "charging")
+                          : "on battery");
 #else
   snprintf(battBuf, sizeof(battBuf), "gauge compiled out");
 #endif
@@ -1364,7 +1465,7 @@ static void drawAboutPage() {
       linkStatusText(),
       rssiBuf,
       battBuf,
-      wakeCause == ESP_SLEEP_WAKEUP_EXT1 ? "woke from sleep" : "power-on / reset",
+      bootReasonText(),
       sleepBuf,
       FW_VERSION,
   };
@@ -1393,6 +1494,11 @@ static void drawAboutPage() {
 // The gamepad face. Drawn once per state change, never per frame: this screen
 // is a still image and a full flush is 110 KB of SPI.
 static void drawPad() {
+  // The pad is a PERSISTED mode -- the switch lives in NVS and setup() enters
+  // it directly -- so a gamepad board boots into this screen and stays here
+  // until a two-second hold. It is also the most power-hungry standing
+  // configuration the device has. A screen you can live on needs the gauge.
+  drawBatteryChip(SCREEN_W - PAD_X, 4);
   drawCentred(SCREEN_W / 2, 16, 2,
               padVia == PAD_BLE ? "BLE GAMEPAD" : "CONTROLLER", C_TEXT);
   gfx->setTextSize(1);
@@ -1455,6 +1561,7 @@ static void drawActions() {
     "View terminal", "Preview on glass", "Send \"continue\"",
     "New terminal", "Switch account",
   };
+  drawBatteryChip(SCREEN_W - PAD_X, 4);
   drawCentred(SCREEN_W / 2, 6, 2, "ACTIONS", C_TEXT);
   for (uint8_t i = 0; i < AR_COUNT; i++) {
     int16_t y = ACT_Y0 + i * ACT_ROW_H;
@@ -1482,6 +1589,7 @@ static void drawActions() {
 // token for is shown but marked, because offering to switch to something that
 // would dump you at /login is exactly the thing this must not do.
 static void drawAccounts() {
+  drawBatteryChip(SCREEN_W - PAD_X, 4);
   drawCentred(SCREEN_W / 2, 6, 2, "ACCOUNT", C_TEXT);
   if (acctCount == 0) {
     gfx->setTextSize(1);
@@ -1693,7 +1801,13 @@ static void enterPad(bool manual, PadVia via = PAD_LINK) {
   // Allow the first park immediately: the modular subtract makes this "already
   // past the check window" without special-casing a device that just booted.
   padWifiUpSince = millis() - PAD_WIFI_CHECK_MS;
-  analogWrite(LCD_BL, PAD_BL_DUTY);        // nobody is looking at this screen
+  // ONLY IF THE PANEL IS SUPPOSED TO BE LIT. screenOn is the single source of
+  // truth for the backlight, and writing the pin behind its back leaves a lit
+  // screen that pollHibernate() can never turn off again -- sleepScreen()
+  // early-returns on !screenOn, so nothing would reach it until someone pressed
+  // a button. Reachable with nobody there: the daemon's G|1 enters the pad at
+  // any moment, including after the screen has already hibernated.
+  if (screenOn) analogWrite(LCD_BL, PAD_BL_DUTY);  // nobody is looking at this
   requestRender();
 }
 
@@ -1735,7 +1849,13 @@ static void leavePad() {
   padActive = false;
   padManual = false;
   padHeld   = 0;
-  analogWrite(LCD_BL, cfg.blDuty());
+  // Same rule as enterPad(): never light the pin while screenOn is false. The
+  // V| handler calls leavePad() on an ERROR/INPUT alert with nobody present, and
+  // this duty is the FULL configured brightness -- up to 255 -- on a panel that
+  // is also never repainted in that state, because loop() only renders when
+  // screenOn. A permanently lit screen showing a frozen frame reads as a crash
+  // and drains the cell at the board's worst rate.
+  if (screenOn) analogWrite(LCD_BL, cfg.blDuty());
   requestRender();
 }
 
@@ -1967,16 +2087,22 @@ static bool handleConfigLine(char *line) {
                       (unsigned)battMv, (unsigned)battRawMv,
                       (double)BATT_DIVIDER);
       else
-        Serial.printf("batt  : level %d/3  %d%% (%u mV filt, %u raw) %s\n",
+        Serial.printf("batt  : level %d/3  %d%% (%u mV filt, %u raw) %s%s\n",
                       (int)battLevel, battPercent,
                       (unsigned)battMv, (unsigned)battRawMv,
-                      battCharging ? "charging" : "on battery");
+                      battCharging ? (battUsbHost ? "on USB" : "charging")
+                                   : "on battery",
+                      battLowWarn() ? "  LOW" : "");
 #else
       Serial.println("batt  : gauge compiled out");
 #endif
-      Serial.printf("boot  : %s\n",
-                    wakeCause == ESP_SLEEP_WAKEUP_EXT1 ? "woke from power-off"
-                                                       : "power-on / reset");
+      // The reset reason AND the ext1 mask, because "the device turned itself
+      // back on" has two completely different causes and this is the only line
+      // that can separate them: a real wake (deep sleep, a pad in the mask) or
+      // a reboot the sleep never survived (panic, brownout, watchdog).
+      Serial.printf("boot  : %s (reset=%d, ext1=0x%llx, cause=%d)\n",
+                    bootReasonText(), (int)resetReason,
+                    (unsigned long long)wakeExt1Mask, (int)wakeCause);
       // The firmware-local settings, so a device that is misbehaving can be
       // diagnosed without guessing at what someone set in the menu. `screen`
       // reporting "off" is the difference between a broken backlight and a
@@ -2390,7 +2516,19 @@ static void powerOff() {
   // WAIT FOR RELEASE. The wake is level-triggered on LOW, so sleeping with the
   // button still down wakes the chip instantly and reads as "power off is
   // broken".
-  while (digitalRead(PIN_BTN_MIRROR) == LOW) delay(10);
+  //
+  // BOUNDED, for the same reason rebootAfterRelease() is bounded -- that
+  // function's comment already names this one as the precedent it learned from,
+  // and this one never got the lesson back. Everything above has already run:
+  // both radios are down, the panel is off and the backlight is latched LOW. So
+  // a pin that reads LOW for any reason that is not a finger parked the device
+  // in a 10 ms spin loop, awake, dark and at full clock, until the cell was
+  // flat -- indistinguishable from dead hardware, and the exact opposite of
+  // what the gesture asked for. Sleeping with the pin still down costs one
+  // spurious wake, which setup() already absorbs; hanging here costs the cell.
+  unsigned long relBegan = millis();
+  while ((millis() - relBegan) < RELEASE_WAIT_MS &&
+         digitalRead(PIN_BTN_MIRROR) == LOW) delay(10);
   delay(80);                                  // let the release settle
 
   // The internal pull-up must be re-armed through the RTC domain; the ordinary
@@ -2435,7 +2573,12 @@ static void notePoke() { lastPokeMs = millis(); }
 static void wakeScreen() {
   if (screenOn) return;
   screenOn = true;
-  analogWrite(LCD_BL, cfg.blDuty());
+  // The pad face has its own dim duty, and waking into cfg.blDuty() there would
+  // light a screen nobody is looking at at up to ten times the brightness the
+  // mode deliberately chose. With enterPad()/leavePad() no longer writing the
+  // pin behind screenOn's back, this pair is the sole owner of the backlight in
+  // every mode -- which is what the rest of the file already assumes.
+  analogWrite(LCD_BL, uiMode == UI_PAD ? PAD_BL_DUTY : cfg.blDuty());
   notePoke();
   requestRender();                            // the frame may have moved on
 }
@@ -2495,6 +2638,27 @@ static void sendSoundPref() {
   char buf[12];
   snprintf(buf, sizeof(buf), "O|SND|%d", cfg.sound() ? 1 : 0);
   emitLine(buf);
+}
+
+// THE DEVICE IS THE AUTHORITY ON WHETHER A TERMINAL VIEW IS OPEN, and this is
+// how it says so across a reconnect.
+//
+// The daemon closes any mirror it is running when it receives H, because a
+// device that just said hello has usually rebooted -- and a mirror left running
+// against a rebooted device pushes nineteen lines a second into a view nobody
+// opened. But "usually" is not "always": a BLE flap shorter than the link
+// watchdog leaves this device still displaying the view, with mirrorOn still
+// true, and closing it would yank a screen the user is actively reading.
+//
+// So whichever half is wrong corrects itself here. The daemon has just closed
+// its mirror, so B|M -- which toggles -- can only open one, and it opens it for
+// the session on the glass, which is the one we were mirroring. On a real
+// reboot mirrorOn is false, nothing is sent, and the daemon stays closed.
+//
+// Only existing verbs, deliberately: an old daemon sees a B|M it already
+// understands, and an old device sends nothing and gets today's behaviour.
+static void reassertMirror() {
+  if (mirrorOn) emitLine("B|M");
 }
 
 // The game's noises, made by the Mac. This board has no DAC, no speaker and a
@@ -2922,11 +3086,40 @@ void setup() {
   // skipping this leaves the backlight pinned low and the board wakes to a
   // black screen -- indistinguishable from the dead-panel failure that a wrong
   // LCD_BL causes, and just as slow to diagnose.
-  wakeCause = esp_sleep_get_wakeup_cause();
+  wakeCause    = esp_sleep_get_wakeup_cause();
+  wakeExt1Mask = esp_sleep_get_ext1_wakeup_status();
+  resetReason  = esp_reset_reason();
+
+  // RELEASE THE LATCHES UNCONDITIONALLY, and that word is the whole fix.
+  //
+  // Both latches live in the RTC domain and survive every reset except a true
+  // power-on: gpio_hold_en(LCD_BL) sets a bit in RTC_CNTL_DIG_PAD_HOLD_REG, and
+  // esp_deep_sleep_start() force-holds the ext1 pad in RTC_CNTL_PAD_HOLD_REG on
+  // its way out. IDF clears the second one for us -- but ONLY when the reset
+  // reason is ESP_RST_DEEPSLEEP, and this code cleared the first one only when
+  // the wake cause was not UNDEFINED. Every other way of arriving here fell
+  // between the two.
+  //
+  // That gap is self-perpetuating, which is what makes it worth this much
+  // comment. esp_deep_sleep_start()'s own failure path is abort() -- a PANIC
+  // reset, not a wake -- so a single sleep that does not take (a brownout on a
+  // tired cell, a wake condition already true as the chip goes down) comes back
+  // with GPIO 46 pinned LOW, so the panel cannot light, and GPIO 6 stuck in RTC
+  // function, so the 4th button reads as permanently pressed. From then on
+  // every power-off attempt fails the same way and nothing on the glass can say
+  // so. Only pulling the cell cleared it.
+  //
+  // All four calls are no-ops when nothing is held, so there is no cost to
+  // doing this on an ordinary boot. rtc_gpio_hold_dis() MUST come before
+  // rtc_gpio_deinit(): deinit only writes the pad's mux bit, and a held pad
+  // ignores writes -- which is why the old line looked like it was handing the
+  // pin back and was not.
+  gpio_hold_dis((gpio_num_t)LCD_BL);
+  gpio_deep_sleep_hold_dis();
+  rtc_gpio_hold_dis((gpio_num_t)PIN_BTN_MIRROR);
+  rtc_gpio_deinit((gpio_num_t)PIN_BTN_MIRROR);     // hand the pin back to GPIO
+
   if (wakeCause != ESP_SLEEP_WAKEUP_UNDEFINED) {
-    gpio_hold_dis((gpio_num_t)LCD_BL);
-    gpio_deep_sleep_hold_dis();
-    rtc_gpio_deinit((gpio_num_t)PIN_BTN_MIRROR);   // hand the pin back to GPIO
     // The wake is level-triggered on LOW, so the chip resumed the instant the
     // pin went down and the button is STILL HELD as this runs. Seed the 4th
     // button as already-pressed and already-spent, so the release that follows
@@ -3093,6 +3286,9 @@ void loop() {
   pollPadRadio();
   pollLed();
   pollBattery();
+  blepad.setBattery(battPercent);           // the HID Battery Service macOS
+                                            // already reads; no-op unless the
+                                            // pad stack is actually up
   pollHibernate();
   cfg.commit();                             // deferred flash write, if any
 
@@ -3133,7 +3329,23 @@ void loop() {
     // longer exists, and a GO press landing somewhere the user did not expect.
     if (!ble.pairRequested()) { pairAskedMs = 0; requestRender(); }
     else if ((now - pairAskedMs) >= PAIR_ASK_MS) answerPairing(false);
-    else requestRender();           // the countdown ticks
+    else {
+      // ONE REDRAW PER SECOND, NOT ONE PER PASS. This used to call
+      // requestRender() unconditionally, and the throttle below does not catch
+      // it -- `quiet` is true on essentially every pass during a prompt -- so a
+      // pairing question cost a full 110 KB canvas rebuild and SPI flush about
+      // thirty-five times a second for its whole 45 s life, to animate a
+      // countdown that changes once a second. It also forces the backlight back
+      // on, and any peer in radio range can re-arm it indefinitely on a board
+      // with no token.
+      //
+      // Ticking on the DISPLAYED VALUE rather than a fixed 1000 ms gate: a
+      // fixed gate drifts by about one render against the countdown's own
+      // second boundary, so over 45 ticks it visibly skips a number.
+      unsigned long left = (PAIR_ASK_MS - (now - pairAskedMs)) / 1000;
+      static unsigned long lastLeft = ~0UL;
+      if (left != lastLeft) { lastLeft = left; requestRender(); }
+    }
   }
   // The token the daemon granted after we said yes. The BLE stack took it live
   // already -- that is what let the handshake straight after it succeed -- so
@@ -3171,6 +3383,8 @@ void loop() {
       net.write("H");
       sendSoundPref();                      // the daemon keeps no per-device
                                             // state; re-assert it every link
+      reassertMirror();                     // ...and neither does it know
+                                            // whether we still have a view open
       lastRxMs = now;                       // the link is alive as of now
     }
     lastNetState = ns;
@@ -3186,6 +3400,7 @@ void loop() {
     if (bs == MateBle::LINKED) {
       ble.write("H");
       sendSoundPref();
+      reassertMirror();
       lastRxMs = now;
     }
     lastBleState = bs;
@@ -3196,6 +3411,22 @@ void loop() {
   // (pollLed() stops any LED loop on the same condition).
   if (!linkLost && (now - lastRxMs) >= LINK_WATCHDOG_MS) {
     linkLost = true;
+    // ...AND CLOSE THE MIRROR. render() tests mirrorOn before it reaches the
+    // branch that draws the status bar and the NO LINK screen, so a device that
+    // went out of range with the terminal view open showed a stale snapshot
+    // forever: no link glyph, no battery chip, no NO LINK -- three indications
+    // gone at the moment they matter, and the view itself a photograph
+    // presented as live. That is precisely the failure LINK LOST exists to
+    // prevent.
+    //
+    // No emitBtn('M') alongside it, unlike the clears in powerOff() and
+    // sleepScreen(). Those run on a deliberate gesture where telling the daemon
+    // to stop polling is the point; this watchdog can fire with the transport
+    // still nominally up and the daemon merely wedged, and a B|M that DID
+    // arrive would toggle the daemon's own mirror key out of agreement with
+    // this device. Clearing the local flag is enough: a daemon that is alive
+    // and still mirroring re-sends every row and M|END within the second.
+    mirrorOn = false;
     requestRender();
   }
 
@@ -3206,7 +3437,14 @@ void loop() {
     bool blinkStrip = false;
     for (uint8_t c = 0; frameRow[3][c]; c++)
       if (frameRow[3][c] >= 'a' && frameRow[3][c] <= 'z') { blinkStrip = true; break; }
-    if (haveFrame && !linkLost && (frameFlash || blinkStrip)) requestRender();
+    // The LOW chip blinks on its own terms, OUTSIDE the haveFrame/!linkLost
+    // guard. That guard is right for the two daemon-driven blinks -- there is
+    // nothing honest to flash about a session when the link is down -- but the
+    // battery is firmware-local and the status bar is drawn on the NO LINK and
+    // splash screens too. A cell going flat while the daemon is unreachable is
+    // exactly when the warning has to still work.
+    if (battLowWarn()) requestRender();
+    else if (haveFrame && !linkLost && (frameFlash || blinkStrip)) requestRender();
   }
 
   // The press blip expiring needs one more frame to clear it.
@@ -3227,9 +3465,64 @@ void loop() {
   // the opposite problem. notePoke() keeps the hibernate timer from blanking
   // the screen under someone mid-level, which idle-detection would otherwise do
   // to a player who is holding a button but sending the daemon nothing.
+  // ONE FREERTOS TICK PER PASS, and this is the largest single power fix in the
+  // file. Nothing on this loop blocks any more -- the BLE poll is two millis()
+  // comparisons where the Wi-Fi path used to sit in a blocking mDNS browse -- so
+  // loopTask (priority 1, core 1) was ALWAYS ready, IDLE1 (priority 0) never
+  // ran, and core 1 therefore never reached `waiti`. The CPU sat at 240 MHz and
+  // 100% duty doing five digitalReads and a handful of millis() comparisons,
+  // tens of thousands of times a second. That is on the order of 10-15 mA --
+  // comparable to the entire radio budget the BLE migration was undertaken to
+  // reduce, which is a large part of why the migration did not show up as
+  // longer runtime.
+  //
+  // Nothing is throttled by this. pumpUsb/pumpNet/pumpBle each drain their whole
+  // buffer in a while loop, so the link is not limited to a byte per
+  // millisecond; DEBOUNCE_MS is 40 and PAD_DEBOUNCE_MS is 8, so no edge is
+  // missed; and the game is a millis-delta accumulator with a fixed 60 Hz step,
+  // so its speed does not change, only its sample rate -- against a frame that
+  // already costs ~28 ms of SPI.
+  //
+  // Above the two early returns below, so all three exits from loop() pay it.
+  delay(1);
+
   if (uiMode == UI_GAME) {
-    game.tick();
-    notePoke();
+    // THE GAME OWNS THE BUTTONS HERE, so the hibernate machinery cannot see
+    // them and this branch has to do both halves itself.
+    //
+    // pollNavBtn() and pollGoBtn() return early in UI_GAME, so PREV/GO/NEXT
+    // never reach onButton() -- which is the only caller of notePoke() and of
+    // wakeScreen(). Read the three pins directly instead. A thumb is presence
+    // whatever screen the game is on, and that matters most on the screens
+    // where the level is NOT running: picking a milestone and reading a codex
+    // card are both things you do for a minute at a time.
+    bool anyKey = digitalRead(PIN_BTN_PREV) == LOW ||
+                  digitalRead(PIN_BTN_GO)   == LOW ||
+                  digitalRead(PIN_BTN_NEXT) == LOW;
+
+    // Waking has to swallow the press that did it, or the tap that lit the
+    // panel also starts a sprint nobody could see. game.tick() is where the
+    // pins are read, so holding it off until every key is up means _navWas
+    // never sees the edge -- and dt is clamped to 100 ms inside tick(), so the
+    // level clock cannot fast-forward across the gap either.
+    static bool swallow = false;
+    if (!screenOn && anyKey) { wakeScreen(); swallow = true; }
+    if (swallow && !anyKey)  swallow = false;
+    if (!swallow) game.tick();
+
+    // A RUNNING LEVEL IS ACTIVITY; A STILL SCREEN WITH NOBODY TOUCHING IT IS
+    // NOT. notePoke() used to be unconditional here, which meant
+    // pollHibernate()'s only sleep trigger could never fire while the game was
+    // open -- not during a sprint, and not on the START screen, the codex cards
+    // or the finish screen either. Anyone who opened SHIP IT and walked away
+    // left the backlight, the largest load on the board, at full duty until the
+    // cell was flat.
+    //
+    // The screen blanks IN PLACE rather than dropping you back to the menu. An
+    // eject would have been simpler and it throws away where you were -- the
+    // card you were reading, the milestone you were choosing -- for a timeout
+    // that is supposed to be about the backlight and nothing else.
+    if (!game.idle() || anyKey) notePoke();
     if (screenOn) { needRender = false; render(); }
     return;
   }

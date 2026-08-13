@@ -51,6 +51,15 @@ tmp = tempfile.mkdtemp(prefix="cm-switch-")
 os.environ["CLAUDE_MATE_ACCOUNTS_DIR"] = os.path.join(tmp, "accounts")
 os.environ["TMPDIR"] = os.path.join(tmp, "tmpdir")
 os.makedirs(os.environ["TMPDIR"], exist_ok=True)
+# THE DEVELOPER'S OWN ACCOUNT MUST NOT REACH THIS TEST. select_account()
+# consults CLAUDE_MATE_ACCOUNT before it ever offers the picker, so anyone who
+# actually uses the feature -- exports it in their shell, which is the whole
+# point of it existing -- got fourteen unexplained failures in the picker
+# section and nowhere else. CI never has it set, so the suite was green there
+# and red on the machine of the person most likely to be changing this file.
+# CLAUDE_CONFIG_DIR is popped further down for the same reason; this is its
+# pair, and it belongs up here with the rest of the sandbox.
+os.environ.pop("CLAUDE_MATE_ACCOUNT", None)
 
 W = load(WRAP, "cmwrap_t")
 
