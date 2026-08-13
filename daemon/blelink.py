@@ -161,7 +161,13 @@ class BleLink:
         self._buf = bytearray()        # notification reassembly
         self._auth_q: "queue.Queue[str]" = queue.Queue()
         self._not_found_logged = 0.0   # throttle for _log_not_found
+        self._notoken_logged = 0.0     # ...and for the no-token paragraph
         self._write_fails = 0          # consecutive failed GATT writes
+        # Did the session just attempted ever reach LINKED? An instance
+        # attribute rather than a local, so the exception path cannot leave it
+        # unbound -- bleak raises out of BleakClient.__aexit__ when the peer is
+        # gone, which is how most real drops arrive.
+        self._linked_once = False
         # Pairing is ARMED, never on. An unprovisioned device in range is not
         # consent to hand it this daemon's secret -- somebody has to ask, at the
         # terminal, and then press a button on the device. See _enrol().
@@ -301,7 +307,7 @@ class BleLink:
                 await self._sleep(min(BLE_RETRY_S * (2 ** fails),
                                       BLE_RETRY_MAX_S))
                 continue
-            fails = 0
+            self._linked_once = False
             try:
                 await self._session(found)
             except Exception as exc:                    # noqa: BLE001
@@ -315,7 +321,31 @@ class BleLink:
                 with self._lock:
                     self._client, self._linked = None, False
                 self._buf.clear()
-            await self._sleep(1.0)
+            # BACK OFF ON A SESSION THAT NEVER LINKED, not just on a failed
+            # scan. `fails` used to be cleared the moment a device was FOUND, so
+            # a session that failed instantly -- no token, wrong token,
+            # handshake timeout, macOS refusing the link -- retried against a
+            # flat 1 s sleep, forever. That is a full connect, GATT setup,
+            # handshake and teardown every few seconds, permanently, and it is
+            # not a corner case: a device with no stored SSID defaults to BLE,
+            # so every factory-reset board sits in exactly this loop.
+            #
+            # It costs the DEVICE, which is the point. Each cycle drags the
+            # peripheral out of its 200 ms / 4 s duty cycle -- reAdvertise()
+            # starts a fresh burst on every drop -- so the transport's whole
+            # power argument is cancelled by the daemon on the other end. The
+            # Wi-Fi path already backs this off to 30 s.
+            #
+            # A session that linked, ran for an hour and then dropped is a
+            # SUCCESS, not something to back off from, which is what the flag
+            # (rather than a bare "did _session raise") gets right.
+            if self._linked_once:
+                fails = 0
+                await self._sleep(1.0)
+            else:
+                fails = min(fails + 1, 4)
+                await self._sleep(min(BLE_RETRY_S * (2 ** fails),
+                                      BLE_RETRY_MAX_S))
 
     def _log_not_found(self) -> None:
         """"Nothing out there yet", with the two things to check, throttled.
@@ -376,6 +406,8 @@ class BleLink:
                 return
             with self._lock:
                 self._client, self._linked = client, True
+            self._linked_once = True     # this session got somewhere; see the
+                                         # backoff in _connect_forever
             self._log(f"BLE device connected: {device.address}")
             began = time.monotonic()
             # WHY a session ended, not just that it did. Four different things
@@ -465,10 +497,23 @@ class BleLink:
             # Otherwise say what to do about it. Pairing FIRST, because it is
             # the only route that needs neither a cable the device may be
             # nowhere near nor a Wi-Fi access point and a phone.
-            self._log("BLE: THE DEVICE HAS NO TOKEN. Pair it: run "
-                      "`claude-mate-connect --pair` (or press `d` at the "
-                      "account picker) and press GO on the device. With a "
-                      "cable, plugging it in is enough.")
+            # Said once, then at most every couple of minutes -- the same
+            # throttle _log_not_found uses, and for the same reason. An
+            # unprovisioned board is re-dialled on a schedule, so an
+            # unthrottled paragraph here filled the log with the same four
+            # lines every few seconds and buried everything else in it.
+            now = time.monotonic()
+            if not self._notoken_logged or \
+                    now - self._notoken_logged >= BLE_NOT_FOUND_GAP_S:
+                self._notoken_logged = now
+                self._log("BLE: THE DEVICE HAS NO TOKEN. Pair it: run "
+                          "`claude-mate-connect --pair` (or press `d` at the "
+                          "account picker) and press GO on the device. With a "
+                          "cable, plugging it in is enough.")
+            # The write stays unconditional whatever the log does: the firmware
+            # needs this byte to end the connection, and swallowing it would
+            # leave the device holding the link open until its own handshake
+            # timeout -- the opposite of what the throttle is for.
             await self._write(client, b"A|NO\n")
             return False
         if not reply.startswith("A|"):

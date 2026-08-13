@@ -108,7 +108,7 @@ are on-board, landing on GPIO 1. Do not connect anything to GPIO 1 yourself.
 
 The chemistry is not interchangeable. The board's charger is a **4.2 V Li-ion**
 charger, and `board_s3.h` calibrates both the percent curve and the
-charge-trend detection for that (`CHARGE_FULL_MV 4150`, `BATT_MIN_MV 3000`). A
+charge-trend detection for that (`CHARGE_FULL_MV 4150`, `BATT_LOW_MV 3300`). A
 3.2 V LiFePO4 cell of the same physical size would be over-charged by the board
 *and* read as permanently flat. A larger Li-ion cell (an 18650) is electrically
 fine but creeps too slowly for the trend fallback — see the note at the

@@ -133,7 +133,7 @@ struct Btn {
                               // -1 to compile the gauge out
 #define BATT_DIVIDER  3.0f    // VBAT / measured. 3:1 on the -1.47B (measured --
                               // see the note above). At 2.0f the gauge reads
-                              // ~2.8 V, falls under BATT_MIN_MV, and the chip
+                              // ~2.8 V, falls under BATT_ABSENT_MV, and the chip
                               // silently HIDES ITSELF -- which looks like a
                               // missing feature rather than a wrong constant.
 // ---- Charging detection -----------------------------------------------------
@@ -218,13 +218,40 @@ struct Btn {
 // consecutive polls agreeing, which no WiFi burst survives.
 #define BATT_LEVEL_HOLD_MS 45000UL
 
-#define BATT_MIN_MV   3000    // below this the reading is treated as "no cell
-                              // wired" and the chip is hidden entirely. NOTE:
-                              // on this board the charger rail sits at ~4.2 V
-                              // whenever USB is attached, so with USB plugged
-                              // in the gauge shows ~100% even with no cell --
-                              // the "nothing wired" case is only detectable on
-                              // battery power.
+// ---- "is there a cell at all?" ----------------------------------------------
+// THIS USED TO BE 3000 mV AND IT HID THE GAUGE EXACTLY WHEN IT MATTERED.
+//
+// The threshold answers "is anything wired to the divider", and below it the
+// chip is not drawn, the About page says "no cell" and `?` says "no cell". At
+// 3000 mV that description was never true of this board. With USB attached the
+// charger rail holds the sense node at ~4.2 V whether a cell is fitted or not,
+// so the unwired case reads as FULL; and with no USB and no cell the board is
+// not running at all. The only thing that could ever take the reading under
+// 3.0 V was a real 14500 that was nearly empty -- so the one state the gauge
+// was there for was the one state it erased itself in. Worse, the same branch
+// forces battCharging false, so putting that flat cell on the charger showed no
+// bolt either until it climbed back over 3.0 V.
+//
+// 2400 mV instead: below that nothing sane is on the divider. The 3V3 regulator
+// drops out somewhere around VBAT 2.7-2.9 V, so a board that is executing this
+// line cannot be running off a cell this low -- a reading here means a wrong
+// BATT_DIVIDER or no sense node, which is exactly what "no cell" should mean.
+// A 2.95 V cell now reports 0%, keeps its one red segment, and keeps the bolt
+// when you plug it in. It also turns the mis-set-divider case that BATT_DIVIDER
+// warns about from a silently hidden chip into a visible, wrong 0%.
+#define BATT_ABSENT_MV 2400
+
+// Where "this cell is nearly empty" begins, for the LOW warning in the status
+// bar. The curve below puts 3300 mV at 0%, so this is the gauge's own idea of
+// empty rather than a second opinion invented here -- and it is well above the
+// ~2.7-2.9 V where the regulator gives up, which is the point: the warning has
+// to arrive while there is still time to do something about it.
+//
+// It matters more than a warning usually would, because a 14500 dragged flat is
+// not just an inconvenience. Below ~3.0 V a Li-ion starts losing capacity
+// permanently, and this firmware has no cutoff -- it runs until the regulator
+// browns out. Repeat that a few times and the cell really has "downgraded".
+#define BATT_LOW_MV   3300
 
 // ---- LAYOUT (320 x 172 landscape) ------------------------------------------
 // The daemon owns all text: it pre-renders FOUR rows of at most 21 characters

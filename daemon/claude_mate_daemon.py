@@ -2379,6 +2379,28 @@ class ButtonReader(threading.Thread):
             if prov:
                 prov()
         if line == "H":
+            # A DEVICE THAT JUST SAID HELLO HAS NO TERMINAL VIEW OPEN.
+            #
+            # The mirror is a daemon-side 1 s timer, and it was torn down by
+            # exactly three things: another B|M, a B|G, or the shown session
+            # disappearing. A device going away was not one of them. So any
+            # restart that did not go through the device's own power-off --
+            # a link restart, a gamepad toggle, a screen flip, `R`, a brownout,
+            # or simply a BLE drop and reconnect -- left this timer running, and
+            # the moment the link came back it pushed a title, seventeen rows
+            # and M|END every second into a device that had never asked. The
+            # firmware takes M|END as permission to show the view, and the view
+            # sits in front of the status bar, so the device woke up in a
+            # terminal nobody opened, with the battery chip and link glyph
+            # hidden behind it, repainting the whole screen once a second and
+            # holding the radio busy. On a battery build that is the single most
+            # expensive thing the daemon can do to a device by accident.
+            #
+            # Fixed here rather than in the firmware deliberately: a device-side
+            # "ignore mirrors I did not ask for" would leave the Mac polling a
+            # wrapper and pushing nineteen lines a second into something that
+            # throws them away, which costs the same radio and saves nothing.
+            self.mirror_close()
             self._screen.resend_full_state()
             return
         if line == "K":                          # keepalive ack to our P: no-op
@@ -2622,6 +2644,15 @@ class ButtonReader(threading.Thread):
             self._mirror_warned = True
             log(f"MIRROR: sending {len(body)} rows for {sess.name} "
                 f"(fetched {'-' if rows is None else len(rows)})")
+        # LAST LOOK BEFORE WRITING. wrapper_ctrl_screen() above is a round trip
+        # to another process, and a close landing during it -- the device's
+        # M|OFF, or the H handler above -- would otherwise be overtaken by the
+        # rows this tick already fetched. The device would set mirrorOn on the
+        # M|END that followed the M|OFF and then sit on a frozen view with
+        # nothing left to close it, because this tick does not re-arm.
+        with self._mirror_lock:
+            if self._mirror_key != key:
+                return
         self._link.write_line(f"M|T|{title}")
         for i in range(MIRROR_ROWS):
             text = body[i] if i < len(body) else ""

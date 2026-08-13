@@ -95,7 +95,8 @@ class BlePad {
 
     _hid->reportMap((uint8_t *)BLEPAD_REPORT_MAP, sizeof(BLEPAD_REPORT_MAP));
     _hid->startServices();
-    _hid->setBatteryLevel(100);
+    _hid->setBatteryLevel(_batt);      // last known charge, not a literal
+    _sentBatt = _batt;
 
     BLEAdvertising *adv = BLEDevice::getAdvertising();
     adv->setAppearance(HID_GAMEPAD);
@@ -119,6 +120,29 @@ class BlePad {
 
   bool up() const { return _up; }
   bool connected() const { return _cb.connected; }
+
+  // THE BATTERY CHANNEL THAT ALREADY EXISTED AND WAS SAYING 100.
+  //
+  // BLEHIDDevice builds a standard Battery Service (0x180F) for every HID
+  // peripheral, and macOS surfaces it for a paired gamepad -- so the one wire
+  // by which this device can tell the Mac about its cell was already
+  // advertised, already read, and already being fed a constant. On a
+  // gamepad-enabled board that was the only battery reading anywhere, and it
+  // was a lie.
+  //
+  // Cached and de-duped in here rather than at the call site, so the sketch can
+  // hand it the percentage every loop for nothing, and so a later begin() --
+  // the stack goes down and up around a pad toggle -- advertises the last known
+  // truth instead of resetting to a literal.
+  void setBattery(int pct) {
+    if (pct < 0) return;                 // -1 = no cell wired / gauge disabled
+    if (pct > 100) pct = 100;
+    _batt = (uint8_t)pct;
+    if (_up && _hid && _batt != _sentBatt) {
+      _sentBatt = _batt;
+      _hid->setBatteryLevel(_batt);
+    }
+  }
 
   // Send the four switches as one report. Cheap enough to call every loop: it
   // returns immediately unless the state actually changed, because a HID host
@@ -159,6 +183,9 @@ class BlePad {
     _cb.connected = false;
     _cb.wasConnected = false;
     _lastMask = 0xFF;
+    _sentBatt = 0xFF;        // force a re-push on the next begin()...
+                             // ...but NOT _batt, which is the last known truth
+                             // and is what that begin() should advertise
   }
 
   BLEServer        *_server = nullptr;
@@ -167,4 +194,6 @@ class BlePad {
   Cb                _cb;
   bool              _up = false;
   uint8_t           _lastMask = 0xFF;
+  uint8_t           _batt = 100;         // last known charge
+  uint8_t           _sentBatt = 0xFF;    // ...and what the characteristic holds
 };
