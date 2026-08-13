@@ -123,14 +123,21 @@ def run_piped(args, stdin_devnull=True):
 
 
 r = run_piped([])
-check("no-arg with a pipe exits cleanly instead of opening the app",
-      r.returncode == 0, f"rc={r.returncode}")
-# The alternate screen is the app's fingerprint. If any of these appear in a
+# EITHER OUTCOME IS RIGHT, and which one depends on whether a daemon happens to
+# be up on the machine running this: 0 with the queue printed, or 1 with "no
+# daemon" on stderr. CI has no daemon and a developer usually does, so pinning
+# 0 here passed locally and failed in CI on the first run. What the check is
+# actually about is that it EXITED -- an app would still be sitting there.
+check("no-arg with a pipe exits instead of opening the app",
+      r.returncode in (0, 1), f"rc={r.returncode}")
+if r.returncode == 1:
+    check("...and says why, rather than failing silently",
+          "no daemon" in (r.stdout + r.stderr), repr(r.stderr[:100]))
+# The alternate screen is the app's fingerprint. If either of these reaches a
 # pipe, something has started an interactive session where it should not.
-for esc, name in ((r"\x1b\[\?1049h", "alternate screen"),
-                  (r"\x1b\[\?25l", "hide cursor")):
-    check(f"...and does not emit the {name} escape",
-          not re.search(esc.encode().decode("unicode_escape"), r.stdout))
+check("...and does not emit the alternate-screen escape",
+      "\x1b[?1049h" not in r.stdout)
+check("...and does not hide the cursor", "\x1b[?25l" not in r.stdout)
 check("...and prints no ANSI colour into a pipe",
       "\x1b[" not in r.stdout, repr(r.stdout[:80]))
 
