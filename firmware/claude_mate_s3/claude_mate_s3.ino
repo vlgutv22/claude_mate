@@ -60,17 +60,26 @@
  * The onboard WS2812 replaces the Nano's single LED: the daemon's V|<KIND>
  * alert class picks both a COLOUR and a RHYTHM, and loops until acknowledged.
  *
- * TWO TRANSPORTS, ONE PROTOCOL
+ * THREE TRANSPORTS, ONE PROTOCOL
  *
  *   USB   native USB CDC at 115200. Plugged into the Mac the board is a drop-in
  *         Nano replacement -- the daemon's autodetect already globs
  *         /dev/cu.usbmodem*, so it just works with no daemon flags at all.
  *   WiFi  a TCP connection to the daemon's --tcp listener, discovered over mDNS
  *         and authenticated with a nonce/HMAC handshake. See netcfg.h.
+ *   BLE   a GATT service the daemon's --ble central connects to, advertised in
+ *         200 ms bursts four seconds apart and authenticated with the SAME
+ *         nonce/HMAC handshake and the SAME token. See blelink.h.
  *
- * Input is accepted from BOTH at once, but button events are sent to only ONE
- * (WiFi when it is up, else USB) -- emitting on both would make the daemon count
- * every press twice.
+ * WiFi and BLE are ALTERNATIVES, never both: one 2.4 GHz radio, and sharing it
+ * degrades both. Which one is a stored setting (SETTINGS -> Link, or I|BLE over
+ * the cable), not a compile-time choice -- Wi-Fi remains right for a host that
+ * is not on this desk, BLE for a device that is, and moving between them should
+ * not need a toolchain.
+ *
+ * Input is accepted from USB AND the wireless one at once, but button events go
+ * to only ONE (the wireless link when it is up, else USB) -- emitting on both
+ * would make the daemon count every press twice.
  *
  * If nothing is heard for ~30 s the firmware stops any LED loop and replaces the
  * (stale) frame with a LINK LOST screen: a dead daemon is an honest, visible
@@ -83,6 +92,7 @@
  *     W|<ssid>|<password>   set WiFi credentials
  *     S|<host>|<port>       set the daemon address (empty host = mDNS discovery)
  *     T|<token>             set the shared secret (must match the daemon's)
+ *     I|WIFI  I|BLE         which radio carries the link (takes effect at once)
  *     X|WIPE                clear all stored config
  *     R                     reboot
  *     Z                     start the WiFi setup portal now
@@ -99,6 +109,8 @@
  *
  * PIN MAP, LAYOUT GEOMETRY AND PALETTE: board_s3.h
  * WIFI TRANSPORT, CONFIG STORAGE AND SETUP PORTAL: netcfg.h
+ * BLE TRANSPORT (duty-cycled advertising + GATT): blelink.h
+ * THE DEVICE AS A BLUETOOTH HID GAMEPAD: blepad.h
  */
 
 #include <Arduino_GFX_Library.h>
@@ -107,6 +119,7 @@
 #include "board_s3.h"
 #include "netcfg.h"
 #include "settings.h"
+#include "blelink.h"
 #include "blepad.h"
 #include "game/ship_it.h"
 
@@ -126,7 +139,14 @@ Arduino_GFX *gfx = nullptr;        // canvas, or the panel if the buffer failed
 static bool buffered = true;
 
 // ---- Wireless transport ------------------------------------------------------
+// TWO radios' worth of transport, EXACTLY ONE OF THEM UP AT A TIME. The S3 has
+// a single 2.4 GHz radio: running Wi-Fi and BLE together degrades both, and
+// this device has no reason to. `transport` says which one this build is
+// currently being, and it is a stored byte rather than a #define so a device on
+// a desk can be moved between them without a cable (see netcfg.h).
 MateNet net;
+MateBle ble;
+static MateTransport transport = LINK_WIFI;
 
 // ---- Device settings (firmware-local; see settings.h for why) ---------------
 MateSettings cfg;
@@ -223,20 +243,31 @@ static char    acctSel[ACCT_NAME + 1] = "";
 static PageId  pageId  = PG_SETTINGS;
 static uint8_t pageIdx = 0;          // selected row within the page
 
-// Settings rows, in screen order: the one mode switch first, then the
-// preferences, then the two rows that open something else, then the destructive
-// one last and on its own.
+// Settings rows, in screen order: the two that decide WHAT THE DEVICE IS first,
+// then the preferences, then the two rows that open something else, then the
+// destructive one last and on its own.
 //
-// SR_PAD is an ACTION, not a stored preference. Controller mode is somewhere the
-// device IS, not something it remembers -- and the daemon drives it too, so a
-// persisted "on" would fight the browser page for who decides.
+// THERE USED TO BE TWO GAMEPAD ROWS. "Game controller" opened the daemon-driven
+// controller mode and "BLE gamepad" opened the HID one, and they sat next to
+// each other offering what reads as the same thing twice. They were not the
+// same thing, but the difference was a transport detail -- which is precisely
+// the kind of thing a menu on a 172 px screen must not ask a person to hold in
+// their head. The HID one wins on every axis that matters from the device's
+// side: no daemon, no Wi-Fi, no loopback, and it is the only one a page served
+// over https can use at all. So the row is now one PERSISTENT ON/OFF SWITCH,
+// and the daemon-driven mode survives only where it belongs -- as something the
+// Mac asks for over the link (G|1), never as a menu item.
+//
+// SR_PAD is therefore a stored preference now rather than an action: on means
+// this device IS a Bluetooth controller, across a screen sleep and across a
+// reboot, until you turn it off. Off means it is the conductor it always was.
 enum SetRow : uint8_t {
-  SR_PAD, SR_BLE, SR_SLEEP, SR_BRIGHT, SR_LED, SR_SOUND, SR_FLIP,
+  SR_PAD, SR_LINK, SR_SLEEP, SR_BRIGHT, SR_LED, SR_SOUND, SR_FLIP,
   SR_WIFI, SR_ABOUT, SR_RESET, SR_COUNT
 };
 // Which row is at the top of the visible window. Five rows fit and there are
-// nine, so the page scrolls -- and the scrollbar in drawSettingsPage() is what
-// says the other four exist, since a cut list otherwise just looks complete.
+// ten, so the page scrolls -- and the scrollbar in drawSettingsPage() is what
+// says the other five exist, since a cut list otherwise just looks complete.
 // Everything here is computed from SR_COUNT, so rows can be added without
 // touching the geometry; that is the whole reason absorbing ABOUT and WI-FI
 // from the top-level strip cost nothing but their two cases.
@@ -307,6 +338,9 @@ static bool    usbOverflow = false;
 static char    netLine[LINE_MAX];
 static uint8_t netLen = 0;
 static bool    netOverflow = false;
+static char    bleLine[LINE_MAX];
+static uint8_t bleLen = 0;
+static bool    bleOverflow = false;
 
 // ---- Battery -----------------------------------------------------------------
 static int      battPercent = -1;      // -1 = no cell wired / gauge disabled
@@ -638,22 +672,87 @@ static void drawRow(int16_t y, uint8_t size, const char *text, uint16_t colour) 
   gfx->print(text);
 }
 
-// A 4-bar signal strength meter, or a "USB" badge when that is the live link.
+// ---- The one transport, whichever it is -------------------------------------
+// Everything above the wire asks these four questions and never which radio
+// answered. That is the same promise the device already made about USB versus
+// Wi-Fi -- "two transports, one protocol" -- extended to a third.
+static bool linkConnected() {
+  return transport == LINK_BLE ? ble.connected() : net.connected();
+}
+static const char *linkStatusText() {
+  return transport == LINK_BLE ? ble.statusText() : net.statusText();
+}
+
+// The name this device answers to on both BLE roles -- the status link and the
+// HID gamepad. One name, because they are one device and never up at once, and
+// because "which of these two Claude Mates do I pair with" is not a question
+// anyone should have to answer in a Bluetooth settings pane.
+#define DEVICE_BLE_NAME "Claude Mate"
+
+// Bring up whichever transport this build is configured for. Safe to call when
+// it is already up.
+static void linkStart() {
+  if (transport == LINK_BLE) ble.begin(DEVICE_BLE_NAME, net.token());
+  else                       net.restart();
+}
+
+// Hand the radio to the HID gamepad.
+//
+// On BLE this is not a courtesy, it is a requirement: the link and the pad are
+// two roles on ONE stack, and BLEDevice::createServer() hands out a singleton,
+// so starting the pad while the link is up would graft a HID service onto the
+// link's server and advertise a chimera. On Wi-Fi it is a courtesy, and is left
+// to pollPadRadio() -- which parks and unparks with your thumbs rather than
+// once, so a paused game still finds out about a failed session.
+static void linkParkForPad() {
+  if (transport == LINK_BLE) ble.shutdown();
+}
+
+// Move the link from one radio to the other, live, with no reboot.
+//
+// The old stack goes down BEFORE the new one comes up, always. Both want the
+// same radio, and the overlap -- even a few hundred milliseconds of it -- is
+// the contention this whole arrangement exists to avoid. Declared here and
+// defined after requestRender(), which it needs.
+static void setTransport(MateTransport t);
+
+// A 4-bar signal strength meter, the Bluetooth rune, or a "USB" badge -- one
+// glance says WHICH pipe is carrying the daemon, which is the first thing you
+// want to know when the frame on the glass looks stale.
+static void drawBleGlyph(int16_t x, int16_t y, uint16_t col) {
+  // The rune, at 7x14: a vertical spine with two bowties hung off it. Drawn
+  // from lines rather than a font glyph because no font here has it, and
+  // because at this size a "B" would read as a battery letter.
+  int16_t cx = x + 3, top = y + 1, bot = y + 14, mid = y + 7;
+  gfx->drawLine(cx, top, cx, bot, col);
+  gfx->drawLine(cx, top, x + 6, y + 4,  col);
+  gfx->drawLine(x + 6, y + 4, cx - 3, mid + 3, col);
+  gfx->drawLine(cx, bot, x + 6, y + 11, col);
+  gfx->drawLine(x + 6, y + 11, cx - 3, mid - 3, col);
+}
+
 static void drawLinkGlyph(int16_t x, int16_t y) {
-  bool wifiUp = net.connected();
-  if (!wifiUp) {
-    gfx->setTextSize(1);
-    gfx->setTextColor(Serial ? C_OK : C_BAD);
-    gfx->setCursor(x, y + 3);
-    gfx->print("USB");
+  if (transport == LINK_BLE) {
+    // Lit when the daemon is on the other end, dim while the device is still
+    // advertising into an empty room. USB stays the fallback badge either way:
+    // a cabled device with no daemon on BLE is still perfectly usable.
+    if (ble.connected() || ble.state() != MateBle::OFF) {
+      drawBleGlyph(x, y, ble.connected() ? C_OK : C_DIMMER);
+      return;
+    }
+  } else if (net.connected()) {
+    int8_t r = net.rssi();                    // dBm: -50 great, -90 unusable
+    int bars = r >= -55 ? 4 : r >= -67 ? 3 : r >= -78 ? 2 : 1;
+    for (int i = 0; i < 4; i++) {
+      int16_t h = 3 + i * 3;
+      gfx->fillRect(x + i * 4, y + 13 - h, 3, h, i < bars ? C_OK : C_DIMMER);
+    }
     return;
   }
-  int8_t r = net.rssi();                      // dBm: -50 great, -90 unusable
-  int bars = r >= -55 ? 4 : r >= -67 ? 3 : r >= -78 ? 2 : 1;
-  for (int i = 0; i < 4; i++) {
-    int16_t h = 3 + i * 3;
-    gfx->fillRect(x + i * 4, y + 13 - h, 3, h, i < bars ? C_OK : C_DIMMER);
-  }
+  gfx->setTextSize(1);
+  gfx->setTextColor(Serial ? C_OK : C_BAD);
+  gfx->setCursor(x, y + 3);
+  gfx->print("USB");
 }
 
 // A 5x7 lightning bolt for the charging indicator: two triangles meeting at the
@@ -671,7 +770,11 @@ static void drawBolt(int16_t x, int16_t y, uint16_t col) {
 // a percentage was actively misleading here.
 static void drawBatteryChip(int16_t right, int16_t y) {
   if (battLevel < 0) {
-    if (!net.connected()) return;
+    // No cell wired: fall back to the Wi-Fi signal so the corner is not dead
+    // space. There is no equivalent on BLE -- a peripheral does not learn the
+    // central's signal strength -- so that build simply leaves the corner empty
+    // rather than inventing a number for it.
+    if (transport == LINK_BLE || !net.connected()) return;
     char buf[12];
     snprintf(buf, sizeof(buf), "%ddBm", (int)net.rssi());
     gfx->setTextSize(1);
@@ -718,7 +821,7 @@ static void drawFooter(uint16_t accent) {
   gfx->setTextSize(1);
   gfx->setTextColor(C_DIM);
   gfx->setCursor(PAD_X, LINK_Y);
-  gfx->print(net.statusText());
+  gfx->print(linkStatusText());
   bool blip = (long)(millis() - blipUntil) < 0;
   gfx->fillRect(0, ACCENT_Y, SCREEN_W, ACCENT_H, blip ? C_TEXT : accent);
 }
@@ -815,8 +918,12 @@ static void drawLinkLost() {
   gfx->setCursor(PAD_X, 84);
   gfx->print("waiting for the daemon");
   gfx->setCursor(PAD_X, 100);
-  gfx->print(net.configured() ? "check it is running with --tcp"
-                              : "hold BOOT at power-on to set up wifi");
+  // Name the flag for the transport this device is actually on. Telling someone
+  // to check for --tcp on a BLE build sends them to look at the wrong half of
+  // the daemon's log, which is worse than saying nothing.
+  gfx->print(transport == LINK_BLE  ? "check it is running with --ble"
+             : net.configured()     ? "check it is running with --tcp"
+                                    : "hold BOOT at power-on to set up wifi");
   drawFooter(C_BAD);
 }
 
@@ -1009,19 +1116,23 @@ static void drawSetRow(uint8_t row, int16_t y, bool sel) {
 
   switch (row) {
     case SR_PAD:
-      label = "Game controller";
-      // An arrow, like Factory reset: this row GOES somewhere rather than
-      // holding a value. It reads "on" nowhere, because the moment you are in
-      // controller mode you are looking at the pad face, not at this list.
-      value = "\x10";
-      vcol  = C_DIM;
-      break;
-    case SR_BLE:
       label = "BLE gamepad";
-      // Needs no daemon, no Wi-Fi and no loopback, which is the only way the
-      // PUBLIC site can drive this hardware: https cannot reach 127.0.0.1.
-      value = "\x10";
-      vcol  = C_DIM;
+      // A VALUE, not an arrow. The row used to go somewhere, and a row that
+      // goes somewhere cannot tell you where you are: with the pad persisted
+      // across a reboot, "is this thing currently a controller?" is a question
+      // the settings list has to be able to answer without you entering the
+      // mode to find out.
+      value = cfg.pad() ? "on" : "off";
+      vcol  = cfg.pad() ? C_DONE : C_DIM;
+      break;
+    case SR_LINK:
+      label = "Link";
+      // Which radio carries the daemon. Never both -- one 2.4 GHz radio, and
+      // sharing it costs the link that matters. Green when that radio has
+      // actually found the daemon, because "ble" and "ble, and it is working"
+      // are the two different things you come to this row to tell apart.
+      value = MateNet::transportName(transport);
+      vcol  = linkConnected() ? C_DONE : C_TEXT;
       break;
     case SR_SLEEP:
       label = "Sleep screen";
@@ -1128,8 +1239,16 @@ static void drawSettingsPage() {
 static void drawAboutPage() {
   char rssiBuf[16], battBuf[40], sleepBuf[28];
 
-  if (net.connected()) snprintf(rssiBuf, sizeof(rssiBuf), "%d dBm", net.rssi());
-  else                 snprintf(rssiBuf, sizeof(rssiBuf), "--");
+  // On BLE the second row answers a different question, because "how strong is
+  // the signal" has no answer a peripheral can give. What it can say is which
+  // radio it is on and whether the pad has taken it over -- which is what you
+  // came to this page to find out on a device that is behaving oddly.
+  if (transport == LINK_BLE)
+    snprintf(rssiBuf, sizeof(rssiBuf), "ble  pad %s", cfg.pad() ? "on" : "off");
+  else if (net.connected())
+    snprintf(rssiBuf, sizeof(rssiBuf), "%d dBm", net.rssi());
+  else
+    snprintf(rssiBuf, sizeof(rssiBuf), "--");
 
 #if PIN_BATT_ADC >= 0
   if (battPercent < 0)
@@ -1146,9 +1265,10 @@ static void drawAboutPage() {
   snprintf(sleepBuf, sizeof(sleepBuf), "screen %s  led %s",
            cfg.hibLabel(), cfg.ledLabel());
 
-  const char *k[] = {"link", "wifi", "batt", "boot", "sleep", "fw"};
+  const char *k[] = {"link", transport == LINK_BLE ? "mode" : "wifi",
+                     "batt", "boot", "sleep", "fw"};
   const char *v[] = {
-      net.statusText(),
+      linkStatusText(),
       rssiBuf,
       battBuf,
       wakeCause == ESP_SLEEP_WAKEUP_EXT1 ? "woke from sleep" : "power-on / reset",
@@ -1350,6 +1470,46 @@ static void requestRender() {
   }
 }
 
+// CHANGING THE LINK REBOOTS THE DEVICE, and there is no cleverer option.
+//
+// The first cut swapped the stacks in place, and it worked exactly once per
+// boot in each direction. BLE cannot be brought back up after it has been torn
+// down -- BLEDevice::deinit(true) does not fully release the controller, so
+// every later init() fails (see blelink.h). So wifi -> ble -> wifi -> ble left
+// the device with NO link at all, silently, until someone power-cycled it. That
+// is much worse than a reboot, and it was found by flipping the row twice on
+// real hardware, which is a thing anyone would do while looking at the setting.
+//
+// The transport is in NVS, so the reboot is not a loss of anything: the device
+// comes back as precisely what you just asked for, in about three seconds. The
+// firmware already reboots for Flip screen and for a factory reset, so the
+// gesture is not new here either.
+// Announce a restart on the glass, then take it. Three seconds of dark panel
+// with no explanation reads as a crash caused by the button you just pressed --
+// which, on a device whose whole job is telling you what is going on, is the
+// one thing it must not do.
+static void restartWithNotice(const char *title, const char *detail) {
+  if (gfx) {
+    gfx->fillScreen(C_BG);
+    drawCentred(SCREEN_W / 2, SCREEN_H / 2 - 20, 2, title, C_TEXT);
+    if (detail)
+      drawCentred(SCREEN_W / 2, SCREEN_H / 2 + 6, 2, detail, C_WORK);
+    drawCentred(SCREEN_W / 2, SCREEN_H / 2 + 34, 1, "restarting...", C_DIM);
+    if (buffered) canvas->flush();
+  }
+  net.shutdown();                           // leave both politely, whichever
+  ble.shutdown();                           // one was actually up
+  cfg.flush();                              // the deferred commit will not run
+  delay(700);                               // long enough to read
+  ESP.restart();                            // never returns
+}
+
+static void setTransport(MateTransport t) {
+  if (t == transport) return;
+  MateNet::storeTransport(t);
+  restartWithNotice("SWITCHING LINK", MateNet::transportName(t));
+}
+
 // Controller mode is entered from two directions -- the daemon's G|1 when a
 // browser page takes the grab, and the settings row when you switch it on
 // yourself -- and both have to leave the device in exactly the same state, so
@@ -1367,10 +1527,17 @@ static void enterPad(bool manual, PadVia via = PAD_LINK) {
                                 requestRender(); }
     return;
   }
-  if (via == PAD_BLE && !blepad.begin("Claude Mate")) {
-    // Refuse rather than open a controller that cannot send anything. A mode
-    // that silently does nothing is worse than one that will not start.
-    return;
+  if (via == PAD_BLE) {
+    linkParkForPad();                        // one stack, one role at a time
+    if (!blepad.begin(DEVICE_BLE_NAME)) {
+      // Refuse rather than open a controller that cannot send anything. A mode
+      // that silently does nothing is worse than one that will not start -- and
+      // put the link back, or refusing would have cost the device its daemon
+      // for nothing.
+      linkStart();
+      cfg.setPad(false);
+      return;
+    }
   }
   padVia      = via;
   padManual   = manual;
@@ -1392,7 +1559,28 @@ static void leavePad() {
   if (uiMode != UI_PAD) return;
   if (padVia == PAD_BLE) {
     blepad.end();                          // frees the controller, not just idle
-    if (padWifiParked) net.restart();      // give the radio back to the daemon
+    // Give the radio back.
+    //
+    // On a BLE build that means REBOOTING, not restarting a stack: the pad and
+    // the link are two roles on one controller, and once that controller has
+    // been deinit'd it will not init again this boot (see blelink.h). Trying
+    // anyway is what left the device with no link at all. Everything worth
+    // keeping is in NVS, including the now-off pad switch written just above,
+    // so the device comes back as a conductor on BLE, which is exactly what
+    // turning the gamepad off asked for.
+    if (transport == LINK_BLE) {
+      padVia = PAD_LINK;                   // so the reboot notice is not drawn
+      restartWithNotice("GAMEPAD OFF", nullptr);   // over the pad face
+    }
+    // On Wi-Fi the two stacks are genuinely separate, so it is just a restart,
+    // and only if the radio policy had actually parked it.
+    if (padWifiParked) linkStart();
+    // The switch and the world must agree. Leaving by the 2 s hold is a real
+    // "turn this off" -- the same gesture as the settings row, made from the
+    // pad face -- and a device that came back from a reboot as a gamepad you
+    // had already left would be the exact failure setPad() writes eagerly to
+    // avoid.
+    cfg.setPad(false);
   }
   padVia    = PAD_LINK;
   padWifiParked = false;
@@ -1402,6 +1590,26 @@ static void leavePad() {
   padHeld   = 0;
   analogWrite(LCD_BL, cfg.blDuty());
   requestRender();
+}
+
+// The BLE gamepad switch, and the ONLY place the device turns itself into one
+// or back. Both directions in one function because they have to be exact
+// mirrors: every path that turns the pad on has to be a path that can turn it
+// off again, and the failure this prevents -- a stored "on" with no HID stack
+// running and no daemon link either, a device that is nothing at all -- is
+// silent and looks like dead hardware.
+//
+// The setting is written FIRST and the mode entered second, so a device that
+// browns out between the two comes back as what the switch says.
+static void padSet(bool on) {
+  cfg.setPad(on);
+  if (on) { enterPad(true, PAD_BLE); return; }   // puts the setting back itself
+                                                 // if the stack will not start
+  if (uiMode == UI_PAD) { leavePad(); return; }
+  // Switched off from somewhere that is not the pad face -- which means a
+  // previous entry left the HID stack up without the UI following it. Take it
+  // down and give the radio back rather than leave the device half-handed.
+  if (blepad.up()) { blepad.end(); linkStart(); requestRender(); }
 }
 
 // -----------------------------------------------------------------------------
@@ -1417,10 +1625,13 @@ static void copyField(char *dst, uint8_t cap, const char *src) {
 }
 
 // Which transport button events go to. Exactly ONE, even when both are up:
-// emitting on both would make the daemon count every press twice.
+// emitting on both would make the daemon count every press twice. The wireless
+// one wins when it is live, whichever radio it is on, and USB is the fallback
+// that always works with a cable in.
 static void emitLine(const char *line) {
-  if (net.connected()) net.write(line);
-  else if (Serial)     Serial.println(line);
+  if (ble.connected())      ble.write(line);
+  else if (net.connected()) net.write(line);
+  else if (Serial)          Serial.println(line);
 }
 
 // Handle one complete, NUL-terminated protocol line (from either transport).
@@ -1476,9 +1687,16 @@ static void handleLine(char *line) {
       //
       // G|2 also makes BLE mode reachable without a thumb, which is the only
       // way it can be tested from the far end of a cable.
-      if (bar[1] == '1')      enterPad(false);
-      else if (bar[1] == '2') enterPad(false, PAD_BLE);
-      else                    leavePad();
+      //
+      // THE DEVICE'S OWN SWITCH OUTRANKS THE MAC'S. Since the BLE gamepad
+      // became a persisted setting rather than an action, "on" is a standing
+      // instruction from the person holding the device -- and a browser tab
+      // closing on the Mac must not revoke it. So G|0 releases only the mode
+      // the daemon itself opened; a pad the user switched on stays on, and the
+      // 2 s hold (or the settings row) is what turns it off.
+      if (bar[1] == '1')      { if (!cfg.pad()) enterPad(false); }
+      else if (bar[1] == '2') padSet(true);
+      else if (!cfg.pad())    leavePad();
       break;
     }
 
@@ -1622,6 +1840,11 @@ static bool handleConfigLine(char *line) {
                     (unsigned)(cfg.blIdx() + 1), (unsigned)BL_STEPS,
                     cfg.ledLabel(), cfg.flipped() ? "on" : "off");
       Serial.printf("fw    : %s\n", FW_VERSION);
+      // Only for the build that is actually on BLE. Printing an advertising
+      // duty cycle on a Wi-Fi device would be four lines of noise in the one
+      // readout someone reaches for when they are already confused.
+      if (transport == LINK_BLE) ble.printStatus(Serial);
+      Serial.printf("pad   : %s\n", cfg.pad() ? "on (BLE gamepad)" : "off");
       return true;
 
     case 'W': {                            // W|<ssid>|<password>
@@ -1655,6 +1878,26 @@ static bool handleConfigLine(char *line) {
       net.setToken(a + 1);
       Serial.println("token set");
       net.restart();
+      return true;
+    }
+
+    case 'I': {                            // I|WIFI or I|BLE -- which radio
+                                           // carries the daemon.
+      // 'I' for interface. It is not one of the protocol's verbs (F G L M P V)
+      // and it is not one of this console's (? R S T W X Y Z), which is a
+      // property worth checking rather than assuming: handleConfigLine() runs
+      // FIRST on USB lines, so a verb claimed by both is silently unreachable
+      // over the cable. tools/test_controller_mode.py asserts the two sets stay
+      // disjoint, which is how X| was caught.
+      char *a = strchr(line, '|');
+      if (!a) return false;
+      a++;
+      MateTransport t;
+      if (!strcasecmp(a, "ble"))       t = LINK_BLE;
+      else if (!strcasecmp(a, "wifi")) t = LINK_WIFI;
+      else { Serial.println("usage: I|WIFI or I|BLE"); return true; }
+      setTransport(t);
+      Serial.printf("link: %s\n", MateNet::transportName(t));
       return true;
     }
 
@@ -1741,6 +1984,34 @@ static void pumpNet() {
       netLine[netLen++] = c;
     } else {
       netOverflow = true;
+    }
+  }
+}
+
+// The BLE link, drained the same way and into its OWN line buffer.
+//
+// Its own, not netLine's, even though only one of the two transports is ever up
+// at a time: sharing the buffer would mean a transport switch mid-line splices
+// the tail of a Wi-Fi frame onto the head of a BLE one, and the resulting
+// garbage line is exactly the kind of once-in-a-thousand-boots corruption that
+// costs a day to find. A hundred and ninety bytes is not worth that.
+static void pumpBle() {
+  int ci;
+  while ((ci = ble.read()) >= 0) {
+    char c = (char)ci;
+    lastRxMs = millis();
+    if (c == '\n' || c == '\r') {
+      if (!bleOverflow && bleLen > 0) {
+        bleLine[bleLen] = 0;
+        handleLine(bleLine);
+        if (linkLost) { linkLost = false; requestRender(); }
+      }
+      bleLen = 0;
+      bleOverflow = false;
+    } else if (bleLen < (LINE_MAX - 1)) {
+      bleLine[bleLen++] = c;
+    } else {
+      bleOverflow = true;
     }
   }
 }
@@ -1892,9 +2163,14 @@ static void powerOff() {
     gfx->print("press the 4th button to wake");
     if (buffered) canvas->flush();
   }
-  // Leave POLITELY: a half-open socket leaves the daemon listing this device as
-  // present until its own timeout notices.
+  // Leave POLITELY, whichever radio is up: a half-open socket leaves the daemon
+  // listing this device as present until its own timeout notices, and a BLE
+  // peripheral that vanishes mid-connection costs the central a supervision
+  // timeout before it starts scanning again -- which is the difference between
+  // waking to a live link and waking to twenty seconds of NO LINK.
   net.shutdown();
+  ble.shutdown();
+  blepad.end();
   rgbLedWrite(PIN_RGB, 0, 0, 0);
   delay(900);
 
@@ -2134,17 +2410,21 @@ static void menuButton(char ev) {
 
   if (ev == 'G') {                            // short press: change the value
     switch (pageIdx) {
-      case SR_PAD:    // Switch the device into controller mode from the device.
+      case SR_PAD:    // The one switch. On: this device is an ordinary
+                      // Bluetooth HID gamepad that the Mac pairs with once, and
+                      // stays one across a screen sleep and across a reboot.
+                      // Off: it is the conductor again and the link comes back.
+                      //
                       // padReturnTo becomes UI_PAGE, so the two-second hold on
                       // the 4th button drops you back on this row rather than
                       // somewhere you did not come from.
-                      enterPad(true);
+                      padSet(!cfg.pad());
                       break;
-      case SR_BLE:    // Same face, different wire: a standard HID gamepad the
-                      // Mac pairs with once. enterPad() refuses if the stack
-                      // will not start, leaving you on this row rather than in
-                      // a controller that cannot send anything.
-                      enterPad(true, PAD_BLE);
+      case SR_LINK:   // Which radio carries the daemon. Live, both ways: the
+                      // whole point of storing it rather than compiling it in
+                      // is that a device on a desk can be moved between them
+                      // with a thumb.
+                      setTransport(transport == LINK_BLE ? LINK_WIFI : LINK_BLE);
                       break;
       case SR_WIFI:   // The portal takes the screen over on its own, via
                       // net.state() == SETUP in render(), which outranks every
@@ -2376,16 +2656,23 @@ static void pollPadButtons() {
 // read something, or paused, or wandered off, and the radio goes back up to see
 // what the daemon has. If what it has is urgent, the V| handler above takes the
 // device off the pad entirely.
+// ...ON WI-FI. On a BLE build there is nothing to alternate WITH: the link and
+// the pad are two roles on one stack, so unparking would mean tearing the HID
+// connection down and re-pairing every time you paused to read something. That
+// is not a policy, it is a fault. There the rule is the plain one the settings
+// row promises -- the gamepad is on, so the device is a gamepad, and turning it
+// off is what brings the daemon back.
 static void pollPadRadio() {
   if (uiMode != UI_PAD || padVia != PAD_BLE) return;
   blepad.poll();                            // re-advertise if the host went away
+  if (transport == LINK_BLE) return;
 
   unsigned long now = millis();
   bool playing = (now - padLastInput) < PAD_PLAY_IDLE_MS;
 
   if (!playing) {
     if (padWifiParked) {                    // you stopped -- go and look
-      net.restart();
+      linkStart();
       padWifiParked  = false;
       padWifiUpSince = now;
       requestRender();
@@ -2490,7 +2777,22 @@ void setup() {
   // how the device is moved to a new network with no serial console around.
   bool forcePortal = (digitalRead(PIN_BTN_BOOT) == LOW) ||
                      (digitalRead(PIN_BTN_GO) == LOW);
-  net.begin(forcePortal);
+
+  // Which radio this boot is going to be. Read before either stack is touched,
+  // because starting one and then discovering it was the wrong one means the
+  // device spends its first seconds contending with itself.
+  //
+  // forcePortal WINS over a BLE build, and has to: the portal is the escape
+  // hatch for a device whose config is wrong, and a device that could not be
+  // reconfigured because of the setting you were trying to fix would be bricked
+  // in every sense that matters to the person holding it.
+  transport = MateNet::storedTransport();
+  if (forcePortal || transport == LINK_WIFI) {
+    net.begin(forcePortal);
+  } else {
+    net.loadConfigOnly();                   // the token, and what `?` prints
+    ble.begin(DEVICE_BLE_NAME, net.token());
+  }
 
   render();                                 // splash until the daemon talks
 
@@ -2498,10 +2800,21 @@ void setup() {
   // WiFi path sends its own H the moment the handshake completes (see loop()).
   if (Serial) { Serial.println("H"); sendSoundPref(); }
   game.sfx = sendSfx;                       // the Mac is the game's only speaker
+
+  // THE GAMEPAD SURVIVES THE REBOOT. Power off is deep sleep and waking runs
+  // setup() from the top, so without this every screen sleep would quietly hand
+  // a paired controller back to being a conductor -- and the person holding it
+  // would find out mid-level, with the Mac still listing "Claude Mate" as a
+  // connected gamepad that has stopped sending anything.
+  //
+  // Last in setup, after the panel and the settings are up, because entering
+  // takes the link down and redraws the glass.
+  if (cfg.pad()) enterPad(true, PAD_BLE);
 }
 
 void loop() {
   static MateNet::State lastNetState = MateNet::OFF;
+  static MateBle::State lastBleState = MateBle::OFF;
 
   // Hold off reconnection attempts while a firmware-local screen is up. Both
   // the mDNS browse and the TCP connect BLOCK this loop, so with no daemon to
@@ -2523,12 +2836,27 @@ void loop() {
   // a still image, so a blocking browse costs nothing to look at -- and if the
   // link drops while the Mac holds the grab, nothing can send G|0 to release
   // it. Holding reconnection there would strand the device in controller mode.
+  // ...and NONE of that applies to BLE, which is the quiet advantage of this
+  // transport rather than a footnote to it. There is nothing here that blocks:
+  // no mDNS browse with no timeout parameter, no 600 ms TCP dial. The duty
+  // cycle is two comparisons against millis(). So the hold has nothing to hold
+  // back, and a device on BLE keeps looking for its daemon while you are deep
+  // in a menu -- which the Wi-Fi build cannot afford to do.
   net.holdReconnect(uiMode != UI_CONDUCTOR && uiMode != UI_PAD &&
                     !(uiMode == UI_GAME && game.idle()));
   net.poll();
   net.applyPendingConfig();
+  ble.poll();
+  // The backstop. ble.poll() retries a start that did not take, and stuck()
+  // means it has run out of tries -- which on this chip means the controller is
+  // not coming back without a reboot. Doing nothing here is what the first cut
+  // did, and it presented as a device that had quietly stopped having a link at
+  // all, with `ble : OFF` visible only over a cable it was probably not
+  // attached to. A reboot is three seconds and the transport is in NVS.
+  if (ble.stuck()) restartWithNotice("LINK RESTART", "ble");
   pumpUsb();
   pumpNet();
+  pumpBle();
   pollButtons();
   pollPadRadio();
   pollLed();
@@ -2551,6 +2879,19 @@ void loop() {
   // was already waiting is not silently missed.
   MateNet::State ns = net.state();
   if (ns != lastNetState) {
+    // A BLE device dragged through the setup portal (BOOT held at power-on) has
+    // to be handed BACK afterwards. The portal outranks the transport setting,
+    // and must -- it is the escape hatch for a device whose config is wrong --
+    // but only for as long as it is up. Leaving the device on a Wi-Fi link it
+    // never asked for would mean the Link row saying "ble" while the glass
+    // showed an IP address, which is the sort of disagreement that costs an
+    // evening.
+    if (transport == LINK_BLE && lastNetState == MateNet::SETUP &&
+        ns != MateNet::SETUP) {
+      net.shutdown();
+      ble.begin(DEVICE_BLE_NAME, net.token());
+      ns = net.state();                     // OFF now; do not re-trigger below
+    }
     if (ns == MateNet::LINKED) {
       net.write("H");
       sendSoundPref();                      // the daemon keeps no per-device
@@ -2559,6 +2900,21 @@ void loop() {
     }
     lastNetState = ns;
     requestRender();                        // the footer/status glyph changed
+  }
+
+  // The same kick on the BLE link, for the same reason and by the same rule:
+  // whichever transport just came up owes the daemon an H, because the daemon
+  // keeps no per-device state and will not resend a frame -- or re-arm an alert
+  // that was already waiting -- until something asks it to.
+  MateBle::State bs = ble.state();
+  if (bs != lastBleState) {
+    if (bs == MateBle::LINKED) {
+      ble.write("H");
+      sendSoundPref();
+      lastRxMs = now;
+    }
+    lastBleState = bs;
+    requestRender();
   }
 
   // Liveness watchdog: nothing heard for too long -> honest NO LINK screen

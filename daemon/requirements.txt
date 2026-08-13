@@ -1,3 +1,9 @@
 # Claude Mate daemon — Python dependencies.
 # Only third-party requirement: pyserial for the USB serial link.
 pyserial>=3.5
+
+# Optional. Needed ONLY for --ble (the Bluetooth LE transport for the battery
+# build); the daemon imports it lazily and reports a clear message if it is
+# missing, so a install without it is a fully working USB/Wi-Fi daemon.
+#   pip install bleak
+# bleak>=0.22

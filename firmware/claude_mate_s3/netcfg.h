@@ -83,6 +83,18 @@
 #define NET_PORTAL_TIMEOUT 300000UL  // 5 minutes
 #define NET_AP_PREFIX     "Claude-Mate-"
 
+// ---- which radio carries the link -------------------------------------------
+// Stored here rather than with the UI settings, and deliberately: this is a
+// LINK setting, so it belongs in the namespace a factory reset treats as
+// provisioning -- alongside the SSID and the token, which it is useless
+// without. Wiping the brightness must not silently move a device back onto
+// Wi-Fi, and re-provisioning already means visiting the portal.
+//
+// A stored byte rather than a compile-time #define because the issue this
+// implements (#21) asks for exactly that: one binary that can be either, so a
+// device on a desk can be moved onto BLE without a cable and a toolchain.
+enum MateTransport : uint8_t { LINK_WIFI = 0, LINK_BLE = 1 };
+
 class MateNet {
  public:
   enum State : uint8_t {
@@ -215,6 +227,42 @@ class MateNet {
   }
   void setToken(const String &token) { _token = token; save("token", _token); }
 
+  // The shared secret, for the transport that is not this one. Both radios
+  // authenticate the same way against the same token, so there is exactly one
+  // to provision and exactly one to get wrong.
+  const String &token() const { return _token; }
+
+  // Read the config WITHOUT associating. On a BLE device the join never
+  // happens, but `?` must still print what is provisioned, the setup portal
+  // must still be reachable from the menu, and blelink needs the token -- all
+  // of which live in this object.
+  //
+  // persistent(false) is set here as well as in begin(), and has to be: it is
+  // what stops the SDK keeping its own second copy of the credentials in its
+  // own NVS, and a device that switches to Wi-Fi later would otherwise
+  // associate from a stale copy nothing in this file wrote.
+  void loadConfigOnly() {
+    loadConfig();
+    WiFi.persistent(false);
+  }
+
+  // ---- transport selection -------------------------------------------------
+  // Static, because they are read in setup() BEFORE anything decides whether
+  // this instance is going to be started at all.
+  static MateTransport storedTransport() {
+    Preferences p;
+    uint8_t v = LINK_WIFI;
+    if (p.begin(NET_NS, true)) { v = p.getUChar("link", LINK_WIFI); p.end(); }
+    return v == LINK_BLE ? LINK_BLE : LINK_WIFI;   // a value from a future
+  }                                                // build reads as Wi-Fi
+  static void storeTransport(MateTransport t) {
+    Preferences p;
+    if (p.begin(NET_NS, false)) { p.putUChar("link", (uint8_t)t); p.end(); }
+  }
+  static const char *transportName(MateTransport t) {
+    return t == LINK_BLE ? "ble" : "wi-fi";
+  }
+
   void wipe() {
     Preferences p;
     if (p.begin(NET_NS, false)) { p.clear(); p.end(); }
@@ -228,6 +276,7 @@ class MateNet {
     out.printf("host  : %s\n", _host.isEmpty() ? "(mDNS discovery)" : _host.c_str());
     out.printf("port  : %u\n", _port);
     out.printf("token : %s\n", _token.isEmpty() ? "(unset)" : "(set)");
+    out.printf("link  : %s\n", transportName(storedTransport()));
     // The driver's own verdict, verbatim. Without it a device that will never
     // join and a device that is merely slow are indistinguishable over serial.
     out.printf("wifi  : status=%d %s\n", (int)WiFi.status(),

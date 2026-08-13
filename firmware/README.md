@@ -7,7 +7,7 @@ apart, and **both can be connected at once**.
 |---|---|---|
 | Board | Arduino Nano | Waveshare ESP32-S3-LCD-1.47**B** |
 | Display | 128×32 mono OLED (SSD1306) | 172×320 colour IPS (ST7789) |
-| Transport | USB serial | **Wi-Fi (TCP)**, USB as fallback |
+| Transport | USB serial | **Wi-Fi (TCP) or BLE**, selectable on the device; USB as fallback |
 | Buttons | 3 — PREV / GO / NEXT | 4 — PREV / GO / NEXT / **MENU**, Kailh Choc (1350) |
 | Alert LED | one LED, rhythm only | WS2812, rhythm **+ colour**, adjustable (incl. off) |
 | Power | USB | USB or a 14500 Li-ion cell, with a battery gauge |
@@ -45,13 +45,17 @@ no daemon attached — flash it first when bringing up new hardware.
 
 ## ESP32-S3 — `claude_mate_s3/`
 
-A cordless companion: colour LCD, four buttons, and a Wi-Fi link to the daemon
+A cordless companion: colour LCD, four buttons, and a wireless link to the daemon
 so it can sit anywhere on a battery.
 
 - `claude_mate_s3.ino` — protocol, the CONDUCTOR view, the menu, hibernate
 - `board_s3.h` — pin map, layout geometry, palette, battery/charging constants
 - `netcfg.h` — Wi-Fi transport, mDNS discovery, HMAC handshake, NVS config,
   setup portal
+- `blelink.h` — the same line protocol over BLE: duty-cycled advertising, a GATT
+  service, the same HMAC handshake. The alternative to `netcfg.h`, never
+  simultaneous with it — one 2.4 GHz radio
+- `blepad.h` — the device as an ordinary Bluetooth HID gamepad
 - `settings.h` — the device's own preferences (NVS, `mate-ui` namespace). The
   only state here that is neither the daemon's nor the network's; none of it is
   about a session, so the daemon has no business knowing
@@ -180,6 +184,7 @@ Or provision over USB serial:
 W|<ssid>|<password>   set Wi-Fi credentials
 S|<host>|<port>       set the daemon address (empty host = mDNS discovery)
 T|<token>             set the shared secret (must match the daemon's)
+I|WIFI  I|BLE         which radio carries the link (takes effect at once)
 X|WIPE                clear all stored config
 R                     reboot
 Z                     start the setup portal now
@@ -286,33 +291,50 @@ spanning 260.
 | Item | What it does |
 |---|---|
 | **CONDUCTOR** | back to the triage view — the daemon's frame, unchanged since iteration 2 shipped |
-| **SETTINGS** | the nine rows below |
+| **SETTINGS** | the ten rows below |
 | **SHIP IT** | the platformer, played on a contribution graph. Runs on the device itself; the record survives a flat battery |
 | **SLEEP** | the same deep sleep the 2 s hold does, made discoverable |
 
 ### Settings
 
-Nine rows, five visible, so the page scrolls and draws a scrollbar — without one
+Ten rows, five visible, so the page scrolls and draws a scrollbar — without one
 a cut list simply looks complete. Everything is computed from the row count, so
 adding a row costs nothing but the row.
 
 | Row | Values | Notes |
 |---|---|---|
-| **Game controller** | → | Switch the device into controller mode from the device, rather than waiting for a browser page to take it. An **action, not a stored preference**: controller mode is somewhere the device *is*, and a persisted "on" would fight the page over who decides. The face says `open 127.0.0.1:8788 to play` when you got here this way and `the Mac has the buttons` when a page did it — the two situations need different sentences. Leave with a 2 s hold of the 4th button, which drops you back on this row |
-| **BLE gamepad** | → | The device as an **ordinary Bluetooth HID gamepad** — pair "Claude Mate" once in System Settings and macOS presents it as a system controller. This is the only input path the **public site** can use: the daemon path needs `http://127.0.0.1`, which an https page cannot reach. It also skips Wi-Fi, mDNS, the TCP dial, the daemon and SSE entirely, which is the chain that was making the controller lurch. Four buttons, no axes, physical order (1 = PREV, 2 = GO, 3 = NEXT, 4 = 4th). **Costs 290 KB of flash and 5.7 KB of RAM**, measured against an empty sketch. See the radio policy below |
+| **BLE gamepad** | on / off | The device as an **ordinary Bluetooth HID gamepad** — pair "Claude Mate" once in System Settings and macOS presents it as a system controller. **On means the device *is* a gamepad**, across a screen sleep and across a reboot, until you turn it off; off means it is the conductor again and the daemon link comes back. This is the only input path the **public site** can use: the daemon path needs `http://127.0.0.1`, which an https page cannot reach. It also skips Wi-Fi, mDNS, the TCP dial, the daemon and SSE entirely, which is the chain that was making the controller lurch. Four buttons, no axes, physical order (1 = PREV, 2 = GO, 3 = NEXT, 4 = 4th). Leave with a 2 s hold of the 4th button, which turns the switch off too. See the radio policy below |
+| **Link** | wi-fi / ble | Which radio carries the daemon — **never both**, since there is one 2.4 GHz radio and sharing it costs the link that matters. **Changing it restarts the device** (~3 s, with a screen that says so); see below for why that is the only option rather than a shortcut. Green when that radio has actually found the daemon, because *"ble"* and *"ble, and it is working"* are the two things you came to this row to tell apart. Stored in the **network** namespace, next to the SSID and the token it is useless without |
 | **Sleep screen** | off · 1m · 2m · 5m · 10m · 30m | One row, not a toggle plus a duration — the two can never disagree, and it costs one row on a screen that has five. Defaults to **off**: nobody's screen should start going dark because they took an update |
 | **Brightness** | 5 steps | Non-linear in duty (20/60/120/200/255). Equal duty steps feel like one enormous jump at the bottom and four identical ones at the top. Applied live, so the step you are on is the step you can see |
 | **Alert LED** | off · low · med · high | **off is genuinely dark.** A 7 Hz red strobe is the right answer to a failed turn at a desk and the wrong one in a bedroom — and the alert still arrives, through the flashing name row and fleet letter |
 | **Mac sound** | on / off | Named for **where it happens**. "Sound: on" on a device with no speaker would be a promise the hardware cannot keep. Crosses the link at once (`O\|SND\|`) — a toggle that only reached NVS would do nothing until the next reconnect and read as a dead row |
 | **Flip screen** | on / off | Applies **on restart**; the row says so and a long GO does it. Rotation is set once after `begin()`, and re-rotating a live panel is the one failure in this firmware that looks exactly like dead hardware |
 | **Wi-Fi setup** | *state* → | Starts the setup portal. The value is the live link state, lowercased from the same enum the `?` dump prints, so the row answers "am I linked?" before you press it — which is the question you walked in with. Previously this was a top-level item, and before that it needed BOOT held through power-on, or `Z` over serial |
-| **About** | → | Link, RSSI, battery % + raw mV, boot cause, firmware version. The serial `?` output, on the glass — the only place it can be read on a cordless device with no console attached. The 4th button backs out to **this page**, not to the top strip: one level at a time |
+| **About** | → | Link, RSSI (or, on BLE, which radio and whether the pad has it), battery % + raw mV, boot cause, firmware version. The serial `?` output, on the glass — the only place it can be read on a cordless device with no console attached. The 4th button backs out to **this page**, not to the top strip: one level at a time |
 | **Factory reset** | hold GO to confirm | Wipes Wi-Fi, token **and** settings. Asks twice, and the second gesture is a **long** press rather than another tap — you cannot double-tap your way into wiping the token. Disarms itself after 6 s |
 
 Settings live in their own NVS namespace (`mate-ui`), separate from the network
 config, which is what lets a factory reset choose what it destroys. Writes are
 deferred 1.5 s, so holding NEXT through the brightness steps costs one flash
-write rather than five.
+write rather than five — with **one deliberate exception**: the gamepad switch
+is written immediately. Turning it on tears the link down, brings the HID stack
+up and hands the glass to the pad face, and a cell pulled in the second and a
+half that follows would bring the device back as a conductor while the Mac still
+lists "Claude Mate" as a paired controller. One flash write per deliberate
+toggle is nothing; a switch that can disagree with reality across a power cycle
+is not.
+
+**There used to be two gamepad rows.** *Game controller* opened the
+daemon-driven controller mode and *BLE gamepad* opened the HID one, side by side
+on a 172 px screen, offering what reads as the same thing twice. They were not
+the same thing, but the difference was a transport detail — precisely the kind
+of thing a menu must not ask you to hold in your head. The HID one wins on every
+axis that matters from the device's side, so the row became one persistent
+switch, and the daemon-driven mode survives only where it belongs: as something
+the Mac asks for over the link (`G|1`), never as a menu item. **The device's own
+switch outranks the Mac's** — a browser tab closing no longer revokes a gamepad
+you turned on yourself.
 
 ### The radio policy, in BLE gamepad mode
 
@@ -336,6 +358,168 @@ The radio is never parked mid-attempt: once it comes up it stays up for at least
 `PAD_WIFI_CHECK_MS` (20 s), because tearing a join down before it can finish
 would mean the check never actually happens — the device would spend the session
 neither playing cleanly nor learning anything, which is the worst of both.
+
+**None of that applies on a BLE link**, and cannot. There the transport and the
+pad are two roles on *one stack*, so unparking would mean tearing the HID
+connection down and re-pairing every time you paused to read something — not a
+policy, a fault. The rule there is the plain one the settings row promises: the
+gamepad is on, so the device is a gamepad, and turning it off is what brings the
+daemon back.
+
+### BLE as the link itself
+
+Wi-Fi keeps an association up all day for a device that has almost nothing to
+say. Status changes are rare and bursty — a session goes WAIT, forty minutes
+later it goes DONE — and in between the radio holds a link open to transmit
+nothing. That is the wrong shape for a cell, so the battery build can carry the
+**same line protocol over BLE** instead (`blelink.h`, and `daemon/blelink.py` on
+the Mac). Nothing above the wire knows which pipe it got.
+
+| | Wi-Fi (`--tcp`) | BLE (`--ble`) |
+|---|---|---|
+| Who dials | the **device** dials the daemon, found over mDNS | the **Mac** scans and connects; the device only advertises |
+| Idle radio | association held open continuously | **200 ms of advertising, then ~4 s silent**, repeating |
+| Auth | nonce + HMAC-SHA256 over the shared token | *the same handshake, the same token* |
+| Blocking the loop | `MDNS.queryService()` has no timeout parameter and a TCP dial costs up to 600 ms — both stop the button poll | nothing blocks; the duty cycle is two comparisons against `millis()` |
+| Range | the whole home or office | one room |
+| Right for | a host that is **not on this desk** | a device that **is** |
+
+The duty-cycle figures come from [issue #21](https://github.com/vlgutv22/claude_mate/issues/21), credited there to
+Jack Jansen in the ESP8266/ESP32 group, who measured roughly 5% of normal
+consumption with that rhythm on his own battery devices. **Be honest about what
+it saves here:** stopping the advertiser cuts the *radio's* share of the draw,
+not the CPU's — this firmware never light-sleeps, because the display, the LED
+pattern engine and the button poll all want the loop running. See
+[`docs/POWER.md`](../docs/POWER.md).
+
+The advertisement carries **identity, not status**. The issue floated packing
+the compact status into the advertising payload, and it cannot work in this
+direction: the status originates on the *host* and this device is the
+*peripheral*, so the only thing it could advertise about is itself. Status
+travels on GATT, where it also gets flow control for free.
+
+Two characteristics, because a GATT characteristic is not bidirectional: an RX
+one the daemon writes frames into, a TX one the device notifies button events
+on. **A notification boundary is not a line boundary** — the device can pack two
+lines into one notification and split one across two — and both ends reassemble
+on newlines rather than assuming otherwise.
+
+The link is **not encrypted and does not pair**. "Just Works" pairing is what a
+device with no keypad gets, it is unauthenticated by definition, and it would
+add an OS-level pairing dance to every fresh Mac. The token handshake is what
+actually decides who may drive this device, and it is already provisioned — so
+the threat model is exactly the Wi-Fi transport's, stated in the same terms: the
+payload is plaintext, anyone in radio range can read session names and states,
+and an on-path attacker could inject button events into an established
+connection.
+
+**Cost, measured rather than guessed:** the whole transport adds **9,008 bytes
+of flash and 2,848 bytes of RAM** against the same sketch without it. It is that
+cheap because the BLE stack was already linked in for the HID gamepad — the
+~290 KB was paid for once, and this is the second thing to use it.
+
+Select it with **SETTINGS → Link**, or `I|BLE` over the cable. It is a stored
+byte rather than a compile-time `#define` on purpose: moving a device on a desk
+between the two should not need a toolchain. Holding BOOT at power-on still
+forces the Wi-Fi setup portal whichever transport is stored — that escape hatch
+has to outrank the setting, or a device could be locked out by the very thing
+you were trying to fix.
+
+#### Why changing the link reboots the device
+
+**BLE does not come back in the same boot.** `BLEDevice::deinit(true)` does not
+fully release the controller, and every `BLEDevice::init()` after it fails —
+deterministically, silently, forever. Measured on hardware, not assumed:
+
+| | Result |
+|---|---|
+| Fresh boot → `ble` | `ADVERTISING` ✓ |
+| `ble` → `wifi` → `ble` in one boot, swapping stacks in place | `ble : OFF`, permanently |
+| ...and `I|BLE` again to force it | still `OFF` — a no-op, since the transport had not changed |
+| Reboot | `ADVERTISING` ✓ |
+
+The first cut swapped the stacks in place and worked exactly once per boot in
+each direction. Flipping the row twice — which is what anyone does while looking
+at a new setting — left the device with **no link at all**, no advertising, no
+Wi-Fi, no retry and no way to force one. `ble : OFF` was visible only over a
+cable a cordless device is probably not attached to.
+
+So the rule is: **anything that takes the BLE stack down reboots to bring it
+back.** The transport is in NVS, so the reboot loses nothing — the device comes
+up as exactly what you asked for, in about three seconds, behind a screen that
+says which link it is switching to. The same applies to turning the **BLE
+gamepad off** on a BLE build, for the same reason: the pad and the link are two
+roles on one controller.
+
+There is a backstop underneath that. `blelink.h` remembers that it was asked to
+be up and retries a failed start a few times; when those are spent, `stuck()`
+tells the sketch and the sketch reboots. Rebooting is genuinely the only way
+back, so the only real choice is between doing it deliberately and pretending
+the problem is not there.
+
+#### Connecting over BLE, start to finish
+
+There is **no pairing step and no portal**. The device advertises, the daemon
+scans, and the shared token — the same one the Wi-Fi transport uses, which a
+provisioned device already has — is what lets them attach. Four things have to
+be true, and all four are easy to check:
+
+**1. The daemon has `bleak`, in the Python that actually runs it.** This is the
+commonest miss, because the daemon usually runs from a LaunchAgent under a
+different interpreter than the one on your `$PATH`:
+
+```sh
+# which Python is running the daemon?
+ps -o comm= -p "$(pgrep -f claude_mate_daemon.py | head -1)"
+# ...then install into THAT one, e.g.
+/usr/local/bin/python3 -m pip install bleak
+```
+
+Without it the daemon says so and carries on over USB, which is a working
+daemon and an easy thing not to notice.
+
+**2. The daemon is running with `--ble`.** In the foreground that is literally
+`--ble`. Under the **LaunchAgent there are no flags** — `install.sh` writes a
+plist whose `ProgramArguments` you are not meant to hand-edit — so use the
+environment variable instead, exactly as `--tcp` is enabled:
+
+```sh
+PLIST=~/Library/LaunchAgents/com.claudemate.daemon.plist
+/usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:CLAUDE_MATE_BLE string 1" "$PLIST"
+launchctl unload "$PLIST" && launchctl load "$PLIST"
+```
+
+Every `--flag` has a `CLAUDE_MATE_*` twin for this reason; see the table in the
+main [README](../README.md#configuration).
+
+**3. macOS is letting that program use Bluetooth.** **System Settings →
+Privacy & Security → Bluetooth** must list the program running the daemon —
+your terminal, or the Python binary for a LaunchAgent. A LaunchAgent has no
+window to raise a prompt from, so it can be refused *silently*: the daemon scans
+forever and finds a device that is sitting right there advertising. If the log
+says `no device found yet` while the device says it is advertising, check this
+before anything else.
+
+**4. The device's Link row reads `ble`.** SETTINGS → Link, or `I|BLE` over USB.
+
+**Knowing it worked**, from either end:
+
+```
+daemon      BLE device connected: 2A55ED32-...
+            handshake H -> resending full state
+
+device (?)  link  : ble
+            ble   : LINKED  adv 200ms/4000ms  token (set)
+```
+
+**When it does not**, the two ends disagree in a way that names the fault:
+
+| Device says | Daemon says | It is |
+|---|---|---|
+| `ble: start the daemon with --ble` | `no device found yet` | one of 1–3 above — usually the Bluetooth permission |
+| `AUTHING`, then `no handshake - is the daemon on --ble?` | *(nothing)* | something connected that is not the daemon. macOS itself probes new GATT services; harmless, and it recycles after 5 s |
+| `x token rejected` | `BLE: token rejected` | the device and the daemon hold different tokens. `T\|<token>` over USB, from `~/.config/claude-mate/token` |
+| `x no token - set one in the setup portal` | `THE DEVICE HAS NO TOKEN` | exactly what it says |
 
 ### Screen sleep
 

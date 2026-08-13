@@ -12,6 +12,127 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
+### 2026-08-11 — BLE as a transport, and one gamepad switch instead of two rows
+
+- **Added: the line protocol over Bluetooth LE** (`firmware/claude_mate_s3/blelink.h`,
+  `daemon/blelink.py`), as an alternative to Wi-Fi for the battery build.
+  Nothing about the protocol changes — the same `F|`/`V|`/`M|`/`P` down and
+  `H`/`K`/`B|` up, the same nonce/HMAC handshake, the same token — so nothing
+  above the wire knows which pipe it got. What changes is the shape of the idle
+  cost: Wi-Fi holds an association open all day for a device whose status
+  changes are rare and bursty, while BLE **advertises for 200 ms and then goes
+  quiet for four seconds**, repeating, until the daemon connects. Those figures
+  are the ones [issue #21](https://github.com/vlgutv22/claude_mate/issues/21)
+  asked for, credited there to Jack Jansen in the ESP8266/ESP32 group, who
+  measured roughly 5% of normal consumption with that rhythm on his own battery
+  devices. The roles are **inverted** from the TCP transport and deliberately:
+  there the device dials out because the daemon's address is stable and a DHCP
+  device's is not; here the Mac scans, because the side with mains power and a
+  real scheduler should be the one doing the looking. The device consequently
+  needs no daemon address at all — no mDNS browse, no host field in the portal.
+- **Changed: `SETTINGS → Link` picks the radio, live, with no reboot** — and it
+  is a stored byte rather than a compile-time `#define`, which is the part of
+  #21 that makes the rest usable: moving a device on a desk between transports
+  should not need a toolchain. `I|WIFI` / `I|BLE` does the same over the cable.
+  The old stack always goes down before the new one comes up, because the S3 has
+  **one 2.4 GHz radio** and even a few hundred milliseconds of overlap is the
+  contention the whole arrangement exists to avoid. Holding BOOT at power-on
+  still forces the Wi-Fi setup portal whichever transport is stored — an escape
+  hatch that could be locked out by the setting you were trying to fix would not
+  be one.
+- **Changed: the two gamepad rows became one switch.** *Game controller* and
+  *BLE gamepad* sat next to each other on a 172 px screen offering what reads as
+  the same thing twice. They were not the same thing, but the difference was a
+  *transport detail* — precisely the kind of thing a menu must not ask someone
+  to hold in their head. The HID one wins on every axis that matters from the
+  device's side (no daemon, no Wi-Fi, no loopback, and it is the only input path
+  a page served over **https** can use at all), so **BLE gamepad** is now a
+  single **on/off** row and the daemon-driven mode survives only where it
+  belongs: as something the Mac asks for over the link (`G|1`), never as a menu
+  item.
+- **Changed: the gamepad switch is remembered, across a screen sleep and across
+  a reboot.** It was an *action* before — somewhere the device went — and since
+  "power off" here is deep sleep and waking re-runs `setup()` from the top,
+  every sleep quietly handed a paired controller back to being a conductor. You
+  found out mid-level, with the Mac still listing "Claude Mate" as a connected
+  gamepad that had stopped sending anything. It is now a stored preference: on
+  means the device **is** a gamepad until you say otherwise, off means it is the
+  conductor and the daemon link comes back. Two consequences worth stating
+  because both are deliberate: the switch is written to NVS **immediately**
+  rather than on the usual 1.5 s deferred timer (a cell pulled in that window
+  could otherwise leave the switch and the device disagreeing across a power
+  cycle), and **`G|0` no longer revokes it** — a browser tab closing on the Mac
+  must not override a standing instruction from the person holding the device.
+  The two-second hold of the 4th button, or the row itself, is what turns it off.
+- **Added: `docs/POWER.md`**, and it is deliberately incomplete. The issue asks
+  for the measured idle draw documented next to the Wi-Fi number, and **neither
+  number has been taken** — so the table says so in as many words, states the
+  expectation *before* measuring so it can be checked, and gives the method in
+  enough detail that two people's readings can be compared (meter in the battery
+  lead, backlight off, both transports back to back on the same cell). A power
+  page full of plausible figures nobody measured is worse than an empty one,
+  because it stops anyone from measuring. It is also honest about the ceiling:
+  stopping the advertiser cuts the *radio's* share, not the CPU's — this
+  firmware never light-sleeps, because the display, the LED engine and the
+  button poll all want the loop running — and the backlight remains the budget.
+- **Measured: the BLE transport costs 9,008 bytes of flash and 2,848 of RAM**,
+  against the same sketch built without it (1,320,866 → 1,329,874 B; 55,536 →
+  58,384 B). That is cheap because the BLE stack was **already linked in** for
+  the HID gamepad: the ~290 KB was paid for once and this is the second thing to
+  use it. The sketch sits at 42% of the 3 MB app partition.
+- **Added: `tools/test_ble_link.py`**, which starts with the check the compiler
+  cannot do: the service and two characteristic UUIDs live in two files, in two
+  languages, and a typo in one produces a device that advertises forever and a
+  daemon that scans forever with **neither side reporting anything wrong**. The
+  rest drives the real `BleLink` against a fake `bleak` injected before the lazy
+  import — the handshake and both ways of failing it, and line reassembly, since
+  a notification boundary is *not* a line boundary and the device can pack two
+  lines into one notification or split one across two. No radio, and no `bleak`
+  install, so CI runs it unchanged.
+- **Changed: `bleak` is an optional dependency and stays optional.** It is
+  imported inside `--ble`, never at module scope, so a daemon without it starts
+  and runs exactly as before and reports one clear line instead of a traceback.
+  The daemon's only hard third-party requirement is still pyserial, which is a
+  promise the README makes.
+- **Changed: `LinkHub` holds a list of wireless transports** rather than a named
+  TCP one. A Nano on a cable, a Wi-Fi board and a BLE board can all be attached
+  at once and every one of them gets every frame — the fan-out deliberately does
+  not short-circuit, since an `or` chain would stop at the first transport that
+  took the bytes and leave the second device showing a frame from a minute ago.
+- **Fixed, on hardware, four ways the link could die and stay dead.** All four
+  were invisible to the test suite and to CI, and all four were found by
+  flashing a board and using it:
+  - **BLE does not come back in the same boot.** `BLEDevice::deinit(true)` does
+    not fully release the controller and every `init()` after it fails —
+    deterministically. The first cut swapped the stacks in place, which worked
+    exactly once per boot in each direction, so flipping SETTINGS → Link twice
+    (what anyone does while looking at a new setting) left the device with **no
+    link at all**: no advertising, no Wi-Fi, no retry, and `ble : OFF` visible
+    only over a cable a cordless device is probably not attached to. Anything
+    that takes the BLE stack down now **reboots** to bring it back, behind a
+    screen that says which link it is switching to. The transport is in NVS, so
+    three seconds is the whole cost. The same applies to turning the gamepad off
+    on a BLE build — the pad and the link are two roles on one controller.
+  - **A failed start was silent and permanent.** `blelink.h` now remembers it
+    was asked to be up, retries, and when the retries are spent says so
+    (`stuck()`) so the sketch can reboot rather than sit there being nothing.
+  - **`I|BLE` could not restart a dead stack**, because `setTransport()`
+    returned early when the value had not changed — so the one command that
+    looked like it should fix it was a no-op.
+  - **The daemon never noticed a device that vanished.** bleak's
+    `disconnected_callback` did not fire when the board rebooted, and the daemon
+    went on believing it was connected **for ninety minutes** — `has_clients()`
+    true, frames written into nothing, and no scan ever started again. A
+    transport whose recovery depends on one notification it does not control has
+    no recovery, so the session loop now asks `is_connected` every tick and
+    counts consecutive failed writes, which is the same thing `NetLink` has
+    always done from the other direction. Recovery measured at ~6 s.
+  `tools/test_ble_link.py` gained a regression test for the last of those, which
+  also meant giving the fake client an `is_connected` the real one has. One of
+  its own checks turned out to be environment-dependent — "bleak missing" passed
+  only because bleak happened not to be installed, and quietly stopped testing
+  anything the day it was; it now blocks the import outright.
+
 ### 2026-08-08 — SHIP IT level 2: M2 · SCAFFOLDING, and the product manager
 
 - **Added: level 2 of SHIP IT**, playable in the web edition through a new

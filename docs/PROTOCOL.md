@@ -112,14 +112,14 @@ input buffer at 96 bytes and drops malformed/oversized lines).
 | `F\|<flags>\|<sel>\|<r0>\|<r1>\|<r2>\|<r3>` | **The whole screen**, pre-rendered as four size-1 rows. See field table below. At least 7 fields; `r3` is the **last** field and may itself contain `\|`. A **transient notice** (why a press was declined, or which account a switch is heading for) rides in `r1`+`r2` for ~4 s: the daemon owns row rendering, so saying something new on the glass costs no firmware change and works on a device already flashed. `r0` and `r3` are left alone, so the message never loses the session it is about. |
 | `V\|<kind>` | LED alert control (indication LED only; never touches the OLED). `<kind>` is `START`, `INPUT`, `DONE`, `ERROR`, or `OFF`. See **LED** below. |
 | `L\|<i>\|<n>\|<name>\|<chip>` | **One saved account**, pushed on every handshake so the device's picker can show the logins you already have. Row 0 is always `default` (the `~/.claude` login, which is not a directory under the profiles root — omitting it let the device switch away from your main account with no way back). `i==0` resets the list, so a profile you deleted cannot leave a stale row behind. `<chip>` is that account's remaining-limit chip and may be empty: the names are free, the limits cost an HTTPS round trip each, so the daemon sends names immediately and re-sends enriched a moment later rather than blocking the handshake. Which account has headroom is the whole basis of the choice. Two consequences of that re-send, both load-bearing: the device must keep its **selection by name** across a rebuild (row numbers do not survive one, and the enriched push lands while a thumb is over GO), and the daemon must decode `B\|A<i>` against the list it actually **pushed** — it re-pushes within ~5 s of the profile set changing, but until then the glass is showing older rows and a fresh `listdir` would decode them to the wrong name. |
-| `G\|2` | **BLE gamepad mode.** The device comes up as an ordinary Bluetooth HID gamepad (four buttons, no axes, physical order) and needs no daemon, no Wi-Fi and no loopback from then on — which is the only way a page served over **https** can be driven by this hardware, since it cannot reach `http://127.0.0.1`. Entering parks the Wi-Fi link (`net.shutdown()`), because the S3 has one 2.4 GHz radio and sharing it costs the link that matters; `G\|0` leaves and gives the radio back. Reachable from the device itself at **SETTINGS → BLE gamepad** — the verb exists so the mode can also be entered, and tested, from the far end of a cable. Verified on hardware: advertises as `Claude Mate` with service `0x1812`, and `deinit` + Wi-Fi restart round-trips cleanly. |
-| `G\|1` `G\|0` | **Controller mode** on / off. Sent by the daemon when a browser page takes or releases the grab on the `--web` bridge (see `daemon/webbridge.py`). While on, the device stops acting on its own buttons, reads the four pins raw and emits press/release **edges** (`B\|+P` …), draws a gamepad face **once** instead of per frame, and drops the backlight to a fraction of its normal duty. That last part is not decoration: a full flush is 110 KB over SPI, and doing it once a second to redraw a screen nobody is looking at — on battery, while the Mac has the buttons — is the overuse the mode exists to avoid. The device leaves on `G\|0`, or on a two-second hold of the 4th button if the Mac never sends one (a crashed tab, a killed daemon). An older firmware ignores `G\|` entirely and simply keeps its menu semantics. **The device can also enter this mode by itself**, from **SETTINGS → Game controller**, with no daemon involvement at all — so `G\|1` arriving while it is already in controller mode is a no-op rather than an error, and the daemon must not assume it is the only thing that puts the device there. |
+| `G\|2` | **BLE gamepad mode.** The device comes up as an ordinary Bluetooth HID gamepad (four buttons, no axes, physical order) and needs no daemon, no Wi-Fi and no loopback from then on — which is the only way a page served over **https** can be driven by this hardware, since it cannot reach `http://127.0.0.1`. Entering parks whichever radio was carrying the link, because the S3 has one 2.4 GHz radio and sharing it costs the link that matters. Reachable from the device itself at **SETTINGS → BLE gamepad** — the verb exists so the mode can also be entered, and tested, from the far end of a cable. Verified on hardware: advertises as `Claude Mate` with service `0x1812`, and `deinit` + Wi-Fi restart round-trips cleanly. **That last part holds only because Wi-Fi is a different stack** — BLE itself does *not* come back after a `deinit` in the same boot (`BLEDevice::init()` fails from then on), so on a device whose *link* is BLE, turning the gamepad off reboots rather than restarting the stack. See `firmware/README.md`. **`G\|2` now also sets the device's stored gamepad switch**, so it survives a reboot exactly as the menu toggle does — and consequently `G\|0` will *not* undo it (see below). |
+| `G\|1` `G\|0` | **Controller mode** on / off. Sent by the daemon when a browser page takes or releases the grab on the `--web` bridge (see `daemon/webbridge.py`). While on, the device stops acting on its own buttons, reads the four pins raw and emits press/release **edges** (`B\|+P` …), draws a gamepad face **once** instead of per frame, and drops the backlight to a fraction of its normal duty. That last part is not decoration: a full flush is 110 KB over SPI, and doing it once a second to redraw a screen nobody is looking at — on battery, while the Mac has the buttons — is the overuse the mode exists to avoid. The device leaves on `G\|0`, or on a two-second hold of the 4th button if the Mac never sends one (a crashed tab, a killed daemon). An older firmware ignores `G\|` entirely and simply keeps its menu semantics. **The device can also be a gamepad by itself**, from **SETTINGS → BLE gamepad**, with no daemon involvement at all — so `G\|1` arriving while it is already a controller is a no-op rather than an error, and the daemon must not assume it is the only thing that puts the device there. <br><br>**`G\|0` releases only the mode the daemon opened.** Since the BLE gamepad became a persisted switch rather than an action, "on" is a standing instruction from the person holding the device, and a browser tab closing on the Mac must not revoke it. A device whose own switch is on stays a gamepad through `G\|0`; the two-second hold of the 4th button, or the settings row, is what turns it off. |
 | `P` | Ping / keepalive, sent every ~15 s. The Arduino replies with `K` (NOT `H` — `H` means "I rebooted" and triggers a full resend + LED re-arm, which would restart the blink phase every ping). |
 
 > **Adding a downlink verb? These letters are already taken, and not by this
 > table.** On the S3, USB serial lines go to the **config console** first —
 > `handleConfigLine()` — and only fall through to the protocol handler if it
-> declines them. It owns `?`, `W`, `S`, `T`, `X`, `R`, `Y`, `Z`. A protocol verb
+> declines them. It owns `?`, `W`, `S`, `T`, `I`, `X`, `R`, `Y`, `Z`. A protocol verb
 > that collides with one of those is **silently unreachable over USB** while
 > working perfectly over TCP, so it survives every test that does not run on a
 > cabled device. This is not hypothetical: controller mode first shipped as
@@ -226,9 +226,12 @@ sentinel, because terminal output can contain any line, **including one that is
 exactly `ok`**, which would truncate the mirror at an arbitrary point. A wrapper
 predating the command answers a bare `ok`, which reads as "no preview".
 
-### 1d. The wireless handshake (TCP devices only)
+### 1d. The wireless handshake (TCP and BLE devices)
 
-Before any of the above flows, a TCP device proves it knows the shared token:
+Before any of the above flows, a wireless device proves it knows the shared
+token. **The same three lines on both radios**, in the same order, verified the
+same way, against the same token — one handshake to understand, one secret to
+provision, one thing to get wrong:
 
 | Direction | Line | Meaning |
 |---|---|---|
@@ -248,6 +251,33 @@ along. A cleared token is the commonest wireless failure there is (it is what
 the setup portal used to cause), so it gets a line of its own and a daemon
 message that says what to do about it. A daemon too old to recognise it reports
 a rejected token, which is still more use than silence.
+
+### 1e. Which pipe carries it
+
+Three, and the bytes above are identical on all of them. Nothing in the protocol
+changes with the transport; only who dials whom, and what the idle radio costs.
+
+| | USB | TCP (`--tcp`) | BLE (`--ble`) |
+|---|---|---|---|
+| Who initiates | the daemon opens the port | the **device** dials the daemon, found over mDNS | the **Mac** scans; the device only advertises |
+| Discovery | serial-port glob | `_claudemate._tcp` | the service UUID `c1a0de00-…-0001` |
+| Idle cost | none (cabled) | an association held open continuously | **200 ms of advertising, then ~4 s silent**, repeating |
+| Handshake | none (physical access is the trust) | §1d | §1d, identical |
+| Framing | newline-delimited ASCII | newline-delimited ASCII | newline-delimited ASCII inside GATT writes/notifications — **a notification boundary is not a line boundary**, and both ends reassemble on newlines |
+
+On BLE the device is the **peripheral** and exposes two characteristics, because
+a GATT characteristic is not bidirectional: `…-0002` is written by the daemon
+(everything in §1a), `…-0003` is notified by the device (everything in §1b).
+Status is **never** encoded into the advertising payload — the status originates
+on the host and the peripheral is the device, so the only thing it could
+advertise about is itself.
+
+**Wi-Fi and BLE are alternatives, never simultaneous:** the ESP32-S3 has one
+2.4 GHz radio. Which one is a stored device setting (**SETTINGS → Link**, or
+`I|WIFI` / `I|BLE` over the cable), not a compile-time choice. The daemon can
+serve both at once — a Nano on a cable, a Wi-Fi board and a BLE board all get
+every frame — because on its side they are three transports, not three
+protocols.
 
 **Reset note:** opening the USB serial port resets the Nano (~1.5 s). The `H`
 handshake plus the daemon re-sending state on `H` is exactly what makes the

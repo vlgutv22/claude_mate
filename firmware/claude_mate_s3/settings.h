@@ -77,6 +77,7 @@ class MateSettings {
       _led  = clampIdx(p.getUChar("led",  LED_DEFAULT_IDX), LED_STEPS);
       _flip = p.getBool("flip", false);
       _snd  = p.getBool("snd",  false);   // off by default: see LED_LEVELS
+      _pad  = p.getBool("pad",  false);   // see setPad()
       p.end();
     }
     _dirty = 0;
@@ -96,6 +97,7 @@ class MateSettings {
   uint8_t blIdx()  const { return _bl;  }
   uint8_t ledIdx() const { return _led; }
   bool    sound()  const { return _snd; }
+  bool    pad()    const { return _pad; }
 
   const char *hibLabel() const {
     static char buf[6];
@@ -114,6 +116,25 @@ class MateSettings {
   void cycleLed() { _led = (uint8_t)((_led + 1) % LED_STEPS); touch(); }
   void toggleFlip() { _flip = !_flip; touch(); }
   void toggleSound() { _snd = !_snd; touch(); }
+
+  // The BLE gamepad, and the ONE setting here that is written immediately
+  // rather than deferred.
+  //
+  // Every other preference is a knob you nudge and then look at -- brightness
+  // cycles five times in a second under a held thumb, and deferring those five
+  // flash writes to one is the whole point of SETTINGS_COMMIT_MS. This is not
+  // that. Turning the pad on tears the link down, brings the HID stack up and
+  // hands the glass to the pad face; if the cell is pulled, or the reset button
+  // pressed, in the second and a half that follows, the device would come back
+  // as a conductor while the Mac still has "Claude Mate" listed as a paired
+  // controller. The setting and the reality must not be able to disagree across
+  // a power cycle, and one flash write per deliberate toggle is nothing.
+  void setPad(bool on) {
+    if (_pad == on) return;
+    _pad = on;
+    touch();
+    write();
+  }
 
   // Called every loop. Writes only once the value has settled, so a thumb held
   // on NEXT costs one flash write rather than one per step.
@@ -165,6 +186,7 @@ class MateSettings {
     p.putUChar("led", _led);
     p.putBool("flip", _flip);
     p.putBool("snd",  _snd);
+    p.putBool("pad",  _pad);
     p.end();
   }
 
@@ -176,5 +198,10 @@ class MateSettings {
   // device is simply the most convenient place to reach for a mute, so the
   // setting lives here and is pushed to the daemon over the link.
   bool          _snd  = false;
+  // The BLE gamepad: on means this device IS a Bluetooth controller and is not
+  // a conductor until you say otherwise. Persisted because a gamepad that
+  // forgot itself every time the screen slept would be a gamepad you had to
+  // re-arm through two menus in the middle of a level.
+  bool          _pad  = false;
   unsigned long _dirty = 0;
 };

@@ -38,7 +38,23 @@
     <key>WorkingDirectory</key>
     <string>__REPO__</string>
 
-    <!-- Unbuffer Python so logs are written promptly. -->
+    <!--
+      Unbuffer Python so logs are written promptly.
+
+      THIS DICT IS ALSO HOW YOU TURN OPTIONS ON. ProgramArguments above carries
+      no flags and is not meant to be hand-edited, so every `--flag` the daemon
+      takes has a CLAUDE_MATE_* twin that belongs here instead:
+
+          CLAUDE_MATE_TCP    1   serve the protocol over TCP  (--tcp)
+          CLAUDE_MATE_BLE    1   serve it over Bluetooth LE   (--ble)
+          CLAUDE_MATE_SOUND  1   macOS alert sounds           (--sound)
+          CLAUDE_MATE_WEB    1   the browser game bridge      (--web)
+
+      Add one, then `launchctl unload` and `load` this file. Note that --ble
+      also needs `bleak` installed in the interpreter named above, and macOS
+      Bluetooth permission granted to it -- a LaunchAgent cannot raise the
+      prompt itself, so a refusal is silent. See firmware/README.md.
+    -->
     <key>EnvironmentVariables</key>
     <dict>
         <key>PYTHONUNBUFFERED</key>
