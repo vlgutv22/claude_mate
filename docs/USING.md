@@ -89,9 +89,54 @@ acknowledge them**. That is the only thing this project really does.
 
 ## The CLI
 
+Four commands ship, and [CLI.md](CLI.md) is the full reference for all of them.
+This page covers the one you use constantly.
+
+### The app
+
 ```sh
-claude-mate                     # the queue, as the device shows it
-claude-mate watch               # ...and keep showing it
+claude-mate
+```
+
+On a terminal, with no arguments, you get an app rather than a printout:
+
+```
+ claude-mate   ● daemon running · 14:22:31
+
+ SESSIONS
+  ▸• api-server   working    1:23   Opus 5  xhigh  work
+    web-ui        waiting    0:05   Opus 5         needs you
+    docs          idle      12:40
+
+  ▸  Start new session
+     Start new session · skip permissions
+     Device · link status and pairing
+     Accounts · switch or review
+     Quit
+
+ ↑↓ move   ⏎ raise this session   a ack   f follow   m mirror   c continue
+ r restart daemon   q quit
+```
+
+Arrow keys move the cursor, Enter chooses, `q` quits. On a session row, Enter
+raises that session's terminal — the same thing the device's GO button does —
+and `a` / `f` / `m` / `c` are acknowledge, follow, mirror and continue.
+
+**Start new session** hands this terminal to `claude`, run through the wrapper
+so the daemon sees it. The second entry adds `--dangerously-skip-permissions`;
+it is a separate entry rather than a setting because that is a decision worth
+naming out loud. Put anything else you want in `CLAUDE_MATE_NEW_ARGS`.
+
+If the daemon is not running, the app says so and `r` starts it.
+
+**Not an app on a pipe.** Redirect it and you get the plain print below, with no
+colour and no escape codes — hooks, scripts and cron are unaffected.
+
+### The plain print
+
+```sh
+claude-mate status              # the queue, once
+claude-mate watch               # ...and keep printing it
 ```
 
 ```

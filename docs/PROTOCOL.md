@@ -347,6 +347,35 @@ The hook is **fire-and-forget**: it connects with a short timeout, writes one
 line, and exits **0** regardless of outcome. If the daemon/socket is down it
 **silently no-ops**. The hook must never block or fail a Claude turn.
 
+### The control socket (CLI → daemon) {#the-control-socket}
+
+The same socket carries **commands**, not just session updates, and this is the
+whole surface — six verbs. Anything unrecognised is parsed as a session update
+above and dropped, so a typo is silent rather than an error.
+
+| Line | Reply | Meaning |
+|---|---|---|
+| `queue` | JSON | the whole queue, as the device shows it. Also the only liveness check there is |
+| `accounts` | JSON | the saved logins and where they live |
+| `accounts-refresh` | `ok` | re-read the accounts directory (after something changed it) |
+| `press\|<code>` | `ok` | press a device button: `P N G K F M C T`, or `A<n>` to continue on saved account *n* |
+| `select\|<n\|name>` | `ok <name>` | point the selection at a row |
+| `pair` | `ok` | arm BLE enrolment for the next unprovisioned device |
+
+**The button codes are the device's own**, and deliberately so: `press|G` is
+handed to the same `ButtonReader` that handles `B|G` off the wire, so GO cannot
+mean one thing to the device and another to the terminal.
+
+There is **no** `status`, `ping` or `version` verb, and **no** delete. A hook in
+any of your shells can write to this socket; a hook firing a malformed line
+should not be able to remove a login, so `claude-mate accounts rm` does the
+deletion in its own process and only asks the daemon to re-read afterwards. The
+socket is mode 0600 — owner only.
+
+Starting the daemon is not on here either, for the reason in
+[CLI.md](CLI.md#starting-and-stopping-the-daemon): it goes through launchd, or
+you get two of them fighting over one socket.
+
 ### Wrapper control socket (daemon → wrapper)
 
 The daemon connects to a session's `ctrl_sock` and sends **only one verb**:

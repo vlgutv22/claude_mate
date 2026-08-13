@@ -184,8 +184,7 @@ def arm_pairing():
 def pair():
     """Drive an enrolment and report what happened, by watching the log."""
     if daemon_pid() is None:
-        print(f"{RED}The daemon is not running.{OFF}  launchctl bootstrap "
-              f"gui/{os.getuid()} {PLIST}")
+        print(f"{RED}The daemon is not running.{OFF}  start it: claude-mate daemon")
         return 1
     where = log_size()               # only judge lines written from here on
     ok, detail = arm_pairing()
@@ -240,9 +239,26 @@ def say(ok, label, detail=""):
 
 
 def main():
-    if "--pair" in sys.argv[1:]:
+    # A REAL --help, and an error for anything it does not know.
+    #
+    # This used to test argv by substring and fall through to the full status
+    # report for everything else -- so `--help` printed four screens of link
+    # diagnosis and never named a flag, and a typo like `--pari` silently did
+    # the wrong thing while looking like it had worked. The flags are few
+    # enough to check exactly.
+    args = sys.argv[1:]
+    if any(a in ("-h", "--help", "help") for a in args):
+        print(__doc__.strip())
+        return 0
+    unknown = [a for a in args if a not in ("--pair", "--token")]
+    if unknown:
+        print(f"claude-mate-connect: unknown argument {unknown[0]!r}\n"
+              f"  usage: claude-mate-connect [--pair | --token]\n"
+              f"  no arguments prints the connection report.", file=sys.stderr)
+        return 2
+    if "--pair" in args:
         return pair()
-    if "--token" in sys.argv[1:]:
+    if "--token" in args:
         tok = read_token()
         if not tok:
             print(f"no token at {TOKEN_FILE}", file=sys.stderr)
@@ -254,8 +270,7 @@ def main():
 
     pid = daemon_pid()
     say(pid is not None, "daemon running",
-        f"pid {pid}" if pid else "start it: launchctl bootstrap "
-                                 f"gui/{os.getuid()} {PLIST}")
+        f"pid {pid}" if pid else "start it: claude-mate daemon")
 
     token = read_token()
     say(token is not None, "shared token exists",
@@ -290,7 +305,7 @@ def main():
               f"token to any device that\nappears on {ports[0]} the moment it "
               "opens the port. If the link is still down:\n")
         if pid is None:
-            print(f"  launchctl bootstrap gui/{os.getuid()} {PLIST}")
+            print("  claude-mate daemon")
         else:
             print("  # something else may be holding the port — bounce the daemon")
             print(f"  launchctl kickstart -k gui/{os.getuid()}/com.claudemate.daemon")

@@ -12,6 +12,57 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
+### 2026-08-13 — `claude-mate` is an app, and the CLI is finally written down
+
+- **`claude-mate` on a terminal is now an arrow-key app.** The queue with the
+  cursor live in it — ↑↓ to move, ⏎ to raise a session, `a`/`f`/`m`/`c` for
+  acknowledge, follow, mirror and continue — plus a menu that **starts a new
+  session** without going back to a shell. That entry runs `claude` through the
+  wrapper in this terminal, because a session started any other way is
+  invisible to the daemon and never reaches the device. There are two entries,
+  one of them `--dangerously-skip-permissions`, rather than one entry and a
+  hidden default: skipping permission prompts is a decision and a menu should
+  say which one it is making.
+- **On a pipe it is exactly what it always was.** The app appears only when
+  stdin *and* stdout are both terminals. Both, deliberately: the test suite run
+  from a developer's terminal inherits a TTY stdin, and CI redirects
+  `< /dev/null` — either check alone is wrong on a machine that matters.
+- **`claude-mate daemon` starts it, and the old advice never could.** Every
+  error path in the project printed `launchctl bootstrap gui/$UID …`, which
+  fails with `Bootstrap failed: 5: Input/output error` whenever the job is
+  already loaded — that is, on every machine that ran the installer, which is
+  every machine that has the file. It goes through `kickstart -k` now, and
+  never spawns the daemon directly: there is no single-instance guard and the
+  socket is unlinked before binding, so a hand-started second copy silently
+  takes the socket from the first while the first keeps the serial port.
+- **Fixed: `claude-mate-switch` was broken for everyone who installed it.**
+  `install.sh` symlinks it into `/usr/local/bin` but deliberately does not
+  symlink the wrapper, and the tool resolved its sibling with
+  `os.path.abspath(__file__)`, which does not follow symlinks — so the
+  installed command died on import with `cannot load
+  /usr/local/bin/claude-mate-wrap` and worked only from a checkout. One word:
+  `realpath`.
+- **Fixed: `claude-mate-connect` had no `--help`** and parsed its flags by
+  substring, so `--help` printed four screens of link diagnosis without naming
+  a flag, and a typo like `--pari` silently ran the report instead of erroring.
+- **Fixed: `claude-mate watch | tee` wrote a clear-screen into the file** once a
+  second. The colours were already blanked for a non-TTY; this one escape was
+  not.
+- **Documentation.** A new [docs/CLI.md](docs/CLI.md) is the thing that did not
+  exist: one page saying that there are **four** binaries, what each is for, why
+  the wrapper is not on `PATH`, every command and alias, and every
+  `CLAUDE_MATE_*` variable. [docs/PROTOCOL.md](docs/PROTOCOL.md) now documents
+  the control socket's six verbs — it called itself the source of truth and had
+  only ever described the session-update line. README's second, drifted copy of
+  the command list (it had lost `continue` and `new-terminal`) is back in sync.
+- `--version`, on the tool that had a `packaging/VERSION` and no way to ask.
+- New `tools/test_app.py`: the key decoder against real byte bursts, and the app
+  driven under a PTY with arrow keys. It caught two bugs in its own subject —
+  a decoder that read through `sys.stdin` while selecting on the descriptor (so
+  every arrow arrived as a bare ESC and nothing moved), and a renderer that
+  trusted `os.get_terminal_size()` and quietly ate its last line whenever a
+  terminal honestly reported 0×0, which is what `pty.openpty()` hands you.
+
 ### 2026-08-13 — Sleep that stays asleep, and a gauge that does not vanish when it matters
 
 Reported after the BLE release: *the device wakes the instant you put it to
