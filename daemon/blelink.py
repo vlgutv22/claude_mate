@@ -92,8 +92,27 @@ BLE_AUTH_S = 5.0            # the firmware allows 5 s; so do we
 # permission to give away a secret.
 BLE_PAIR_CONFIRM_S = 50.0
 BLE_PAIR_ARM_S = 180.0
-BLE_RETRY_S = 3.0           # between scan attempts...
-BLE_RETRY_MAX_S = 30.0      # ...doubling on consecutive failures, capped
+# Between scan attempts, doubling on consecutive failures, capped -- and the cap
+# is LOW on purpose, which is the opposite of the Wi-Fi transport's reasoning.
+#
+# There, backing off protects the DEVICE: the retry is an mDNS browse and a TCP
+# dial made from the firmware's own loop, so a fast retry costs it button
+# responsiveness and battery. Here the scanning happens on the MAC, and the
+# device advertises its 200 ms burst every 4.2 s whether anyone is listening or
+# not -- it pays the same either way. So a long cap buys the battery side
+# nothing and spends the only thing the user actually feels.
+#
+# It was 30 s, which with an 8 s scan meant a board waking from sleep waited up
+# to ~38 s before the next scan even STARTED. Measured against a real overnight
+# sleep: "device looking for connection about a minute after awake". At 6 s the
+# worst case is ~14 s and the typical one ~10 s.
+#
+# What that costs, said plainly: the Mac's BLE scanner runs at roughly 60% duty
+# instead of 20% while no device is present. It is a filtered scan on a machine
+# that is usually plugged in, against a wait the user experiences every single
+# time they pick the device up.
+BLE_RETRY_S = 2.0
+BLE_RETRY_MAX_S = 6.0
 BLE_MAX_LINE = 512          # drop over-long lines (the longest real one is ~94B)
 BLE_NOT_FOUND_GAP_S = 120.0  # between "still looking" notes; see _log_not_found
 BLE_WRITE_FAIL_LIMIT = 3     # consecutive failed writes that end a session
@@ -246,10 +265,11 @@ class BleLink:
                 # Throttled, because the scan repeats and a message per attempt
                 # is its own kind of useless.
                 self._log_not_found()
-                # Exponential backoff, capped. A device that is off stays off
-                # for hours -- asleep in a drawer, or being a gamepad -- and
-                # scanning every three seconds for hours is a pointless drain on
-                # the Mac's radio and a noisy log. Success resets it.
+                # Exponential backoff, capped low -- see BLE_RETRY_MAX_S for
+                # why this transport wants a different cap from the Wi-Fi one.
+                # The log stays quiet regardless: _log_not_found throttles to one
+                # line every two minutes, so the noise argument for a long sleep
+                # was already handled somewhere else. Success resets it.
                 fails = min(fails + 1, 4)
                 await self._sleep(min(BLE_RETRY_S * (2 ** fails),
                                       BLE_RETRY_MAX_S))
@@ -330,6 +350,14 @@ class BleLink:
             with self._lock:
                 self._client, self._linked = client, True
             self._log(f"BLE device connected: {device.address}")
+            began = time.monotonic()
+            # WHY a session ended, not just that it did. Four different things
+            # end this loop and all four used to log the same sentence, so an
+            # intermittent drop -- "working, not stable" -- left nothing to work
+            # from: a peripheral that went away, a peripheral that went away
+            # WITHOUT saying so, our own writes failing, and a daemon shutting
+            # down are four different faults with four different fixes.
+            why = "peer disconnected"
             try:
                 while not self._stop_evt.is_set() and not disconnected.is_set():
                     # DO NOT TRUST THE DISCONNECT CALLBACK ALONE. Observed on
@@ -345,8 +373,16 @@ class BleLink:
                     # transport learned the same lesson from the other
                     # direction: NetLink reaps a client the first time a write
                     # to it fails, rather than waiting to be informed.
-                    if not client.is_connected or \
-                            self._write_fails >= BLE_WRITE_FAIL_LIMIT:
+                    if self._write_fails >= BLE_WRITE_FAIL_LIMIT:
+                        why = (f"{self._write_fails} consecutive writes failed "
+                               f"(link up but not carrying)")
+                        break
+                    if not client.is_connected:
+                        # The callback did not fire; the poll caught it. Worth
+                        # distinguishing, because it is the failure mode that
+                        # once cost this transport ninety minutes of writing
+                        # frames into nothing.
+                        why = "peer vanished (no disconnect callback)"
                         break
                     try:
                         await asyncio.wait_for(disconnected.wait(), timeout=0.5)
@@ -355,7 +391,11 @@ class BleLink:
             finally:
                 with self._lock:
                     self._client, self._linked = None, False
-                self._log(f"BLE device disconnected: {device.address}")
+                if self._stop_evt.is_set():
+                    why = "daemon stopping"
+                held = time.monotonic() - began
+                self._log(f"BLE device disconnected after {held:.0f}s: "
+                          f"{why} [{device.address}]")
 
     async def _authenticate(self, client) -> bool:
         """Nonce challenge / HMAC response. False = reject and drop.

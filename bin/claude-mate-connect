@@ -119,6 +119,13 @@ def ble_state(lines):
     advertising" -- see the note about the Bluetooth pane above.
     """
     for ln in reversed(lines):
+        # Disconnect FIRST: "BLE device connected" is not a substring of
+        # "BLE device disconnected", but reading them in the wrong order still
+        # walks past the newer line to an older connect and reports a device
+        # that is gone as present -- the exact question this command exists to
+        # answer.
+        if "BLE device disconnected" in ln:
+            return "gone", ln.split(":", 3)[-1].strip()
         if "BLE device connected" in ln:
             return "linked", ln.split("BLE device connected:")[-1].strip()
         if "THE DEVICE HAS NO TOKEN" in ln:
@@ -258,6 +265,7 @@ def main():
     say({"linked": True, "searching": None, "unknown": None}.get(state, False),
         "BLE link",
         {"linked": f"connected {detail}",
+         "gone": f"disconnected — {detail}" if detail else "disconnected",
          "notoken": "the device has no token yet",
          "rejected": "the device holds a DIFFERENT token",
          "searching": "scanning — nothing found yet",

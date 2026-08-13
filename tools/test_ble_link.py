@@ -110,6 +110,17 @@ check("...and the gap between them is 4 s",
 scan = re.search(r"^BLE_SCAN_S\s*=\s*([\d.]+)", py_ble, re.M)
 check("the daemon's scan window outlasts a full off-period",
       scan and float(scan.group(1)) > int(adv_off.group(1)) / 1000.0)
+# ...and the GAP between scans is what a person waits through when they pick the
+# device up. It was 30 s, which with an 8 s scan meant up to ~38 s before the
+# next scan even started -- reported from a real overnight sleep as "about a
+# minute after awake". The Wi-Fi transport's long backoff protects the DEVICE's
+# loop; here the scanning is the Mac's and the device advertises regardless, so
+# the same number protects nobody.
+cap = re.search(r"^BLE_RETRY_MAX_S\s*=\s*([\d.]+)", py_ble, re.M)
+check("...and the gap between scans stays short enough to wake into",
+      cap and float(cap.group(1)) <= 10.0)
+check("...so worst-case discovery after a long absence is under 25 s",
+      cap and float(scan.group(1)) * 2 + float(cap.group(1)) < 25.0)
 
 
 # --------------------------------------------------------------------------- #
