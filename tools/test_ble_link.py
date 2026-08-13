@@ -21,9 +21,13 @@ testing are the parts that are not about radios:
   * that handshake lines are consumed by the handshake and never leak up to the
     daemon's ButtonReader as unknown verbs.
 
-Finally a few static assertions about the firmware, guarding the invariants that
-the menu rework depends on: ONE gamepad row, persisted, and a config verb that
-does not collide with the protocol's.
+Finally two sets of static assertions about the firmware. One guards the
+invariants the menu rework depends on: ONE gamepad row, persisted, and a config
+verb that does not collide with the protocol's. The other guards the bootstrap --
+every state a device with EMPTY NVS was found stuck in, unable to be given a
+token at all without a reflash. Those are static of necessity: a stranded device
+advertises nothing and answers nothing, so there is no behaviour on either side
+of the protocol for a test to drive.
 """
 import hmac
 import os
@@ -65,6 +69,7 @@ print("== the firmware and the daemon agree on the service ==")
 fw_ble = read(os.path.join(FW, "blelink.h"))
 py_ble = read(os.path.join(DAEMON_DIR, "blelink.py"))
 ino = read(INO)
+netcfg = read(os.path.join(FW, "netcfg.h"))
 
 
 def fw_define(name, src=None):
@@ -105,6 +110,17 @@ check("...and the gap between them is 4 s",
 scan = re.search(r"^BLE_SCAN_S\s*=\s*([\d.]+)", py_ble, re.M)
 check("the daemon's scan window outlasts a full off-period",
       scan and float(scan.group(1)) > int(adv_off.group(1)) / 1000.0)
+# ...and the GAP between scans is what a person waits through when they pick the
+# device up. It was 30 s, which with an 8 s scan meant up to ~38 s before the
+# next scan even started -- reported from a real overnight sleep as "about a
+# minute after awake". The Wi-Fi transport's long backoff protects the DEVICE's
+# loop; here the scanning is the Mac's and the device advertises regardless, so
+# the same number protects nobody.
+cap = re.search(r"^BLE_RETRY_MAX_S\s*=\s*([\d.]+)", py_ble, re.M)
+check("...and the gap between scans stays short enough to wake into",
+      cap and float(cap.group(1)) <= 10.0)
+check("...so worst-case discovery after a long absence is under 25 s",
+      cap and float(scan.group(1)) * 2 + float(cap.group(1)) < 25.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -153,6 +169,7 @@ class FakeClient:
     """
     token = TOKEN
     mode = "normal"            # or "notoken"
+    pair_answer = "ok"         # "ok" | "no" | "silent" (nobody pressed anything)
     written = []               # every line the daemon sent us
     instances = []
 
@@ -189,6 +206,20 @@ class FakeClient:
             if not raw:
                 continue
             FakeClient.written.append(raw)
+            # Enrolment. The real device puts PAIR? on its screen here and waits
+            # for a thumb; `pair_answer` stands in for what the thumb did, with
+            # "silent" for the case that matters most -- nobody was there.
+            if raw == "E|?":
+                if FakeClient.pair_answer == "ok":
+                    self.notify("E|OK")
+                elif FakeClient.pair_answer == "no":
+                    self.notify("E|NO")
+                continue
+            if raw.startswith("E|"):
+                FakeClient.token = raw[2:]      # adopted, exactly as the board
+                FakeClient.mode = "normal"      # does: live, before NVS
+                self.notify("E|SET")
+                continue
             if raw.startswith("C|"):
                 if FakeClient.mode == "notoken":
                     self.notify("A|NOTOKEN")
@@ -338,6 +369,89 @@ finally:
     link.stop()
 
 # --------------------------------------------------------------------------- #
+print("\n== pairing: a token crosses the air only when a human says so ==")
+# The point of the whole exchange is that being in radio range buys you nothing.
+# An unprovisioned device is not consent, and the daemon must not hand out the
+# secret because it found something willing to take one.
+blelink.BLE_PAIR_CONFIRM_S = 0.6      # the tests are not waiting on a human
+
+
+def pairing_phase(answer):
+    """A fresh unprovisioned device, advertising OUR service.
+
+    install_fake_bleak also clears `written`, which each phase below reads as
+    'everything this daemon said to this device' -- and it puts the advertised
+    UUID back, which the foreign-service test above deliberately left wrong.
+    """
+    install_fake_bleak(py_const("BLE_SVC_UUID"))
+    FakeClient.mode = "notoken"
+    FakeClient.token = "not-the-daemons-token"
+    FakeClient.pair_answer = answer
+    return new_link()
+
+
+link, rx, logs = pairing_phase("ok")
+try:
+    link.start()                      # NOT armed
+    time.sleep(1.2)
+    check("an unprovisioned device is NOT enrolled just for being there",
+          not any(l.startswith("E|") for l in FakeClient.written))
+    check("...and the log says how to pair it rather than nothing",
+          any("--pair" in l for l in logs))
+finally:
+    link.stop()
+
+link, rx, logs = pairing_phase("silent")
+try:
+    link.arm_pairing(30)
+    link.start()
+    time.sleep(2.0)
+    check("arming asks the device first, and asks with E|?",
+          "E|?" in FakeClient.written)
+    check("...and nobody pressing anything sends NO token at all",
+          not any(l.startswith("E|") and l != "E|?" for l in FakeClient.written))
+    check("...which is reported as the timeout it is",
+          any("nobody pressed" in l or "timed out" in l for l in logs))
+finally:
+    link.stop()
+
+link, rx, logs = pairing_phase("no")
+try:
+    link.arm_pairing(30)
+    link.start()
+    time.sleep(1.5)
+    check("a device that DECLINES is not sent the token either",
+          not any(l.startswith("E|") and l != "E|?" for l in FakeClient.written))
+    check("...and one refusal disarms, so it is not asked again on a loop",
+          not link._pair_armed())
+finally:
+    link.stop()
+
+# And the happy path, which has to end LINKED without anyone touching a cable.
+link, rx, logs = pairing_phase("ok")
+try:
+    link.arm_pairing(30)
+    link.start()
+    ok = wait_for(lambda: link.has_clients(), 8.0)
+    check("a device whose human presses GO is enrolled and ends up LINKED",
+          bool(ok))
+    check("...having been sent the daemon's real token, once",
+          [l for l in FakeClient.written if l.startswith("E|") and l != "E|?"]
+          == [f"E|{TOKEN}"])
+    check("...and it authenticated with it afterwards, so the token took",
+          FakeClient.token == TOKEN)
+    check("...and pairing disarmed itself, rather than staying open",
+          not link._pair_armed())
+    check("...and the handshake lines never leaked to the daemon as verbs",
+          rx.empty() or all(not l.startswith(("E|", "A|", "C|"))
+                            for l in list(rx.queue)))
+finally:
+    link.stop()
+FakeClient.pair_answer = "ok"
+FakeClient.token = TOKEN
+FakeClient.mode = "normal"
+
+# --------------------------------------------------------------------------- #
 print("\n== bleak missing costs the BLE link and nothing else ==")
 # `sys.modules["bleak"] = None` makes `import bleak` raise ImportError outright.
 # Merely POPPING the stub is not enough and quietly stopped testing anything the
@@ -376,7 +490,58 @@ rows = [r.strip() for r in re.split(r"[,\s]+", m.group(1)) if r.strip()]
 check("SR_BLE is gone -- the two rows became one",
       "SR_BLE" not in rows)
 check("SR_PAD is still there, and is the gamepad row", "SR_PAD" in rows)
-check("...and a Link row chooses the transport", "SR_LINK" in rows)
+# NO transport row on the glass. `Link` was a plain toggle, so one press moved a
+# cordless board onto Wi-Fi -- which reboots into a portal that outranks the menu
+# and does not time out for a Wi-Fi device, hiding the row you would undo it
+# with. The transport still compiles; only the glass cannot reach it, which keeps
+# that switch behind a cable you have to actually have.
+check("no Link row -- one press must not be able to move a cordless board "
+      "onto Wi-Fi", "SR_LINK" not in rows)
+check("...and no dangling case for it in the row painter or the input handler",
+      not re.search(r"case SR_LINK\b", ino))
+check("...but the transport is still switchable over the cable",
+      re.search(r'strcasecmp\(a, "ble"\)', ino)
+      and re.search(r'strcasecmp\(a, "wifi"\)', ino))
+
+# NO SETUP-PORTAL ROW EITHER: there is no Wi-Fi anywhere on this menu.
+#
+# It existed for exactly one reason -- a factory-reset board with no cable had no
+# way to be given a token -- and BLE ENROLMENT replaced that reason outright. The
+# check is worth keeping in this order: removing the row BEFORE pairing existed
+# stranded a real board within minutes, so what makes it safe now is not taste,
+# it is that `E|?` is implemented and tested above.
+check("no setup-portal row -- pairing replaced the only reason it existed",
+      "SR_SETUP" not in rows and "SR_WIFI" not in rows)
+check("...and no row paints or opens one",
+      not re.search(r"case SR_(SETUP|WIFI)\b", ino)
+      and not re.search(r'label = "Wi-Fi setup";', ino))
+# What makes the removal safe, asserted rather than assumed.
+check("...because the device can be given a token over BLE instead",
+      re.search(r'if \(!strcmp\(line, "E\|\?"\)\)', fw_ble))
+check("...and the portal is still reachable where a mistake cannot reach it",
+      "net.startPortalNow();" in ino          # `Z` over USB
+      and re.search(r"digitalRead\(PIN_BTN_BOOT\) == LOW", ino))
+# GO MUST NOT ARM A WI-FI FLOW. Factory reset is confirmed with a long press of
+# GO and reboots at once, so GO was still down when setup() read the buttons:
+# every menu factory reset came back up in the Wi-Fi setup portal, on a BLE
+# device, reliably. Two independent fixes, because either alone leaves a trap.
+check("a held GO cannot raise the setup portal at boot",
+      not re.search(r"digitalRead\(PIN_BTN_GO\) == LOW\)",
+                    re.search(r"bool forcePortal = .*?;", ino, re.S).group(0)))
+check("...and a reboot waits for the button that asked for it to come up",
+      re.search(r"static void rebootAfterRelease\(\)", ino)
+      and not re.search(r"cfg\.factoryResetAll\(\);\s*\n\s*ESP\.restart", ino))
+# Pinned as a SUBTRACTION, because that is the rollover-safe form. The first
+# version of this check pinned `millis() < until`, which is the bug -- the test
+# would have defended it.
+check("...bounded, so a stuck button cannot block a decided reboot",
+      re.search(r"\(millis\(\) - began\) < RELEASE_WAIT_MS", ino))
+# And the radio is OFF on a build that will never use it -- said plainly in the
+# firmware as "certainty, not the reason the battery lasts".
+check("a BLE build powers the Wi-Fi radio down explicitly",
+      "net.radioOff();" in ino
+      and re.search(r"void radioOff\(\) \{\s*\n\s*WiFi\.mode\(WIFI_OFF\);",
+                    netcfg))
 check('the row is labelled "BLE gamepad"',
       re.search(r'case SR_PAD:\s*\n\s*label = "BLE gamepad";', ino))
 check('no row is labelled "Game controller" any more',
@@ -398,7 +563,8 @@ check("boot restores the gamepad", re.search(
 # silently unreachable over the cable -- the exact bug X| once was.
 # test_controller_mode.py asserts the two sets are disjoint; this asserts the
 # new verb landed on the right side of that line.
-def case_labels(src, signature):
+def fn_body(src, signature):
+    """The braced body of one function, so a check cannot match the whole file."""
     start = src.index(signature)
     i = src.index("{", start)
     depth, j = 0, i
@@ -410,13 +576,259 @@ def case_labels(src, signature):
             if depth == 0:
                 break
         j += 1
-    return set(re.findall(r"case\s+'(.)'\s*:", src[i:j]))
+    return src[i:j]
+
+
+def case_labels(src, signature):
+    return set(re.findall(r"case\s+'(.)'\s*:", fn_body(src, signature)))
 
 
 proto = case_labels(ino, "static void handleLine(char *line)")
 config = case_labels(ino, "static bool handleConfigLine(char *line)")
 check("I| is a config-console verb", "I" in config)
 check("...and is not claimed by the protocol as well", "I" not in proto)
+
+# --------------------------------------------------------------------------- #
+# 4. A factory-reset device can get itself a token.
+# --------------------------------------------------------------------------- #
+# Every check here stands for a state a device with EMPTY NVS was found in and
+# could not leave without a reflash. None of them is visible from either side of
+# the protocol -- a stranded device advertises nothing and says nothing -- so
+# there is no behavioural test that would catch a regression, only these.
+print("\n== a device with nothing in NVS can bootstrap itself ==")
+
+stored = fn_body(netcfg, "static MateTransport storedTransport()")
+# The portal outranks every screen in render() and blocks the menu, and it only
+# ever timed out on a device that had credentials to fall back to. So a
+# factory-reset device that defaulted to Wi-Fi was locked in the Wi-Fi portal,
+# with the Link row that would have got it out visible to nobody.
+check("nothing in NVS at all comes up on BLE, not in the Wi-Fi portal",
+      re.search(r"if \(!p\.begin\(NET_NS, true\)\) return LINK_BLE", stored))
+check("...and so does a wiped namespace with no SSID in it",
+      re.search(r"return haveSsid \? LINK_WIFI : LINK_BLE", stored))
+# The other half of that: an upgrade must not move a working device onto a
+# different radio behind its owner's back.
+check("...but a stored SSID still means Wi-Fi", 'p.getString("ssid"' in stored)
+check("...and an explicit setting outranks both",
+      re.search(r"if \(v == LINK_BLE\)\s+return LINK_BLE;", stored)
+      and re.search(r"if \(v == LINK_WIFI\) return LINK_WIFI;", stored))
+
+# The two ways a token reaches a device that is ALREADY advertising. Both were
+# broken, both in the same way -- the secret landed in NVS and the running stack
+# never heard about it -- and both present as the daemon rejecting a token that
+# is right.
+check("T| over USB hands the token to the live BLE stack, not just to NVS",
+      re.search(r"net\.setToken\(a \+ 1\);.*?ble\.setToken\(a \+ 1\);",
+                fn_body(ino, "static bool handleConfigLine(char *line)"), re.S))
+check("...and so does the portal, whose page handler cannot reach the stack",
+      re.search(r"if \(_state != OFF\) \{ setToken\(token\); return true; \}",
+                fw_ble))
+# ...and the portal has to ACCEPT a token on its own to be that route at all. It
+# used to 400 on a blank network box, which on a BLE device -- where the page is
+# only ever visited for the token -- left "type a fake network name" as the way
+# through, and a <select> that always submits something silently stored whichever
+# network topped the scan.
+save = fn_body(netcfg, "void serveSave()")
+check("...and the portal saves a token with no network at all",
+      re.search(r"if \(ssid\.isEmpty\(\) && token\.isEmpty\(\) && !clearing\)",
+                save)
+      and re.search(r"if \(!ssid\.isEmpty\(\)\) setWifi\(ssid, pass\);", save))
+check("...and offers 'none' to a device that has another link",
+      re.search(r"if \(_fallbackLink\)\s*\n\s*html \+= F\(\"<option value=''>",
+                fn_body(netcfg, "void serveForm()")))
+
+# A BLE device stores Wi-Fi credentials for later; it must not ASSOCIATE on them.
+# Both radios up at once is the contention one-transport-at-a-time exists to
+# prevent, and net.restart() on a BLE build with an SSID stored does exactly it.
+check("no config verb restarts Wi-Fi without checking it is the live transport",
+      not re.search(r"^\s*net\.restart\(\);",
+                    fn_body(ino, "static bool handleConfigLine(char *line)"),
+                    re.M))
+
+# The escape hatch has to be an escape hatch in both directions: BOOT held at
+# power-on on a cordless BLE board opens a Wi-Fi portal it can never fill in.
+check("a device with another link says so, so the portal is allowed to expire",
+      "net.setFallbackLink(transport == LINK_BLE);" in ino)
+check("...and the portal timeout honours it",
+      re.search(r"if \(\(configured\(\) \|\| _fallbackLink\) &&",
+                netcfg))
+check("...and expiring with no SSID powers the radio down rather than "
+      "dialling an empty one",
+      re.search(r"\} else \{\s*\n\s*note\(\"setup timed out\"\);\s*\n\s*"
+                r"shutdown\(\);", fn_body(netcfg, "void pollPortal()")))
+# ...which strands the device unless the sketch notices SETUP ending and starts
+# the transport the Link row claims this device is on.
+check("...and the sketch hands the glass back to BLE afterwards",
+      re.search(r"transport == LINK_BLE && lastNetState == MateNet::SETUP.*?"
+                r"net\.shutdown\(\);\s*\n\s*ble\.begin\(", ino, re.S))
+
+# Last: the screens a fresh board actually shows. A device with no token that
+# says "check the daemon is running with --ble" sends you to read the wrong log.
+check("the BLE status line names the missing token first",
+      re.search(r"case ADVERTISING: return _token\.isEmpty\(\)", fw_ble))
+check("...and so does the NO LINK screen",
+      re.search(r"gfx->print\(!net\.hasToken\(\)", ino))
+# Matched against the note() STRING, not the file: the comments around these
+# lines quote the wording they replaced, and a check that reads comments would
+# pass or fail on prose.
+check("...and the NOTOKEN answer names neither a cable nor a portal, which a "
+      "cordless board may have neither of",
+      not re.search(r'note\("[^"]*setup portal', fw_ble)
+      and not re.search(r'note\("[^"]*over USB', fw_ble))
+# The three no-token strings a person can actually see, all pointing at the same
+# place. They drifted once already -- the glass said "over USB" while the only
+# on-glass route had been deleted -- so they are pinned together.
+# --------------------------------------------------------------------------- #
+# The other half of the pairing contract, which lives in C++ and cannot be
+# driven from here. The daemon's side is exercised above against a fake device;
+# these check the real device would answer it the same way.
+print("\n== the firmware's half of the pairing handshake ==")
+
+check("the device answers E|? rather than ignoring it",
+      re.search(r'if \(!strcmp\(line, "E\|\?"\)\)', fw_ble))
+# THE ONE THAT MADE PAIRING IMPOSSIBLE, and that neither end could see: the
+# device answered A|NOTOKEN and hung up in the same breath, so E|? always
+# arrived at a connection that had already gone. The daemon logged that it had
+# asked; the firmware never saw a byte. "I have no token" is precisely the
+# moment to stay on the line -- it is when someone may be about to give you one.
+# Scoped to the answer itself -- from the A|NOTOKEN notify to the return that
+# ends that branch -- rather than to a brace-matched block, which silently ran
+# past its own closing brace and swallowed the code after it.
+# Matching the ASSIGNMENT, not the word: the comment right there explains what
+# used to be on that line, and a check that reads comments fails on prose. Third
+# time this file has been caught by that, hence the note.
+notok = re.search(r'notifyLine\("A\|NOTOKEN"\);(.*?)return;', fw_ble, re.S)
+check("...and stays connected after saying it has no token",
+      notok and not re.search(r"_pendingDisconnect\s*=\s*true", notok.group(1)))
+check("...refuses to be re-enrolled once it HAS a token",
+      re.search(r'if \(!_token\.isEmpty\(\)\) \{ notifyLine\("E\|NO"\); return; \}',
+                fw_ble))
+# The one that matters: without it, "no token yet" is itself permission and a
+# freshly reset board belongs to whoever is in radio range first.
+check("...and takes a token ONLY against an approval a human just gave",
+      re.search(r"if \(!_pairOk \|\| !_token\.isEmpty\(\)", fw_ble))
+# An EMPTY payload is not a token. Without this, a bare `E|` spent the one-shot
+# approval, stored "" as the live token and reported E|SET and "paired" -- and on
+# the path where the portal had just written a real token to NVS while this stack
+# still held none, it wiped it.
+check("...and an empty E| is not one",
+      re.search(r"\|\| line\[2\] == 0", fw_ble))
+# Every other assignment in the file clears it; exactly one grants it, and that
+# one is the human's answer. Written as "count the grants" rather than "count the
+# assignments" so that adding another place that CLEARS approval -- which is
+# always safe -- does not fail a test about who may give it.
+# Counting the GRANTS, not the assignments: adding another place that clears
+# approval is always safe, and a negative lookahead here would be defeated by
+# backtracking over the whitespace anyway (`\s*` can match nothing, and " false"
+# does not start with "false").
+check("...where that approval is granted in exactly one place, pairAnswer()",
+      [v for v in re.findall(r"_pairOk\s*=\s*(\w+)", fw_ble) if v != "false"]
+      == ["yes"]
+      and re.search(r"void pairAnswer\(bool yes\) \{\s*\n\s*_pairAsk = false;"
+                    r"\s*\n\s*_pairOk = yes;", fw_ble))
+check("...is single-use", re.search(r"_pairOk = false;\s+// single use", fw_ble))
+check("...and does not survive the connection it was given in",
+      re.search(r"void reAdvertise\(\) \{.*?_pairOk = false;", fw_ble, re.S))
+check("the sketch puts the question on the glass",
+      "drawPairAsk()" in ino and "PAIR THIS DEVICE?" in ino)
+# ...and says which BUTTON, in the biggest type on the screen. Someone looking up
+# at this having just run a command does not need the situation described, they
+# need to know what to press.
+check("...naming the button rather than describing the situation",
+      re.search(r'gfx->print\("GO = ACCEPT"\);', ino))
+# A RECEIPT ON THE DEVICE. Without it the screen snapped straight back to the
+# conductor view and the only evidence was on the Mac -- reported as "paired but
+# it is not obvious", which for a security decision made with a button press on
+# this device is a fair complaint.
+check("...and a confirmation afterwards, where the button was pressed",
+      "drawPairedOk()" in ino and re.search(r'"PAIRED"', ino))
+check("...which dismisses itself, so it is a receipt and not a mode",
+      re.search(r"pairedNoticeMs && \(now - pairedNoticeMs\) >= "
+                r"PAIRED_NOTICE_MS", ino))
+check("...and any button clears it early",
+      re.search(r"if \(pairedNoticeMs\) \{\s*\n\s*pairedNoticeMs = 0;", ino))
+check("...stamped from `now`, like every other deadline in this loop",
+      re.search(r"pairedNoticeMs = now \? now : 1UL;", ino))
+check("...answers it with a button, GO for yes",
+      re.search(r"if \(ev == 'G' \|\| ev == 'K'\) answerPairing\(true\);", ino))
+check("...and lets it expire rather than standing open",
+      re.search(r"else if \(\(now - pairAskedMs\) >= PAIR_ASK_MS\) "
+                r"answerPairing\(false\);", ino))
+check("...and takes it down when the peer that asked goes away",
+      re.search(r"if \(!ble\.pairRequested\(\)\) \{ pairAskedMs = 0;", ino))
+# Stamped from `now`, which was read at the top of this loop pass. A fresh
+# millis() here is a few microseconds LATER, the unsigned `now - pairAskedMs`
+# underflows to ~4.29e9, and the prompt answers itself with "no" in the same
+# pass that raised it. Same family as the `| 1` sentinel bugs elsewhere.
+check("...and the countdown cannot start in the future",
+      re.search(r"pairAskedMs = now \? now : 1UL;", ino))
+# THE BUG THE HOST TESTS COULD NOT SEE. The fake device has no handshake
+# timeout; the real one hung up 5 s into a 45 s question, ~40 s before anyone
+# could have answered it, and the first pairing attempt on hardware therefore
+# got no reply at all. A handshake is a machine waiting, a pairing question is a
+# person walking over, and one budget cannot serve both.
+pair_to = re.search(r"#define BLE_PAIR_TIMEOUT\s+(\d+)", fw_ble)
+ask_ms = re.search(r"#define PAIR_ASK_MS (\d+)", ino)
+check("the link does not hang up while a human is being asked",
+      re.search(r"unsigned long budget = _pairAsk \? BLE_PAIR_TIMEOUT "
+                r": BLE_AUTH_TIMEOUT;", fw_ble))
+check("...with a window that outlasts the one the glass offers",
+      pair_to and ask_ms and int(pair_to.group(1)) > int(ask_ms.group(1)))
+check("a granted token reaches NVS, not just the live stack",
+      re.search(r"ble\.takeGrantedToken\(granted\)\) \{\s*\n\s*net\.setToken\(granted\);",
+                ino))
+
+# --------------------------------------------------------------------------- #
+print("\n== the gamepad and the link never fight for the controller ==")
+# One stack, one controller, and no init after a deinit in the same boot. setup()
+# used to bring the LINK up and then tear it down for the pad three lines later,
+# which meant the pad could never start on a BLE board in any boot -- and failing
+# took the link with it, so flipping the switch rebooted the device and came back
+# with the switch off.
+check("boot does not start the link when the gamepad is on",
+      re.search(r"if \(!cfg\.pad\(\)\) ble\.begin\(DEVICE_BLE_NAME", ino))
+check("...and turning it ON at runtime reboots on BLE, as turning it off does",
+      re.search(r'if \(transport == LINK_BLE\) restartWithNotice\("GAMEPAD ON"',
+                ino))
+check("...so the switch is durable before either reboot",
+      re.search(r"cfg\.setPad\(on\);", ino)
+      and re.search(r"cfg\.setPad\(false\);\s*\n\s*if \(transport == LINK_BLE\)",
+                    ino))
+
+print("\n== the PAIR? prompt is answerable wherever it is drawn ==")
+# It is drawn OVER the game, and both nav pollers used to return before any edge
+# detection in UI_GAME -- so GO started a run behind the prompt and the firmware
+# auto-refused 45 s later. The 4th button never reached onButton() at all, which
+# made "any other button = refuse" simply untrue.
+check("the game does not swallow the buttons while a question is up",
+      len(re.findall(r"if \(uiMode == UI_GAME && !pairAskedMs\)", ino)) == 2)
+check("...and the 4th button answers it rather than changing screens",
+      re.search(r"static bool pairPromptTookPress\(\)", ino)
+      and len(re.findall(r"pairPromptTookPress\(\)\) return;", ino)) == 2)
+
+print("\n== the two ends of a pairing wait are ordered ==")
+# The device answers for its human at 45 s, drops the link at 60 s, and the
+# daemon gives up at 65 s. Ordered the other way (50 s daemon vs 45 s device) the
+# daemon's "nobody pressed GO" branch was unreachable for its own case and every
+# unanswered offer was reported as though somebody had refused.
+ask = int(re.search(r"#define PAIR_ASK_MS (\d+)", ino).group(1))
+drop = int(re.search(r"#define BLE_PAIR_TIMEOUT\s+(\d+)", fw_ble).group(1))
+give_up = float(re.search(r"^BLE_PAIR_CONFIRM_S = ([\d.]+)", py_ble, re.M).group(1))
+check(f"device answers ({ask/1000:.0f}s) before it drops the link ({drop/1000:.0f}s)",
+      ask < drop)
+check(f"...and the daemon waits ({give_up:.0f}s) longer than both",
+      give_up > drop / 1000.0)
+
+print("\n== the no-token guidance still agrees with itself ==")
+# These have drifted twice: once when the glass said "over USB" after the only
+# on-glass route had been deleted, and once when the daemon learned to pair while
+# both screens went on naming the long way round. Pinned together since.
+check("every no-token message names the same route",
+      re.search(r'\? "no token: claude-mate-connect"', fw_ble)
+      and re.search(r'\? "no token: claude-mate-connect"', ino)
+      and re.search(r'note\("no token - claude-mate-connect"\)', fw_ble)
+      and "claude-mate-connect --pair" in read(
+          os.path.join(DAEMON_DIR, "blelink.py")))
 
 print(f"\n{checks - len(failures)}/{checks} checks passed")
 if failures:

@@ -227,6 +227,10 @@ class MateNet {
   }
   void setToken(const String &token) { _token = token; save("token", _token); }
 
+  // "There is another transport that works, so this portal is not the only way
+  // out of here." Set by the sketch, because only the sketch knows.
+  void setFallbackLink(bool has) { _fallbackLink = has; }
+
   // The shared secret, for the transport that is not this one. Both radios
   // authenticate the same way against the same token, so there is exactly one
   // to provision and exactly one to get wrong.
@@ -246,15 +250,53 @@ class MateNet {
     WiFi.persistent(false);
   }
 
+  // Put the Wi-Fi radio down and leave it down, for a build that is never going
+  // to use it.
+  //
+  // BE HONEST ABOUT WHAT THIS SAVES. Nothing here starts the Wi-Fi driver on a
+  // BLE build -- loadConfigOnly() only reads NVS and sets a flag -- so on a
+  // clean boot this is close to a no-op, and it is NOT the reason the battery
+  // lasts (the backlight is, by an order of magnitude; see the hibernate note).
+  // What it buys is certainty and one less thing to reason about: the radio is
+  // off because something turned it off, not because we believe nobody turned
+  // it on. It also matters on the path that HAS started it -- a BOOT-held
+  // portal that timed out, or a transport switched at runtime -- where the
+  // driver is genuinely up and holding the shared 2.4 GHz radio that BLE wants.
+  void radioOff() {
+    WiFi.mode(WIFI_OFF);
+    _state = OFF;
+  }
+
   // ---- transport selection -------------------------------------------------
   // Static, because they are read in setup() BEFORE anything decides whether
   // this instance is going to be started at all.
+  // AN UNPROVISIONED DEVICE DEFAULTS TO BLE, and that is a bootstrap fix, not a
+  // preference.
+  //
+  // A factory reset wipes this namespace: no SSID, no token, and no stored
+  // transport. Defaulting that to Wi-Fi meant begin() found no SSID and opened
+  // the setup portal -- which outranks every screen in render(), blocks the menu
+  // in fourthDoubleTap(), and only ever times out on a device that HAS
+  // credentials to fall back to. A factory-reset device was therefore locked in
+  // the Wi-Fi portal permanently, with SETTINGS -> Link visible to nobody. You
+  // could not choose BLE because choosing anything required getting past a
+  // screen that existed only to configure Wi-Fi.
+  //
+  // So: if there is nothing to join, come up on the radio that needs nothing to
+  // join. If an SSID IS stored, this device was provisioned for Wi-Fi by someone
+  // and keeps behaving as it always did -- an upgrade must never move a working
+  // device onto a different radio behind its owner's back. An explicit setting
+  // always wins over both.
   static MateTransport storedTransport() {
     Preferences p;
-    uint8_t v = LINK_WIFI;
-    if (p.begin(NET_NS, true)) { v = p.getUChar("link", LINK_WIFI); p.end(); }
-    return v == LINK_BLE ? LINK_BLE : LINK_WIFI;   // a value from a future
-  }                                                // build reads as Wi-Fi
+    if (!p.begin(NET_NS, true)) return LINK_BLE;   // nothing written ever
+    uint8_t v = p.getUChar("link", 0xFF);          // 0xFF = never set
+    bool haveSsid = !p.getString("ssid", "").isEmpty();
+    p.end();
+    if (v == LINK_BLE)  return LINK_BLE;
+    if (v == LINK_WIFI) return LINK_WIFI;
+    return haveSsid ? LINK_WIFI : LINK_BLE;        // a value from a future
+  }                                                // build falls here too
   static void storeTransport(MateTransport t) {
     Preferences p;
     if (p.begin(NET_NS, false)) { p.putUChar("link", (uint8_t)t); p.end(); }
@@ -302,8 +344,35 @@ class MateNet {
   // Restart the link from the top (after a config change).
   void restart() {
     _client.stop();
+    // NOTHING TO JOIN MEANS THE PORTAL, not silence -- the same rule begin()
+    // follows, and it has to be the same or the two disagree about what an
+    // unprovisioned device does.
+    //
+    // This used to stop the portal, see no SSID and drop to OFF. An
+    // unprovisioned Wi-Fi device is a device sitting IN the portal, because
+    // that is where begin() put it, so any config write -- `T|<token>` typed at
+    // exactly the device that needs one -- tore down the only screen that could
+    // finish the job and left no link, no portal and no way back but a reboot.
+    // Found by doing it to a real board.
+    //
+    // Tested on _web rather than on SETUP because applyPendingConfig() calls
+    // stopPortal() before this and stopPortal() does not touch the state: the
+    // state is the intent, the pointer is whether a portal is actually being
+    // served. Getting that backwards leaves a SETUP screen advertising an AP
+    // that no longer exists.
+    if (_ssid.isEmpty()) {
+      // ...unless this device has a link that is not Wi-Fi. A BLE board that
+      // saved a token through the portal and no network -- the route this
+      // firmware added and advertises -- came straight back to a REGENERATED
+      // portal: _state never left SETUP, so the sketch's "SETUP ended, start
+      // BLE" handoff never fired, the phone was kicked off an AP whose password
+      // had changed, and resubmitting just repeated it. pollPortal() consults
+      // _fallbackLink for exactly this device; this path did not.
+      if (_fallbackLink) { stopPortal(); radioOff(); return; }
+      if (!_web) startPortal();
+      return;
+    }
     if (_state == SETUP) stopPortal();
-    if (_ssid.isEmpty()) { _state = OFF; return; }
     WiFi.disconnect();
     startJoin();
   }
@@ -381,6 +450,7 @@ class MateNet {
   char          _dropWhy[48] = {0};   // why the last connection attempt failed
   unsigned long _dropAt = 0;          // ...and when (0 = nothing has failed)
   unsigned long _portalTouched = 0;   // last portal page load, for the timeout
+  bool          _fallbackLink = false;  // see setFallbackLink()
   uint8_t       _fails = 0;           // consecutive dial/discover failures
   bool          _holdReconnect = false;  // UI is busy; do not block the loop
   char          _line[192];        // handshake line assembly
@@ -686,10 +756,29 @@ class MateNet {
     // way it will ever be configured. The clock is reset by every page load, so
     // a user who is mid-setup with the form open is never timed out from under
     // them -- only a portal nobody is looking at expires.
-    if (configured() && (millis() - _portalTouched) > NET_PORTAL_TIMEOUT) {
-      note("setup timed out - rejoining");
-      stopPortal();
-      startJoin();
+    // ...or a device that has a DIFFERENT link to fall back to. The original
+    // rule was "only time out if credentials are stored", because for an
+    // unprovisioned Wi-Fi device the portal is the only thing there is. A BLE
+    // device breaks that assumption: it has a working link and no need of this
+    // screen, so leaving the portal up forever would strand it exactly the way
+    // the rule was written to prevent.
+    if ((configured() || _fallbackLink) &&
+        (millis() - _portalTouched) > NET_PORTAL_TIMEOUT) {
+      // Two endings, because "rejoining" is only true when there is something to
+      // rejoin. The fallback-link device that lands here has no SSID at all: it
+      // is on BLE and got here by holding BOOT at power-on. startJoin() would
+      // hand WiFi.begin() an empty string, put the STA back up on the one radio
+      // the other transport wants, and leave a status line naming a network that
+      // does not exist. The radio goes OFF instead, and the sketch sees SETUP
+      // end and hands the glass back to BLE.
+      if (configured()) {
+        note("setup timed out - rejoining");
+        stopPortal();
+        startJoin();
+      } else {
+        note("setup timed out");
+        shutdown();
+      }
     }
   }
 
@@ -727,15 +816,26 @@ class MateNet {
           "background:#35c4f0;color:#06212b;font-size:16px;font-weight:600}"
           "small{color:#6b7280;display:block;margin-top:6px;font-size:12px}"
           "</style><h1>Claude Mate</h1><p>Point this companion at your daemon.</p>"
-          "<form method=POST action=/save>"
-          "<label>Network</label>");
+          "<form method=POST action=/save>");
+    // Say so when the network is optional. On a device whose link is BLE this
+    // page is only ever visited for the token, and a required-looking field it
+    // will never use is how you end up typing a fake network name.
+    html += _fallbackLink
+                ? F("<label>Network <em>(optional - this device is on BLE)</em></label>")
+                : F("<label>Network</label>");
     if (manual) {
       html += F("<input name=ssid autocomplete=off placeholder='type the network name'>"
                 "<small>No networks were seen in this scan. Type the name - it may "
                 "be hidden, or on 5 GHz, which this radio cannot see. Reload to "
                 "scan again.</small>");
     } else {
-      html += "<select name=ssid>" + opts + "</select>";
+      // ...and give the dropdown a way to say "none", first and selected. A
+      // <select> always submits something, so without this a BLE user setting a
+      // token would silently store whichever network happened to top the scan.
+      html += "<select name=ssid>";
+      if (_fallbackLink)
+        html += F("<option value=''>(none - leave the Wi-Fi config alone)</option>");
+      html += opts + "</select>";
     }
     html += F(
               "<label>Password</label><input name=pass type=password autocomplete=off>"
@@ -758,10 +858,18 @@ class MateNet {
                 "Or read it with<br><code>cat ~/.config/claude-mate/token</code>"
                 "</small>");
     }
-    html += F("<label>Daemon host <em>(optional)</em></label><input name=host placeholder='found automatically'>"
-              "<small>Leave empty to discover it over mDNS.</small>"
-              "<label>Port</label><input name=port value='8787'>"
-              "<button type=submit>Save &amp; connect</button></form>");
+    // PREFILLED FROM WHAT IS STORED, both of them. A form that shows blanks for
+    // fields it is about to overwrite is a form that erases whatever you do not
+    // retype -- and the commonest visit here re-enters one field and leaves the
+    // rest alone. The token box is the exception and says so, because a secret
+    // should not be echoed back into a page.
+    html += F("<label>Daemon host <em>(optional)</em></label><input name=host "
+              "placeholder='found automatically' value='");
+    html += _host;
+    html += F("'><small>Leave empty to discover it over mDNS.</small>"
+              "<label>Port</label><input name=port value='");
+    html += String(_port);
+    html += F("'><button type=submit>Save &amp; connect</button></form>");
     _web->send(200, "text/html", html);
   }
 
@@ -772,8 +880,18 @@ class MateNet {
     String token = _web->arg("token");
     String host  = _web->arg("host");
     uint16_t port = (uint16_t)_web->arg("port").toInt();
-    if (ssid.isEmpty()) { _web->send(400, "text/plain", "network required"); return; }
-    setWifi(ssid, pass);
+    // "Network required" is only true when the network is what you came for. On
+    // a device whose link is BLE this page is a TOKEN form and nothing else --
+    // there is no Wi-Fi anywhere in that device's path -- and rejecting an
+    // otherwise complete submission over the one field it will never use made
+    // the no-cable route a 400, leaving "type a fake network name" as the way
+    // through. Refuse only a submission that would save nothing at all.
+    bool clearing = _web->arg("cleartoken") == "1";
+    if (ssid.isEmpty() && token.isEmpty() && !clearing) {
+      _web->send(400, "text/plain", "fill in a network, a token, or both");
+      return;
+    }
+    if (!ssid.isEmpty()) setWifi(ssid, pass);
     // AN EMPTY TOKEN BOX MEANS "KEEP THE ONE I HAVE", NOT "ERASE IT".
     //
     // This used to write unconditionally, and it was the single worst bug in
@@ -786,8 +904,15 @@ class MateNet {
     //
     // Clearing a token is still possible, deliberately and explicitly, via the
     // checkbox or `X|WIPE` over serial.
-    if (_web->arg("cleartoken") == "1") setToken("");
-    else if (!token.isEmpty())          setToken(token);
+    if (clearing)              setToken("");
+    else if (!token.isEmpty()) setToken(token);
+    // Safe to write unconditionally ONLY because the form now round-trips both
+    // fields -- see serveForm(). It did not: the host input had no prefill and
+    // the port input carried a literal 8787, so a visit that only re-entered a
+    // token (the expected visit on a BLE device, now that an empty network box
+    // is no longer a 400) submitted an empty host and the default port. That
+    // silently erased an explicitly configured daemon address and dropped the
+    // device back to the mDNS discovery it had been configured to avoid.
     setDaemon(host, port);
     _web->send(200, "text/html",
                F("<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"

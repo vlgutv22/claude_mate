@@ -129,7 +129,7 @@ For end-to-end setup including the hooks, follow
 ### Python (daemon)
 
 - **Python 3.9+ only.** Do not use syntax newer than 3.9.
-- **The only allowed third-party dependency is `pyserial`.** Everything else
+- **Third-party dependencies are `pyserial` (the USB link) and, for the BLE transport, `bleak`. Both are imported so that their absence degrades one transport rather than failing the daemon; anything beyond them needs an argument in the PR.** Everything else
   must come from the standard library.
 - Keep it clean, commented, and runnable with
   `python3 daemon/claude_mate_daemon.py`.

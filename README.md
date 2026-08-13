@@ -86,6 +86,8 @@ session you have open — in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
 
 ## Contents
 
+- **[Install & use](#install--use)** — one command, then every CLI command
+- **[The manual, 0 → hero](docs/USING.md)** — daemon, CLI and device in one page
 - [What it is](#what-it-is)
 - [The terminal mirror (ESP32-S3)](#the-terminal-mirror-esp32-s3)
 - [Two ways to feed it](#two-ways-to-feed-it)
@@ -103,6 +105,75 @@ session you have open — in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
 
 ---
 
+## Install & use
+
+**Install — one command.**
+
+```sh
+git clone https://github.com/vlgutv22/claude_mate.git && cd claude_mate
+./install/install.sh --yes
+```
+
+It installs the Claude Code status hook, merges the hooks block into
+`~/.claude/settings.json` (backing it up first), installs and **starts the
+LaunchAgent** so the daemon runs at login, installs `pyserial` + `bleak`, and
+puts the three commands below on your `PATH`. Idempotent — re-run it after a
+`git pull`. Drop `--yes` and it asks before editing `settings.json`, its only
+question.
+
+**Then point `claude` at the wrapper** — this is what puts model, effort, account
+and remaining limit on the screen:
+
+```sh
+echo 'alias claude="'"$PWD"'/bin/claude-mate-wrap"' >> ~/.zshrc && exec zsh
+```
+
+**No hardware needed.** `claude-mate` in a terminal is the same interface as the
+device:
+
+```sh
+claude-mate watch
+```
+```
+   0  aladdin      idle      6:54  work 2  5h94%
+   1  api-server   waiting   0:42  Opus 5  xhigh  work   <-- needs you
+ > 2  claude_mate  working   6:55  xhigh  default  5h97%
+```
+
+### Every command
+
+| Command | Device button | What it does |
+|---|---|---|
+| `claude-mate` | — | print the queue and exit |
+| `claude-mate watch` | — | reprint it every second until Ctrl-C |
+| `claude-mate next` / `prev` | NEXT / PREV | step the selection (or scroll the mirror) |
+| `claude-mate go` | GO | acknowledge **and raise that session's terminal** |
+| `claude-mate ack` | GO, held | acknowledge only — leave your windows alone |
+| `claude-mate follow` | ACK, held | toggle FOLLOW: `next`/`prev` then also raise |
+| `claude-mate mirror` | 4th, tapped | toggle the live terminal mirror on the device |
+| `claude-mate continue` | — | type `continue` into that session |
+| `claude-mate new-terminal` | — | open a terminal in that session's directory |
+| `claude-mate select <n\|name>` | *(none)* | point at a row instead of stepping to it |
+| `claude-mate accounts` | — | the saved logins |
+| `claude-mate accounts rm <n\|name>` | — | delete one, after typing its name back |
+
+Two more commands beside it:
+
+| | |
+|---|---|
+| `claude-mate-connect` | every link with a verdict, and the shortest fix for whichever is down. `--pair` enrols a cordless device over BLE |
+| `claude-mate-switch` | carry this terminal's conversation to another account, with remaining limits |
+
+**It presses the same buttons.** `claude-mate go` sends `press|G`, which the
+daemon hands to the *same* handler that receives `B|G` from the device — so GO
+means one thing here, and there is no second implementation to drift.
+
+📖 **[docs/USING.md](docs/USING.md) is the full manual**, 0 → hero: the daemon,
+every command above in detail, every button and screen on the device, how to
+connect one, and a symptom → cause table for when something is wrong.
+
+---
+
 ## What it is
 
 **Claude Mate** is a small desk companion paired with a lightweight Python
@@ -112,7 +183,7 @@ daemon on your Mac. Build it either way — or both, at the same time:
 |---|---|---|
 | Board | Arduino Nano (ATmega328P) | Waveshare ESP32-S3-LCD-1.47**B** |
 | Display | 0.91" 128×32 mono OLED (SSD1306) | 1.47" 172×320 colour IPS (ST7789) |
-| Transport | USB serial | **Wi-Fi (TCP)**, USB as fallback |
+| Transport | USB serial | **BLE** or **Wi-Fi (TCP)**, USB as fallback |
 | Buttons | 3 — PREV / GO / NEXT | 4 — + **MENU** (Kailh Choc low-profile) |
 | Alert light | one LED, rhythm only | WS2812, rhythm **+ colour** |
 | Power | USB | USB **or** a 14500 cell, with a gauge |
@@ -255,8 +326,9 @@ hooks are the zero-dependency feed. Use whichever fits each session.
 - **Cordless, on a cell** — Wi-Fi (TCP) instead of USB, discovered over mDNS
   and authenticated with a nonce/HMAC handshake in which the token never
   crosses the wire. Wi-Fi credentials, daemon address and token live in **NVS**,
-  a separate partition, so they **survive a reflash**; an unprovisioned board
-  raises a setup portal you join from a phone.
+  a separate partition, so they **survive a reflash**. An unprovisioned board
+  comes up on BLE and asks for a token over the cable; hold **BOOT** at power-on
+  for a Wi-Fi setup portal you join from a phone.
 - **Colour as a second channel** — the WS2812 plays the same rhythm *and* the
   alert class's colour, and every fleet letter is drawn in its own state colour.
   The colours differ in **brightness** as well as hue, so they stay distinct for
@@ -272,12 +344,19 @@ hooks are the zero-dependency feed. Use whichever fits each session.
 - **A live terminal mirror** — see [above](#the-terminal-mirror-esp32-s3).
 - **An on-device menu** — double-tap the 4th button. Four items: the triage view,
   SETTINGS, SHIP IT and long sleep. Settings holds the rest — a **BLE gamepad**
-  switch, a **Link** row that moves the daemon between Wi-Fi and Bluetooth, screen
-  sleep, brightness, alert-LED level including a genuine *off*, Mac sound, flip,
-  the Wi-Fi setup portal, an About readout, and
-  factory reset. About and Wi-Fi live there rather than on the top strip because
-  neither is a place you go: one is something you read, the other something you
-  set. Entirely **firmware-local**: while it is up PREV/GO/NEXT are handled on
+  switch, screen sleep, brightness, alert-LED level including a genuine *off*,
+  Mac sound, flip, an About readout, and factory reset. **Nothing to do with
+  Wi-Fi is on it at all** — not the radio switch, not the setup portal. Pairing
+  a cordless board is `claude-mate-connect --pair` plus one press of GO, so the
+  portal stopped being the only way in and stopped earning a row. **On the radio
+  switch specifically:** one
+  press used to be enough to move a cordless board onto Wi-Fi, and a board with
+  no credentials then reboots into a portal that outranks the menu — hiding the
+  row you would use to undo it. `I|WIFI` / `I|BLE` over USB still do it, which
+  puts that switch behind a cable you have to actually have. About lives here
+  rather than on the top strip because it is not a place you go: it is something
+  you read. Entirely
+  **firmware-local**: while it is up PREV/GO/NEXT are handled on
   the device and never emitted, so the queue cannot move while you are aiming at
   a settings row — and there is **no protocol change and no daemon change** for
   any of it.
@@ -510,6 +589,44 @@ More build photos are in [`assets/photos/`](assets/photos/).
 
 ## Quick start
 
+**One command.** Clone it and run the installer:
+
+```sh
+git clone https://github.com/vlgutv22/claude_mate.git && cd claude_mate
+./install/install.sh --yes
+```
+
+That installs the status hook, merges the hooks block into
+`~/.claude/settings.json` (backing it up first), installs and **starts the
+LaunchAgent** so the daemon runs at login, and puts `claude-mate`,
+`claude-mate-connect` and `claude-mate-switch` on your `PATH`. Drop `--yes` and it
+asks before touching `settings.json` — that is the only question it has. Re-run it
+any time; it is idempotent.
+
+Then point `claude` at the PTY wrapper, which is what puts model, effort, account
+and remaining limit on the screen:
+
+```sh
+echo 'alias claude="'"$PWD"'/bin/claude-mate-wrap"' >> ~/.zshrc && exec zsh
+```
+
+Check it with `claude-mate` (your sessions) and `claude-mate-connect` (every
+link, with a verdict). **No hardware needed to try it** — `claude-mate` is the
+same interface as the device:
+
+```sh
+claude-mate watch
+```
+
+📖 **[docs/USING.md](docs/USING.md) is the manual** — the daemon, every CLI
+command, every button and screen on the device, and what to do when something is
+wrong. The rest of this section is the manual way, and what to flash.
+
+---
+
+<details>
+<summary><b>The manual way, and flashing a device</b></summary>
+
 1. **Build & flash the firmware** — pick your device (or do both; they coexist):
 
    - **Arduino Nano** (`firmware/claude_mate/claude_mate.ino`). Install
@@ -527,8 +644,10 @@ More build photos are in [`assets/photos/`](assets/photos/).
      ```sh
      ./firmware/flash_s3.sh
      ```
-     On first boot an unprovisioned board raises a Wi-Fi setup portal
-     (`Claude-Mate-XXXX`); join it from a phone and point it at your Mac.
+     On first boot an unprovisioned board comes up on **BLE** with no token —
+     and with the daemon running you do nothing: it hands its token to any
+     device that appears on the cable. Cordless, pair it in one command:
+     `claude-mate-connect --pair`, then press **GO** on the device.
 2. **Run the daemon** on your Mac:
    ```sh
    python3 daemon/claude_mate_daemon.py
@@ -548,7 +667,7 @@ More build photos are in [`assets/photos/`](assets/photos/).
    this desk**; BLE is right when it **is**, and lets the device advertise in
    200 ms bursts four seconds apart instead of holding an association open all
    day for a device that has almost nothing to say. Pick one on the device at
-   **SETTINGS → Link** — it has a single 2.4 GHz radio, so it is never both. See
+   `I|BLE` over USB — it has a single 2.4 GHz radio, so it is never both. See
    [docs/POWER.md](docs/POWER.md).
    Add `--sound` to also play a macOS alert sound when the worst unacknowledged
    alert class changes. The device has no speaker of its own — the ESP32-S3 has
@@ -565,8 +684,11 @@ More build photos are in [`assets/photos/`](assets/photos/).
      (`claude -p …`, pipes, CI) execs the real binary, and it locates the real
      `claude` even when every `claude` on `PATH` is your own shim.
 
+</details>
+
 Step-by-step guides:
 
+- 📖 **The manual — daemon, CLI and device** — [docs/USING.md](docs/USING.md)
 - 📦 **Install** — [docs/INSTALL.md](docs/INSTALL.md)
 - 🔌 **Wiring (Nano)** — [docs/WIRING.md](docs/WIRING.md)
 - 📶 **Both firmwares, flashing & provisioning** — [firmware/README.md](firmware/README.md)
@@ -588,8 +710,9 @@ Step-by-step guides:
 | `CLAUDE_MATE_TCP_BIND` | `0.0.0.0`     | Bind address — a remote device needs a routable one; `127.0.0.1` keeps it on this machine |
 | `CLAUDE_MATE_BLE`   | off              | `1` also serves the protocol over **Bluetooth LE** for the battery build (same as `--ble`). Needs the optional `bleak` package; without it the daemon says so and carries on |
 | `CLAUDE_MATE_BLE_ADDRESS` | scan       | Connect to this BLE address instead of scanning for the service. macOS reports its own per-host UUIDs, not MAC addresses — use the string `bleak` printed |
-| `CLAUDE_MATE_TOKEN` / `_TOKEN_FILE` | `~/.config/claude-mate/token` | Shared secret wireless devices authenticate with — **the same one on both radios**. `--tcp`/`--ble` **generate one** (0600) and print it if none exists — type that into the device's setup portal. Either transport still refuses to start if a token can neither be read nor created |
+| `CLAUDE_MATE_TOKEN` / `_TOKEN_FILE` | `~/.config/claude-mate/token` | Shared secret wireless devices authenticate with — **the same one on both radios**. `--tcp`/`--ble` **generate one** (0600) and print it if none exists — send that to the device as `T\|<token>` over USB, or type it into the setup portal. Either transport still refuses to start if a token can neither be read nor created |
 | `CLAUDE_MATE_SOUND`  | off              | `1` plays a macOS alert sound when the worst unacknowledged alert class changes (same as `--sound`) |
+| `CLAUDE_MATE_NO_USB_PROVISION` | off | `1` stops the daemon handing its token to a device that appears on the USB cable. On by default because *"how do I connect it after a factory reset"* should not be a question: provisioning over USB is already the trusted path, so the cable does it with nobody typing anything |
 
 The listener is advertised as `_claudemate._tcp` over mDNS, so a device with no
 host configured finds the daemon on its own.
@@ -619,6 +742,61 @@ selects a profile non-interactively, and an already-exported
 `CLAUDE_CONFIG_DIR` always wins. A fresh profile starts logged out — claude
 prompts `/login` there on first run — and keeps its own settings, history, and
 MCP config. With no profile dirs, nothing changes.
+
+**The same thing from a terminal** — `claude-mate`. The device is the good
+interface, but it is one device, sometimes across the room, and sometimes flat.
+Everything it does is a line on the daemon's socket, so none of it needed to be
+exclusive to the hardware:
+
+```sh
+claude-mate                  # the queue, as the device shows it
+claude-mate watch            # ...and keep showing it
+claude-mate next / prev      # step the selection
+claude-mate go               # ack + raise that session's terminal
+claude-mate ack / follow     # ack only · toggle FOLLOW
+claude-mate mirror           # toggle the terminal mirror
+claude-mate select api       # point at a row instead of stepping to it
+claude-mate accounts         # the saved logins
+claude-mate accounts rm old  # delete one, after typing its name back
+```
+
+**It presses the same buttons.** `claude-mate go` sends `press|G`, which the
+daemon hands to the *same* `ButtonReader` that handles `B|G` off the wire — so GO
+means one thing on this project (mirror closes first, a double press toggles
+FOLLOW, the raised window is the one whose name was on the glass) and there is no
+second implementation to drift. `claude-mate select` is the only thing the device
+has no equivalent for; it walks there with PREV/NEXT instead.
+
+**Deleting an account happens in the CLI's own process, never over the socket.**
+That socket is `chmod 0600` — the user's own, which is all a hook needs. Even
+so, a hook firing a malformed line should not be able to remove a login.
+
+**Device will not connect?** — press `d` at the account picker, or run
+`claude-mate-connect`. It reports every link — daemon, token, cable, BLE — and
+prints the shortest fix for whichever one is down.
+
+With a cable it has nothing to do: **the daemon hands its token to any device
+that appears on USB**, so a board that has just been factory reset links itself
+a few seconds after being plugged in, with nobody typing anything. Cordless,
+**pair it over BLE** — one command and one button:
+
+```sh
+claude-mate-connect --pair     # the device shows PAIR? — press GO on it
+```
+
+The device is the one that asks its human, which is what makes it safe to expose
+to the radio: being in range gets you a prompt on a screen you cannot reach, and
+nothing else. The token is sent only after the button, and once — see
+[`docs/PROTOCOL.md`](docs/PROTOCOL.md#enrolment).
+
+> **It will never appear in System Settings → Bluetooth**, and that is correct,
+> not a fault. The status link is an unpaired GATT peripheral advertising in
+> short bursts; there is no pairing step by design, because Just Works pairing
+> authenticates nobody and the token handshake is what decides who may drive the
+> device. Only a CoreBluetooth scan sees it, which is what the daemon does — its
+> log is the one place the Mac can answer *"is it advertising?"*. (The **gamepad**
+> mode is a genuine HID device and does appear there; that is a different role of
+> the same board.)
 
 **Hit the limit? Carry the conversation across** — `claude-mate-switch`
 continues *this terminal's* conversation on another account. An account is a

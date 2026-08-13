@@ -261,13 +261,37 @@ static uint8_t pageIdx = 0;          // selected row within the page
 // SR_PAD is therefore a stored preference now rather than an action: on means
 // this device IS a Bluetooth controller, across a screen sleep and across a
 // reboot, until you turn it off. Off means it is the conductor it always was.
+// THERE IS NO `Link` ROW, and that is a safety change rather than a tidy-up. It
+// was a plain toggle, so one press moved a cordless board onto Wi-Fi -- and a
+// board with no credentials then reboots into the setup portal, which outranks
+// the menu, does not time out for a Wi-Fi device, and therefore hides the very
+// row you would use to undo it. One press on the glass, no way back without a
+// cable. The transport is not deleted, only off the glass: `I|WIFI` / `I|BLE`
+// still work over USB, which keeps that switch behind a cable you have to
+// actually have -- if you can type I|WIFI you can type I|BLE back. Which radio
+// is live, and whether it has found the daemon, is on the About page.
+//
+// AND NO SETUP-PORTAL ROW EITHER. There is no Wi-Fi anywhere on this menu.
+//
+// It was here for one reason: a factory-reset board with no cable had no way to
+// be given a token, and the portal was the only on-glass route. That reason is
+// gone -- BLE ENROLMENT replaced it. `claude-mate-connect --pair` puts PAIR? on
+// this screen and one press of GO provisions the device over the link it was
+// already using, with no access point, no phone and no secret typed by hand. So
+// the row was not carrying a capability any more, only a Wi-Fi flow wearing a
+// label that said "Set token".
+//
+// The portal itself still exists and is still reachable -- `Z` over USB, or BOOT
+// (or GO) held at power-on -- because a board whose BLE will not start needs
+// something, and both of those need physical access this menu does not.
 enum SetRow : uint8_t {
-  SR_PAD, SR_LINK, SR_SLEEP, SR_BRIGHT, SR_LED, SR_SOUND, SR_FLIP,
-  SR_WIFI, SR_ABOUT, SR_RESET, SR_COUNT
+  SR_PAD, SR_SLEEP, SR_BRIGHT, SR_LED, SR_SOUND, SR_FLIP,
+  SR_ABOUT, SR_RESET, SR_COUNT
 };
 // Which row is at the top of the visible window. Five rows fit and there are
-// ten, so the page scrolls -- and the scrollbar in drawSettingsPage() is what
-// says the other five exist, since a cut list otherwise just looks complete.
+// more than five, so the page scrolls -- and the scrollbar in
+// drawSettingsPage() is what says the rest exist, since a cut list otherwise
+// just looks complete.
 // Everything here is computed from SR_COUNT, so rows can be added without
 // touching the geometry; that is the whole reason absorbing ABOUT and WI-FI
 // from the top-level strip cost nothing but their two cases.
@@ -282,6 +306,18 @@ static_assert(PAGE_ROWS_VIS >= 1, "the settings window needs at least one row");
 // way into wiping the token by accident. It disarms itself if you walk away.
 #define RESET_ARM_MS 6000UL
 static unsigned long resetArmedMs = 0;
+// A daemon has asked to enrol this device (BLE E|?); the glass is showing the
+// question and the buttons are answering it. 0 = nothing pending. Times out on
+// its own, because a prompt left standing on a device nobody is near would be a
+// standing offer to whoever walks past next.
+static unsigned long pairAskedMs = 0;
+#define PAIR_ASK_MS 45000UL
+// ...and the answer, held on the glass afterwards. Without this the screen just
+// snapped back to the conductor view and the only evidence anything had happened
+// was on the Mac -- "paired but it is not obvious", which is a fair description
+// of a security decision that leaves no trace where you made it.
+static unsigned long pairedNoticeMs = 0;
+#define PAIRED_NOTICE_MS 6000UL
 
 // A flip only takes effect through the panel's rotation, which is applied once
 // at begin(). Rather than re-initialising a live display -- the one failure mode
@@ -908,6 +944,76 @@ static void drawFrame() {
 
 // Firmware-local: nothing heard for LINK_WATCHDOG_MS. An honest state instead
 // of a silently stale frame.
+// "The Mac is asking to pair with me." The one screen on this device that is a
+// QUESTION rather than a report, so it says who is asking, what saying yes
+// means, and which button does which -- there is no undo behind it.
+// Answer the pending question and take the prompt down. One place, because the
+// three ways to answer -- GO, any other button, and the timeout -- must leave
+// exactly the same state behind.
+static void answerPairing(bool yes) {
+  if (!pairAskedMs) return;
+  pairAskedMs = 0;
+  ble.pairAnswer(yes);
+  // Over the cable, because this is the one exchange where the two ends can
+  // disagree about whether anything happened at all -- the daemon sees silence
+  // and cannot tell "never arrived" from "arrived and was refused". Cheap, and
+  // it is what turned the first two hardware failures from guesswork into a
+  // one-line answer.
+  Serial.printf("pair: answered %s\n", yes ? "yes" : "no");
+  requestRender();
+}
+
+static void drawPairAsk() {
+  // THE ANSWER GOES FIRST, IN THE BIGGEST TYPE. Someone looks up at this screen
+  // having just run a command; what they need is not a description of the
+  // situation, it is which button to press. The explanation is underneath for
+  // the person who did NOT run the command and should be pressing nothing.
+  gfx->setTextSize(2);
+  gfx->setTextColor(C_WAIT);
+  drawCentred(SCREEN_W / 2, 34, 2, "PAIR THIS DEVICE?", C_WAIT);
+
+  gfx->setTextSize(2);
+  gfx->setTextColor(C_DONE);
+  gfx->setCursor(PAD_X, 66);
+  gfx->print("GO = ACCEPT");
+  gfx->setTextSize(1);
+  gfx->setTextColor(C_DIM);
+  gfx->setCursor(PAD_X, 92);
+  gfx->print("any other button = refuse");
+
+  gfx->setTextColor(C_TEXT);
+  gfx->setCursor(PAD_X, 116);
+  gfx->print("your Mac is offering this");
+  gfx->setCursor(PAD_X, 130);
+  gfx->print("device its access token");
+
+  // The countdown is the honest part: this offer is not standing.
+  unsigned long left = (millis() - pairAskedMs) < PAIR_ASK_MS
+                           ? (PAIR_ASK_MS - (millis() - pairAskedMs)) / 1000
+                           : 0;
+  gfx->setTextColor(left <= 10 ? C_ERROR : C_DIM);
+  gfx->setCursor(PAD_X, 148);
+  gfx->printf("expires in %lus", left);
+  drawFooter(C_WAIT);
+}
+
+// "It worked", on the device where the button was pressed. Auto-dismisses, and
+// any button dismisses it early -- it is a receipt, not a mode, and there must
+// never be a screen on this device you cannot get out of.
+static void drawPairedOk() {
+  drawCentred(SCREEN_W / 2, 44, 2, "PAIRED", C_DONE);
+  gfx->setTextSize(1);
+  gfx->setTextColor(C_TEXT);
+  gfx->setCursor(PAD_X, 84);
+  gfx->print("this device and your Mac now");
+  gfx->setCursor(PAD_X, 98);
+  gfx->print("share a token. connecting...");
+  gfx->setTextColor(C_DIM);
+  gfx->setCursor(PAD_X, 126);
+  gfx->print("any button to carry on");
+  drawFooter(C_DONE);
+}
+
 static void drawLinkLost() {
   gfx->setTextSize(3);
   gfx->setTextColor(C_BAD);
@@ -921,9 +1027,20 @@ static void drawLinkLost() {
   // Name the flag for the transport this device is actually on. Telling someone
   // to check for --tcp on a BLE build sends them to look at the wrong half of
   // the daemon's log, which is worse than saying nothing.
-  gfx->print(transport == LINK_BLE  ? "check it is running with --ble"
-             : net.configured()     ? "check it is running with --tcp"
-                                    : "hold BOOT at power-on to set up wifi");
+  //
+  // A missing TOKEN outranks all of it, because it is the first thing that will
+  // fail and no amount of daemon flags will get past it. That is the state a
+  // factory-reset board is in, so it is the state this screen has to handle
+  // best -- it is the first thing anyone sees on a fresh device.
+  //
+  // And it names the one command that fixes it from the Mac, which is the
+  // shortest route from here: run it, then press GO on this device. A cable is
+  // a dead end on a board sitting on its cell across the room, and the local
+  // menu row is the long way -- an access point, a phone, a typed secret.
+  gfx->print(!net.hasToken()        ? "no token: claude-mate-connect"
+             : transport == LINK_BLE ? "check it is running with --ble"
+             : net.configured()      ? "check it is running with --tcp"
+                                     : "hold BOOT at power-on to set up wifi");
   drawFooter(C_BAD);
 }
 
@@ -1125,15 +1242,6 @@ static void drawSetRow(uint8_t row, int16_t y, bool sel) {
       value = cfg.pad() ? "on" : "off";
       vcol  = cfg.pad() ? C_DONE : C_DIM;
       break;
-    case SR_LINK:
-      label = "Link";
-      // Which radio carries the daemon. Never both -- one 2.4 GHz radio, and
-      // sharing it costs the link that matters. Green when that radio has
-      // actually found the daemon, because "ble" and "ble, and it is working"
-      // are the two different things you come to this row to tell apart.
-      value = MateNet::transportName(transport);
-      vcol  = linkConnected() ? C_DONE : C_TEXT;
-      break;
     case SR_SLEEP:
       label = "Sleep screen";
       value = cfg.hibLabel();
@@ -1172,21 +1280,6 @@ static void drawSetRow(uint8_t row, int16_t y, bool sel) {
         vcol  = cfg.flipped() ? C_DONE : C_DIM;
       }
       break;
-    case SR_WIFI: {
-      label = "Wi-Fi setup";
-      // The one row that answers before you press it. This is where you come
-      // when the device is not linked, so "joining" or "linked" settles the
-      // question you walked in with. Lowercased from stateName() rather than
-      // mapped again here: a second table would be one more thing to forget to
-      // update, and this one cannot fall out of step with the enum.
-      char *p = buf;
-      for (const char *s = net.stateName(); *s && p < buf + sizeof(buf) - 1; s++)
-        *p++ = (*s >= 'A' && *s <= 'Z') ? (char)(*s - 'A' + 'a') : *s;
-      *p = 0;
-      value = buf;
-      vcol  = net.connected() ? C_DONE : C_WAIT;
-      break;
-    }
     case SR_ABOUT:
       label = "About";
       value = "\x10";
@@ -1282,7 +1375,12 @@ static void drawAboutPage() {
     gfx->setTextColor(C_DIM);
     gfx->setCursor(PAD_X, y);
     gfx->print(k[i]);
-    gfx->setTextColor(C_TEXT);
+    // The link row goes GREEN when the daemon is actually on the other end.
+    // That signal used to live on the Link row in SETTINGS, which is gone, and
+    // it is the difference between the two things you come to this page to tell
+    // apart: "ble", and "ble, and it is working". Nothing else here has a
+    // working/not-working state, so nothing else is coloured.
+    gfx->setTextColor(i == 0 && linkConnected() ? C_DONE : C_TEXT);
     gfx->setCursor(PAD_X + 6 * GLYPH_W, y);
     gfx->print(v[i]);
     y += PAGE_INFO_LH;
@@ -1423,6 +1521,16 @@ static void render() {
   // portal can start from paths that do not go through the menu at all.
   if (net.state() == MateNet::SETUP) {
     drawSetup();
+  } else if (pairedNoticeMs) {
+    drawPairedOk();
+  } else if (pairAskedMs) {
+    // Second only to the portal, and above everything else including the game:
+    // it is on screen because somebody asked for it seconds ago, it expires,
+    // and it cannot be answered from any other screen. It does NOT outrank the
+    // portal, whose AP password exists nowhere but the glass -- covering that
+    // would strand someone mid-setup to ask them a question the daemon will
+    // happily ask again.
+    drawPairAsk();
   } else if (uiMode == UI_ACTIONS) {
     drawActions();
   } else if (uiMode == UI_ACCOUNTS) {
@@ -1488,6 +1596,34 @@ static void requestRender() {
 // with no explanation reads as a crash caused by the button you just pressed --
 // which, on a device whose whole job is telling you what is going on, is the
 // one thing it must not do.
+// REBOOT ONLY ONCE THE BUTTON THAT ASKED FOR IT IS BACK UP.
+//
+// Every reboot on this device is confirmed by a LONG PRESS, so the button is
+// still down at the moment ESP.restart() runs -- and setup() reads the buttons
+// within milliseconds of coming back. A factory reset confirmed with GO
+// therefore came up with GO apparently "held at power-on", which used to mean
+// the Wi-Fi setup portal: wipe the device and land in the exact flow the wipe
+// was meant to escape, every single time. powerOff() already waits for release
+// for the same reason (a level-triggered wake fires instantly otherwise); this
+// is that lesson applied to the other half of the file.
+//
+// Bounded, because a stuck button must not stop a reboot that has already been
+// decided: after RELEASE_WAIT_MS we go anyway.
+#define RELEASE_WAIT_MS 3000UL
+static void rebootAfterRelease() {
+  // SUBTRACT, DO NOT COMPARE. `millis() + X` wraps every ~49 days and
+  // `millis() < until` then reads as already-expired for the whole window --
+  // this file fixes that same arithmetic in three other places and had grown one
+  // more. The unsigned difference is correct across the wrap.
+  unsigned long began = millis();
+  while ((millis() - began) < RELEASE_WAIT_MS &&
+         (digitalRead(PIN_BTN_GO) == LOW || digitalRead(PIN_BTN_BOOT) == LOW ||
+          digitalRead(PIN_BTN_MIRROR) == LOW))
+    delay(10);
+  delay(80);                                  // let the release settle
+  ESP.restart();                              // never returns
+}
+
 static void restartWithNotice(const char *title, const char *detail) {
   if (gfx) {
     gfx->fillScreen(C_BG);
@@ -1501,11 +1637,17 @@ static void restartWithNotice(const char *title, const char *detail) {
   ble.shutdown();                           // one was actually up
   cfg.flush();                              // the deferred commit will not run
   delay(700);                               // long enough to read
-  ESP.restart();                            // never returns
+  rebootAfterRelease();                     // ...and for the button to come up
 }
 
 static void setTransport(MateTransport t) {
-  if (t == transport) return;
+  // NO EARLY RETURN ON "no change". Commit 1cb2855 claimed to have removed one
+  // and did not, so `I|BLE` -- which three places document as the way to revive
+  // a BLE stack that is down -- stored nothing, rebooted nothing, and printed
+  // success. A stack that has been shut down cannot come back in the same boot,
+  // and ble.stuck() cannot fire for it either, because shutdown() clears the
+  // very flag stuck() tests. The reboot IS the repair, and storing a value the
+  // device already holds is idempotent.
   MateNet::storeTransport(t);
   restartWithNotice("SWITCHING LINK", MateNet::transportName(t));
 }
@@ -1568,6 +1710,17 @@ static void leavePad() {
     // keeping is in NVS, including the now-off pad switch written just above,
     // so the device comes back as a conductor on BLE, which is exactly what
     // turning the gamepad off asked for.
+    // THE SWITCH GOES OFF BEFORE ANYTHING THAT MIGHT NOT RETURN, and the order
+    // is the whole fix. This write used to sit BELOW the branch, and
+    // restartWithNotice() ends in ESP.restart() -- so on BLE the 2 s hold that
+    // means "leave the gamepad" rebooted with pad=true still in NVS and setup()
+    // put the device straight back into the pad. There is no way out of that
+    // from the glass: UI_PAD routes all four buttons to the pad poller, the menu
+    // is unreachable from the pad face, and the Mac's G|0 is gated on the very
+    // switch that is still on. The comment above already claimed the write had
+    // happened; now it has. setPad() writes NVS eagerly, so it is durable before
+    // the reboot rather than after it.
+    cfg.setPad(false);
     if (transport == LINK_BLE) {
       padVia = PAD_LINK;                   // so the reboot notice is not drawn
       restartWithNotice("GAMEPAD OFF", nullptr);   // over the pad face
@@ -1575,12 +1728,6 @@ static void leavePad() {
     // On Wi-Fi the two stacks are genuinely separate, so it is just a restart,
     // and only if the radio policy had actually parked it.
     if (padWifiParked) linkStart();
-    // The switch and the world must agree. Leaving by the 2 s hold is a real
-    // "turn this off" -- the same gesture as the settings row, made from the
-    // pad face -- and a device that came back from a reboot as a gamepad you
-    // had already left would be the exact failure setPad() writes eagerly to
-    // avoid.
-    cfg.setPad(false);
   }
   padVia    = PAD_LINK;
   padWifiParked = false;
@@ -1603,8 +1750,18 @@ static void leavePad() {
 // browns out between the two comes back as what the switch says.
 static void padSet(bool on) {
   cfg.setPad(on);
-  if (on) { enterPad(true, PAD_BLE); return; }   // puts the setting back itself
-                                                 // if the stack will not start
+  if (on) {
+    // ON A BLE BOARD, TURNING IT ON REBOOTS -- the mirror image of turning it
+    // off, and for the identical reason. The link stack is up (it is this
+    // device's transport), the pad needs the controller the link is holding, and
+    // an init after a deinit never succeeds on this chip. Rebooting is the only
+    // way the pad gets a fresh controller, and setup() now leaves the link
+    // alone when the switch is on, so it comes up as a gamepad and stays one.
+    // The switch is already in NVS, written eagerly one line above.
+    if (transport == LINK_BLE) restartWithNotice("GAMEPAD ON", nullptr);
+    enterPad(true, PAD_BLE);                     // Wi-Fi: puts the setting back
+    return;                                      // itself if it will not start
+  }
   if (uiMode == UI_PAD) { leavePad(); return; }
   // Switched off from somewhere that is not the pad face -- which means a
   // previous entry left the HID stack up without the UI following it. Take it
@@ -1855,7 +2012,10 @@ static bool handleConfigLine(char *line) {
       if (b) *b++ = 0;
       net.setWifi(a, b ? b : "");
       Serial.printf("wifi set: %s\n", a);
-      net.restart();
+      // Stored either way, applied only if Wi-Fi is the live transport: on a
+      // BLE device this is provisioning for later (I|WIFI, or the API build),
+      // and associating now would put both radios up at once.
+      if (transport == LINK_WIFI) net.restart();
       requestRender();
       return true;
     }
@@ -1868,7 +2028,7 @@ static bool handleConfigLine(char *line) {
       if (b) *b++ = 0;
       net.setDaemon(a, b ? (uint16_t)atoi(b) : 0);
       Serial.printf("daemon set: %s\n", a[0] ? a : "(mDNS discovery)");
-      net.restart();
+      if (transport == LINK_WIFI) net.restart();   // see W| above
       return true;
     }
 
@@ -1876,8 +2036,19 @@ static bool handleConfigLine(char *line) {
       char *a = strchr(line, '|');
       if (!a) return false;
       net.setToken(a + 1);
-      Serial.println("token set");
-      net.restart();
+      // Hand it to the LIVE BLE stack as well as to NVS. This is the whole
+      // bootstrap path on a factory-reset board -- flash, send the token down
+      // the same cable, watch it link -- and without this the running stack
+      // keeps answering A|NOTOKEN with the token sitting in flash beside it,
+      // which looks exactly like the daemon rejecting a token that is right.
+      ble.setToken(a + 1);
+      Serial.printf("token set (link: %s)\n",
+                    MateNet::transportName(transport));
+      // Only kick Wi-Fi if Wi-Fi is what carries this device. restart() on a
+      // BLE build with an SSID stored would associate, and then both radios
+      // would be up -- the exact contention one-transport-at-a-time exists to
+      // prevent.
+      if (transport == LINK_WIFI) net.restart();
       return true;
     }
 
@@ -2060,6 +2231,25 @@ static void notePoke();
 static void onButton(char ev) {
   if (!screenOn) { wakeScreen(); return; }
   notePoke();
+  // A PAIRING REQUEST TAKES THE BUTTONS, wherever you were. It is a question
+  // only the person holding the device can answer, it is on screen because
+  // somebody at the Mac just asked for it, and it expires on its own -- so
+  // swallowing one press of GO or NEXT costs nothing and leaving the prompt
+  // answerable only from one screen would be a trap.
+  if (pairAskedMs) {
+    if (ev == 'G' || ev == 'K') answerPairing(true);
+    else if (ev == 'N' || ev == 'P' || ev == 'B') answerPairing(false);
+    blipUntil = millis() + BLIP_MS;
+    requestRender();
+    return;
+  }
+  // The receipt is dismissible by anything, and the press is SWALLOWED: it was
+  // aimed at "ok, got it", not at whatever screen is behind it.
+  if (pairedNoticeMs) {
+    pairedNoticeMs = 0;
+    requestRender();
+    return;
+  }
   if (uiMode == UI_CONDUCTOR) { emitBtn(ev); return; }
   menuButton(ev);
   blipUntil = millis() + BLIP_MS;
@@ -2073,8 +2263,15 @@ static void pollNavBtn(Btn &b, char ev) {
   // needs "is it held down NOW" and this poller deals in events with a 400/200
   // ms auto-repeat. Track the level so that leaving the game does not deliver
   // the release of a press the menu never saw as an event.
-  if (uiMode == UI_GAME) { b.pressed = raw; b.changeMs = now; b.longFired = true;
-                           return; }
+  // A PAIRING QUESTION OUTRANKS THE GAME, because it is already drawn OVER the
+  // game (see render()) and told the user which button to press. Without this
+  // the prompt was unanswerable from the SHIP IT screen: both pollers returned
+  // here before any edge detection, so GO started a run behind the prompt and
+  // the firmware auto-refused for the user 45 s later.
+  if (uiMode == UI_GAME && !pairAskedMs) {
+    b.pressed = raw; b.changeMs = now; b.longFired = true;
+    return;
+  }
   if (raw != b.pressed && (now - b.changeMs) >= DEBOUNCE_MS) {
     b.pressed  = raw;
     b.changeMs = now;
@@ -2107,8 +2304,10 @@ static void pollNavBtn(Btn &b, char ev) {
 static void pollGoBtn(Btn &b) {
   bool raw = (digitalRead(b.pin) == LOW);
   unsigned long now = millis();
-  if (uiMode == UI_GAME) { b.pressed = raw; b.changeMs = now; b.longFired = true;
-                           return; }
+  if (uiMode == UI_GAME && !pairAskedMs) {    // see pollNavBtn
+    b.pressed = raw; b.changeMs = now; b.longFired = true;
+    return;
+  }
   if (raw != b.pressed && (now - b.changeMs) >= DEBOUNCE_MS) {
     b.pressed  = raw;
     b.changeMs = now;
@@ -2420,18 +2619,6 @@ static void menuButton(char ev) {
                       // somewhere you did not come from.
                       padSet(!cfg.pad());
                       break;
-      case SR_LINK:   // Which radio carries the daemon. Live, both ways: the
-                      // whole point of storing it rather than compiling it in
-                      // is that a device on a desk can be moved between them
-                      // with a thumb.
-                      setTransport(transport == LINK_BLE ? LINK_WIFI : LINK_BLE);
-                      break;
-      case SR_WIFI:   // The portal takes the screen over on its own, via
-                      // net.state() == SETUP in render(), which outranks every
-                      // firmware-local screen -- so hand the glass back first.
-                      uiMode = UI_CONDUCTOR;
-                      net.startPortalNow();
-                      break;
       case SR_ABOUT:  pageId = PG_ABOUT; break;
       case SR_SLEEP:  cfg.cycleHib(); break;
       case SR_BRIGHT: cfg.cycleBl();
@@ -2467,11 +2654,11 @@ static void menuButton(char ev) {
   if (ev == 'K') {                            // long press: confirm / commit
     if (pageIdx == SR_RESET && resetArmedMs) {
       cfg.factoryResetAll();
-      ESP.restart();                          // never returns
+      rebootAfterRelease();                   // never returns
     }
     if (pageIdx == SR_FLIP && flipNeedsRestart) {
       cfg.flush();
-      ESP.restart();                          // never returns
+      rebootAfterRelease();                   // never returns
     }
   }
 }
@@ -2524,6 +2711,17 @@ static void fourthTap() {
   requestRender();
 }
 
+// The 2 s hold. Guarded for the same reason the tap is: sleeping the device
+// mid-offer leaves the daemon waiting out its full timeout on a screen nobody
+// can see, and "any other button = refuse" has to include this one.
+static bool pairPromptTookPress() {
+  if (!pairAskedMs) return false;
+  answerPairing(false);
+  clickPending = false;
+  blipUntil = millis() + BLIP_MS;
+  return true;
+}
+
 static void fourthDoubleTap() {
   // NOT over the WiFi setup portal. That screen shows an AP name and a password
   // that is regenerated on every portal start, and the glass is the only place
@@ -2551,6 +2749,15 @@ static void pollTapBtn(Btn &b) {
       // otherwise waking the device would open the mirror or the menu.
       if (!screenOn) { wakeScreen(); return; }
       notePoke();
+      // THE 4th BUTTON ANSWERS THE PAIRING QUESTION TOO, and it has to: the
+      // prompt says "any other button = refuse", and this button never reaches
+      // onButton() -- it is dispatched here, to the mirror, the menu and sleep.
+      // So a tap during an offer used to change uiMode BEHIND the prompt (the
+      // ACTIONS sheet appearing later with nobody having asked for it), a
+      // double-tap opened the menu and emitted B|M to the daemon, and a 2 s
+      // hold slept the board mid-offer, leaving the daemon to burn its whole
+      // 60 s timeout. Answering "no" is what the screen promised.
+      if (pairPromptTookPress()) return;
       if (clickPending && (now - clickMs) <= DBLCLICK_MS) {
         clickPending = false;
         fourthDoubleTap();
@@ -2568,6 +2775,10 @@ static void pollTapBtn(Btn &b) {
     // thumb that rests on it for two seconds while thinking about a jump would
     // switch the device off mid-run. Holding it leaves the game instead.
     if (uiMode == UI_GAME) { uiMode = UI_MENU; requestRender(); return; }
+    // ...and NOT out from under a pairing offer. Sleeping mid-question leaves
+    // the daemon waiting out its whole timeout against a dark screen, and the
+    // prompt said any other button refuses -- so this one refuses.
+    if (pairPromptTookPress()) return;
     cfg.flush();                              // deferred commit will not run
     powerOff();                               // never returns
   }
@@ -2773,10 +2984,18 @@ void setup() {
   gfx->fillScreen(C_BG);
   if (buffered) canvas->flush();
 
-  // Holding BOOT (or GO) through power-on forces the WiFi setup portal: that is
-  // how the device is moved to a new network with no serial console around.
-  bool forcePortal = (digitalRead(PIN_BTN_BOOT) == LOW) ||
-                     (digitalRead(PIN_BTN_GO) == LOW);
+  // Holding BOOT through power-on forces the WiFi setup portal: the escape
+  // hatch for a board whose BLE will not start at all.
+  //
+  // BOOT ONLY -- GO USED TO COUNT AND THAT WAS A TRAP. Factory reset is
+  // confirmed with a LONG PRESS OF GO and reboots immediately, so GO was still
+  // down when setup() read it: every menu factory reset came back up in the
+  // Wi-Fi setup portal, on a BLE device, reliably. rebootAfterRelease() below
+  // fixes the timing, but GO has no business arming a Wi-Fi flow either way --
+  // it is the most-pressed button on the device, and with pairing and USB
+  // provisioning the portal is a last resort rather than a route. BOOT is on
+  // the board, under the enclosure, which is the right amount of deliberate.
+  bool forcePortal = (digitalRead(PIN_BTN_BOOT) == LOW);
 
   // Which radio this boot is going to be. Read before either stack is touched,
   // because starting one and then discovering it was the wrong one means the
@@ -2787,11 +3006,24 @@ void setup() {
   // reconfigured because of the setting you were trying to fix would be bricked
   // in every sense that matters to the person holding it.
   transport = MateNet::storedTransport();
+  // The portal is not the only way out of here on a BLE device, so it is
+  // allowed to time out and hand the glass back. Without this a BOOT-held
+  // portal on a cordless BLE board is a one-way door.
+  net.setFallbackLink(transport == LINK_BLE);
   if (forcePortal || transport == LINK_WIFI) {
     net.begin(forcePortal);
   } else {
     net.loadConfigOnly();                   // the token, and what `?` prints
-    ble.begin(DEVICE_BLE_NAME, net.token());
+    net.radioOff();                         // and nothing else about Wi-Fi
+    // ...but NOT the link if the gamepad is about to take the radio. The pad and
+    // the link are two roles on one stack, and this chip cannot re-init BLE
+    // after a deinit in the same boot -- so bringing the link up here and then
+    // tearing it down for the pad three lines later GUARANTEED the pad never
+    // started. It would fail, clear its own switch, try to bring the link back,
+    // fail at that too, and loop()'s stuck() backstop would reboot ~6 s later:
+    // flipping the gamepad on a BLE board rebooted it and came back with the
+    // switch off. Nothing needs the link up first when the pad is on.
+    if (!cfg.pad()) ble.begin(DEVICE_BLE_NAME, net.token());
   }
 
   render();                                 // splash until the daemon talks
@@ -2872,6 +3104,49 @@ void loop() {
   if (resetArmedMs && (now - resetArmedMs) >= RESET_ARM_MS) {
     resetArmedMs = 0;
     requestRender();
+  }
+
+  // ---- pairing ------------------------------------------------------------
+  // A daemon asked to enrol us. Raise the question on the glass; the buttons
+  // answer it (see onButton) and it expires on its own, because an offer left
+  // standing on a device nobody is near is an offer to whoever passes next.
+  if (ble.pairRequested() && !pairAskedMs) {
+    // STAMPED FROM `now`, NOT A FRESH millis(). `now` was read at the top of
+    // this iteration, so a later reading is a few microseconds AHEAD of it --
+    // and the unsigned `now - pairAskedMs` below then underflows to ~4.29e9,
+    // which is comfortably >= PAIR_ASK_MS. The prompt would answer itself, with
+    // "no", in the same loop pass that raised it. The same trap as the `| 1`
+    // sentinel bugs elsewhere in this file, arrived at from the other side.
+    pairAskedMs = now ? now : 1UL;  // 0 is the sentinel; never stamp it
+    wakeScreen();                   // a question nobody can see is a no
+    Serial.println("pair: asked");
+    requestRender();
+  }
+  if (pairedNoticeMs && (now - pairedNoticeMs) >= PAIRED_NOTICE_MS) {
+    pairedNoticeMs = 0;
+    requestRender();
+  }
+  if (pairAskedMs) {
+    // WITHDRAWN. The peer that asked can vanish -- it drops, or the link times
+    // it out -- and blelink clears the request when that happens. Leaving the
+    // question on the glass would mean answering into a connection that no
+    // longer exists, and a GO press landing somewhere the user did not expect.
+    if (!ble.pairRequested()) { pairAskedMs = 0; requestRender(); }
+    else if ((now - pairAskedMs) >= PAIR_ASK_MS) answerPairing(false);
+    else requestRender();           // the countdown ticks
+  }
+  // The token the daemon granted after we said yes. The BLE stack took it live
+  // already -- that is what let the handshake straight after it succeed -- so
+  // this is only the durable half. Doing it here rather than on the BLE task
+  // keeps every NVS write on the main loop, where the rest of them are.
+  {
+    String granted;
+    if (ble.takeGrantedToken(granted)) {
+      net.setToken(granted);
+      Serial.println("paired: token stored");
+      pairedNoticeMs = now ? now : 1UL;   // stamped from `now`; see pairAskedMs
+      requestRender();
+    }
   }
 
   // A freshly authenticated link needs the same kick a Nano's reset gives: H

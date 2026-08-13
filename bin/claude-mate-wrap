@@ -1157,22 +1157,93 @@ def select_account(flag_name, interactive):
     profiles = list_profiles()
     if not interactive or not profiles:
         return
-    print("claude-mate — select account (Enter = default, or type a new name):")
-    print(f"  0) default   {account_email() or '(not logged in)'}")
-    for i, p in enumerate(profiles, 1):
-        email = account_email(os.path.join(ACCOUNTS_DIR, p))
-        print(f"  {i}) {p:<10} {email or '(not logged in)'}")
-    try:
-        ans = input("account> ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        os._exit(130)
+    # `d` IS HERE BECAUSE THIS PROMPT IS THE ONLY CLAUDE MATE UI ON THE MAC.
+    # A device that will not link says so on its own glass and in the daemon's
+    # log, and neither is anywhere the person at this prompt is looking -- so
+    # "how do I connect the device" had no answer reachable from the one screen
+    # they always see. It does not select anything: it prints the state of every
+    # link and the shortest fix, then comes back here.
+    while True:
+        print("claude-mate — select account (Enter = default, or type a new name):")
+        print(f"  0) default   {account_email() or '(not logged in)'}")
+        for i, p in enumerate(profiles, 1):
+            email = account_email(os.path.join(ACCOUNTS_DIR, p))
+            print(f"  {i}) {p:<10} {email or '(not logged in)'}")
+        print("  d) device     connect a Claude Mate, or see why it is not linked")
+        try:
+            ans = input("account> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            os._exit(130)
+        if ans.lower() in ("d", "device"):
+            rc = _run_connect()
+            # Say where we ended up, ON THE LINE ABOVE THE PROMPT. The device
+            # itself now shows a PAIRED receipt, and the terminal that asked for
+            # it should not be the quieter of the two.
+            if rc == 0:
+                print("claude-mate: device is linked.\n")
+            continue                     # ...and ask again; nothing was chosen
+        break
     if not ans or ans == "0":
         return
     if ans.isdigit() and 1 <= int(ans) <= len(profiles):
         use_profile(profiles[int(ans) - 1])
-    else:
-        use_profile(ans)   # a name: existing profile or a new one to create
+        return
+    if ans in profiles:
+        use_profile(ans)
+        return
+    # A NEW NAME CREATES A PROFILE, SO IT HAS TO BE ASKED FOR. Anything typed
+    # here used to become one, and an arrow key types an ESCAPE SEQUENCE -- so a
+    # real accounts dir ended up with a directory named `\033`, which prints as
+    # a blank row with somebody's email beside it, and another named `в` from a
+    # keyboard left in the wrong layout. Both were logged into afterwards,
+    # because the picker had already committed and claude asked for a login.
+    if not _plausible_profile(ans):
+        print(f"  ignoring {ans!r} — that does not look like an account name.")
+        return
+    try:
+        yn = input(f'  "{ans}" is new. Create a profile for it? [y/N] ').strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        os._exit(130)
+    if yn.lower() not in ("y", "yes"):
+        print("  staying on the default account.")
+        return
+    use_profile(ans)
+
+
+def _plausible_profile(name):
+    """Could this be a profile name someone meant to type?
+
+    Deliberately narrow: printable, no path separators (a name becomes a
+    DIRECTORY under ~/.claude-accounts, so `../` there is not a naming choice),
+    and short enough to be a name rather than a paste.
+    """
+    return (name
+            and len(name) <= 32
+            and all(32 <= ord(c) < 127 for c in name)
+            and "/" not in name and "\\" not in name
+            and name not in (".", ".."))
+
+
+def _run_connect():
+    """Hand over to claude-mate-connect, which owns everything about linking.
+
+    A subprocess rather than an import: the tool is a hyphenated script with no
+    module name, it is useful on its own, and keeping the knowledge of transports
+    out of the wrapper is the whole reason it is a separate file. Beside this one
+    first, so a repo checkout runs its own copy rather than an older installed
+    one."""
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "claude-mate-connect")
+    cmd = [sys.executable, here] if os.path.exists(here) else ["claude-mate-connect"]
+    try:
+        rc = subprocess.run(cmd, check=False).returncode
+    except OSError as e:
+        sys.stderr.write(f"[claude-mate-wrap] cannot run claude-mate-connect: {e}\n")
+        rc = 1
+    print()
+    return rc
 
 # --------------------------------------------------------------------------- #
 # Account + remaining-limit reporting (shown on the device's r1/r2 right edges)

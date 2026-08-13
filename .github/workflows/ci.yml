@@ -33,7 +33,7 @@ jobs:
         run: python -m pip install --upgrade pip pyserial pyte
 
       - name: Byte-compile daemon + wrapper
-        run: python -m py_compile daemon/claude_mate_daemon.py bin/claude-mate-wrap
+        run: python -m py_compile daemon/claude_mate_daemon.py bin/claude-mate-wrap bin/claude-mate-connect bin/claude-mate
 
       - name: Run the test suite
         env:

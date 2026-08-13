@@ -307,6 +307,32 @@ ok = wait_for(lambda: any("TCP listening" in l for l in daemon_err), 10.0)
 check("--tcp with a token file opens the listener", bool(ok))
 
 # --------------------------------------------------------------------------- #
+# The cable provisions the radio, with nobody typing anything.
+# --------------------------------------------------------------------------- #
+# "How do I connect it after a factory reset" had one honest answer -- open a
+# portal from a phone, or type T|<token> down the cable -- and both are work the
+# user should never have been asked to do, since the daemon and the wiped device
+# are already joined by a cable over which provisioning is the trusted path. So
+# every serial open now hands the device this daemon's token. A device that
+# never needed one is unaffected: NVS skips a write whose value is unchanged.
+# NOT to whatever arrives -- to whatever ANSWERS. The daemon writes `P` on open
+# and waits for the `K` a Claude Mate replies with, because autodetect() takes
+# the first glob match and tries /dev/cu.usbserial* BEFORE the usbmodem* the S3
+# actually uses: any FTDI dongle on the desk outranked the real device and was
+# handed the shared secret.
+ok = wait_for(lambda: usb_seen(lambda l: l == "P"), 10.0)
+check("the daemon asks who is on the cable before trusting it", bool(ok))
+check("...and sends no token to a port that has said nothing",
+      not usb_seen(lambda l: l.startswith("T|")))
+
+# Answer as the device does, and the token follows.
+os.write(master_fd, b"K\n")
+ok = wait_for(lambda: usb_seen(lambda l: l == f"T|{TOKEN}"), 10.0)
+check("...then hands it the token once it answers the protocol", bool(ok))
+check("...which is exactly the line the firmware's config console takes",
+      bool(usb_seen(lambda l: l.startswith("T|"))))
+
+# --------------------------------------------------------------------------- #
 # Phase 1: a wrong token is rejected
 # --------------------------------------------------------------------------- #
 print("\n-- phase 1: a wrong token is rejected --")

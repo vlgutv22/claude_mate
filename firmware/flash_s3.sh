@@ -187,6 +187,11 @@ if [ "$booted" != yes ]; then
 fi
 
 echo
-echo "Flashed. An unprovisioned board comes up in the WiFi setup portal;"
-echo "send 'W|<ssid>|<pass>' and 'T|<token>' over $PORT, or hold BOOT at"
-echo "power-on for the portal. '?' prints the current config."
+echo "Flashed. An unprovisioned board comes up on BLE with no token."
+echo
+echo "  cabled    nothing to do -- the daemon hands it a token when it opens"
+echo "            $PORT. Just start the daemon."
+echo "  cordless  claude-mate-connect --pair, then press GO on the device."
+echo
+echo "For WiFi instead: 'W|<ssid>|<pass>' then 'I|WIFI' over $PORT."
+echo "'?' prints the current config."

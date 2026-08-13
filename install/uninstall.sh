@@ -12,6 +12,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The repo root, as install.sh resolves it. Needed to tell OUR PATH symlinks
+# apart from a file someone else put there under the same name -- and `set -u`
+# would abort on it rather than silently comparing against an empty string,
+# which is the failure this line exists to prevent.
+REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 CLAUDE_DIR="${HOME}/.claude"
 CLAUDE_SETTINGS="${CLAUDE_DIR}/settings.json"
@@ -64,6 +69,18 @@ warn "  ${HOOK_DST}"
 warn "(the UserPromptSubmit / Notification / Stop / StopFailure entries"
 warn " that reference claude-status.sh)."
 echo
+
+# The PATH symlinks install.sh made. Only ours, and only if they still point
+# into this repo -- never a file someone put there themselves under the same
+# name, which is a thing an uninstaller has no business deleting.
+for cand in /usr/local/bin "${HOME}/.local/bin"; do
+    for tool in claude-mate claude-mate-connect claude-mate-switch; do
+        link="${cand}/${tool}"
+        if [ -L "$link" ] && [ "$(readlink "$link")" = "${REPO_DIR}/bin/${tool}" ]; then
+            rm -f "$link" && ok "Removed ${link}"
+        fi
+    done
+done
 
 ok "Claude Mate uninstalled."
 info "Note: log files in ~/Library/Logs/claude-mate.*.log were left in place."

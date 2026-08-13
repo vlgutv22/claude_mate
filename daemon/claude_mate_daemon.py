@@ -74,6 +74,7 @@ from __future__ import annotations
 import argparse
 import glob
 import hmac
+import json
 import os
 import queue
 import secrets
@@ -87,7 +88,7 @@ import time
 import urllib.parse
 import wave
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 try:
     import serial  # pyserial
@@ -546,6 +547,17 @@ class SerialLink:
         self._baud = baud
         self._ser: Optional[serial.Serial] = None
         self._lock = threading.Lock()  # guards writes + (re)connect
+        self._provision_token: Optional[str] = None
+        self._pending_provision = False   # armed on open, spent on the first K/H
+
+    def set_provision_token(self, token: Optional[str]) -> None:
+        """The secret to hand a device that arrives on the cable. See _provision().
+
+        Set only when a wireless transport is up, because that is the only time
+        there is a shared secret to share -- a USB-only daemon has nothing to
+        provision the device FOR.
+        """
+        self._provision_token = token
 
     @staticmethod
     def autodetect() -> Optional[str]:
@@ -593,11 +605,74 @@ class SerialLink:
                 log(f"serial opened on {port} @ {self._baud} 8N1")
                 # Opening the port resets the Nano (~1.5s); it will emit H when
                 # ready, prompting a full state resend. We do not block here.
+                #
+                # The token is NOT sent yet -- see provision_if_ours(). A `P`
+                # asks whoever is on this port to identify itself; a Claude Mate
+                # answers `K` (or `H` on boot), and only then does a secret go
+                # down the wire.
+                self._pending_provision = True
+                self._write_locked("P")
                 return True
             except (serial.SerialException, OSError) as exc:
                 log(f"serial open failed on {port}: {exc}")
                 self._close_locked()
                 return False
+
+    def provision_if_ours(self) -> None:
+        """The device answered the protocol, so it is safe to give it the token.
+
+        Called by the reader when a `K` or `H` arrives. THE HANDSHAKE IS THE
+        POINT: autodetect() takes the first match of a glob, and PORT_GLOBS tries
+        `/dev/cu.usbserial*` BEFORE the `/dev/cu.usbmodem*` the S3 actually
+        enumerates as -- so any FTDI or CH340 dongle on the desk outranked the
+        real device and was handed the shared secret, on every reconnect. It
+        cannot answer `K`, so it no longer gets one.
+        """
+        with self._lock:
+            if not self._pending_provision:
+                return
+            self._pending_provision = False
+            self._provision_locked()
+
+    def _write_locked(self, line: str) -> None:
+        """Write with the lock already held. Failures are the caller's problem."""
+        try:
+            self._ser.write((line + "\n").encode("ascii", errors="replace"))
+        except (serial.SerialException, OSError):
+            pass
+
+    def _provision_locked(self) -> None:
+        """Give the device on the cable this daemon's token, once per open.
+
+        THE CABLE IS THE ANSWER TO "how do I connect it after a factory reset",
+        and it should not involve the human at all. A wiped board comes up on
+        BLE with no token; the daemon connects, gets A|NOTOKEN, and both ends
+        then sit there knowing exactly what is wrong and doing nothing about it
+        -- while a USB cable, over which provisioning is already the documented
+        and trusted path, is plugged into the same two devices.
+
+        Unconditional rather than conditional on "does it need one", because
+        there is no way to ask over this link (USB has no handshake -- it is
+        trusted by being physical) and because the daemon's token is the
+        authority: a device holding a different one is a device that cannot
+        link, so overwriting is the repair, not a side effect. NVS skips a write
+        whose value is unchanged, so the steady state costs nothing.
+
+        T| is a CONFIG verb, handled before the protocol on the firmware side,
+        and the Nano ignores it as an unknown line -- so this is safe to send to
+        whatever happens to be on the port.
+        """
+        token = self._provision_token
+        if not token or os.environ.get("CLAUDE_MATE_NO_USB_PROVISION") == "1":
+            return
+        try:
+            self._ser.write(f"T|{token}\n".encode("ascii", errors="replace"))
+        except (serial.SerialException, OSError) as exc:
+            # Not fatal and not worth closing the port over: the link still
+            # works, it just may not be able to authenticate over the radio.
+            log(f"serial: could not hand the device a token: {exc}")
+            return
+        log("serial: handed the device this daemon's token (USB provisioning)")
 
     def _close_locked(self) -> None:
         if self._ser is not None:
@@ -1026,6 +1101,16 @@ class LinkHub:
     # the maintainer: with a wireless device connected they return True while
     # the serial port is shut, so a Nano that drops -- or is plugged in later --
     # would never be reopened and would sit on NO LINK forever.
+    def provision_if_ours(self) -> None:
+        """Forward to the serial link. See SerialLink.provision_if_ours().
+
+        The ButtonReader holds whatever `link` main() built -- this hub whenever
+        a radio is enabled -- so a serial-only method that is not forwarded here
+        is simply never called, silently. That is what happened: the token push
+        waited for a `K` that reached a hub with no way to pass it on.
+        """
+        self._serial.provision_if_ours()
+
     def serial_is_open(self) -> bool:
         return self._serial.is_open()
 
@@ -1301,6 +1386,48 @@ class Screen:
             nxt = queue[(idx + delta) % len(queue)]
             self._sel_key = nxt.key
         self.refresh()
+
+    def select_by(self, want: str) -> Optional[str]:
+        """Select a session by queue index or by name. Returns the name, or None.
+
+        The device has no equivalent -- it walks there with PREV/NEXT -- but a
+        terminal that can print the whole queue at once should be able to point
+        at a row instead of stepping to it. The index is into the SAME queue the
+        snapshot prints, so what you read is what you get.
+
+        Name matching is exact-first, then unique prefix, then unique substring.
+        AMBIGUITY IS A REFUSAL rather than a guess: this moves what GO acts on,
+        and picking the wrong session is the one mistake that costs you the
+        window you were trying to raise.
+        """
+        want = want.strip()
+        if not want:
+            return None
+        queue = self._reg.queue()
+        if not queue:
+            return None
+        pick = None
+        if want.isdigit():
+            i = int(want)
+            if 0 <= i < len(queue):
+                pick = queue[i]
+        if pick is None:
+            for pred in (lambda s: s.name == want,
+                         lambda s: s.name.lower() == want.lower(),
+                         lambda s: s.name.lower().startswith(want.lower()),
+                         lambda s: want.lower() in s.name.lower()):
+                hits = [s for s in queue if pred(s)]
+                if len(hits) == 1:
+                    pick = hits[0]
+                    break
+                if len(hits) > 1:
+                    return None            # ambiguous: refuse, do not guess
+        if pick is None:
+            return None
+        with self._lock:
+            self._sel_key = pick.key
+        self.refresh()
+        return pick.name
 
     def stay_on(self, sess: Optional[Session]) -> None:
         """After a GO/ACK: pin the selection to the session the press acted on
@@ -1921,6 +2048,14 @@ class SocketServer(threading.Thread):
         self._reg = registry
         self._on_update = on_update
         self._on_haptic = on_haptic   # called with a LED kind on session events
+        # Set by main() when there is something to command. See _process_line:
+        # this socket carries session updates, and now the controls that have to
+        # come from a terminal rather than from a hook.
+        self.on_pair_request = None
+        self.on_press = None              # inject a device button code
+        self.on_select = None             # move the selection; returns the name
+        self.on_accounts_refresh = None   # re-read ~/.claude-accounts
+        self.screen = None                # for queue_snapshot()
         self._stop_evt = threading.Event()  # NOT `_stop`: Thread.join() calls its own _stop()
         self._srv: Optional[socket.socket] = None
 
@@ -1935,7 +2070,17 @@ class SocketServer(threading.Thread):
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             srv.bind(self._sock_path)
-            os.chmod(self._sock_path, 0o666)  # let hooks (any user session) write
+            # 0600, NOT 0666. Hooks run in the user's own shells -- same uid --
+            # so owner-only has always been enough for them, and 0666 was
+            # over-permission that cost nothing while this socket only carried
+            # session updates. It stopped being free the moment it grew commands:
+            # at 0666, ANY local account could `press|C` to type into the user's
+            # live Claude session, `press|A0` to SIGTERM it, `pair` to arm an
+            # over-the-air handout of the shared token, or `queue` to read every
+            # session's working directory. The PTY wrapper's own control socket is
+            # 0600 for exactly that reason, and this one was quietly undoing it by
+            # proxy -- the daemon runs as the user and holds that 0600 socket.
+            os.chmod(self._sock_path, 0o600)
             srv.listen(16)
             srv.settimeout(0.5)
         except OSError as exc:
@@ -1976,10 +2121,25 @@ class SocketServer(threading.Thread):
                 buf += chunk
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
-                    self._process_line(line)
+                    self._reply(conn, self._process_line(line))
             # Process any trailing line without a newline.
             if buf:
-                self._process_line(buf)
+                self._reply(conn, self._process_line(buf))
+        except OSError:
+            pass
+
+    @staticmethod
+    def _reply(conn: socket.socket, body: Optional[str]) -> None:
+        """Write a command's answer back, if it had one.
+
+        Session updates from hooks answer nothing and must keep costing nothing:
+        they are fire-and-forget, the writer usually closes immediately, and a
+        write into that closed socket is an ordinary EPIPE rather than a fault.
+        """
+        if not body:
+            return
+        try:
+            conn.sendall(body.encode("utf-8", errors="replace"))
         except OSError:
             pass
 
@@ -1990,6 +2150,65 @@ class SocketServer(threading.Thread):
             return
         if not line:
             return
+        # A COMMAND, not a session update. `pair` arms BLE enrolment for a few
+        # minutes: the daemon owns the radio, so a separate process cannot do
+        # this itself, and this socket is the one channel that already exists
+        # between a terminal and the daemon. It is deliberately the ONLY command
+        # here -- a hook can write to this socket, so anything that arrives on it
+        # must be something a hook doing it by accident could not hurt, and the
+        # worst an unwanted arming does is put a prompt on the device's screen
+        # that nobody presses.
+        if line == "pair":
+            if self.on_pair_request:
+                self.on_pair_request()
+                log("pairing armed from the terminal")
+                return "ok\n"
+            log("pairing requested, but BLE is not running "
+                "(start the daemon with --ble)")
+            return "error: BLE is not running (start the daemon with --ble)\n"
+
+        # ---- the CLI's command surface ------------------------------------- #
+        # A terminal can now do what the device does, and does it by the SAME
+        # route: `press|G` is dispatched through the ButtonReader that handles
+        # `B|G` off the wire, so the CLI cannot drift into a second, subtly
+        # different implementation of GO.
+        #
+        # WHAT MAY LIVE HERE. These verbs can type into the user's session
+        # (`press|C`), stop it (`press|A<n>`), hand this daemon's token to a
+        # peripheral over the air (`pair`), and read every session's working
+        # directory (`queue`). That is not a surface to expose to every local
+        # process, which is what the socket's old 0666 mode did -- it is 0600
+        # now (see run()), so this is the user talking to their own daemon.
+        #
+        # Even so, DELETION IS NOT HERE. A hook in any of the user's shells can
+        # write to this socket, and a hook firing a malformed line should not be
+        # able to remove a login. `accounts rm` therefore deletes in the CLI's
+        # own process and only asks the daemon to re-read afterwards.
+        if line == "queue":
+            return self._json(self.queue_snapshot())
+        if line == "accounts":
+            return self._json(self.accounts_snapshot())
+        if line == "accounts-refresh":
+            if self.on_accounts_refresh:
+                self.on_accounts_refresh()
+                return "ok\n"
+            return "error: no account reporter\n"
+        if line.startswith("press|"):
+            code = line[6:].strip()
+            if not code:
+                return "error: press| needs a button code\n"
+            if not self.on_press:
+                return "error: no button reader\n"
+            log(f"press {code!r} from the terminal")
+            self.on_press(code)
+            return "ok\n"
+        if line.startswith("select|"):
+            want = line[7:].strip()
+            if not self.on_select:
+                return "error: no screen\n"
+            got = self.on_select(want)
+            return f"ok {got}\n" if got else f"error: no session matching {want!r}\n"
+
         # Expected: "<state>|<session_id>|<name>|<ctrl_sock?>|<model?>|<effort?>
         # |<account?>|<limit?>". The hook path sends only the first three
         # fields; the PTY wrapper adds the control socket, the scraped model +
@@ -2022,6 +2241,68 @@ class SocketServer(threading.Thread):
         if haptic and self._on_haptic:
             log(f"LED: {haptic} transition for {name or sid} ({state})")
             self._on_haptic(haptic)
+
+    # ---- what the CLI reads ------------------------------------------------ #
+
+    @staticmethod
+    def _json(obj: Any) -> str:
+        return json.dumps(obj) + "\n"
+
+    def queue_snapshot(self) -> Dict[str, Any]:
+        """The device's screen, as data.
+
+        Built from the SAME Registry.queue() the frame is drawn from, so the
+        order a terminal prints is the order PREV/NEXT steps through. A CLI that
+        sorted its own way would make `select 3` mean two different things
+        depending on which surface you happened to be looking at.
+        """
+        sel = shown = None
+        follow = False
+        scr = self.screen
+        if scr is not None:
+            sel_s = scr.resolve_press_target()
+            shown_s = scr.current_shown()
+            sel = sel_s.key if sel_s else None
+            shown = shown_s.key if shown_s else None
+            follow = scr.is_follow()
+        out = []
+        for i, sess in enumerate(self._reg.queue()):
+            out.append({
+                "i": i,
+                "key": sess.key,
+                "name": sess.name,
+                "state": sess.state,
+                "secs": round(sess.display_seconds()),
+                "model": sess.model,
+                "effort": sess.effort,
+                "account": sess.account,
+                "limit": sess.limit,
+                "cwd": sess.cwd,
+                "acked": sess.acked,
+                "shown": sess.key == shown,
+            })
+        return {"queue": out, "follow": follow, "shown": shown, "selected": sel}
+
+    @staticmethod
+    def accounts_snapshot() -> Dict[str, Any]:
+        """The saved logins, in the order the device is shown them.
+
+        `dir` is included because the CLI is what deletes one, and it should
+        delete the path the daemon MEANS rather than one it rebuilt from a name
+        and an assumption -- 'default' is ~/.claude and not under the profiles
+        root at all, which is exactly the assumption that would go wrong.
+
+        No limit chips: reading one costs a Keychain lookup and an HTTP call per
+        account, fine on the device's slow poll and wrong for a command someone
+        runs to see a list. claude-mate-switch already prints them.
+        """
+        out = []
+        for name in account_profiles(limit=0):
+            cfg = account_dir(name)
+            out.append({"name": name, "dir": cfg,
+                        "exists": os.path.isdir(cfg),
+                        "removable": name != "default"})
+        return {"accounts": out, "accounts_dir": ACCOUNTS_DIR}
 
     def stop(self) -> None:
         self._stop_evt.set()
@@ -2076,8 +2357,27 @@ class ButtonReader(threading.Thread):
                 continue
             self._dispatch(line)
 
+    def press(self, code: str) -> None:
+        """Act on a button code as though the device had sent it.
+
+        Through _dispatch rather than by calling the handlers directly, and that
+        is the whole point: every rule that applies to a real press applies here
+        too -- PREV scrolling the mirror instead of moving the selection, GO
+        closing the mirror first, a browser holding the grab swallowing the lot.
+        A CLI that called _go_pressed() itself would be a second implementation
+        of GO, and the two would drift the first time either changed.
+        """
+        self._dispatch(f"B|{code}")
+
     def _dispatch(self, line: str) -> None:
         # Tolerate garbled / partial lines: only act on exact, known shapes.
+        # EITHER of these is proof that a Claude Mate is on the other end of the
+        # cable, which is what the token push waits for. Cheap and idempotent:
+        # the flag is armed once per serial open and spent on the first answer.
+        if line in ("H", "K"):
+            prov = getattr(self._link, "provision_if_ours", None)
+            if prov:
+                prov()
         if line == "H":
             self._screen.resend_full_state()
             return
@@ -2782,6 +3082,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 f"created. Set CLAUDE_MATE_TOKEN, pass --token, or write one "
                 f"to {DEFAULT_TOKEN_FILE}. Continuing with USB serial only.")
         else:
+            # The cable can now provision the radio. See SerialLink._provision().
+            serial_link.set_provision_token(token)
             if args.tcp:
                 candidate = NetLink(args.tcp_bind, args.tcp_port, token, rx)
                 if candidate.start():
@@ -2967,6 +3269,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     screen.on_handshake_extra = _on_handshake
 
     socket_server = SocketServer(args.sock, registry, on_update, on_haptic)
+    # `pair` over the socket reaches the radio. Left unset when BLE is not
+    # running, so the command answers "BLE is not running" rather than silently
+    # doing nothing -- the failure a terminal cannot otherwise see.
+    if ble is not None:
+        socket_server.on_pair_request = ble.arm_pairing
+    # The CLI's hooks. `press` goes through the SAME _dispatch that handles a
+    # B| line off the wire, so `claude-mate go` and pressing GO on the device
+    # cannot mean two different things -- there is one implementation of GO and
+    # the terminal is just another way to reach it.
+    socket_server.screen = screen
+    socket_server.on_press = lambda code: button_reader.press(code)
+    socket_server.on_select = screen.select_by
+    socket_server.on_accounts_refresh = refresh_accounts
     button_reader = ButtonReader(link, screen)
     button_reader.on_ack = on_ack
     button_reader.bridge = web

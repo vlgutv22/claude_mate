@@ -12,6 +12,286 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
+### 2026-08-13 — The rest of the review, including two features that could not work
+
+- **Fixed: the gamepad could never start on a BLE board.** `setup()` brought the
+  link up and then tore it down for the pad three lines later — the
+  init-after-deinit this chip does not survive — so the pad failed in *every*
+  boot, and failing took the link with it: flipping the switch rebooted the
+  device and came back with the switch off, while `setup()`'s own comment
+  promised "THE GAMEPAD SURVIVES THE REBOOT". The link is no longer started when
+  the switch is on, and turning it on at runtime reboots, mirroring the exit that
+  already did.
+- **Fixed: the PAIR? prompt was unanswerable from the game screen, and the 4th
+  button never answered it anywhere.** The prompt is drawn *over* the game, but
+  both nav pollers returned before edge detection in `UI_GAME`, so GO started a
+  run behind it and the firmware auto-refused 45 s later. The 4th button is
+  dispatched by its own poller and never reached `onButton()`, so *"any other
+  button = refuse"* was untrue: a tap changed screens behind the prompt, a
+  double-tap opened the menu and emitted `B|M`, and a 2 s hold slept the board
+  mid-offer. All three gestures answer it now.
+- **Fixed: the three pairing timeouts were ordered wrong** — 50 s daemon against
+  45 s device, so the device always spoke first and the daemon's *"nobody pressed
+  GO"* branch was unreachable for its own case: every unanswered offer was
+  reported as though somebody had refused. Now 45 s (device answers) → 60 s
+  (device drops the link) → 65 s (daemon gives up), pinned by a test that reads
+  all three out of two languages and three files.
+- **Fixed: a successful pairing could report itself as declined.** The flag meant
+  "a question was answered" rather than "it was refused", so a slow handshake
+  after GO told the person who had just pressed it that they had said no.
+- **Fixed: the daemon waited out the clock on a device that had gone.**
+  `_await_auth_line` checked neither the connection nor the disconnect event, so
+  a board carried out of range mid-pairing pinned the daemon inside the client
+  context for ~51 s — not scanning, not recovering.
+- **Fixed: BLE dropped the farewell frames on shutdown** (7 of 10 runs measured).
+  `V|OFF` and the "daemon stopped" frame are coroutines *scheduled* on the BLE
+  loop, and stopping the loop in the same batch discarded them, so a battery
+  device sat on a stale frame flashing an alert for up to 30 s — exactly what
+  those two writes exist to prevent.
+- **Fixed: the setup portal erased a configured daemon address.** The host input
+  had no prefill and the port carried a literal `8787`, so a visit that only
+  re-entered a token — the expected visit on a BLE device now — silently reset
+  both and dropped the device back to the mDNS discovery an explicit host exists
+  to avoid. The form round-trips them, like the token box already explained
+  itself.
+- **Fixed: `rebootAfterRelease()` used `millis() + X`**, the one non-rollover-safe
+  idiom left in a file that fixes that arithmetic in three other places — **and
+  the test pinned the buggy form**, so it would have defended it.
+- Also: `PORT_GLOBS` in `claude-mate-connect` claimed a `wchusbserial` pattern the
+  daemon never looks for, so a CH340 board got a promise it could not keep *and*
+  the pairing advice that would have worked was short-circuited; a `select` check
+  written as `A or B` covered every possible reply and could not fail; and the
+  docs still named the deleted **Set token** row, GO-at-power-on after
+  `forcePortal` became BOOT-only, and `pyserial` as the only permitted dependency.
+
+
+### 2026-08-12 — One command to install it, and a manual for both ways to drive it
+
+- **Changed: the install is one command.** `./install/install.sh --yes` does all
+  of it — hook, the `settings.json` merge (backed up first), the LaunchAgent
+  started, and the three CLI tools on `PATH`. It had exactly one interactive
+  prompt, which is the difference between "one command" and "one command, then
+  watch for a question". `--yes` is opt-in rather than the default on purpose:
+  the question is whether to edit `~/.claude/settings.json`, and a script that
+  rewrites your editor config without being asked is not one to trust twice.
+- **Added: [`docs/USING.md`](docs/USING.md), the manual.** The daemon (what it
+  is, how to check and restart it, the five states and which three need you), the
+  CLI (every command, each **paired with the device button it presses**), the
+  device (four buttons, three gestures, the screen, the LED, all eight SETTINGS
+  rows), connecting a device, and a symptom-to-cause table for when it is not
+  working. One page, because there are two ways to drive one thing and
+  documenting them apart would invite them to drift.
+- **Fixed: `docs/INSTALL.md` described a project two iterations old.** Nano only,
+  Arduino IDE, no ESP32-S3, no BLE, no LaunchAgent, no CLI. It leads with the one
+  command now and hands S3 flashing to `firmware/README.md`, where the reasons
+  `arduino-cli upload` cannot do it are already written down.
+- **Added: a docs-drift guard.** `tools/test_cli.py` asserts that every button
+  command the CLI implements appears in the manual, that the install one-liner
+  printed in the docs is verbatim what the installer accepts, and that the manual
+  states the same-press claim the design rests on. Docs rot silently; a command
+  documented but removed is worse than one undocumented, because someone types it.
+
+
+### 2026-08-12 — `claude-mate`: the device's interface, in a terminal
+
+- **Added: `claude-mate`.** The queue, the selection, GO, ACK, FOLLOW, the
+  mirror, "continue", a new terminal — everything the device does, from a
+  terminal. The device is the better interface, but it is one device, sometimes
+  across the room and sometimes flat, and all of this was already a line on the
+  daemon's socket.
+- **It presses the same buttons.** `claude-mate go` sends `press|G`, which the
+  daemon hands to the **same `ButtonReader`** that handles `B|G` off the wire. So
+  every rule that applies to a real press applies here: PREV scrolls the mirror
+  instead of moving the selection when the mirror is open, GO closes the mirror
+  first, a browser holding the grab swallows the lot. A CLI that called
+  `_go_pressed()` itself would be a second implementation of GO, and the two
+  would drift the first time either changed. `select` is the one addition — the
+  device walks there with PREV/NEXT, and a terminal that prints the whole queue
+  should be able to point at a row. Ambiguous names are **refused rather than
+  guessed**, because this moves what GO acts on.
+- **Added: `claude-mate accounts`, and `accounts rm`.** Deletion runs in the
+  CLI's own process, never over the socket: that socket is `chmod 0666` so hooks
+  in any shell can post updates, so everything on it is reachable by every local
+  process. Reading state and pressing buttons survive a stray write; removing a
+  login does not. Confirmation is **typing the name back**, not a y/n — a y/n on
+  a destructive action is a reflex, and typing the name also proves you are
+  deleting the one you think you are.
+- **Fixed: a stray keystroke at the account picker created an account.** Anything
+  typed there became a profile, and an arrow key types an *escape sequence* — so
+  a real accounts dir held a directory named `\033`, which prints as a blank row
+  with somebody's email beside it, and another named `в` from a keyboard left in
+  the wrong layout. Both had been logged into, because the picker committed and
+  claude then asked for a login. A new name is now **offered** rather than
+  assumed, and implausible ones (unprintable, over 32 chars, containing a path
+  separator — `../` under the profiles root was never a naming choice) are
+  ignored outright. `claude-mate accounts` shows such names as reprs so they can
+  be identified, and `accounts rm` takes an index, because `\033` cannot be typed
+  at a prompt.
+
+
+### 2026-08-12 — No Wi-Fi on the device's menu at all
+
+- **Removed: the setup-portal row.** It existed for exactly one reason — a
+  factory-reset board with no cable had no way to be given a token — and
+  enrolment removed that reason. What was left was a Wi-Fi flow wearing a label
+  that said *Set token*: press it and you get an access point, a phone and a
+  secret to transcribe, on a device whose whole point is that it does not need
+  any of that. `SETTINGS` is now eight rows and none of them touches Wi-Fi.
+- **The order mattered and was learned the hard way.** Removing this row
+  *before* pairing existed stranded a real board within minutes, and putting it
+  back was the right call at the time. `tools/test_ble_link.py` now asserts the
+  `E|?` handler exists in the same breath as asserting the row does not, so the
+  removal cannot be repeated without the replacement.
+- The portal is still reachable where a mistake cannot reach it: `Z` over USB,
+  or **BOOT**/**GO** held at power-on. A board whose BLE will not start needs
+  something, and both of those require physical access the menu does not.
+
+### 2026-08-12 — Pairing: one command, one button, no Wi-Fi anywhere
+
+- **Added: `E|`, an enrolment handshake over BLE, and `claude-mate-connect
+  --pair`.** Provisioning a cordless board meant a cable it was nowhere near, or
+  a Wi-Fi access point, a phone and a 32-character secret typed by hand — over a
+  BLE link that was *already connected and talking to the daemon*. Now: run the
+  command (or press `d` at the account picker), the device puts **PAIR?** on its
+  screen, press **GO**, done.
+- **The device is the one that asks its human**, which is the whole security
+  argument. Being in radio range gets an attacker a prompt on a screen they
+  cannot reach and nothing else; `E|<token>` is refused outright unless a button
+  was pressed in that same connection, because *"has no token yet"* must never
+  be permission by itself. Approval is single-use and dies with the connection,
+  the daemon's side is **armed for three minutes** rather than on, and a refusal
+  disarms it so a declined device is not asked again on a loop. The cost is
+  stated in `docs/PROTOCOL.md` rather than glossed: the token crosses the air
+  once, in the clear, inside that window — the link is already unencrypted by
+  design, but a sniffer listening at that second learns it.
+- **Changed: every "no token" message names that route.** Two screens and the
+  daemon's log had been pointing at the Wi-Fi portal, which is the long way
+  round, and before that at a cable a cordless board may not have. They now all
+  say `claude-mate-connect`, pinned together by a test — they had already
+  drifted twice.
+
+### 2026-08-12 — The cable provisions the radio, and the picker can say why it did not
+
+- **Added: the daemon hands its token to any device that appears on USB.** *"How
+  do I connect it after a factory reset"* had two honest answers — raise a portal
+  from a phone, or type `T|<token>` down the cable — and both are work nobody
+  should be asked to do, because the wiped device and the daemon that knows the
+  secret are *already joined by a cable over which provisioning is the trusted
+  path*. Every serial open now pushes the token. Measured on hardware: `no token`
+  → `serial: handed the device this daemon's token` → `BLE device connected`, in
+  **four seconds**, with nothing typed. Unconditional rather than conditional on
+  "does it need one", because USB has no handshake to ask over (it is trusted by
+  being physical) and the daemon's token is the authority — a device holding a
+  different one cannot link, so overwriting is the repair. NVS skips a write
+  whose value is unchanged, so the steady state costs nothing.
+  `CLAUDE_MATE_NO_USB_PROVISION=1` turns it off.
+- **Added: `claude-mate-connect`, and a `d) device` entry in the account
+  picker.** That prompt is the only Claude Mate UI on the Mac, and until now it
+  could only choose an account — so a device that would not link had its
+  explanation in two places nobody at that prompt was looking: the device's own
+  glass, and a log file. The command reports every link (daemon, token, cable,
+  BLE) and prints the shortest fix for whichever is down, then the picker comes
+  back. It also states the thing that reads as a fault and is not: **the device
+  never appears in System Settings → Bluetooth**, because the status link is an
+  unpaired GATT peripheral and the token handshake, not pairing, is what decides
+  who may drive it.
+
+### 2026-08-12 — The radio switch comes off the glass, the token screen moves to the front
+
+- **Changed: no `Link` row in SETTINGS.** It was a plain toggle, so **one press
+  moved a cordless board onto Wi-Fi** — and a board with no credentials then
+  reboots into the setup portal, which outranks the menu and does not time out
+  for a Wi-Fi device, so it hides the very row you would use to undo it. One
+  press on the glass, and no way back without a cable. Found the way these
+  things are always found: a board that had "stopped working over BLE" turned
+  out to be sitting on Wi-Fi with no SSID, because the row had been pressed. The
+  transport is not deleted — `I|WIFI` / `I|BLE` still work over USB, which keeps
+  that switch behind a cable you have to actually have: if you can type `I|WIFI`
+  you can type `I|BLE` back. Which radio is live, and whether it has found the
+  daemon, is still on the glass in **SETTINGS → About**, which now colours the
+  link green when the daemon is on the other end — the signal the `Link` row
+  used to carry.
+- **Changed: `Wi-Fi setup` becomes `Set token`, and moves to the top of
+  SETTINGS.** Same portal behind it; a different name, because on a BLE device
+  the only field that matters is the token and a row labelled *Wi-Fi setup* is
+  a row nobody presses when a token is what they need. The value answers before
+  you press it — `none`, in red, *is* the reason a freshly reset board is doing
+  nothing. It is first because it is the row you need when nothing else works,
+  and five rows are visible without scrolling.
+- **Fixed: a factory-reset board with no cable attached could not be given a
+  token at all.** For one commit this row was removed alongside `Link`, on the
+  reasoning that both were Wi-Fi doors. They are not: the `Link` row *changes*
+  the transport, while this one *provisions* the device, and on BLE it is the
+  only on-glass route to a token. What remained was BOOT-held-at-power-on — an
+  incantation nobody discovers, and useless advice to someone holding a cordless
+  board that has just wiped itself. It is also not the trap `Link` was: on a BLE
+  device the portal expires after five idle minutes and hands the glass back,
+  and the token it takes reaches the running stack.
+- **Changed: every "no token" message on the glass names that row** rather than
+  a cable. `send T|<token> over USB` is not an instruction when the board is on
+  its cell across the room; the status line, the NO LINK screen and the
+  `A|NOTOKEN` note now all say `MENU > Set token`, and the daemon's log gives
+  both routes. A test pins the three device-side strings together, because they
+  drifted once already — the glass advertised a USB-only route while the only
+  on-glass route had been deleted.
+- **Fixed: a config write to an unprovisioned Wi-Fi device killed the setup
+  portal.** `restart()` stopped the portal, saw no SSID and dropped to `OFF`. An
+  unprovisioned Wi-Fi device *is* a device sitting in the portal — that is where
+  `begin()` puts it — so `T|<token>`, typed at exactly the device that needs a
+  token, tore down the only screen that could finish the job and left no link,
+  no portal, and no way back but a reboot. It now does what `begin()` does:
+  nothing to join means the portal.
+
+### 2026-08-12 — A board with nothing in NVS can get itself a token
+
+Five ways a factory-reset ESP32-S3 could not be provisioned at all, found by
+wiping one and trying. Every one of them ends the same way: a device advertising
+nothing and answering nothing, which no test on either side of the protocol
+could have seen. `tools/test_ble_link.py` now pins all five statically
+(43 → 57 checks).
+
+- **Fixed: an unprovisioned board came up in a portal it could not satisfy.**
+  Empty NVS defaulted the transport to Wi-Fi, so `begin()` found no SSID and
+  raised the setup portal — which outranks every screen in `render()` and blocks
+  the menu, including the **SETTINGS → Link** row that would have moved the
+  device to BLE. The way out was reachable only from behind the thing blocking
+  it. A board with nothing stored now comes up **on BLE**, the radio that needs
+  nothing stored to work. A board with an SSID still comes up on Wi-Fi: an
+  upgrade must not move a working device onto a different radio behind its
+  owner's back.
+- **Fixed: `T|<token>` reached NVS but not the running BLE stack.** The device
+  went on answering `A|NOTOKEN` with the correct secret in flash beside it —
+  indistinguishable, from either end, from a daemon rejecting a token that is
+  right. Since BLE cannot be restarted in the same boot, the stack now takes the
+  token live. The same hole existed on the **portal** path, where the page
+  handler writes to NVS and has never heard of the stack, and that was the worse
+  one: it is the only way a cordless board can be given a token with no cable.
+- **Fixed: holding BOOT on a BLE board was a one-way door.** The portal only ever
+  timed out on a device with credentials to fall back to, because for an
+  unprovisioned Wi-Fi device the portal is all there is. A BLE device has a
+  working link and no use for the screen, so it now expires after five idle
+  minutes and hands the glass back — and expiring with no SSID powers the radio
+  down rather than dialling an empty one, which would put the STA back up on the
+  one radio the other transport is trying to use.
+- **Fixed: `W|`, `S|` and `T|` restarted Wi-Fi on a BLE device.** Provisioning
+  credentials for later would associate immediately, leaving both radios up —
+  the exact contention one-transport-at-a-time exists to prevent. They are
+  stored either way and applied only when Wi-Fi is the live link.
+- **Fixed: the portal would not save a token without a network.** A blank
+  network box was a `400 network required`, which is the right rule for the
+  Wi-Fi flow and the wrong one on a device whose link is BLE, where the page is
+  only ever opened for the token — it left "type a fake network name" as the way
+  through. It now refuses only a submission that would save nothing, the
+  network field says it is optional, and the dropdown offers **none**: a
+  `<select>` always submits something, so a BLE user setting a token was
+  silently storing whichever network happened to top the scan.
+- **Changed: the screens a fresh board actually shows name the missing token
+  first.** `ble: start the daemon with --ble` and `check it is running with
+  --ble` are both true and both send you to the wrong half of the daemon's log
+  when the real answer is that this device has no secret yet. The status line and
+  the NO LINK screen now say `send T|<token> over USB`, and the `A|NOTOKEN` note
+  no longer points a BLE user at a portal it never opens.
+
 ### 2026-08-11 — BLE as a transport, and one gamepad switch instead of two rows
 
 - **Added: the line protocol over Bluetooth LE** (`firmware/claude_mate_s3/blelink.h`,

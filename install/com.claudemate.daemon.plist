@@ -59,6 +59,20 @@
     <dict>
         <key>PYTHONUNBUFFERED</key>
         <string>1</string>
+        <!--
+          BLE ON BY DEFAULT, because every route the installer and the docs
+          advertise for connecting a device runs through it: `claude-mate-connect
+          --pair` needs it, and even USB token provisioning is gated behind a
+          transport being enabled (a daemon with no radio has no secret to
+          share). Shipping it off made a clean install unable to provision a
+          device by either method it tells you about.
+
+          It costs a daemon with no device nothing: bleak is imported lazily and
+          a missing one is reported and carried on from, and a scan that finds
+          nothing logs once every two minutes.
+        -->
+        <key>CLAUDE_MATE_BLE</key>
+        <string>1</string>
     </dict>
 
     <key>StandardOutPath</key>

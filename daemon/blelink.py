@@ -86,8 +86,39 @@ BLE_DEVICE_NAME = "Claude Mate"
 # makes a miss a coincidence rather than a coin flip.
 BLE_SCAN_S = 8.0
 BLE_AUTH_S = 5.0            # the firmware allows 5 s; so do we
-BLE_RETRY_S = 3.0           # between scan attempts...
-BLE_RETRY_MAX_S = 30.0      # ...doubling on consecutive failures, capped
+# Pairing waits on a person, not a radio. The device gives its human 45 s to
+# answer the prompt on its screen, so allow a little more than that before
+# giving up on them -- and keep the ARMED window short, because it is a standing
+# permission to give away a secret.
+# ...and it must OUTLAST the firmware's own 45 s prompt, not undercut it. At 50 s
+# against 45 s the device always answered E|NO first, so "nobody pressed GO" was
+# unreachable for the case it describes and every unanswered offer was reported
+# as "declined on the device" -- which reads as somebody having refused. 65 s
+# leaves room for the device to speak for itself, and the branch only fires when
+# the device really has gone quiet.
+BLE_PAIR_CONFIRM_S = 65.0
+BLE_PAIR_ARM_S = 180.0
+# Between scan attempts, doubling on consecutive failures, capped -- and the cap
+# is LOW on purpose, which is the opposite of the Wi-Fi transport's reasoning.
+#
+# There, backing off protects the DEVICE: the retry is an mDNS browse and a TCP
+# dial made from the firmware's own loop, so a fast retry costs it button
+# responsiveness and battery. Here the scanning happens on the MAC, and the
+# device advertises its 200 ms burst every 4.2 s whether anyone is listening or
+# not -- it pays the same either way. So a long cap buys the battery side
+# nothing and spends the only thing the user actually feels.
+#
+# It was 30 s, which with an 8 s scan meant a board waking from sleep waited up
+# to ~38 s before the next scan even STARTED. Measured against a real overnight
+# sleep: "device looking for connection about a minute after awake". At 6 s the
+# worst case is ~14 s and the typical one ~10 s.
+#
+# What that costs, said plainly: the Mac's BLE scanner runs at roughly 60% duty
+# instead of 20% while no device is present. It is a filtered scan on a machine
+# that is usually plugged in, against a wait the user experiences every single
+# time they pick the device up.
+BLE_RETRY_S = 2.0
+BLE_RETRY_MAX_S = 6.0
 BLE_MAX_LINE = 512          # drop over-long lines (the longest real one is ~94B)
 BLE_NOT_FOUND_GAP_S = 120.0  # between "still looking" notes; see _log_not_found
 BLE_WRITE_FAIL_LIMIT = 3     # consecutive failed writes that end a session
@@ -131,6 +162,10 @@ class BleLink:
         self._auth_q: "queue.Queue[str]" = queue.Queue()
         self._not_found_logged = 0.0   # throttle for _log_not_found
         self._write_fails = 0          # consecutive failed GATT writes
+        # Pairing is ARMED, never on. An unprovisioned device in range is not
+        # consent to hand it this daemon's secret -- somebody has to ask, at the
+        # terminal, and then press a button on the device. See _enrol().
+        self._pair_until = 0.0
 
     # ---- lifecycle --------------------------------------------------------- #
 
@@ -156,12 +191,33 @@ class BleLink:
         self._stop_evt.set()
         loop = self._loop
         if loop is not None:
+            # LET THE LAST WRITES GO OUT FIRST. main() writes `V|OFF` and a
+            # "daemon stopped" frame immediately before calling this, and on this
+            # transport those are coroutines SCHEDULED onto the loop rather than
+            # completed calls. Stopping the loop in the same batch of callbacks
+            # discarded them -- measured 7 of 10 shutdowns delivering nothing,
+            # with "Task was destroyed but it is pending" on stderr, while
+            # write_line() had returned True to a caller that believed it. The
+            # firmware's watchdog is 30 s, so the device sat on a stale frame
+            # flashing an alert for half a minute, which is exactly what those
+            # two writes exist to prevent.
+            async def _drain_then_stop() -> None:
+                for _ in range(20):            # ~200 ms, bounded
+                    if not [t for t in asyncio.all_tasks(loop)
+                            if t is not asyncio.current_task()]:
+                        break
+                    await asyncio.sleep(0.01)
+                loop.stop()
+
             # The loop is running on another thread; poking it any other way is
-            # a race. call_soon_threadsafe is the one supported door.
+            # a race. These two are the supported doors.
             try:
-                loop.call_soon_threadsafe(loop.stop)
+                asyncio.run_coroutine_threadsafe(_drain_then_stop(), loop)
             except RuntimeError:
-                pass
+                try:
+                    loop.call_soon_threadsafe(loop.stop)
+                except RuntimeError:
+                    pass
         thread = self._thread
         if thread is not None:
             thread.join(timeout=3.0)
@@ -236,10 +292,11 @@ class BleLink:
                 # Throttled, because the scan repeats and a message per attempt
                 # is its own kind of useless.
                 self._log_not_found()
-                # Exponential backoff, capped. A device that is off stays off
-                # for hours -- asleep in a drawer, or being a gamepad -- and
-                # scanning every three seconds for hours is a pointless drain on
-                # the Mac's radio and a noisy log. Success resets it.
+                # Exponential backoff, capped low -- see BLE_RETRY_MAX_S for
+                # why this transport wants a different cap from the Wi-Fi one.
+                # The log stays quiet regardless: _log_not_found throttles to one
+                # line every two minutes, so the noise argument for a long sleep
+                # was already handled somewhere else. Success resets it.
                 fails = min(fails + 1, 4)
                 await self._sleep(min(BLE_RETRY_S * (2 ** fails),
                                       BLE_RETRY_MAX_S))
@@ -320,6 +377,14 @@ class BleLink:
             with self._lock:
                 self._client, self._linked = client, True
             self._log(f"BLE device connected: {device.address}")
+            began = time.monotonic()
+            # WHY a session ended, not just that it did. Four different things
+            # end this loop and all four used to log the same sentence, so an
+            # intermittent drop -- "working, not stable" -- left nothing to work
+            # from: a peripheral that went away, a peripheral that went away
+            # WITHOUT saying so, our own writes failing, and a daemon shutting
+            # down are four different faults with four different fixes.
+            why = "peer disconnected"
             try:
                 while not self._stop_evt.is_set() and not disconnected.is_set():
                     # DO NOT TRUST THE DISCONNECT CALLBACK ALONE. Observed on
@@ -335,8 +400,16 @@ class BleLink:
                     # transport learned the same lesson from the other
                     # direction: NetLink reaps a client the first time a write
                     # to it fails, rather than waiting to be informed.
-                    if not client.is_connected or \
-                            self._write_fails >= BLE_WRITE_FAIL_LIMIT:
+                    if self._write_fails >= BLE_WRITE_FAIL_LIMIT:
+                        why = (f"{self._write_fails} consecutive writes failed "
+                               f"(link up but not carrying)")
+                        break
+                    if not client.is_connected:
+                        # The callback did not fire; the poll caught it. Worth
+                        # distinguishing, because it is the failure mode that
+                        # once cost this transport ninety minutes of writing
+                        # frames into nothing.
+                        why = "peer vanished (no disconnect callback)"
                         break
                     try:
                         await asyncio.wait_for(disconnected.wait(), timeout=0.5)
@@ -345,7 +418,11 @@ class BleLink:
             finally:
                 with self._lock:
                     self._client, self._linked = None, False
-                self._log(f"BLE device disconnected: {device.address}")
+                if self._stop_evt.is_set():
+                    why = "daemon stopping"
+                held = time.monotonic() - began
+                self._log(f"BLE device disconnected after {held:.0f}s: "
+                          f"{why} [{device.address}]")
 
     async def _authenticate(self, client) -> bool:
         """Nonce challenge / HMAC response. False = reject and drop.
@@ -370,11 +447,28 @@ class BleLink:
             self._log("BLE: handshake timed out")
             return False
         if reply.strip().upper() == "A|NOTOKEN":
-            # The commonest wireless failure by far, because it is exactly what
-            # a cleared token looks like -- so it gets the message that says
-            # what to do rather than one that says a handshake failed.
-            self._log("BLE: THE DEVICE HAS NO TOKEN. Send T|<token> over USB, "
-                      "or set it in the device's setup portal.")
+            # An unprovisioned device. If somebody armed pairing at the terminal
+            # in the last few minutes, this is the moment it was armed for.
+            if self._pair_armed():
+                if await self._enrol(client):
+                    # _authenticate, not _handshake -- there is no _handshake on
+                    # this class. The first cut called one, so every SUCCESSFUL
+                    # pairing logged "paired" and then raised AttributeError one
+                    # statement later; _connect_forever swallowed it as "session
+                    # ended" and disconnected the device it had just paired.
+                    # Nothing noticed: the host test's 8 s wait absorbed the
+                    # reconnect, and the CLI greps for the log line written just
+                    # BEFORE the crash. Recursion is bounded -- the device now
+                    # has a token, so it cannot answer A|NOTOKEN again.
+                    return await self._authenticate(client)
+                return False
+            # Otherwise say what to do about it. Pairing FIRST, because it is
+            # the only route that needs neither a cable the device may be
+            # nowhere near nor a Wi-Fi access point and a phone.
+            self._log("BLE: THE DEVICE HAS NO TOKEN. Pair it: run "
+                      "`claude-mate-connect --pair` (or press `d` at the "
+                      "account picker) and press GO on the device. With a "
+                      "cable, plugging it in is enough.")
             await self._write(client, b"A|NO\n")
             return False
         if not reply.startswith("A|"):
@@ -390,10 +484,71 @@ class BleLink:
         await self._write(client, b"A|OK\n")
         return True
 
-    async def _await_auth_line(self) -> Optional[str]:
-        """The device's one handshake line, or None if it never came."""
-        deadline = time.monotonic() + BLE_AUTH_S
+    # ---- pairing ----------------------------------------------------------- #
+
+    def arm_pairing(self, seconds: float = BLE_PAIR_ARM_S) -> None:
+        """Allow the next unprovisioned device to be enrolled, for a while.
+
+        A window rather than a switch: whoever asked for this is standing at the
+        device right now, and an arming that outlived them would hand the token
+        to the next unprovisioned board that wandered into range.
+        """
+        self._pair_until = time.monotonic() + seconds
+
+    def _pair_armed(self) -> bool:
+        return time.monotonic() < self._pair_until
+
+    async def _enrol(self, client) -> bool:
+        """Give an unprovisioned device this daemon's token, if a human agrees.
+
+        The device is the one that asks the human -- it puts PAIR? on its own
+        screen and waits for a button. That is what makes this safe to expose to
+        the radio at all: being in range gets you a prompt on a screen you
+        cannot reach, and nothing else. See the E| protocol note in blelink.h.
+        """
+        self._log("BLE: pairing — press GO on the device to accept "
+                  f"(waiting up to {int(BLE_PAIR_CONFIRM_S)}s)")
+        await self._write(client, b"E|?\n")
+        reply = await self._await_auth_line(BLE_PAIR_CONFIRM_S, client)
+        if reply is None:
+            self._log("BLE: pairing timed out — nobody pressed GO")
+            self._pair_until = 0.0
+            return False
+        if reply.strip().upper() != "E|OK":
+            # A refusal is a decision, so it disarms. Re-asking a device whose
+            # owner just said no would be the wrong kind of persistent.
+            self._log(f"BLE: pairing declined by the device ({reply.strip()})")
+            self._pair_until = 0.0
+            return False
+        await self._write(client, b"E|" + self._token + b"\n")
+        confirm = await self._await_auth_line(client=client)
+        if confirm is None or confirm.strip().upper() != "E|SET":
+            self._log(f"BLE: the device did not take the token ({confirm!r})")
+            return False
+        # Disarm on SUCCESS as well: this window existed for one device, and it
+        # has been paired.
+        self._pair_until = 0.0
+        self._log("BLE: paired — the device now has this daemon's token")
+        return True
+
+    async def _await_auth_line(self, timeout: float = BLE_AUTH_S,
+                               client=None) -> Optional[str]:
+        """The device's one handshake line, or None if it never came.
+
+        The timeout is a parameter because pairing waits on a HUMAN pressing a
+        button, and five seconds is the right budget for a handshake and the
+        wrong one for a person noticing their device has lit up.
+
+        `client` lets it give up the moment the peer goes away instead of waiting
+        out the clock. That matters most on the long pairing wait: a device
+        carried out of range mid-offer used to pin the daemon inside the
+        BleakClient context for the full fifty seconds -- not scanning, not
+        recovering, with nothing to show for it.
+        """
+        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            if client is not None and not client.is_connected:
+                return None
             try:
                 return self._auth_q.get_nowait()
             except queue.Empty:

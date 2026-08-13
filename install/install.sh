@@ -12,6 +12,24 @@ set -euo pipefail
 
 # --- Resolve paths ----------------------------------------------------------
 # Directory of this script (install/), and the repo root one level up.
+# --yes / -y (or CLAUDE_MATE_ASSUME_YES=1) answers the one question this script
+# asks, which is the difference between "one command" and "one command, then keep
+# an eye out for a prompt". Opt-in on purpose: the question is whether to edit
+# ~/.claude/settings.json, and a script that rewrites your editor config without
+# being asked is not one to trust twice. It backs the file up either way.
+ASSUME_YES="${CLAUDE_MATE_ASSUME_YES:-0}"
+for arg in "$@"; do
+    case "$arg" in
+        -y|--yes) ASSUME_YES=1 ;;
+        -h|--help)
+            echo "usage: install.sh [--yes]"
+            echo "  --yes   merge the hooks snippet into ~/.claude/settings.json"
+            echo "          without asking (the file is backed up first)"
+            exit 0 ;;
+        *) echo "install.sh: unknown option $arg" >&2; exit 2 ;;
+    esac
+done
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
@@ -77,37 +95,40 @@ if [[ -f "${SNIPPET_SRC}" ]]; then
 
     if command -v jq >/dev/null 2>&1; then
         # jq is available -> offer to merge automatically.
-        if [[ ! -t 0 ]]; then
-            # Non-interactive run (e.g. piped). Don't touch settings; just instruct.
+        reply="n"
+        if [[ "${ASSUME_YES}" = "1" ]]; then
+            reply="y"
+        elif [[ ! -t 0 ]]; then
+            # Piped, and not told to assume yes. Touch nothing; just instruct.
             warn "Non-interactive shell: skipping automatic merge."
-            warn "Run install.sh in a terminal to merge automatically, or merge the snippet above by hand."
+            warn "Re-run with --yes to merge it, or add the snippet above by hand."
         else
             read -r -p "Merge this snippet into ${CLAUDE_SETTINGS} now with jq? [y/N] " reply
-            case "${reply}" in
-                [yY]|[yY][eE][sS])
-                    if [[ -f "${CLAUDE_SETTINGS}" ]]; then
-                        backup="${CLAUDE_SETTINGS}.bak.$(date +%Y%m%d%H%M%S)"
-                        cp "${CLAUDE_SETTINGS}" "${backup}"
-                        ok "Backed up existing settings -> ${backup}"
-                    else
-                        echo '{}' > "${CLAUDE_SETTINGS}"
-                    fi
-                    tmp="$(mktemp)"
-                    # Deep-merge: snippet's hooks take precedence on key collisions.
-                    if jq -s '.[0] * .[1]' "${CLAUDE_SETTINGS}" "${SNIPPET_SRC}" > "${tmp}"; then
-                        mv "${tmp}" "${CLAUDE_SETTINGS}"
-                        ok "Merged hooks into ${CLAUDE_SETTINGS}"
-                    else
-                        rm -f "${tmp}"
-                        err "jq merge failed; your settings.json was NOT modified."
-                        warn "Merge the snippet above into ${CLAUDE_SETTINGS} manually."
-                    fi
-                    ;;
-                *)
-                    info "Skipping automatic merge. Add the snippet above manually."
-                    ;;
-            esac
         fi
+        case "${reply}" in
+            [yY]|[yY][eE][sS])
+                if [[ -f "${CLAUDE_SETTINGS}" ]]; then
+                    backup="${CLAUDE_SETTINGS}.bak.$(date +%Y%m%d%H%M%S)"
+                    cp "${CLAUDE_SETTINGS}" "${backup}"
+                    ok "Backed up existing settings -> ${backup}"
+                else
+                    echo '{}' > "${CLAUDE_SETTINGS}"
+                fi
+                tmp="$(mktemp)"
+                # Deep-merge: snippet's hooks take precedence on key collisions.
+                if jq -s '.[0] * .[1]' "${CLAUDE_SETTINGS}" "${SNIPPET_SRC}" > "${tmp}"; then
+                    mv "${tmp}" "${CLAUDE_SETTINGS}"
+                    ok "Merged hooks into ${CLAUDE_SETTINGS}"
+                else
+                    rm -f "${tmp}"
+                    err "jq merge failed; your settings.json was NOT modified."
+                    warn "Merge the snippet above into ${CLAUDE_SETTINGS} manually."
+                fi
+                ;;
+            *)
+                info "Skipping automatic merge. Add the snippet above manually."
+                ;;
+        esac
     else
         warn "jq not found. Add the snippet above into ${CLAUDE_SETTINGS} manually."
         warn "Tip: 'brew install jq' to enable automatic merging next time."
@@ -156,10 +177,53 @@ else
     launchctl bootstrap "gui/${uid}" "${PLIST_DST}" 2>/dev/null || true
 fi
 
+# --- 5b. Python dependencies -------------------------------------------------
+# pyserial is required for a USB device; bleak is required for BLE, which the
+# plist above enables because every documented way to connect a device needs it.
+# BEST EFFORT, never fatal: a managed or externally-managed Python will refuse
+# the install, and a daemon without these still runs -- it just reports which
+# transport it cannot offer. Saying so here beats a working install that
+# silently cannot do the thing its last line tells you to do.
+info "Python dependencies (pyserial, bleak)..."
+if "${PYTHON_BIN}" -m pip install --user --quiet --disable-pip-version-check \
+        pyserial bleak 2>/dev/null; then
+    ok "Installed pyserial + bleak"
+else
+    warn "Could not install them automatically. If a device does not link:"
+    warn "  ${PYTHON_BIN} -m pip install pyserial bleak"
+fi
+
+# --- 6. Put the command-line tools on PATH ----------------------------------
+# WHY THIS STEP EXISTS. `claude` is normally an alias straight into bin/, so
+# nothing in this repo ever needed to be on PATH -- and the day a tool started
+# telling people to run `claude-mate-connect --pair`, that instruction failed
+# with "command not found" for the person who had followed every other
+# instruction correctly. Symlinks, not copies, so a `git pull` updates them.
+TOOL_DIR=""
+for cand in /usr/local/bin "${HOME}/.local/bin"; do
+    if [ -d "$cand" ] && [ -w "$cand" ]; then TOOL_DIR="$cand"; break; fi
+done
+if [ -n "$TOOL_DIR" ]; then
+    for tool in claude-mate claude-mate-connect claude-mate-switch; do
+        if [ -x "${REPO_DIR}/bin/${tool}" ]; then
+            ln -sf "${REPO_DIR}/bin/${tool}" "${TOOL_DIR}/${tool}"
+            ok "Linked ${tool} -> ${TOOL_DIR}"
+        fi
+    done
+    case ":${PATH}:" in
+        *":${TOOL_DIR}:"*) ;;
+        *) warn "${TOOL_DIR} is not on your PATH; add it to use these by name" ;;
+    esac
+else
+    warn "No writable dir on PATH (/usr/local/bin, ~/.local/bin) -- run the"
+    warn "tools by path: ${REPO_DIR}/bin/claude-mate-connect"
+fi
+
 echo
 ok "Claude Mate installed."
 info "Daemon logs:"
 info "  out: ${LOG_DIR}/claude-mate.out.log"
 info "  err: ${LOG_DIR}/claude-mate.err.log"
 info "Check status:  launchctl list | grep ${PLIST_LABEL}"
+info "Device not linked? claude-mate-connect  (or press \`d\` at the account picker)"
 info "Uninstall:     ${SCRIPT_DIR}/uninstall.sh"
