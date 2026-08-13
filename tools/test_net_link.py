@@ -77,7 +77,16 @@ class FakeDevice:
         self._buf = b""
 
     def _read_line(self, timeout=5.0):
-        self.sock.settimeout(timeout)
+        # settimeout() INSIDE the guard, not above it. The pump thread sits in
+        # this function while phase 5 closes the socket under it to simulate a
+        # device dropping off Wi-Fi, and settimeout() on a closed fd raises
+        # OSError(EBADF) -- which killed the thread with a traceback on every
+        # run of that phase. The recv below was already guarded; this was the
+        # one line outside the net.
+        try:
+            self.sock.settimeout(timeout)
+        except OSError:
+            return None
         while b"\n" not in self._buf:
             try:
                 chunk = self.sock.recv(1024)
@@ -465,8 +474,15 @@ check("...with a DIFFERENT nonce (a captured handshake cannot be replayed)",
 dev2.send("H")
 check("the reconnected device is resynced from scratch",
       bool(wait_for(lambda: dev2.seen(is_frame))))
+# WAIT FOR IT, like every other check in this file. The daemon reaps a dropped
+# socket asynchronously -- it finds out on its next write or its own sweep, not
+# at the moment dev.close() returns -- so reading daemon_err once, right here,
+# is a race that the test wins only on a fast, idle machine. It lost on CI's
+# py3.11 runner while passing on 3.9 and 3.12 beside it, which is the signature
+# of a timing race rather than a real regression.
 check("the daemon logged the disconnect of the old socket",
-      any("TCP device disconnected" in l for l in daemon_err))
+      bool(wait_for(lambda: any("TCP device disconnected" in l
+                                for l in daemon_err))))
 
 # --------------------------------------------------------------------------- #
 # Phase 6: the goodbye frame reaches wireless devices too
