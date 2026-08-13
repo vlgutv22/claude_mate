@@ -86,6 +86,8 @@ session you have open — in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
 
 ## Contents
 
+- **[Install & use](#install--use)** — one command, then every CLI command
+- **[The manual, 0 → hero](docs/USING.md)** — daemon, CLI and device in one page
 - [What it is](#what-it-is)
 - [The terminal mirror (ESP32-S3)](#the-terminal-mirror-esp32-s3)
 - [Two ways to feed it](#two-ways-to-feed-it)
@@ -100,6 +102,75 @@ session you have open — in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
 - [Limitations](#limitations)
 - [Changelog](#changelog)
 - [License](#license)
+
+---
+
+## Install & use
+
+**Install — one command.**
+
+```sh
+git clone https://github.com/vlgutv22/claude_mate.git && cd claude_mate
+./install/install.sh --yes
+```
+
+It installs the Claude Code status hook, merges the hooks block into
+`~/.claude/settings.json` (backing it up first), installs and **starts the
+LaunchAgent** so the daemon runs at login, installs `pyserial` + `bleak`, and
+puts the three commands below on your `PATH`. Idempotent — re-run it after a
+`git pull`. Drop `--yes` and it asks before editing `settings.json`, its only
+question.
+
+**Then point `claude` at the wrapper** — this is what puts model, effort, account
+and remaining limit on the screen:
+
+```sh
+echo 'alias claude="'"$PWD"'/bin/claude-mate-wrap"' >> ~/.zshrc && exec zsh
+```
+
+**No hardware needed.** `claude-mate` in a terminal is the same interface as the
+device:
+
+```sh
+claude-mate watch
+```
+```
+   0  aladdin      idle      6:54  work 2  5h94%
+   1  api-server   waiting   0:42  Opus 5  xhigh  work   <-- needs you
+ > 2  claude_mate  working   6:55  xhigh  default  5h97%
+```
+
+### Every command
+
+| Command | Device button | What it does |
+|---|---|---|
+| `claude-mate` | — | print the queue and exit |
+| `claude-mate watch` | — | reprint it every second until Ctrl-C |
+| `claude-mate next` / `prev` | NEXT / PREV | step the selection (or scroll the mirror) |
+| `claude-mate go` | GO | acknowledge **and raise that session's terminal** |
+| `claude-mate ack` | GO, held | acknowledge only — leave your windows alone |
+| `claude-mate follow` | ACK, held | toggle FOLLOW: `next`/`prev` then also raise |
+| `claude-mate mirror` | 4th, tapped | toggle the live terminal mirror on the device |
+| `claude-mate continue` | — | type `continue` into that session |
+| `claude-mate new-terminal` | — | open a terminal in that session's directory |
+| `claude-mate select <n\|name>` | *(none)* | point at a row instead of stepping to it |
+| `claude-mate accounts` | — | the saved logins |
+| `claude-mate accounts rm <n\|name>` | — | delete one, after typing its name back |
+
+Two more commands beside it:
+
+| | |
+|---|---|
+| `claude-mate-connect` | every link with a verdict, and the shortest fix for whichever is down. `--pair` enrols a cordless device over BLE |
+| `claude-mate-switch` | carry this terminal's conversation to another account, with remaining limits |
+
+**It presses the same buttons.** `claude-mate go` sends `press|G`, which the
+daemon hands to the *same* handler that receives `B|G` from the device — so GO
+means one thing here, and there is no second implementation to drift.
+
+📖 **[docs/USING.md](docs/USING.md) is the full manual**, 0 → hero: the daemon,
+every command above in detail, every button and screen on the device, how to
+connect one, and a symptom → cause table for when something is wrong.
 
 ---
 
@@ -697,9 +768,8 @@ second implementation to drift. `claude-mate select` is the only thing the devic
 has no equivalent for; it walks there with PREV/NEXT instead.
 
 **Deleting an account happens in the CLI's own process, never over the socket.**
-That socket is `chmod 0666` so hooks in any of your shells can post updates,
-which means every local process can write to it — reading state and pressing
-buttons survive a stray write, and deleting a login does not.
+That socket is `chmod 0600` — the user's own, which is all a hook needs. Even
+so, a hook firing a malformed line should not be able to remove a login.
 
 **Device will not connect?** — press `d` at the account picker, or run
 `claude-mate-connect`. It reports every link — daemon, token, cable, BLE — and

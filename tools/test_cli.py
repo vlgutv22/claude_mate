@@ -259,11 +259,41 @@ try:
     # CLI but left in the manual is worse -- someone types it and it fails.
     print("\n== the manual still describes what exists ==")
     using = open(os.path.join(ROOT, "docs", "USING.md"), encoding="utf-8").read()
+    # The README carries the command list TOO, because it is the front door and
+    # a list you have to follow a link to find is a list nobody finds. Two copies
+    # is a rot risk taken deliberately -- so both are pinned, not just the one I
+    # happened to write first.
+    readme = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
     cli_src = open(CLI, encoding="utf-8").read()
     verbs = sorted(re.findall(r'"([a-z-]+)": "[PNGKFMCT]"', cli_src))
-    missing = [v for v in verbs if f"`{v}`" not in using and f" {v} " not in using]
-    check(f"every button command is in docs/USING.md ({len(verbs)} of them)",
-          not missing)
+    for doc, name in ((using, "docs/USING.md"), (readme, "README.md")):
+        missing = [v for v in verbs
+                   if f"`{v}`" not in doc and f"`claude-mate {v}`" not in doc
+                   and f" {v} " not in doc]
+        check(f"every button command is in {name} ({len(verbs)} of them)",
+              not missing)
+    check("...and the README lists the sibling commands beside it",
+          "claude-mate-connect" in readme and "claude-mate-switch" in readme)
+    check("...and puts the install where a reader lands, not below the fold",
+          readme.index("./install/install.sh --yes")
+          < readme.index("## What it is"))
+
+    # THE SOCKET MODE, IN THE CODE AND IN EVERY PLACE THAT DESCRIBES IT. Three
+    # documents explained the 0666 permission and the reasoning built on it, and
+    # when the code became 0600 all three went on asserting the old value as
+    # current -- including the CLI's own docstring. A number that appears in
+    # prose four times and in code once is a number that will drift.
+    daemon_src = open(DAEMON, encoding="utf-8").read()
+    mode = re.search(r"os\.chmod\(self\._sock_path, (0o\d+)\)", daemon_src)
+    check("the daemon's socket mode is discoverable and owner-only",
+          mode and mode.group(1) == "0o600")
+    stale = []
+    for name, text in (("README.md", readme), ("docs/USING.md", using),
+                       ("bin/claude-mate", cli_src)):
+        # "is chmod 0666" as a CURRENT claim. Saying it *was* 0666 is history.
+        if re.search(r"(is|are)\s+`?chmod 0666", text):
+            stale.append(name)
+    check("...and nothing still describes it as world-writable", not stale)
     for extra in ("select", "accounts", "watch"):
         check(f"...and `{extra}`", extra in using)
     check("...as is the one-command install, verbatim",

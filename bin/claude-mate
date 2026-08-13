@@ -26,12 +26,11 @@ the glass. There is no second implementation to drift.
   claude-mate accounts        the saved logins
   claude-mate accounts rm <name>   delete one, after saying its name back
 
-WHAT IT DELIBERATELY DOES NOT DO OVER THE SOCKET. That socket is chmod 0666 --
-hooks in any of your shells post session updates to it -- so every local process
-can write to it. Reading state and pressing buttons survive a stray write;
-deleting an account does not. `accounts rm` therefore does the deletion HERE, in
-your own process under your own uid, and only asks the daemon to re-read
-afterwards.
+WHAT IT DELIBERATELY DOES NOT DO OVER THE SOCKET. The socket is chmod 0600 --
+owner-only, which is all a hook needs, since hooks run in your own shells. Even
+so, deletion is not a daemon command: a hook firing a malformed line should not
+be able to remove a login. `accounts rm` therefore does the deletion HERE, in
+this process, and only asks the daemon to re-read afterwards.
 """
 import json
 import os

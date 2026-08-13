@@ -1,15 +1,18 @@
-# Claude Mate — the manual
+# Claude Mate — the manual, 0 → hero
+
+Read it in order and you go from an empty machine to a working desk companion.
+Every section stands alone if you already have the one before it.
+
+**1.** [Install](#install-one-command) — one command · **2.** [The daemon](#the-daemon)
+— what it is · **3.** [The CLI](#the-cli) — every command · **4.**
+[The device](#the-device) — every button · **5.** [Connect one](#connecting-a-device)
+· **6.** [When it is wrong](#when-something-is-wrong)
 
 Two ways to drive the same thing: **the device** and **`claude-mate`** in a
 terminal. They are not two implementations — a terminal command and a button
 press arrive at the same code, so anything true of one is true of the other.
-
-- [Install (one command)](#install-one-command)
-- [The daemon](#the-daemon)
-- [The CLI](#the-cli)
-- [The device](#the-device)
-- [Connecting a device](#connecting-a-device)
-- [When something is wrong](#when-something-is-wrong)
+**You need no hardware for any of this except section 4 and 5**: the CLI is the
+same interface.
 
 ---
 
@@ -167,11 +170,13 @@ not delete it.
 For switching a live conversation to another account — and for remaining-limit
 numbers — use `claude-mate-switch`.
 
-> **Why deletion is not a daemon command.** The daemon's socket is `chmod 0666`
-> so that hooks in any of your shells can post updates, which means every local
-> process can write to it. Reading state and pressing buttons survive a stray
-> write; removing a login does not. So `accounts rm` deletes in the CLI's own
-> process, under your own uid, and only asks the daemon to re-read afterwards.
+> **Why deletion is not a daemon command.** The daemon's socket is `chmod 0600` — the user's own,
+> which is all a hook needs, since hooks run in the user's own shells. It was
+> `0666` until a review pointed out that this branch had grown it from
+> state-updates-only into a command channel any local process could type into.
+> Even at `0600`, deletion stays out: a hook firing a malformed line should not
+> be able to remove a login. So `accounts rm` deletes in the CLI's own process
+> and only asks the daemon to re-read afterwards.
 
 ---
 
