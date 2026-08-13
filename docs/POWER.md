@@ -58,6 +58,37 @@ The honest expectation, stated before measuring so it can be checked against:
   **whether the radio or the OLED dominates once the radio is duty-cycled** —
   which is exactly how issue #21 framed it.
 
+### Two things the reader has to know before reading the table
+
+Both were found by auditing the build rather than by measuring, and both mean
+the duty cycle saves less here than the figure above would lead you to expect.
+They are stated up front so the blanks below are read against the right
+expectation, not the ESP32 folklore one.
+
+1. **The BLE controller never modem-sleeps on this target.** Arduino-ESP32
+   ships the ESP32-S3's prebuilt `libbt` with `CONFIG_BT_CTRL_MODEM_SLEEP` off
+   — sleep mode "none" — so `stopAdvertising()` stops the packets and not the
+   baseband. The silent 4 s still pays a continuous controller floor. Classic
+   ESP32 defaults the *other* way, which is exactly where the 5% figure above
+   comes from. `CONFIG_PM_ENABLE` is off too, so there is no automatic light
+   sleep to make up the difference. Not fixable from the sketch: the setting is
+   baked into the prebuilt library.
+
+2. **The duty cycle only runs while ADVERTISING, and the device is almost never
+   advertising.** The daemon connects and holds one link open all day, so
+   `LINKED` is the state this device actually lives in — which is the same
+   always-associated shape this page criticises Wi-Fi for. The firmware asks
+   the central for nothing: no connection-parameter update, no slave latency.
+   macOS therefore picks its own default, typically a 15–30 ms interval with
+   zero latency, and the radio wakes tens of times a second for a link whose
+   real traffic is one keepalive every 15 s.
+
+Neither has been changed, deliberately. Both are radio-behaviour changes whose
+whole justification is a number nobody has taken yet, and the table below is
+that number. Take the readings first —
+[issue #25](https://github.com/vlgutv22/claude_mate/issues/25) carries the
+evidence for both and what each fix would cost.
+
 ### The table
 
 | Configuration | Idle draw at the cell | Status |
@@ -65,7 +96,7 @@ The honest expectation, stated before measuring so it can be checked against:
 | Deep sleep (`SLEEP`, or a 2 s hold) | ~1 mA (WS2812 floor) + ~8 µA | **estimated** from the WS2812 datasheet floor; consistent with observed ~1 month standby on a 14500 |
 | Wi-Fi linked, backlight off | — | **not yet measured** |
 | BLE advertising (200/4000), no daemon, backlight off | — | **not yet measured** |
-| BLE connected, backlight off | — | **not yet measured** |
+| BLE connected, backlight off | — | **not yet measured** — record the negotiated connection interval alongside it; on macOS this is not ours to choose (see above) and the figure is meaningless without it |
 | Any of the above, backlight at step 4 | — | **not yet measured** |
 
 **These blanks are deliberate.** The BLE transport shipped without them because
@@ -112,6 +143,17 @@ uses; the app partition is 3 MB, so the sketch sits at 42% of it.
 
 Nothing on the radio side changes the fact that **the backlight is the budget**.
 In rough order of effect on how long a cell lasts:
+
+0. **The CPU, which used to be item zero and is now fixed.** `loop()` never
+   yielded, so `loopTask` was always ready, `IDLE1` never ran, and core 1 never
+   reached `waiti` — a 240 MHz core at 100% duty doing five `digitalRead`s per
+   pass. On the datasheet's modem-sleep figures that is roughly 40 mA against
+   the ~25 mA of a parked core, so on the order of 10–15 mA was going into an
+   idle loop: **comparable to the entire radio budget the BLE migration was
+   undertaken to reduce**, and a large part of why the migration did not show up
+   as longer runtime. One `delay(1)` per pass fixed it. Listed here because the
+   next person comparing a BLE reading against an old Wi-Fi one needs to know
+   the baseline moved.
 
 1. **Sleep screen** — off by default, and the single largest saving available.
 2. **Brightness** — five non-linear steps; step 1 is genuinely usable indoors.

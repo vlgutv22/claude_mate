@@ -28,6 +28,25 @@
  * backlight remains the biggest single consumer on the board either way (see
  * the hibernate note in the sketch). docs/POWER.md holds the measurements.
  *
+ * AND TWO THINGS THAT UNDERCUT THE PREMISE ON THIS TARGET SPECIFICALLY, both
+ * verified in the build rather than assumed, neither fixable from this file:
+ *
+ *   * The BT CONTROLLER NEVER MODEM-SLEEPS here. Arduino-ESP32 ships the S3's
+ *     prebuilt libbt with CONFIG_BT_CTRL_MODEM_SLEEP off (sleep mode "none"),
+ *     so stopAdvertising() removes the packets but not the baseband: the silent
+ *     4 s still pays a continuous controller floor. Classic ESP32 defaults the
+ *     other way, so anyone reasoning from ESP32 experience -- which is where
+ *     the 5% figure comes from -- will assume the wrong default.
+ *   * THE DUTY CYCLE ONLY RUNS WHILE ADVERTISING. The daemon holds one
+ *     connection open all day, so LINKED is the state this device actually
+ *     lives in, and nothing here asks the central for a slower interval or any
+ *     slave latency. macOS therefore picks, and it picks fast.
+ *
+ * Neither is being changed here on purpose: both want a meter first, and
+ * docs/POWER.md is still where that goes. Tracked in issue #25, which spells
+ * out what each would cost and what has to be measured before either is worth
+ * doing.
+ *
  * ADVERTISING IS NOT THE PAYLOAD. The issue floated encoding the compact status
  * into the advertising packet. It cannot work in this direction: the status
  * originates on the HOST and this device is the peripheral, so the only thing
