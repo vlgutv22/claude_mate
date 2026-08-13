@@ -899,16 +899,27 @@ static void drawBatteryChip(int16_t right, int16_t y) {
   // The blink is the loud part: a static red chip is what the eye has already
   // stopped reading by then.
   bool low = battLowWarn();
+  // THE PAD FACE CANNOT BLINK, so on it the warning is drawn steady.
+  //
+  // UI_PAD is a still image on purpose -- loop() drops every redraw request
+  // that is not the pad's own, because a full flush is 110 KB of SPI and
+  // nobody is looking at the glass while they play. The blink clock is exactly
+  // such a request, so a blinking chip there would be painted once, in
+  // whichever phase happened to be current, and then frozen -- and half the
+  // time that is the OFF phase, leaving a battery chip with no lit segments at
+  // all. An unlit chip reads as "dead", which is a worse lie than a steady
+  // warning is a weak one.
+  bool phase = (uiMode == UI_PAD) ? true : blinkOn;
   if (low) {
     gfx->setTextSize(1);
-    gfx->setTextColor(blinkOn ? C_ERROR : C_DIMMER);
+    gfx->setTextColor(phase ? C_ERROR : C_DIMMER);
     gfx->setCursor(bx - 4 * GLYPH_W - 4, y + 5);
     gfx->print("LOW");
   }
 
   for (int8_t i = 0; i < 3; i++) {
     int16_t sx = bx + i * (segW + gap);
-    bool lit = i < battLevel && !(low && !blinkOn);
+    bool lit = i < battLevel && !(low && !phase);
     if (lit) gfx->fillRect(sx, by, segW, segH, col);
     else     gfx->drawRect(sx, by, segW, segH, low ? C_ERROR : C_DIMMER);
   }
@@ -2629,6 +2640,27 @@ static void sendSoundPref() {
   emitLine(buf);
 }
 
+// THE DEVICE IS THE AUTHORITY ON WHETHER A TERMINAL VIEW IS OPEN, and this is
+// how it says so across a reconnect.
+//
+// The daemon closes any mirror it is running when it receives H, because a
+// device that just said hello has usually rebooted -- and a mirror left running
+// against a rebooted device pushes nineteen lines a second into a view nobody
+// opened. But "usually" is not "always": a BLE flap shorter than the link
+// watchdog leaves this device still displaying the view, with mirrorOn still
+// true, and closing it would yank a screen the user is actively reading.
+//
+// So whichever half is wrong corrects itself here. The daemon has just closed
+// its mirror, so B|M -- which toggles -- can only open one, and it opens it for
+// the session on the glass, which is the one we were mirroring. On a real
+// reboot mirrorOn is false, nothing is sent, and the daemon stays closed.
+//
+// Only existing verbs, deliberately: an old daemon sees a B|M it already
+// understands, and an old device sends nothing and gets today's behaviour.
+static void reassertMirror() {
+  if (mirrorOn) emitLine("B|M");
+}
+
 // The game's noises, made by the Mac. This board has no DAC, no speaker and a
 // backlight circuit with no inductor to abuse, so the link is the only speaker
 // there is -- which does mean a run played with the daemon down is silent, and
@@ -3351,6 +3383,8 @@ void loop() {
       net.write("H");
       sendSoundPref();                      // the daemon keeps no per-device
                                             // state; re-assert it every link
+      reassertMirror();                     // ...and neither does it know
+                                            // whether we still have a view open
       lastRxMs = now;                       // the link is alive as of now
     }
     lastNetState = ns;
@@ -3366,6 +3400,7 @@ void loop() {
     if (bs == MateBle::LINKED) {
       ble.write("H");
       sendSoundPref();
+      reassertMirror();
       lastRxMs = now;
     }
     lastBleState = bs;
@@ -3452,32 +3487,42 @@ void loop() {
   delay(1);
 
   if (uiMode == UI_GAME) {
-    game.tick();
-    // A RUNNING LEVEL IS ACTIVITY; A START SCREEN IS NOT. notePoke() used to be
-    // unconditional here, which meant pollHibernate()'s only sleep trigger
-    // could never fire while the game was open -- not during a sprint, and not
-    // on the START screen, the codex cards or the finish screen either. Anyone
-    // who opened SHIP IT from the menu and walked away left the backlight (the
-    // largest load on the board) at full duty until the cell was flat.
-    if (!game.idle()) {
-      notePoke();                 // mid-run: the daemon hears nothing from us,
-                                  // but a thumb on the glass is still a person
-    } else if (cfg.hibernates() &&
-               (millis() - lastPokeMs) >= cfg.hibernateMs()) {
-      // Abandoned on a still screen. Hand the glass back to the MENU rather
-      // than blanking it here: pollNavBtn() and pollGoBtn() return early in
-      // UI_GAME, so PREV/GO/NEXT never reach onButton(), the only caller of
-      // wakeScreen() -- a panel blanked under the game would answer nothing but
-      // the 4th button, while the other three kept driving the game in the
-      // dark. In the menu every button wakes it the ordinary way.
-      //
-      // The cfg.hibernates() guard is load-bearing: with screen sleep off
-      // hibernateMs() is 0, and an unguarded compare would eject you from the
-      // game on the very first pass.
-      uiMode = UI_MENU;
-      requestRender();
-      return;
-    }
+    // THE GAME OWNS THE BUTTONS HERE, so the hibernate machinery cannot see
+    // them and this branch has to do both halves itself.
+    //
+    // pollNavBtn() and pollGoBtn() return early in UI_GAME, so PREV/GO/NEXT
+    // never reach onButton() -- which is the only caller of notePoke() and of
+    // wakeScreen(). Read the three pins directly instead. A thumb is presence
+    // whatever screen the game is on, and that matters most on the screens
+    // where the level is NOT running: picking a milestone and reading a codex
+    // card are both things you do for a minute at a time.
+    bool anyKey = digitalRead(PIN_BTN_PREV) == LOW ||
+                  digitalRead(PIN_BTN_GO)   == LOW ||
+                  digitalRead(PIN_BTN_NEXT) == LOW;
+
+    // Waking has to swallow the press that did it, or the tap that lit the
+    // panel also starts a sprint nobody could see. game.tick() is where the
+    // pins are read, so holding it off until every key is up means _navWas
+    // never sees the edge -- and dt is clamped to 100 ms inside tick(), so the
+    // level clock cannot fast-forward across the gap either.
+    static bool swallow = false;
+    if (!screenOn && anyKey) { wakeScreen(); swallow = true; }
+    if (swallow && !anyKey)  swallow = false;
+    if (!swallow) game.tick();
+
+    // A RUNNING LEVEL IS ACTIVITY; A STILL SCREEN WITH NOBODY TOUCHING IT IS
+    // NOT. notePoke() used to be unconditional here, which meant
+    // pollHibernate()'s only sleep trigger could never fire while the game was
+    // open -- not during a sprint, and not on the START screen, the codex cards
+    // or the finish screen either. Anyone who opened SHIP IT and walked away
+    // left the backlight, the largest load on the board, at full duty until the
+    // cell was flat.
+    //
+    // The screen blanks IN PLACE rather than dropping you back to the menu. An
+    // eject would have been simpler and it throws away where you were -- the
+    // card you were reading, the milestone you were choosing -- for a timeout
+    // that is supposed to be about the backlight and nothing else.
+    if (!game.idle() || anyKey) notePoke();
     if (screenOn) { needRender = false; render(); }
     return;
   }

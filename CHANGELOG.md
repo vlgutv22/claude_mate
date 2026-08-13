@@ -55,9 +55,12 @@ faults, found by auditing the whole power path rather than the transport.
 - **Fixed: the game pinned the backlight on forever.** `UI_GAME` re-armed the
   hibernate timer on every pass with no test of `game.idle()`, so an abandoned
   START screen, codex card or finish screen held the largest load on the board
-  at full duty until the cell died. A still screen now hands back to the menu
-  after the configured delay, where every button can wake it — blanking inside
-  the game would have left three of the four buttons driving it in the dark.
+  at full duty until the cell died. The screen now blanks in place, and because
+  the three nav buttons never reach `onButton()` in this mode, the game branch
+  reads their pins itself — both to count a thumb as presence on the screens
+  where no level is running (picking a milestone, reading a codex card) and to
+  wake the panel, swallowing the press that did it so it cannot also start a
+  sprint nobody can see.
 - **Fixed: a lit panel hibernate could never turn off again.** `enterPad()` and
   `leavePad()` wrote the backlight directly while `screenOn` stayed false, and
   `sleepScreen()` early-returns on `!screenOn`. Both are reachable with nobody
@@ -75,7 +78,18 @@ faults, found by auditing the whole power path rather than the transport.
   things, none of which was the device going away — so after any reboot or
   reconnect the Mac pushed 19 lines a second into a device that had not asked,
   and the view sits in front of the status bar, hiding the battery and the link
-  glyph. Closed on `H`, with the fetch race behind it closed too.
+  glyph. Closed on `H`, with the fetch race behind it closed too — and because
+  "said hello" means *rebooted* only most of the time, a device whose view
+  survived the drop (a BLE flap shorter than the 30 s watchdog) answers its own
+  `H` with `B|M` to put it straight back. The device is the authority on what is
+  on its glass; the daemon asks rather than assumes, using verbs both ends
+  already speak.
+
+- **Fixed (test): `tools/test_account_switch.py` failed for anyone who actually
+  uses account switching.** `select_account()` consults `CLAUDE_MATE_ACCOUNT`
+  before it offers the picker, and the test never cleared it — so fourteen
+  checks failed on a developer's machine and none of them in CI, which is the
+  worst possible place for that asymmetry to be.
 - **Fixed (daemon): an unprovisioned board was re-dialled every few seconds
   forever.** The backoff counter was cleared when a device was *found*, before
   the session was tried, so a handshake that failed instantly retried against a

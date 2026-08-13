@@ -2400,8 +2400,19 @@ class ButtonReader(threading.Thread):
             # "ignore mirrors I did not ask for" would leave the Mac polling a
             # wrapper and pushing nineteen lines a second into something that
             # throws them away, which costs the same radio and saves nothing.
-            self.mirror_close()
-            self._screen.resend_full_state()
+            # ...and if it really did still have one open, it will say so
+            # immediately: the device answers its own H with B|M when the view
+            # survived on its side (a link flap rather than a reboot), which
+            # re-opens this for the session on the glass. Closing first is what
+            # makes that toggle unambiguous.
+            #
+            # _mirror_close_locked() resends the frame itself, so only push one
+            # when there was nothing to hand the glass back from. Doing both
+            # cost two full resends, two L| account bursts and two rounds of
+            # per-profile HTTPS lookups on every reconnect -- self-inflicted, on
+            # the very path this handler exists to make cheaper.
+            if not self.mirror_close():
+                self._screen.resend_full_state()
             return
         if line == "K":                          # keepalive ack to our P: no-op
             return
@@ -2571,10 +2582,18 @@ class ButtonReader(threading.Thread):
         self._link.write_line("M|OFF")            # hand the glass back to the
         self._screen.resend_full_state()          # normal frame
 
-    def mirror_close(self) -> None:
+    def mirror_close(self) -> bool:
+        """Close any open view. True if there was one.
+
+        The return value exists for the handshake path: _mirror_close_locked()
+        ends with its own resend_full_state(), so a caller that would otherwise
+        resend needs to know whether that has already happened.
+        """
         with self._mirror_lock:
-            if self._mirror_key is not None:
-                self._mirror_close_locked()
+            if self._mirror_key is None:
+                return False
+            self._mirror_close_locked()
+            return True
 
     def _mirror_scroll_by(self, delta: int) -> None:
         """PREV/NEXT scroll the view instead of moving the selection."""

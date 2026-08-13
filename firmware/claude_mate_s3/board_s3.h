@@ -132,10 +132,25 @@ struct Btn {
 #define PIN_BATT_ADC  1       // ADC1_CH0, the board's own sense divider; set to
                               // -1 to compile the gauge out
 #define BATT_DIVIDER  3.0f    // VBAT / measured. 3:1 on the -1.47B (measured --
-                              // see the note above). At 2.0f the gauge reads
-                              // ~2.8 V, falls under BATT_ABSENT_MV, and the chip
-                              // silently HIDES ITSELF -- which looks like a
-                              // missing feature rather than a wrong constant.
+                              // see the note above).
+                              //
+                              // GET IT WRONG AND THE GAUGE LIES RATHER THAN
+                              // DISAPPEARS, which is the opposite of what this
+                              // note used to say and worth being exact about.
+                              // At 2.0f the reading is two thirds of the true
+                              // cell voltage -- ~2.8 V off a full 4.2 V cell --
+                              // which is still above BATT_ABSENT_MV, so the
+                              // chip does NOT hide. It sits at a permanent,
+                              // wrong 0% with one red segment and a LOW that
+                              // never stops blinking: a healthy cell presented
+                              // as a dying one. (Only below ~3.6 V of actual
+                              // VBAT does the scaled reading fall under the
+                              // floor and the chip vanish as well.)
+                              //
+                              // `?` is what settles it: a real 14500 in a board
+                              // that is still running cannot sit at ~2800 mV,
+                              // so filtered and raw both reading there means
+                              // this constant, not the cell.
 // ---- Charging detection -----------------------------------------------------
 // This board gives us NO charge-status line: Waveshare does not publish one,
 // and an ADC sweep of GPIO 1-10 found every pin except the sense divider
