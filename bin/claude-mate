@@ -13,8 +13,9 @@ exactly one thing on this project: the mirror closes first, a double press
 inside the window toggles FOLLOW, the raised window is the one whose name was on
 the glass. There is no second implementation to drift.
 
-  claude-mate                 the queue, as the device shows it
-  claude-mate watch           ...and keep showing it
+  claude-mate                 the app: arrow keys, on a terminal
+  claude-mate status          the queue, printed once (what a pipe gets)
+  claude-mate watch           ...and keep printing it
   claude-mate next|prev       step the selection (or scroll the mirror)
   claude-mate go              ack + raise that session's terminal
   claude-mate ack             ack only, leave the window alone
@@ -24,7 +25,17 @@ the glass. There is no second implementation to drift.
   claude-mate new-terminal    open a terminal in that session's directory
   claude-mate select <n|name> point at a row instead of stepping to it
   claude-mate accounts        the saved logins
-  claude-mate accounts rm <name>   delete one, after saying its name back
+  claude-mate accounts rm <name|n> delete one, after saying its name back
+  claude-mate daemon          start (or restart) the daemon via launchd
+  claude-mate --version       what this is
+
+RUN IT WITH NO ARGUMENTS ON A TERMINAL and you get the app: the queue with the
+arrow keys live in it, and a menu that starts a new session -- the wrapper with
+`--dangerously-skip-permissions`, which is the thing you would otherwise type --
+without leaving for a shell. Redirect it anywhere (a pipe, a hook, cron, a test)
+and it is the same one-shot queue print it has always been, because a program
+that changes shape depending on who is watching has to be obvious about which
+shape is which.
 
 WHAT IT DELIBERATELY DOES NOT DO OVER THE SOCKET. The socket is chmod 0600 --
 owner-only, which is all a hook needs, since hooks run in your own shells. Even
@@ -34,12 +45,33 @@ this process, and only asks the daemon to re-read afterwards.
 """
 import json
 import os
+import select
 import shutil
 import socket
+import subprocess
 import sys
+import termios
 import time
+import tty
 
 SOCK = os.environ.get("CLAUDE_MATE_SOCK", "/tmp/claude-mate.sock")
+
+# Resolved through the SYMLINK, not around it. install.sh links this file into
+# /usr/local/bin, so abspath() would put the sibling lookup in /usr/local/bin --
+# where claude-mate-wrap is deliberately not linked (it is reached by shell
+# alias, not by PATH). realpath() lands back in the repo, where the wrapper
+# actually lives. claude-mate-switch had this exact bug and was broken for every
+# installed user; it is fixed there too.
+HERE = os.path.dirname(os.path.realpath(__file__))
+WRAP = os.path.join(HERE, "claude-mate-wrap")
+
+# The LaunchAgent the installer sets up. Starting the daemon goes through
+# launchd and never spawns python directly -- see start_daemon().
+LAUNCHD_LABEL = "com.claudemate.daemon"
+LAUNCHD_PLIST = os.path.expanduser(
+    f"~/Library/LaunchAgents/{LAUNCHD_LABEL}.plist")
+
+VERSION_FILE = os.path.join(os.path.dirname(HERE), "packaging", "VERSION")
 
 B, D, OFF = "\033[1m", "\033[2m", "\033[0m"
 COLOUR = {
@@ -59,6 +91,13 @@ PRESSES = {
     "prev": "P", "next": "N", "go": "G", "ack": "K", "follow": "F",
     "mirror": "M", "continue": "C", "new-terminal": "T",
 }
+
+# The app's single-key shortcuts, named as CLI VERBS rather than button codes so
+# PRESSES above stays the only place a code is written down. (It is also the
+# only place tools/test_cli.py looks: it scrapes that dict and insists every
+# verb it finds is documented, and a second dict of codes here would have made
+# it demand documentation for a keystroke.)
+APP_KEYS = {"a": "ack", "f": "follow", "m": "mirror", "c": "continue"}
 
 
 def talk(line, timeout=6.0):
@@ -89,9 +128,12 @@ def die(msg, code=1):
 def need(line):
     reply = talk(line)
     if reply is None:
+        # NAME A COMMAND THAT WORKS. This used to say `launchctl bootstrap`,
+        # which fails with "Bootstrap failed: 5: Input/output error" whenever
+        # the job is already loaded -- i.e. on every machine that ran the
+        # installer, which is every machine that has this file. See start_daemon().
         die(f"claude-mate: no daemon on {SOCK}\n"
-            f"  start it:  launchctl bootstrap gui/{os.getuid()} "
-            f"~/Library/LaunchAgents/com.claudemate.daemon.plist")
+            f"  start it:  claude-mate daemon")
     if reply.startswith("error:"):
         die(f"claude-mate: {reply.strip()[7:]}")
     return reply
@@ -99,6 +141,15 @@ def need(line):
 
 def mmss(secs):
     return f"{int(secs) // 60}:{int(secs) % 60:02d}"
+
+
+def read_version():
+    """The packaged version, or a plain marker when running from a checkout."""
+    try:
+        with open(VERSION_FILE) as fh:
+            return fh.read().strip() or "(unknown)"
+    except OSError:
+        return "(from a source checkout)"
 
 
 def render(snap):
@@ -125,9 +176,14 @@ def render(snap):
 def cmd_status(watch=False):
     while True:
         snap = json.loads(need("queue"))
-        if watch:
+        if watch and sys.stdout.isatty():
             # Full clear, not a scroll: this is a dashboard, and a screen that
             # accumulates history is one you have to read the bottom of.
+            #
+            # GUARDED, because this was the one place the "a pipe gets plain
+            # text" contract leaked: the colours two dozen lines up are blanked
+            # for a non-TTY and this escape was not, so `claude-mate watch | tee`
+            # wrote a clear-screen into the file once a second.
             sys.stdout.write("\033[2J\033[H")
             print(f"{B}claude-mate{OFF}  {D}{time.strftime('%H:%M:%S')} "
                   f"· ctrl-c to stop{OFF}\n")
@@ -140,8 +196,10 @@ def cmd_status(watch=False):
 def cmd_press(name):
     need(f"press|{PRESSES[name]}")
     # Show the result rather than announcing the action: what matters after a
-    # `next` is which session is now under the cursor.
-    if name in ("prev", "next", "select", "follow"):
+    # `next` is which session is now under the cursor. ("select" used to be in
+    # this tuple and could never match -- it is routed to cmd_select and is not
+    # a key in PRESSES, so cmd_press never sees it.)
+    if name in ("prev", "next", "follow"):
         render(json.loads(need("queue")))
     return 0
 
@@ -250,8 +308,442 @@ def show_name(name):
     return repr(name)
 
 
+# ---------------------------------------------------------------------------
+# The daemon, as something you can start rather than be told about
+# ---------------------------------------------------------------------------
+# THROUGH LAUNCHD, ALWAYS, and never by spawning the daemon directly. There is
+# no pidfile, no flock and no single-instance guard anywhere in the daemon --
+# and SocketServer.run() UNLINKS the socket path before binding it. So a second
+# instance does not fail, it silently steals the socket from the first, while
+# the first keeps the serial port: the CLI then talks to a daemon with no
+# device, and the device is driven by a daemon nothing can reach. That is a
+# genuinely horrible afternoon, and one `launchctl` call away from impossible.
+
+def daemon_alive():
+    """Is a daemon answering? `queue` is the only liveness proof there is.
+
+    The socket has no ping, status or version verb -- six verbs, and anything
+    unrecognised is parsed as a session update and dropped -- so the honest test
+    is to ask it something real and see whether JSON comes back.
+    """
+    reply = talk("queue", timeout=2.0)
+    if reply is None:
+        return False
+    try:
+        json.loads(reply)
+        return True
+    except ValueError:
+        return False
+
+
+def launchd_loaded():
+    """Is the LaunchAgent bootstrapped? `launchctl list` exits 113 if not."""
+    try:
+        return subprocess.call(["launchctl", "list", LAUNCHD_LABEL],
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL) == 0
+    except OSError:
+        return False
+
+
+def start_daemon():
+    """Start (or restart) the daemon through its LaunchAgent. Returns a note.
+
+    THE ORDER MATTERS AND THE OLD ADVICE WAS WRONG. Every error path in this
+    project used to print `launchctl bootstrap gui/$UID ...`, which fails with
+    "Bootstrap failed: 5: Input/output error" whenever the job is ALREADY
+    loaded -- which is the common case, because the installer loads it. So the
+    one instruction we gave people worked only on the machine where it was
+    least needed. packaging/scripts/postinstall already had the modern
+    sequence; this is that sequence, and the other call sites now point here.
+    """
+    if not os.path.exists(LAUNCHD_PLIST):
+        return (f"no LaunchAgent at {LAUNCHD_PLIST}\n"
+                f"  run the installer first:  ./install/install.sh")
+    dom = f"gui/{os.getuid()}"
+    run = lambda *a: subprocess.call(list(a), stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+    if not launchd_loaded():
+        run("launchctl", "bootstrap", dom, LAUNCHD_PLIST)
+    run("launchctl", "enable", f"{dom}/{LAUNCHD_LABEL}")
+    # -k so an already-running job is restarted rather than left as it was;
+    # this is also the "it is wedged, kick it" path.
+    run("launchctl", "kickstart", "-k", f"{dom}/{LAUNCHD_LABEL}")
+    # The daemon opens its socket a moment after launchd forks it. Wait, rather
+    # than reporting a failure that is really just impatience.
+    for _ in range(40):
+        if daemon_alive():
+            return None
+        time.sleep(0.1)
+    return ("started it, but nothing is answering on the socket yet.\n"
+            f"  check the log:  tail -f ~/Library/Logs/claude-mate.err.log")
+
+
+# ---------------------------------------------------------------------------
+# Terminal plumbing
+# ---------------------------------------------------------------------------
+# The repo already had exactly one raw-mode implementation -- the PTY relay in
+# claude-mate-wrap -- and this follows its discipline: save termios up front,
+# restore through ONE idempotent teardown, and wire that teardown to atexit as
+# well as to the normal exit path so a traceback cannot leave someone with a
+# terminal that does not echo.
+#
+# Two deliberate differences from the wrapper:
+#
+#   setcbreak, NOT setraw. cbreak leaves ISIG alone, so ctrl-C still raises
+#   KeyboardInterrupt instead of arriving as a byte nobody handles, and it
+#   leaves OPOST alone, so ordinary print() does not stair-step down the screen
+#   -- which matters because this app hands the terminal to other programs and
+#   they expect it sane.
+#
+#   The alternate screen buffer, not a clear. `watch` clears with ESC[2J every
+#   second, which flickers and eats the scrollback it was printed into. The
+#   alternate buffer gives the app its own screen and hands the original back
+#   untouched on exit, which is what every full-screen tool on the machine does.
+
+ESC = "\x1b"
+# One place that knows what an arrow key looks like. Nothing in this repo
+# decoded escape sequences before -- an ESC[A had only ever been HOSTILE input
+# to be rejected, because a real accounts directory once ended up with a profile
+# literally named "\033" -- so this is the first and should stay the only one.
+CSI_KEYS = {
+    "A": "up", "B": "down", "C": "right", "D": "left",
+    "H": "home", "F": "end", "5~": "pgup", "6~": "pgdn", "3~": "delete",
+}
+
+
+# READ THE FILE DESCRIPTOR, NOT sys.stdin, and keep our own buffer.
+#
+# This is the bug that makes hand-rolled key readers not work, and it cost a
+# round here before the PTY test caught it. select() answers about the KERNEL's
+# buffer; sys.stdin.read(1) fills PYTHON's. An arrow key arrives as three bytes
+# in one burst, so the first read pulls all three into the TextIOWrapper and
+# hands back ESC -- and the select that follows, asking the kernel whether more
+# is coming, correctly says no. Every arrow then decoded as a bare ESC and the
+# selection never moved. os.read() has no layer to hide bytes in.
+_KEYBUF = bytearray()
+
+
+def _fill(fd, timeout):
+    """Wait for bytes and buffer them. False on timeout, True on data/EOF."""
+    if not select.select([fd], [], [], timeout)[0]:
+        return False
+    try:
+        chunk = os.read(fd, 64)
+    except OSError:
+        return False
+    if not chunk:
+        _KEYBUF.extend(b"\x00")          # EOF, as a byte we recognise below
+        return True
+    _KEYBUF.extend(chunk)
+    return True
+
+
+def read_key(fd, timeout=None):
+    """One keypress as a name, or None on timeout.
+
+    ESC IS AMBIGUOUS and that is the whole difficulty: it is both a key someone
+    pressed and the first byte of every arrow. The only way to tell them apart
+    is time -- a real escape sequence arrives in one burst from the terminal,
+    and a human cannot type ESC then [ within milliseconds -- so a lone ESC is
+    declared only after a short grace with nothing behind it.
+    """
+    if not _KEYBUF and not _fill(fd, timeout):
+        return None
+    b = _KEYBUF.pop(0)
+    if b == 0x00:
+        return "eof"
+    if b != 0x1B:
+        if b in (0x0D, 0x0A):
+            return "enter"
+        if b == 0x09:
+            return "tab"
+        if b == 0x7F:
+            return "backspace"
+        if b == 0x03:
+            return "ctrl-c"
+        if b < 0x20:
+            return "ctrl"
+        return chr(b)
+    # An escape sequence, or the ESC key on its own.
+    if not _KEYBUF and not _fill(fd, 0.05):
+        return "esc"
+    second = chr(_KEYBUF.pop(0))
+    if second == "O":                     # SS3: some terminals send arrows here
+        if not _KEYBUF and not _fill(fd, 0.05):
+            return "esc"
+        return CSI_KEYS.get(chr(_KEYBUF.pop(0)), "esc")
+    if second != "[":
+        return "esc"
+    # CSI: parameters, then a final byte. Bounded so a malformed sequence
+    # cannot spin here.
+    body = ""
+    for _ in range(8):
+        if not _KEYBUF and not _fill(fd, 0.05):
+            break
+        c = chr(_KEYBUF.pop(0))
+        body += c
+        if c.isalpha() or c == "~":
+            break
+    return CSI_KEYS.get(body, "esc")
+
+
+class Term:
+    """Raw-ish mode + the alternate screen, with a guaranteed way back."""
+
+    def __init__(self):
+        self.fd = sys.stdin.fileno()
+        self.saved = None
+
+    def __enter__(self):
+        self.saved = termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)
+        sys.stdout.write("\033[?1049h\033[?25l")   # alt screen, hide cursor
+        sys.stdout.flush()
+        return self
+
+    def __exit__(self, *exc):
+        self.restore()
+        return False
+
+    def restore(self):
+        """Idempotent, because it is called from the exit path AND from exec."""
+        if self.saved is None:
+            return
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+        self.saved = None
+        sys.stdout.write("\033[?25h\033[?1049l")   # cursor back, main screen
+        sys.stdout.flush()
+
+    def size(self):
+        """Columns and rows, with a floor under both.
+
+        A TERMINAL CAN HONESTLY REPORT 0x0. A pty allocated without a winsize
+        does exactly that, which is not exotic -- it is what `pty.openpty()`
+        gives you, so it is what every test and every `script`-style harness
+        gives you. With rows=0 the paint below computed `lines[:-1]` and quietly
+        dropped the last line of every frame, and cols=0 clipped the text; the
+        app looked like it was rendering fine and was eating its own footer.
+        """
+        try:
+            sz = os.get_terminal_size()
+            cols, rows = sz.columns, sz.lines
+        except OSError:
+            cols = rows = 0
+        return max(cols, 20), max(rows, 6)
+
+    def paint(self, lines):
+        """Repaint from the top, clearing each line as we go.
+
+        Not ESC[2J: erasing the whole screen and then drawing it is what makes
+        a 1 Hz repaint flicker. Home, then ESC[K per line, then ESC[J once at
+        the end for whatever the previous frame left below us.
+        """
+        cols, rows = self.size()
+        out = ["\033[H"]
+        for line in lines[:rows - 1]:
+            out.append(line[:cols + 40] + "\033[K\r\n")
+        out.append("\033[J")
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------
+# Starting a session
+# ---------------------------------------------------------------------------
+# WHAT THE MENU ITEM ACTUALLY DOES: exactly what the maintainer types today,
+# `claude --dangerously-skip-permissions`, but through the wrapper so the
+# session is reported to the daemon and shows up on the device. Bare `claude`
+# would run untracked and the whole point of the project would miss it.
+#
+# It EXECs rather than forking. The wrapper takes raw mode on this terminal's
+# stdin itself and needs both fds to be real TTYs or it silently degrades to
+# unwrapped claude; handing it the process rather than sitting above it as a
+# parent avoids two programs negotiating over one terminal. The precedent is
+# claude-mate-switch, which re-execs the wrapper the same way when it moves a
+# conversation to another account.
+#
+# TWO ITEMS, NOT A HIDDEN DEFAULT. Skipping permission prompts is a real
+# decision and this is somebody else's machine as often as it is ours, so the
+# menu says which one it is doing rather than quietly picking. Anything else
+# goes in CLAUDE_MATE_NEW_ARGS.
+def exec_new_session(extra_argv, term=None):
+    if term is not None:
+        term.restore()
+    if not os.path.exists(WRAP):
+        die(f"claude-mate: cannot find the wrapper at {WRAP}")
+    argv = [sys.executable, WRAP] + list(extra_argv)
+    print(f"{D}starting: claude {' '.join(extra_argv)}{OFF}\n")
+    sys.stdout.flush()
+    try:
+        os.execve(sys.executable, argv, dict(os.environ))
+    except OSError as exc:
+        die(f"claude-mate: could not start the wrapper: {exc}")
+
+
+def extra_new_args():
+    raw = os.environ.get("CLAUDE_MATE_NEW_ARGS", "").strip()
+    return raw.split() if raw else []
+
+
+# ---------------------------------------------------------------------------
+# The app
+# ---------------------------------------------------------------------------
+REFRESH_S = 1.0
+
+
+def _rows(snap):
+    """The screen as a flat list of selectable rows, sessions first."""
+    rows = [{"kind": "session", "s": s} for s in (snap or {}).get("queue", [])]
+    rows.append({"kind": "new", "label": "Start new session",
+                 "argv": extra_new_args()})
+    rows.append({"kind": "new", "label": "Start new session · skip permissions",
+                 "argv": ["--dangerously-skip-permissions"] + extra_new_args()})
+    rows.append({"kind": "device", "label": "Device · link status and pairing"})
+    rows.append({"kind": "accounts", "label": "Accounts · switch or review"})
+    rows.append({"kind": "quit", "label": "Quit"})
+    return rows
+
+
+def _draw(term, snap, sel, rows, note, alive):
+    cols = term.size()[0]
+    dot = f"{COLOUR['done']}●{OFF}" if alive else f"{COLOUR['error']}●{OFF}"
+    state = "running" if alive else "not running"
+    out = [
+        f" {B}claude-mate{OFF}   {D}{dot} daemon {state}"
+        f" · {time.strftime('%H:%M:%S')}{OFF}",
+        "",
+    ]
+    sessions = [r for r in rows if r["kind"] == "session"]
+    if sessions:
+        width = max(len(r["s"]["name"]) for r in sessions)
+        out.append(f" {D}SESSIONS{OFF}")
+    elif alive:
+        out.append(f" {D}no sessions yet — start one below{OFF}")
+    else:
+        out.append(f" {D}the daemon is not running, so there is nothing to"
+                   f" show yet{OFF}")
+    for i, r in enumerate(rows):
+        here = f"{B}▸{OFF}" if i == sel else " "
+        if r["kind"] == "session":
+            s = r["s"]
+            col = COLOUR.get(s["state"], "")
+            glass = f"{B}•{OFF}" if s.get("shown") else " "
+            flag = "" if s.get("acked") else f"  {col}{B}needs you{OFF}"
+            right = "  ".join(x for x in (s.get("model"), s.get("effort"),
+                                          s.get("account"), s.get("limit")) if x)
+            out.append(f" {here}{glass} {col}{s['name']:<{width}}  "
+                       f"{s['state']:<7}{OFF} {mmss(s['secs']):>6}  "
+                       f"{D}{right}{OFF}{flag}")
+        else:
+            if rows[i - 1]["kind"] == "session":
+                out.append("")
+            label = r["label"]
+            body = f"{B}{label}{OFF}" if i == sel else label
+            out.append(f" {here}  {body}")
+    out.append("")
+    if note:
+        out.append(f" {note}")
+        out.append("")
+    if rows[sel]["kind"] == "session":
+        out.append(f" {D}↑↓ move   ⏎ raise this session   a ack   f follow"
+                   f"   m mirror   c continue{OFF}")
+    else:
+        out.append(f" {D}↑↓ move   ⏎ choose{OFF}")
+    out.append(f" {D}r {'restart' if alive else 'start'} daemon   q quit{OFF}")
+    return out
+
+
+def cmd_app():
+    """The arrow-key app. Only ever reached on a real terminal; see main()."""
+    with Term() as term:
+        sel, note, last_poll = 0, None, 0.0
+        snap, alive = None, False
+        while True:
+            now = time.time()
+            if now - last_poll >= REFRESH_S:
+                last_poll = now
+                alive = daemon_alive()
+                snap = json.loads(talk("queue") or "null") if alive else None
+            rows = _rows(snap)
+            sel = max(0, min(sel, len(rows) - 1))
+            term.paint(_draw(term, snap, sel, rows, note, alive))
+
+            key = read_key(term.fd, timeout=0.25)
+            if key is None:
+                continue
+            note = None
+            row = rows[sel]
+            if key in ("q", "ctrl-c", "eof"):
+                return 0
+            if key == "up":
+                sel -= 1
+                if sel < 0:
+                    sel = len(rows) - 1
+            elif key == "down":
+                sel = (sel + 1) % len(rows)
+            elif key == "r":
+                note = f"{D}starting the daemon...{OFF}"
+                term.paint(_draw(term, snap, sel, rows, note, alive))
+                problem = start_daemon()
+                note = (f"{COLOUR['error']}{problem}{OFF}" if problem
+                        else f"{COLOUR['done']}daemon started{OFF}")
+                last_poll = 0.0
+            elif key == "enter":
+                if row["kind"] == "quit":
+                    return 0
+                if row["kind"] == "new":
+                    exec_new_session(row["argv"], term)     # never returns
+                if row["kind"] == "device":
+                    _foreground(term, [sys.executable,
+                                       os.path.join(HERE, "claude-mate-connect")])
+                    last_poll = 0.0
+                elif row["kind"] == "accounts":
+                    _foreground(term, [sys.executable,
+                                       os.path.join(HERE, "claude-mate-switch"),
+                                       "--help"])
+                    last_poll = 0.0
+                elif row["kind"] == "session":
+                    talk(f"select|{row['s']['name']}")
+                    talk("press|G")
+                    note = f"{D}raised {row['s']['name']}{OFF}"
+                    last_poll = 0.0
+            elif row["kind"] == "session" and key in APP_KEYS:
+                talk(f"select|{row['s']['name']}")
+                talk(f"press|{PRESSES[APP_KEYS[key]]}")
+                note = f"{D}sent {key} to {row['s']['name']}{OFF}"
+                last_poll = 0.0
+
+
+def _foreground(term, argv):
+    """Hand the terminal to another tool, then take it back.
+
+    The device and account tools are interactive and print with ordinary
+    escapes; they cannot run inside the alternate screen while this app holds
+    cbreak. So leave properly, run them as an ordinary foreground child, and
+    re-enter -- which is also what makes ctrl-C inside them behave normally.
+    """
+    term.restore()
+    try:
+        subprocess.call(argv)
+        input("\n  press enter to go back ")
+    except (OSError, EOFError, KeyboardInterrupt):
+        pass
+    term.__enter__()
+
+
 def main(argv):
     if not argv or argv[0] in ("status", "queue", "ls", "list"):
+        # THE APP ONLY ON A REAL TERMINAL, and it needs BOTH ends of it. stdout
+        # alone is not enough -- the test suite runs the CLI from a developer's
+        # terminal and would inherit a TTY stdin -- and stdin alone is not
+        # enough either, because CI redirects `< /dev/null`. Piped, cron'd,
+        # hooked or tested, this stays the one-shot queue print it always was.
+        if not argv and sys.stdin.isatty() and sys.stdout.isatty():
+            try:
+                return cmd_app()
+            except KeyboardInterrupt:
+                return 0
         return cmd_status()
     cmd, rest = argv[0], argv[1:]
     if cmd in ("watch", "-w", "--watch"):
@@ -268,6 +760,26 @@ def main(argv):
         return cmd_select(rest[0])
     if cmd in ("accounts", "account"):
         return cmd_accounts(rest)
+    if cmd in ("app", "ui", "menu"):
+        # The app by name, for when stdin is not a terminal but you want it
+        # anyway -- and so the thing has a name to put in the documentation.
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            die("claude-mate app: needs a terminal on both stdin and stdout")
+        try:
+            return cmd_app()
+        except KeyboardInterrupt:
+            return 0
+    if cmd == "daemon":
+        if rest and rest[0] not in ("start", "restart"):
+            die(f"claude-mate daemon: unknown subcommand {rest[0]!r}")
+        problem = start_daemon()
+        if problem:
+            die(f"claude-mate: {problem}")
+        print("daemon running.")
+        return 0
+    if cmd in ("-V", "--version", "version"):
+        print(f"claude-mate {read_version()}")
+        return 0
     if cmd in ("-h", "--help", "help"):
         print(__doc__.strip())
         return 0

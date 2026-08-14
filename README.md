@@ -129,22 +129,46 @@ echo 'alias claude="'"$PWD"'/bin/claude-mate-wrap"' >> ~/.zshrc && exec zsh
 ```
 
 **No hardware needed.** `claude-mate` in a terminal is the same interface as the
-device:
+device — and run bare, it is an app rather than a printout:
 
 ```sh
-claude-mate watch
+claude-mate
 ```
 ```
-   0  aladdin      idle      6:54  work 2  5h94%
-   1  api-server   waiting   0:42  Opus 5  xhigh  work   <-- needs you
- > 2  claude_mate  working   6:55  xhigh  default  5h97%
+ claude-mate   ● daemon running · 14:22:31
+
+ SESSIONS
+  ▸• api-server   working    1:23   Opus 5  xhigh  work
+    web-ui        waiting    0:05   Opus 5         needs you
+    docs          idle      12:40
+
+  ▸  Start new session
+     Start new session · skip permissions
+     Device · link status and pairing
+     Accounts · switch or review
+     Quit
+
+ ↑↓ move   ⏎ raise this session   a ack   f follow   m mirror   c continue
+ r restart daemon   q quit
 ```
+
+Arrow keys move, Enter chooses, `q` quits. **Start new session** runs `claude`
+through the wrapper in this terminal, which is the part you would otherwise
+have typed — and going through the wrapper is what makes the new session show
+up on the device at all.
+
+Piped, hooked, cron'd or tested, `claude-mate` is still the plain one-shot queue
+print it always was; the app appears only when both ends are a terminal.
 
 ### Every command
 
+Full reference, including the other three binaries and every environment
+variable: **[docs/CLI.md](docs/CLI.md)**.
+
 | Command | Device button | What it does |
 |---|---|---|
-| `claude-mate` | — | print the queue and exit |
+| `claude-mate` | — | the app on a terminal, else print the queue and exit |
+| `claude-mate status` | — | the queue, printed once |
 | `claude-mate watch` | — | reprint it every second until Ctrl-C |
 | `claude-mate next` / `prev` | NEXT / PREV | step the selection (or scroll the mirror) |
 | `claude-mate go` | GO | acknowledge **and raise that session's terminal** |
@@ -156,11 +180,14 @@ claude-mate watch
 | `claude-mate select <n\|name>` | *(none)* | point at a row instead of stepping to it |
 | `claude-mate accounts` | — | the saved logins |
 | `claude-mate accounts rm <n\|name>` | — | delete one, after typing its name back |
+| `claude-mate daemon` | — | start the daemon, or restart it, through launchd |
+| `claude-mate --version` | — | which build this is |
 
-Two more commands beside it:
+Three more commands beside it:
 
 | | |
 |---|---|
+| `claude-mate-wrap` | the thing that actually runs `claude` and reports it. Reached through the shell alias above, never by name |
 | `claude-mate-connect` | every link with a verdict, and the shortest fix for whichever is down. `--pair` enrols a cordless device over BLE |
 | `claude-mate-switch` | carry this terminal's conversation to another account, with remaining limits |
 
@@ -749,16 +776,26 @@ Everything it does is a line on the daemon's socket, so none of it needed to be
 exclusive to the hardware:
 
 ```sh
-claude-mate                  # the queue, as the device shows it
-claude-mate watch            # ...and keep showing it
+claude-mate                  # the app: arrow keys, and a menu
+claude-mate status           # the queue, printed once (what a pipe gets)
+claude-mate watch            # ...and keep printing it
 claude-mate next / prev      # step the selection
 claude-mate go               # ack + raise that session's terminal
 claude-mate ack / follow     # ack only · toggle FOLLOW
 claude-mate mirror           # toggle the terminal mirror
+claude-mate continue         # type "continue" into that session
+claude-mate new-terminal     # open a terminal in that session's directory
 claude-mate select api       # point at a row instead of stepping to it
 claude-mate accounts         # the saved logins
 claude-mate accounts rm old  # delete one, after typing its name back
+claude-mate daemon           # start it, or restart it
 ```
+
+Run it bare on a terminal and it is an app rather than a printout: arrow keys
+through the queue, Enter to raise a session, and a menu that starts a new
+wrapped session without going back to a shell. Piped, hooked or scripted it
+stays exactly the one-shot print above. **[docs/CLI.md](docs/CLI.md)** is the
+full reference for all four commands.
 
 **It presses the same buttons.** `claude-mate go` sends `press|G`, which the
 daemon hands to the *same* `ButtonReader` that handles `B|G` off the wire — so GO

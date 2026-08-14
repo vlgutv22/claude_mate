@@ -39,7 +39,16 @@ import shutil
 import sys
 import time
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+# realpath, NOT abspath, and this one line was the whole bug.
+#
+# install.sh symlinks this file into /usr/local/bin but deliberately does NOT
+# symlink claude-mate-wrap (the wrapper is reached by shell alias, not PATH).
+# abspath() does not follow symlinks, so an installed claude-mate-switch looked
+# for its sibling at /usr/local/bin/claude-mate-wrap, found nothing, and died on
+# import with "cannot load /usr/local/bin/claude-mate-wrap" -- i.e. the command
+# was broken for everyone who installed it and worked only when run out of the
+# checkout. realpath() resolves back to the repo, where the sibling is.
+HERE = os.path.dirname(os.path.realpath(__file__))
 WRAP = os.path.join(HERE, "claude-mate-wrap")
 
 
