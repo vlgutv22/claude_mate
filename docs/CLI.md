@@ -45,6 +45,9 @@ You get a full-screen app. Arrow keys move, Enter chooses, `q` quits.
  r restart daemon   q quit
 ```
 
+Every level under the top one works the same way: **Accounts** and **Device**
+are arrow-driven menus, not a dumped `--help`, and `esc` always means back.
+
 **Start new session** is the reason the app exists. It runs `claude` through the
 wrapper in this terminal — the app hands the terminal over and gets out of the
 way, exactly as if you had typed the command yourself. The second entry adds
@@ -86,6 +89,22 @@ arrow key types an escape sequence — so a real accounts directory can contain 
 profile literally called `\033`, which prints as nothing and cannot be typed
 back at a prompt. The index is how you delete it.
 
+### The menus underneath
+
+| Menu | What is in it |
+|---|---|
+| **Accounts** | every saved login with its email; open one to use it for the next session or delete it |
+| **Device** | the connection report, pairing, the shared token, and a daemon restart |
+
+Deleting from the Accounts menu asks with a chooser rather than by making you
+type the name, and the cursor starts on **No**. At a shell prompt typing the
+name is the right gate — it proves you mean *that* profile — but in a menu the
+cursor has already proved which row you are on, and the account most likely to
+need deleting is the one whose name **cannot be typed**: an arrow key at the old
+picker typed an escape sequence, so a profile literally called `\033` could get
+created, and it renders as a blank row. Those show as `'\x1b'` and are marked
+*unprintable name*.
+
 ---
 
 ## `claude-mate-wrap` — the wrapper
@@ -100,6 +119,12 @@ It runs the real `claude` inside a pseudo-terminal, watches the screen, and
 reports the session's state to the daemon — which is what puts it on the device
 and in `claude-mate`. Everything you pass goes straight through to `claude`,
 so `claude --dangerously-skip-permissions` works exactly as before.
+
+**The account picker is a chooser now.** When you start a session and profiles
+exist, the wrapper asks which one with the same arrow-key menu the app uses —
+including a *New account…* entry, which is the one place a name is still typed,
+because there it is the actual answer. It falls back to the old numbered prompt
+whenever there is no terminal on both ends, so scripts and tests are unaffected.
 
 It owns exactly one flag of its own, `--account <name>`, which it strips before
 handing the rest over. `claude-mate-wrap --help` shows *claude's* help, not

@@ -1141,6 +1141,86 @@ def use_profile(name):
         os._exit(1)
     os.environ["CLAUDE_CONFIG_DIR"] = d
 
+# The shared chooser, if it is reachable. Imported softly because this file is
+# also loaded as a module by claude-mate-switch and by the tests, and a missing
+# sibling must degrade to the typed prompt rather than break the wrapper that
+# every session runs through.
+_PICK_CANCELLED = object()
+try:
+    _uidir = os.path.dirname(os.path.realpath(__file__))
+    if _uidir not in sys.path:
+        sys.path.insert(0, _uidir)
+    import claude_mate_ui as _ui
+except Exception:                                    # noqa: BLE001
+    _ui = None
+
+
+def _pick_account(profiles):
+    """The account picker, with arrow keys. A profile name, "" for default,
+    None if nothing was chosen, or _PICK_CANCELLED on esc/ctrl-C."""
+    while True:
+        items = [_ui.Item("default", value="",
+                          detail=account_email() or "(not logged in)")]
+        for p in profiles:
+            email = account_email(os.path.join(ACCOUNTS_DIR, p))
+            # show_name's rule, locally: a name that is not plainly printable
+            # is shown as a repr so the row is at least identifiable.
+            label = p if all(32 <= ord(c) < 127 for c in p) else repr(p)
+            items.append(_ui.Item(label, value=p,
+                                  detail=email or "(not logged in)"))
+        items.append(_ui.Item("New account…", value=_NEW, gap=True,
+                              detail="create a profile and log in there"))
+        # `d` IS HERE BECAUSE THIS PROMPT IS THE ONLY CLAUDE MATE UI ON THE MAC.
+        # A device that will not link says so on its own glass and in the
+        # daemon's log, neither of which is in front of the person here.
+        items.append(_ui.Item("Device…", value=_DEVICE,
+                              detail="connect a Claude Mate, or see why it is not"))
+        got = _ui.pick("claude-mate — which account?", items,
+                       hint="↑↓ move   ⏎ start   esc cancel")
+        if got is None:
+            return _PICK_CANCELLED
+        if got is _DEVICE:
+            rc = _run_connect()
+            if rc == 0:
+                print("claude-mate: device is linked.\n")
+            continue
+        if got is _NEW:
+            name = _ask_new_profile()
+            if name:
+                return name
+            continue
+        return got
+
+
+def _ask_new_profile():
+    """Type a name, deliberately, having chosen to create one.
+
+    Typing is right HERE and wrong at the picker: this is the one place where a
+    new string is the actual answer, and you got here by choosing to. The name
+    is still validated, because "\\033" must not become a directory however you
+    arrived at it.
+    """
+    try:
+        name = input("\n  new account name: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    if not name:
+        return None
+    if not _plausible_profile(name):
+        print(f"  ignoring {name!r} — that does not look like an account name.")
+        try:
+            input("  press enter to go back ")
+        except (EOFError, KeyboardInterrupt):
+            pass
+        return None
+    return name
+
+
+_NEW = object()
+_DEVICE = object()
+
+
 def select_account(flag_name, interactive):
     """Decide which account profile this session runs under.
     Precedence: existing $CLAUDE_CONFIG_DIR (never second-guess an explicit
@@ -1156,6 +1236,30 @@ def select_account(flag_name, interactive):
         return
     profiles = list_profiles()
     if not interactive or not profiles:
+        return
+    # ARROWS FIRST, TYPING AS THE FALLBACK. This prompt is the one Claude Mate
+    # screen everybody sees, on every session, and it was the last one still
+    # asking you to read a number off a list and type it.
+    #
+    # It is also where the damage came from. Typing was how you chose, so an
+    # arrow key -- the thing a person naturally reaches for at a list -- typed
+    # an ESCAPE SEQUENCE into the name field and CREATED A PROFILE CALLED
+    # "\033", which then rendered as a blank row with somebody's email beside
+    # it and could not be typed back to delete. The maintainer's machine had
+    # one, and a "в" from a keyboard left in the wrong layout. A chooser cannot
+    # do that to you.
+    #
+    # The typed path below is kept verbatim for everything that is not a
+    # terminal on both ends -- a test harness feeding stdin, a script, a
+    # terminal that cannot do escape sequences -- because losing it would mean
+    # this function only worked in the one case it is easiest to test in.
+    if _ui and _ui.supports_ui():
+        chosen = _pick_account(profiles)
+        if chosen is _PICK_CANCELLED:
+            print()
+            os._exit(130)
+        if chosen:
+            use_profile(chosen)
         return
     # `d` IS HERE BECAUSE THIS PROMPT IS THE ONLY CLAUDE MATE UI ON THE MAC.
     # A device that will not link says so on its own glass and in the daemon's
