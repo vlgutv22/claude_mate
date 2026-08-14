@@ -12,6 +12,52 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
+### 2026-08-14 — Arrow keys all the way down, not just at the top
+
+The top level got a chooser and every level underneath it kept asking you to
+read a number off a list and type it. Reported bluntly and fairly: *"top level
+navigation is amazing but internal is bullshit."* It was — **Accounts** ran
+`claude-mate-switch --help` and left you looking at an argparse usage block
+under a "press enter to go back".
+
+- **One chooser, in `bin/claude_mate_ui.py`, that every level calls.** The app's
+  submenus, `claude-mate accounts rm`, and the account picker the wrapper shows
+  on every session all use the same `pick()` — so ↑↓ / ⏎ / esc mean the same
+  thing everywhere, and `esc` always means back.
+- **Accounts is a real menu**: every login with its email, open one to use it
+  for the next session or delete it. **Device** is a real menu too: connection
+  report, pair, show the token, restart the daemon.
+- **`claude-mate accounts rm` with no argument asks** instead of answering
+  "which account?". That error was fair at the end of a pipe and silly at a
+  terminal, where the list is already known.
+- **The wrapper's account picker is a chooser**, with the old typed prompt kept
+  intact for anything that is not a terminal on both ends.
+
+**And that last one is a bug fix, not a coat of paint.** The picker asked you to
+*type* a profile name — so an arrow key, the thing anyone reaches for at a list,
+typed an **escape sequence into the name field and created a profile called
+`\033`**. It renders as a blank row with somebody's email beside it, and it
+cannot be typed back to delete. The maintainer's machine had one, plus a `в`
+from a keyboard left in the wrong layout. A chooser cannot do that to you, and
+`tools/test_app.py` now mashes the arrow keys at the picker and asserts no
+profile appears.
+
+Those existing casualties are reachable again: unprintable names show as
+`'\x1b'`, are marked *unprintable name*, and can be selected and deleted.
+Deleting from a menu confirms with a chooser whose cursor starts on **No**,
+rather than by typing a name that in this exact case cannot be typed.
+
+- **Fixed: a profile name could emit a control sequence into your terminal.**
+  The name is also a *directory* name, so the path carries the raw ESC too, and
+  printing it does not show a funny character — it starts an escape sequence and
+  the bytes after it are eaten. Everything rendered from data goes through
+  `printable()` now. Pinned by a test that feeds the chooser a label containing
+  `\x1b[31m` and an OSC title-set, and counts stray ESC bytes in the output.
+- **Fixed: importing the shared module put colour back into pipes.** The import
+  re-bound `B`/`D`/`OFF` *after* this file blanks them for a non-TTY, so every
+  piped `claude-mate` regained ANSI. Caught by the existing test; the module
+  keeps its own copies and the script keeps its own.
+
 ### 2026-08-13 — `claude-mate` is an app, and the CLI is finally written down
 
 - **`claude-mate` on a terminal is now an arrow-key app.** The queue with the

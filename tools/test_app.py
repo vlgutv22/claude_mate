@@ -25,9 +25,11 @@ import os
 import pty
 import re
 import select
+import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import termios
 import time
 
@@ -56,6 +58,11 @@ def load(path, name):
 
 
 M = load(CLI, "cmate")
+# The decoder and the chooser live in the shared module now -- that is the whole
+# point of it, since the wrapper's account picker calls the same code. Test it
+# where it lives rather than through whichever script happens to re-export it.
+sys.path.insert(0, os.path.join(REPO, "bin"))
+import claude_mate_ui as UI  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -66,8 +73,8 @@ def decode(payload, n=1):
     r, w = os.pipe()
     os.write(w, payload)
     os.close(w)
-    M._KEYBUF.clear()                      # the decoder's own buffer is global
-    keys = [M.read_key(r, timeout=0.5) for _ in range(n)]
+    UI._KEYBUF.clear()                     # the decoder's own buffer is global
+    keys = [UI.read_key(r, timeout=0.5) for _ in range(n)]
     os.close(r)
     return keys if n > 1 else keys[0]
 
@@ -240,6 +247,123 @@ check("...and says which one skips permissions",
       "skip permissions" in menu)
 check("...and offers to start the daemon, saying start rather than restart "
       "when it is down", "start daemon" in menu)
+
+# --------------------------------------------------------------------------- #
+# The shared chooser, and the picker every session goes through
+# --------------------------------------------------------------------------- #
+# THE LEVELS UNDER THE TOP ONE are the point of claude_mate_ui existing: the app
+# had arrow keys and choosing an account still meant typing a number. These
+# drive the real chooser and the real wrapper picker under a pty, because the
+# whole class of bug here (escape sequences, terminal state, unprintable names)
+# only exists on a terminal.
+print("\n== the shared chooser ==")
+
+
+def drive_snippet(code, keystrokes, accounts_dir=None, warmup=1.5, settle=0.45):
+    """Run a python snippet under its own pty and feed it keys."""
+    m_in, s_in = pty.openpty()
+    m_out, s_out = pty.openpty()
+    fcntl.ioctl(s_out, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 110, 0, 0))
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.path.join(REPO, "bin")
+    if accounts_dir:
+        env["CLAUDE_MATE_ACCOUNTS_DIR"] = accounts_dir
+    p = subprocess.Popen([sys.executable, "-c", code], stdin=s_in,
+                         stdout=s_out, stderr=s_out, close_fds=True,
+                         cwd=REPO, env=env)
+    os.close(s_in)
+    os.close(s_out)
+
+    def drain(t):
+        buf, end = b"", time.time() + t
+        while time.time() < end:
+            if select.select([m_out], [], [], 0.05)[0]:
+                try:
+                    buf += os.read(m_out, 65536)
+                except OSError:
+                    break
+        return buf.decode("utf-8", errors="replace")
+
+    out = drain(warmup)
+    for k in keystrokes:
+        os.write(m_in, k)
+        time.sleep(settle)
+        out += drain(settle)
+    try:
+        p.wait(timeout=6)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        out += drain(0.3)
+    os.close(m_in)
+    os.close(m_out)
+    return out
+
+
+PICK = ("import claude_mate_ui as U;"
+        "items=[U.Item('alpha'),U.Item('beta'),U.Item('gamma')];"
+        "print('CHOSE',repr(U.pick('PICK ONE',items)))")
+
+out = drive_snippet(PICK, [b"\x1b[B", b"\r"])
+check("down then enter chooses the second item", "CHOSE 'beta'" in out, out[-120:])
+out = drive_snippet(PICK, [b"\x1b[A", b"\r"])
+check("up from the top wraps to the last", "CHOSE 'gamma'" in out)
+out = drive_snippet(PICK, [b"\x1b"])
+check("esc backs out with nothing chosen", "CHOSE None" in out)
+out = drive_snippet(PICK, [b"q"])
+check("...and so does q", "CHOSE None" in out)
+out = drive_snippet(PICK, [b"2"])
+check("a digit still picks that row, for the old muscle memory",
+      "CHOSE 'gamma'" in out)
+
+# UNPRINTABLE NAMES ARE THE REASON printable() EXISTS. A profile really is
+# called "\033" on a real machine, so its label and its path both carry a raw
+# ESC -- printing that does not show a character, it starts a control sequence.
+NASTY = ("import claude_mate_ui as U;"
+         "items=[U.Item('\\x1b[31mred', detail='\\x1b]0;title\\x07'),U.Item('ok')];"
+         "print('CHOSE',repr(U.pick('T',items)))")
+out = drive_snippet(NASTY, [b"\r"])
+body = out.split("CHOSE")[0]
+stray = re.sub(r"\x1b(\[[0-9;?]*[a-zA-Z]|\][^\x07]*\x07)", "", body).count("\x1b")
+check("an item label containing a raw ESC cannot emit one", stray == 0,
+      f"{stray} stray ESC bytes")
+check("...it is shown escaped instead", "\\x1b" in body)
+
+print("\n== the account picker the wrapper shows ==")
+tmp = tempfile.mkdtemp(prefix="cm-pick-")
+for name in ("work", "personal", "\x1b"):
+    os.makedirs(os.path.join(tmp, name), exist_ok=True)
+WRAPPICK = (
+    "import importlib.machinery,importlib.util,os,sys;"
+    "s=importlib.util.spec_from_loader('w',importlib.machinery.SourceFileLoader("
+    "'w','bin/claude-mate-wrap'));"
+    "W=importlib.util.module_from_spec(s);s.loader.exec_module(W);"
+    "W.ACCOUNTS_DIR=os.environ['CLAUDE_MATE_ACCOUNTS_DIR'];"
+    "print('CHOSE',repr(W._pick_account(W.list_profiles())))")
+
+out = drive_snippet(WRAPPICK, [b"\r"], accounts_dir=tmp, warmup=2.0)
+check("it opens as a chooser, not a typed prompt",
+      "which account?" in out and "account>" not in out)
+check("enter on the first row means the default account", "CHOSE ''" in out)
+
+out = drive_snippet(WRAPPICK, [b"\x1b[B", b"\r"], accounts_dir=tmp, warmup=2.0)
+check("arrowing down picks a real profile",
+      "CHOSE" in out and "CHOSE None" not in out and "CHOSE ''" not in out,
+      out.split("CHOSE")[-1][:40] if "CHOSE" in out else "")
+
+out = drive_snippet(WRAPPICK, [b"\x1b"], accounts_dir=tmp, warmup=2.0)
+check("esc cancels rather than choosing something",
+      "_PICK_CANCELLED" in out or "object at" in out.split("CHOSE")[-1],
+      out.split("CHOSE")[-1][:60] if "CHOSE" in out else "no CHOSE")
+
+# THE BUG THAT MADE THIS NECESSARY: the old picker typed names, so an arrow key
+# typed an escape sequence and CREATED a profile called "\033".
+before = set(os.listdir(tmp))
+drive_snippet(WRAPPICK, [b"\x1b[A", b"\x1b[B", b"\x1b[C", b"\x1b[D", b"\x1b"],
+              accounts_dir=tmp, warmup=2.0)
+check("mashing the arrow keys at the picker creates no profiles",
+      set(os.listdir(tmp)) == before,
+      f"{sorted(set(os.listdir(tmp)) - before)!r}")
+shutil.rmtree(tmp, ignore_errors=True)
 
 print(f"\n{'FAILED' if fails else 'all passed'}: "
       f"{fails} failure{'' if fails == 1 else 's'}")

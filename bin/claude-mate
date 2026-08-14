@@ -45,14 +45,11 @@ this process, and only asks the daemon to re-read afterwards.
 """
 import json
 import os
-import select
 import shutil
 import socket
 import subprocess
 import sys
-import termios
 import time
-import tty
 
 SOCK = os.environ.get("CLAUDE_MATE_SOCK", "/tmp/claude-mate.sock")
 
@@ -64,6 +61,10 @@ SOCK = os.environ.get("CLAUDE_MATE_SOCK", "/tmp/claude-mate.sock")
 # installed user; it is fixed there too.
 HERE = os.path.dirname(os.path.realpath(__file__))
 WRAP = os.path.join(HERE, "claude-mate-wrap")
+# The shared chooser lives beside this file. Through realpath for the same
+# reason HERE is: this script is symlinked onto PATH, and the module is not.
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
 
 # The LaunchAgent the installer sets up. Starting the daemon goes through
 # launchd and never spawns python directly -- see start_daemon().
@@ -226,8 +227,30 @@ def cmd_accounts(argv):
     if argv[0] not in ("rm", "remove", "delete"):
         die(f"claude-mate accounts: unknown subcommand {argv[0]!r}")
     if len(argv) < 2:
-        die("claude-mate accounts rm: which account?")
-    want = argv[1]
+        # ASK, RATHER THAN SCOLD. "which account?" is a fair error at the end
+        # of a pipe and a silly one at a terminal, where we already know the
+        # list and the answer is one arrow key away. It is also the only way to
+        # reach a profile whose name cannot be typed -- see show_name().
+        if not supports_ui():
+            die("claude-mate accounts rm: which account? "
+                "(see `claude-mate accounts`)")
+        items = []
+        for i, a in enumerate(accts):
+            if not a["removable"]:
+                continue
+            email = read_email(a["name"], a["dir"]) or "(not logged in)"
+            items.append(Item(show_name(a["name"]) or "(blank)",
+                              value=a["name"], detail=email))
+        if not items:
+            die("claude-mate accounts rm: no removable profiles")
+        items.append(Item("Cancel", value=None, gap=True))
+        want = pick("DELETE WHICH ACCOUNT?", items,
+                    hint="↑↓ move   ⏎ choose   esc cancel")
+        if want is None:
+            print("not deleted.")
+            return 1
+    else:
+        want = argv[1]
     match = [a for a in accts if a["name"] == want]
     if not match and want.isdigit() and 0 <= int(want) < len(accts):
         # BY INDEX TOO, because a name is not always typeable: a profile called
@@ -382,171 +405,20 @@ def start_daemon():
 # ---------------------------------------------------------------------------
 # Terminal plumbing
 # ---------------------------------------------------------------------------
-# The repo already had exactly one raw-mode implementation -- the PTY relay in
-# claude-mate-wrap -- and this follows its discipline: save termios up front,
-# restore through ONE idempotent teardown, and wire that teardown to atexit as
-# well as to the normal exit path so a traceback cannot leave someone with a
-# terminal that does not echo.
-#
-# Two deliberate differences from the wrapper:
-#
-#   setcbreak, NOT setraw. cbreak leaves ISIG alone, so ctrl-C still raises
-#   KeyboardInterrupt instead of arriving as a byte nobody handles, and it
-#   leaves OPOST alone, so ordinary print() does not stair-step down the screen
-#   -- which matters because this app hands the terminal to other programs and
-#   they expect it sane.
-#
-#   The alternate screen buffer, not a clear. `watch` clears with ESC[2J every
-#   second, which flickers and eats the scrollback it was printed into. The
-#   alternate buffer gives the app its own screen and hands the original back
-#   untouched on exit, which is what every full-screen tool on the machine does.
-
-ESC = "\x1b"
-# One place that knows what an arrow key looks like. Nothing in this repo
-# decoded escape sequences before -- an ESC[A had only ever been HOSTILE input
-# to be rejected, because a real accounts directory once ended up with a profile
-# literally named "\033" -- so this is the first and should stay the only one.
-CSI_KEYS = {
-    "A": "up", "B": "down", "C": "right", "D": "left",
-    "H": "home", "F": "end", "5~": "pgup", "6~": "pgdn", "3~": "delete",
-}
-
-
-# READ THE FILE DESCRIPTOR, NOT sys.stdin, and keep our own buffer.
-#
-# This is the bug that makes hand-rolled key readers not work, and it cost a
-# round here before the PTY test caught it. select() answers about the KERNEL's
-# buffer; sys.stdin.read(1) fills PYTHON's. An arrow key arrives as three bytes
-# in one burst, so the first read pulls all three into the TextIOWrapper and
-# hands back ESC -- and the select that follows, asking the kernel whether more
-# is coming, correctly says no. Every arrow then decoded as a bare ESC and the
-# selection never moved. os.read() has no layer to hide bytes in.
-_KEYBUF = bytearray()
-
-
-def _fill(fd, timeout):
-    """Wait for bytes and buffer them. False on timeout, True on data/EOF."""
-    if not select.select([fd], [], [], timeout)[0]:
-        return False
-    try:
-        chunk = os.read(fd, 64)
-    except OSError:
-        return False
-    if not chunk:
-        _KEYBUF.extend(b"\x00")          # EOF, as a byte we recognise below
-        return True
-    _KEYBUF.extend(chunk)
-    return True
-
-
-def read_key(fd, timeout=None):
-    """One keypress as a name, or None on timeout.
-
-    ESC IS AMBIGUOUS and that is the whole difficulty: it is both a key someone
-    pressed and the first byte of every arrow. The only way to tell them apart
-    is time -- a real escape sequence arrives in one burst from the terminal,
-    and a human cannot type ESC then [ within milliseconds -- so a lone ESC is
-    declared only after a short grace with nothing behind it.
-    """
-    if not _KEYBUF and not _fill(fd, timeout):
-        return None
-    b = _KEYBUF.pop(0)
-    if b == 0x00:
-        return "eof"
-    if b != 0x1B:
-        if b in (0x0D, 0x0A):
-            return "enter"
-        if b == 0x09:
-            return "tab"
-        if b == 0x7F:
-            return "backspace"
-        if b == 0x03:
-            return "ctrl-c"
-        if b < 0x20:
-            return "ctrl"
-        return chr(b)
-    # An escape sequence, or the ESC key on its own.
-    if not _KEYBUF and not _fill(fd, 0.05):
-        return "esc"
-    second = chr(_KEYBUF.pop(0))
-    if second == "O":                     # SS3: some terminals send arrows here
-        if not _KEYBUF and not _fill(fd, 0.05):
-            return "esc"
-        return CSI_KEYS.get(chr(_KEYBUF.pop(0)), "esc")
-    if second != "[":
-        return "esc"
-    # CSI: parameters, then a final byte. Bounded so a malformed sequence
-    # cannot spin here.
-    body = ""
-    for _ in range(8):
-        if not _KEYBUF and not _fill(fd, 0.05):
-            break
-        c = chr(_KEYBUF.pop(0))
-        body += c
-        if c.isalpha() or c == "~":
-            break
-    return CSI_KEYS.get(body, "esc")
-
-
-class Term:
-    """Raw-ish mode + the alternate screen, with a guaranteed way back."""
-
-    def __init__(self):
-        self.fd = sys.stdin.fileno()
-        self.saved = None
-
-    def __enter__(self):
-        self.saved = termios.tcgetattr(self.fd)
-        tty.setcbreak(self.fd)
-        sys.stdout.write("\033[?1049h\033[?25l")   # alt screen, hide cursor
-        sys.stdout.flush()
-        return self
-
-    def __exit__(self, *exc):
-        self.restore()
-        return False
-
-    def restore(self):
-        """Idempotent, because it is called from the exit path AND from exec."""
-        if self.saved is None:
-            return
-        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
-        self.saved = None
-        sys.stdout.write("\033[?25h\033[?1049l")   # cursor back, main screen
-        sys.stdout.flush()
-
-    def size(self):
-        """Columns and rows, with a floor under both.
-
-        A TERMINAL CAN HONESTLY REPORT 0x0. A pty allocated without a winsize
-        does exactly that, which is not exotic -- it is what `pty.openpty()`
-        gives you, so it is what every test and every `script`-style harness
-        gives you. With rows=0 the paint below computed `lines[:-1]` and quietly
-        dropped the last line of every frame, and cols=0 clipped the text; the
-        app looked like it was rendering fine and was eating its own footer.
-        """
-        try:
-            sz = os.get_terminal_size()
-            cols, rows = sz.columns, sz.lines
-        except OSError:
-            cols = rows = 0
-        return max(cols, 20), max(rows, 6)
-
-    def paint(self, lines):
-        """Repaint from the top, clearing each line as we go.
-
-        Not ESC[2J: erasing the whole screen and then drawing it is what makes
-        a 1 Hz repaint flicker. Home, then ESC[K per line, then ESC[J once at
-        the end for whatever the previous frame left below us.
-        """
-        cols, rows = self.size()
-        out = ["\033[H"]
-        for line in lines[:rows - 1]:
-            out.append(line[:cols + 40] + "\033[K\r\n")
-        out.append("\033[J")
-        sys.stdout.write("".join(out))
-        sys.stdout.flush()
-
+# ALL OF IT MOVED TO claude_mate_ui, and that is the point of this change rather
+# than a tidy-up. The top level had arrow keys and every level underneath it
+# still asked you to read a number off a list and type it; the only way to fix
+# that once is for the submenus, `accounts rm` and the wrapper's own account
+# picker to call the SAME chooser. See the note at the top of that module -- it
+# is also a bug fix, because a prompt you type names into is how a profile
+# called "\033" came to exist.
+# THE MACHINERY ONLY, AND NOT THE COLOURS. Importing B/D/OFF from here would
+# re-bind the names this file blanked for a non-TTY forty lines above, and put
+# escape codes back into every pipe -- which is exactly what it did until the
+# test caught it. The module keeps its own copies for its own rendering.
+from claude_mate_ui import (                                    # noqa: E402
+    Item, Term, confirm, pick, printable, read_key, supports_ui,
+)
 
 # ---------------------------------------------------------------------------
 # Starting a session
@@ -682,6 +554,10 @@ def cmd_app():
                     sel = len(rows) - 1
             elif key == "down":
                 sel = (sel + 1) % len(rows)
+            elif key == "home":
+                sel = 0
+            elif key == "end":
+                sel = len(rows) - 1          # same keys as pick(), everywhere
             elif key == "r":
                 note = f"{D}starting the daemon...{OFF}"
                 term.paint(_draw(term, snap, sel, rows, note, alive))
@@ -695,13 +571,10 @@ def cmd_app():
                 if row["kind"] == "new":
                     exec_new_session(row["argv"], term)     # never returns
                 if row["kind"] == "device":
-                    _foreground(term, [sys.executable,
-                                       os.path.join(HERE, "claude-mate-connect")])
+                    note = menu_device(term)
                     last_poll = 0.0
                 elif row["kind"] == "accounts":
-                    _foreground(term, [sys.executable,
-                                       os.path.join(HERE, "claude-mate-switch"),
-                                       "--help"])
+                    note = menu_accounts(term)
                     last_poll = 0.0
                 elif row["kind"] == "session":
                     talk(f"select|{row['s']['name']}")
@@ -715,13 +588,143 @@ def cmd_app():
                 last_poll = 0.0
 
 
+# ---------------------------------------------------------------------------
+# The levels underneath the top one
+# ---------------------------------------------------------------------------
+# THESE USED TO BE SHELL-OUTS AND THAT WAS THE COMPLAINT. "Accounts" ran
+# `claude-mate-switch --help` and left you looking at an argparse usage block
+# under a "press enter to go back"; "Device" dumped a four-screen report the
+# same way. Both are arrow-driven menus now, built from the same pick() as the
+# top level, so there is one set of keys in this program and esc always means
+# back.
+
+def _accounts_snapshot():
+    reply = talk("accounts")
+    if not reply:
+        return None
+    try:
+        return json.loads(reply)
+    except ValueError:
+        return None
+
+
+def menu_accounts(term):
+    """The saved logins, and what you can do to one. Returns a note, or None."""
+    while True:
+        snap = _accounts_snapshot()
+        if snap is None:
+            return f"{COLOUR['error']}no daemon — cannot read the accounts{OFF}"
+        accts = snap["accounts"]
+        items = []
+        for a in accts:
+            email = read_email(a["name"], a["dir"]) or "(not logged in)"
+            marks = [] if a["exists"] else ["missing"]
+            # SAY WHEN A NAME IS UNTYPEABLE. This is where the "\033" profile
+            # shows up, and the whole reason the old list was unusable: it
+            # printed as a blank row, so the one account you wanted to delete
+            # was the one you could not name.
+            if show_name(a["name"]) != a["name"]:
+                marks.append("unprintable name")
+            items.append(Item(show_name(a["name"]) or "(blank)",
+                              value=("acct", a),
+                              detail="  ".join([email] + marks)))
+        items.append(Item("Back", value=("back", None), gap=True))
+        got = pick("ACCOUNTS", items, term=term,
+                   hint="↑↓ move   ⏎ open   esc back",
+                   note=f"{D}{printable(snap['accounts_dir'])}{OFF}")
+        if got is None or got[0] == "back":
+            return None
+        note = menu_one_account(term, got[1])
+        if note:
+            return note
+
+
+def menu_one_account(term, a):
+    """What you can do to one login."""
+    name = show_name(a["name"])
+    email = read_email(a["name"], a["dir"]) or "(not logged in)"
+    items = [Item("Use for the next new session", value="use",
+                  detail="sets CLAUDE_MATE_ACCOUNT for a session started here")]
+    if a["removable"]:
+        items.append(Item("Delete this profile", value="rm", danger=True,
+                          detail="its login and every transcript under it",
+                          gap=True))
+    items.append(Item("Back", value="back", gap=True))
+    got = pick(f"ACCOUNT · {name}", items, term=term,
+               note=f"{D}{printable(email)}\n {printable(a['dir'])}{OFF}".replace("\n", "\n "))
+    if got == "use":
+        os.environ["CLAUDE_MATE_ACCOUNT"] = a["name"]
+        return (f"{COLOUR['done']}next new session will run as "
+                f"{name}{OFF}")
+    if got == "rm":
+        return _delete_account(term, a)
+    return None
+
+
+def _delete_account(term, a):
+    """Delete, behind a chooser rather than a typed name.
+
+    The typed confirmation is right at a shell prompt -- typing the name proves
+    you mean THAT one -- and wrong here, because the account most likely to need
+    deleting is the one whose name cannot be typed. The chooser already proves
+    which row you are on, so the second gate is the gesture, not the spelling:
+    No is where the cursor starts.
+    """
+    name = show_name(a["name"])
+    email = read_email(a["name"], a["dir"])
+    ok = confirm(
+        f"DELETE {name}?",
+        f"{printable(email) or '(not logged in)'} · {printable(a['dir'])} · there is no undo")
+    if not ok:
+        return None
+    try:
+        shutil.rmtree(a["dir"])
+    except OSError as e:
+        return f"{COLOUR['error']}could not delete: {e}{OFF}"
+    talk("accounts-refresh")
+    return f"{COLOUR['done']}deleted {name}{OFF}"
+
+
+def menu_device(term):
+    """Link state and the things you can do about it."""
+    while True:
+        items = [
+            Item("Connection report", value="report",
+                 detail="every link, and the shortest fix for whichever is down"),
+            Item("Pair a device", value="pair",
+                 detail="puts PAIR? on its screen; press GO within 45s"),
+            Item("Show the shared token", value="token",
+                 detail="for typing into a cordless board's setup portal"),
+            Item("Restart the daemon", value="daemon", gap=True),
+            Item("Back", value="back", gap=True),
+        ]
+        got = pick("DEVICE", items, term=term)
+        if got is None or got == "back":
+            return None
+        if got == "daemon":
+            problem = start_daemon()
+            return (f"{COLOUR['error']}{problem}{OFF}" if problem
+                    else f"{COLOUR['done']}daemon restarted{OFF}")
+        if got == "pair":
+            reply = talk("pair")
+            if reply is None:
+                return f"{COLOUR['error']}no daemon{OFF}"
+            if reply.startswith("error:"):
+                return f"{COLOUR['error']}{reply.strip()[7:]}{OFF}"
+            return (f"{COLOUR['done']}pairing armed — press GO on the device"
+                    f"{OFF}")
+        # The two that are genuinely a page of text rather than a choice.
+        _foreground(term, [sys.executable,
+                           os.path.join(HERE, "claude-mate-connect")]
+                    + ([] if got == "report" else ["--token"]))
+
+
 def _foreground(term, argv):
     """Hand the terminal to another tool, then take it back.
 
-    The device and account tools are interactive and print with ordinary
-    escapes; they cannot run inside the alternate screen while this app holds
-    cbreak. So leave properly, run them as an ordinary foreground child, and
-    re-enter -- which is also what makes ctrl-C inside them behave normally.
+    Only for output that is a PAGE rather than a choice -- the connection
+    report, the token. Anything that asks a question belongs in pick(), where
+    the keys are the same as everywhere else.
     """
     term.restore()
     try:
