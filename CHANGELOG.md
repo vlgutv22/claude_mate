@@ -12,6 +12,34 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
+### 2026-08-14 — A dead cable no longer takes every device button with it
+
+Reported from the couch as "the daemon is stuck". It was not stuck. It was
+running perfectly, and the one thread that reads the device had been dead for
+over two hours.
+
+The USB port dropped (`Device not configured`), and six seconds later the device
+came back on BLE and said `H`. The hub forwards `H`/`K` to the serial link's
+token push no matter which transport carried it, so the write landed on a port
+that had just closed — an `AttributeError`, which the handler around that write
+does not catch. It escaped the dispatcher and ended the button reader.
+
+**Nothing else stopped**, which is the whole problem. Sessions kept updating,
+LEDs kept firing, the terminal keys and the web page kept working, the link
+still showed connected. Every button on the device was simply dead, and the only
+evidence was one traceback in a 34 MB log.
+
+- **Fixed: provisioning a port that closed under it.** The token push checks the
+  port is open, and closing it now spends the pending arm rather than leaving it
+  aimed at a port that no longer exists.
+- **Fixed: one bad line could cost the entire input path.** The button reader
+  logs a failed dispatch and reads the next line. It is the only way in from the
+  device; a line it cannot handle is worth a log entry, not the buttons.
+
+`tools/test_net_link.py` covers both. The reader check feeds **two** presses and
+throws on the first — with one press a dead thread and a live one both leave the
+loop, and the test would pass against the bug it exists to catch.
+
 ### 2026-08-14 — Arrow keys all the way down, not just at the top
 
 The top level got a chooser and every level underneath it kept asking you to
