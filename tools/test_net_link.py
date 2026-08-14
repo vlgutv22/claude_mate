@@ -537,6 +537,69 @@ check("...and ensure_serial_open() actually reaches the serial port",
       _ClosedSerial.opened)
 
 # --------------------------------------------------------------------------- #
+print("\n-- phase 8: a closed cable must not take the buttons down with it --")
+# Regression, found on real hardware. The USB port dropped ('Device not
+# configured') and six seconds later the device reconnected over BLE and said
+# H. The hub forwards H/K to the serial link's provisioning regardless of which
+# transport carried it, so the token write landed on `self._ser is None` -- an
+# AttributeError, which the SerialException/OSError handler around it did not
+# catch. It escaped _dispatch and ended the button-reader thread. The daemon
+# then ran for hours looking perfectly healthy, with every device button dead.
+
+_link = _cmd.SerialLink(port="/dev/nonexistent-claude-mate", baud=115200)
+_link.set_provision_token("t0ken")
+_link._pending_provision = True          # armed by an open that has since died
+_link._ser = None                        # ...exactly the state that crashed
+
+try:
+    _link.provision_if_ours()
+    _crashed = False
+except Exception:
+    _crashed = True
+check("provisioning a port that closed under it does not raise", not _crashed)
+
+# The arm belongs to one open, so closing must spend it rather than leave it
+# pointed at a port that no longer exists.
+_link._pending_provision = True
+_link.close()
+check("closing the port disarms the pending token push",
+      _link._pending_provision is False)
+
+# ...and the reader survives a dispatch that throws anyway, whatever the cause.
+# This is the guard that turns "the device is bricked until you restart the
+# daemon" into one log line, so it is tested independently of the bug above.
+class _TwoLineLink:
+    """Open, hands out two presses, then goes quiet."""
+    def __init__(self): self.lines = ["B|G", "B|N"]
+    def is_open(self): return True
+    def read_line(self):
+        return self.lines.pop(0) if self.lines else None
+
+_reader = _cmd.ButtonReader.__new__(_cmd.ButtonReader)
+_reader._link = _TwoLineLink()
+_reader._stop_evt = threading.Event()
+_dispatched = []
+
+def _exploding_dispatch(line):
+    # The FIRST press throws; the second must still arrive. Two lines, not one:
+    # with a single line a dead thread and a surviving one both leave the loop,
+    # and the test would pass against the very bug it exists to catch.
+    _dispatched.append(line)
+    if len(_dispatched) >= 2:
+        _reader._stop_evt.set()
+        return
+    raise RuntimeError("boom")
+
+_reader._dispatch = _exploding_dispatch
+_t = threading.Thread(target=_reader.run, name="button-reader-under-test",
+                      daemon=True)
+_t.start()
+_t.join(timeout=5.0)
+check("a throwing dispatch does not kill the button reader -- the next press "
+      "still lands", _dispatched == ["B|G", "B|N"])
+check("...and the reader stops cleanly when asked", not _t.is_alive())
+
+# --------------------------------------------------------------------------- #
 print()
 failed = [l for l, ok in results if not ok]
 if failed:

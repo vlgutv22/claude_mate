@@ -85,6 +85,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.parse
 import wave
 from dataclasses import dataclass, field
@@ -636,6 +637,8 @@ class SerialLink:
 
     def _write_locked(self, line: str) -> None:
         """Write with the lock already held. Failures are the caller's problem."""
+        if not self.is_open():
+            return
         try:
             self._ser.write((line + "\n").encode("ascii", errors="replace"))
         except (serial.SerialException, OSError):
@@ -665,6 +668,17 @@ class SerialLink:
         token = self._provision_token
         if not token or os.environ.get("CLAUDE_MATE_NO_USB_PROVISION") == "1":
             return
+        # THE PORT CAN CLOSE BETWEEN THE ARM AND THE WRITE, and it is not a rare
+        # window: the arm is spent by a K/H reaching the ButtonReader, which the
+        # hub forwards here from WHATEVER transport it arrived on -- so a device
+        # that drops off the cable and says hello over the radio a few seconds
+        # later lands exactly here with `self._ser` already None. That is an
+        # AttributeError, not a SerialException, so the except below did not
+        # catch it and it killed the reader thread. Observed in the wild: a
+        # serial read failure at 21:37:42 and a BLE connect at 21:37:48 left the
+        # daemon running with every device button dead.
+        if not self.is_open():
+            return
         try:
             self._ser.write(f"T|{token}\n".encode("ascii", errors="replace"))
         except (serial.SerialException, OSError) as exc:
@@ -681,6 +695,11 @@ class SerialLink:
             except Exception:
                 pass
         self._ser = None
+        # The arm belongs to the open that made it. Leaving it set means the
+        # next K/H -- possibly from a device that is now on the radio, with no
+        # cable at all -- tries to provision a port that is gone; ensure_open()
+        # re-arms it if and when the cable comes back.
+        self._pending_provision = False
 
     def close(self) -> None:
         with self._lock:
@@ -2355,7 +2374,20 @@ class ButtonReader(threading.Thread):
             line = self._link.read_line()
             if not line:
                 continue
-            self._dispatch(line)
+            # THIS THREAD IS THE ONLY WAY IN FROM THE DEVICE, and until this
+            # guard existed one unhandled exception ended it for the lifetime of
+            # the daemon -- silently, as far as anything a user looks at goes.
+            # Nothing else stops: sessions keep updating, LEDs keep firing, the
+            # terminal keys and the web page keep working, the link still shows
+            # connected. Only the buttons are dead, and the single traceback
+            # explaining why has long since scrolled out of a log nobody reads
+            # until something breaks. "The daemon is stuck" is what that looks
+            # like from the couch. One bad line is worth a log entry, not the
+            # whole input path.
+            try:
+                self._dispatch(line)
+            except Exception:
+                log(f"button dispatch failed for {line!r}:\n{traceback.format_exc()}")
 
     def press(self, code: str) -> None:
         """Act on a button code as though the device had sent it.
