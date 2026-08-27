@@ -113,11 +113,14 @@
 // WHAT IT COSTS: the Mac has one Wi-Fi radio, so while it is on the device's AP
 // it is not on yours. That is the trade, it is not fixable from this side, and
 // docs/USING.md says so plainly rather than letting people discover it.
-// LINK_CABLE is "no radio at all": the USB serial link carries everything, which
+// LINK_CABLE is "no radio for the LINK": the USB serial link carries everything,
+// which
 // it already does in every other mode -- config lines, token provisioning, the
 // boot H. So this mode does not start anything, it declines to. On a desk where
 // the device is plugged into the Mac it is running against, that is the whole
-// link, and both radios stay dark.
+// link, and neither radio is started for it. (The BLE gamepad is a separate
+// role on a separate switch -- turn that on and the BLE controller comes up for
+// the pad, which is a choice the user made about a different thing.)
 //
 // LINK_AUTO is a MODE, NEVER AN EFFECTIVE TRANSPORT. It is stored, and it is
 // resolved to one of the real values at boot by resolveTransport(); nothing
@@ -418,7 +421,16 @@ class MateNet {
       // straight to BLE would move it off its own network the moment its owner
       // chose AUTO, which is the opposite of what "auto" promises.
       uint8_t l = p.getUChar("link", 0xFF);
-      if (l == LINK_WIFI || l == LINK_P2P) v = l;
+      if (l == LINK_WIFI || l == LINK_P2P) {
+        v = l;
+      } else if (!p.getString("ssid", "").isEmpty()) {
+        // AND "link" IS NOT ENOUGH EITHER. A board provisioned through the
+        // setup portal never wrote "link" -- it reaches Wi-Fi through
+        // storedTransport()'s `haveSsid ? LINK_WIFI : LINK_BLE`, which is the
+        // rule this has to match or the fallback misses exactly the devices it
+        // was added for. One rule, stated in both places.
+        v = LINK_WIFI;
+      }
     }
     p.end();
     if (v == LINK_WIFI || v == LINK_P2P) return (MateTransport)v;
@@ -482,13 +494,21 @@ class MateNet {
 
   // A dump for the USB console. Deliberately never prints the token itself --
   // only whether one is set -- so a console log cannot leak it.
-  void printConfig(Print &out) {
+  void printConfig(Print &out, MateTransport effective = LINK_AUTO) {
     out.printf("ssid  : %s\n", _ssid.isEmpty() ? "(unset)" : _ssid.c_str());
     out.printf("pass  : %s\n", _pass.isEmpty() ? "(unset)" : "(set)");
     out.printf("host  : %s\n", _host.isEmpty() ? "(mDNS discovery)" : _host.c_str());
     out.printf("port  : %u\n", _port);
     out.printf("token : %s\n", _token.isEmpty() ? "(unset)" : "(set)");
-    out.printf("link  : %s\n", transportName(storedTransport()));
+    // The stored MODE, and -- when that mode is AUTO -- what it actually chose
+    // this boot. Printing only "auto" makes the one mode that decides for you
+    // the one mode you cannot diagnose over the console you reach for when it
+    // is behaving oddly.
+    MateTransport mode = storedTransport();
+    if (mode == LINK_AUTO && effective != LINK_AUTO)
+      out.printf("link  : auto -> %s\n", transportName(effective));
+    else
+      out.printf("link  : %s\n", transportName(mode));
     if (_p2pMode) {
       // Everything a human needs to finish the job, on the console they are
       // already looking at: the network to join, the password to type, and

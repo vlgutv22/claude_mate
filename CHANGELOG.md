@@ -71,6 +71,26 @@ Found by auditing the change rather than running it:
   pairing they do not need for a link that is already up. The token
   authenticates a radio; cable has none.
 
+A second audit pass, run against the finished row, confirmed twelve more and
+five were live:
+
+- **`auto` still demoted portal-provisioned boards.** The first fix fell back to
+  the stored `link` key — but a board set up through the portal never writes
+  `link` at all; it reaches Wi-Fi through `storedTransport()`'s `haveSsid` rule.
+  So the fallback missed exactly the devices it was added to protect. It uses
+  the same `ssid` rule now, stated in both places.
+- **`auto` asked about USB once, too early.** Enumeration is not instant, so a
+  single `isPlugged()` at boot answers "no host" on a device plainly on a cable,
+  and the mode whose job is noticing the cable misses it. It settles for up to
+  400 ms and exits the moment a host answers.
+- **`auto (cable)` was painted green whether or not anything was on the cable.**
+  Green means the link is up, not that the mode is clever.
+- **The row read NVS on every repaint** — flash wear and latency in the draw
+  path, for a value that cannot change without a reboot. Cached at boot.
+- **`?` printed `auto` and never what it resolved to**, making the one mode that
+  decides for you the one you cannot diagnose over the console you reach for
+  when it is behaving oddly.
+
 A build failure worth recording, because it names nothing that was edited:
 defining a function up beside the `SetRow` enum moved arduino-cli's generated
 prototypes above `struct LedStep`, and the error arrived 250 lines away as

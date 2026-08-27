@@ -819,6 +819,26 @@ static bool linkIsCable()   { return transport == LINK_CABLE; }
 
 // Is a computer actually on the other end of the cable? SOF-based, so a wall
 // charger does not count -- see the note on battUsbHost.
+// How long AUTO will wait for USB enumeration before deciding there is no host.
+// Long enough for a cold plug to raise SOF, short enough that a cordless boot
+// does not feel it -- and only ever paid on a device set to AUTO.
+#define USB_SETTLE_MS 400UL
+
+// ...and asked with a short settle, because enumeration is not instantaneous.
+// A cold plug takes a beat to bring SOF frames up, and setup() runs before that
+// beat is over. One read taken at boot therefore answers "no host" on a device
+// that is plainly on a cable -- so AUTO picks a radio, and the mode whose whole
+// job is noticing the cable is the one that misses it. Bounded, and it exits the
+// moment the answer is yes, so a genuinely cordless boot pays it once.
+static bool usbHostSettled(unsigned long budget_ms) {
+  unsigned long until = millis() + budget_ms;
+  do {
+    if (usbHostPresent()) return true;
+    delay(10);
+  } while ((long)(millis() - until) < 0);
+  return false;
+}
+
 static bool usbHostPresent() {
 #if ARDUINO_USB_MODE && ARDUINO_USB_CDC_ON_BOOT
   return HWCDC::isPlugged();
@@ -1461,8 +1481,14 @@ static MateTransport connCycle(MateTransport t) {
 // the stored mode otherwise. Deliberately the stored MODE and not the resolved
 // transport -- a device showing "cable" because AUTO resolved that way this boot
 // would be a row that lies about what it is set to.
+static MateTransport connModeCached = LINK_AUTO;   // seeded in setup()
+
 static MateTransport connShown() {
-  return connTouchedMs ? connPending : MateNet::storedTransport();
+  // NOT storedTransport() -- that opens NVS, and this runs inside the draw path,
+  // which repaints on every state change and every blip. Reading flash to
+  // decide what a label says is latency in the render loop and wear on the part
+  // for a value that cannot change without a reboot.
+  return connTouchedMs ? connPending : connModeCached;
 }
 
 static void drawSetRow(uint8_t row, int16_t y, bool sel) {
@@ -1534,7 +1560,10 @@ static void drawSetRow(uint8_t row, int16_t y, bool sel) {
         snprintf(buf, sizeof(buf), "auto (%s)",
                  MateNet::transportName(transport));
         value = buf;
-        vcol  = C_DONE;
+        // Green means the link is UP, not that the mode is clever. Painting
+        // auto green unconditionally made the one row that reports a live
+        // decision the one row that would not tell you the decision had failed.
+        vcol  = linkConnected() ? C_DONE : C_DIM;
       } else {
         value = MateNet::transportName(shown);
         vcol  = linkConnected() ? C_DONE : C_DIM;
@@ -2256,7 +2285,7 @@ static void handleLine(char *line) {
 static bool handleConfigLine(char *line) {
   switch (line[0]) {
     case '?':
-      net.printConfig(Serial);
+      net.printConfig(Serial, transport);
       // The gauge is inferred (divider ratio measured, charging deduced from
       // the cell), so print the raw millivolts it is working from. Without this
       // a wrong BATT_DIVIDER is invisible -- it just shows a plausible, wrong
@@ -3467,7 +3496,9 @@ void setup() {
   // rather than battUsbHost, which is only set by a battery poll that has not
   // run yet -- reading it here would answer the question with the value it was
   // initialised to, on every boot, which is exactly when it matters.
-  transport = MateNet::resolveTransport(usbHostPresent());
+  transport = MateNet::resolveTransport(usbHostSettled(USB_SETTLE_MS));
+  // Read once, here, so the settings row never touches NVS to paint itself.
+  connModeCached = MateNet::storedTransport();
   // The portal is not the only way out of here on a BLE device, so it is
   // allowed to time out and hand the glass back. Without this a BOOT-held
   // portal on a cordless BLE board is a one-way door.

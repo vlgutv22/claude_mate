@@ -546,6 +546,24 @@ check("AUTO cannot resolve to a Wi-Fi transport with no network to join",
 _radio = re.search(r"static MateTransport storedRadio\(\) \{.*?\n  \}", netcfg, re.S)
 check("...and AUTO falls back to the transport already stored, not to BLE",
       bool(_radio) and 'p.getUChar("link"' in _radio.group(0))
+# ...and "link" alone is not enough: a portal-provisioned board never wrote it,
+# reaching Wi-Fi through storedTransport()'s haveSsid rule. Missing that meant
+# the fallback skipped exactly the devices it was added to protect.
+check("...including a board provisioned by the portal, which never wrote 'link'",
+      bool(_radio) and 'p.getString("ssid"' in _radio.group(0))
+# USB enumeration is not instant, so one read at boot answers "no host" on a
+# device plainly on a cable -- and AUTO picks a radio.
+check("AUTO waits for USB enumeration rather than reading isPlugged() once",
+      re.search(r"transport = MateNet::resolveTransport\(usbHostSettled\(", ino))
+check("...on a bounded budget that exits as soon as a host answers",
+      re.search(r"if \(usbHostPresent\(\)\) return true;", ino))
+# The settings row must not read flash to paint a label.
+check("the Connection row paints from a cached mode, not from NVS",
+      re.search(r"return connTouchedMs \? connPending : connModeCached;", ino))
+# `?` has to say what AUTO chose, or the mode is undiagnosable over the console.
+check("`?` reports what AUTO actually resolved to",
+      re.search(r'out\.printf\("link  : auto -> %s', netcfg)
+      and re.search(r"net\.printConfig\(Serial, transport\);", ino))
 check("...and the transport is still switchable over the cable",
       re.search(r'strcasecmp\(a, "ble"\)', ino)
       and re.search(r'strcasecmp\(a, "wifi"\)', ino)
@@ -556,7 +574,7 @@ check("...and the transport is still switchable over the cable",
 # if it ever reached the twenty-odd `transport == LINK_x` sites they would all
 # fall through their else branches and the device would behave as a Wi-Fi board.
 check("AUTO is resolved at boot rather than compared against downstream",
-      re.search(r"transport = MateNet::resolveTransport\(usbHostPresent\(\)\);", ino)
+      re.search(r"transport = MateNet::resolveTransport\(", ino)
       and not re.search(r"transport == LINK_AUTO", ino))
 # ...and CABLE must not be mistaken for Wi-Fi by the old "not BLE means net"
 # idiom, which is what every one of those sites used to say.
