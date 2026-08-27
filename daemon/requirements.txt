@@ -2,8 +2,14 @@
 # Only third-party requirement: pyserial for the USB serial link.
 pyserial>=3.5
 
-# Optional. Needed ONLY for --ble (the Bluetooth LE transport for the battery
-# build); the daemon imports it lazily and reports a clear message if it is
-# missing, so a install without it is a fully working USB/Wi-Fi daemon.
-#   pip install bleak
-# bleak>=0.22
+# Needed for --ble (the Bluetooth LE transport for the battery build). The
+# daemon still imports it lazily and still runs without it -- it just reports
+# the transport it cannot offer.
+#
+# UNCOMMENTED DELIBERATELY, because the plist ships CLAUDE_MATE_BLE=1 and the
+# daemon's own crash message tells you to `pip install -r daemon/requirements.txt`.
+# While this line was a comment, following that instruction produced a daemon
+# that started, stopped crash-looping, looked fixed -- and left a BLE device
+# with nothing to connect to, because the transport had quietly logged
+# "Continuing without BLE" and carried on.
+bleak>=0.22

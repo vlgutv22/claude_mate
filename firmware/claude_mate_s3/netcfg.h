@@ -52,6 +52,11 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <mbedtls/md.h>
+// P2P only: the DHCP lease table of our own AP, which is how we learn the one
+// address we need. WiFi.h does not expose it -- softAPgetStationNum() counts
+// stations but will not tell you where they are.
+#include <esp_wifi.h>
+#include <esp_wifi_ap_get_sta_list.h>
 
 // ---- tuning -----------------------------------------------------------------
 #define NET_NS            "claudemate"   // NVS namespace
@@ -93,7 +98,38 @@
 // A stored byte rather than a compile-time #define because the issue this
 // implements (#21) asks for exactly that: one binary that can be either, so a
 // device on a desk can be moved onto BLE without a cable and a toolchain.
-enum MateTransport : uint8_t { LINK_WIFI = 0, LINK_BLE = 1 };
+// LINK_P2P is Wi-Fi with the infrastructure taken out. Instead of joining a
+// router, the DEVICE is the access point and the Mac joins IT: one AP, one
+// station, nothing else on the segment and no third party in the path. The
+// device reads the Mac's DHCP lease off its own AP and dials it on the usual
+// port, so every byte above the socket -- the nonce handshake, the line
+// protocol, all of it -- is the same code as LINK_WIFI. See startAP().
+//
+// WHY IT EXISTS: LINK_WIFI needs the credentials of a network you both trust,
+// which is a non-starter on a guest network, a locked-down corporate SSID, or
+// anywhere you would simply rather not put a keypad's password. P2P needs no
+// network at all.
+//
+// WHAT IT COSTS: the Mac has one Wi-Fi radio, so while it is on the device's AP
+// it is not on yours. That is the trade, it is not fixable from this side, and
+// docs/USING.md says so plainly rather than letting people discover it.
+// LINK_CABLE is "no radio for the LINK": the USB serial link carries everything,
+// which
+// it already does in every other mode -- config lines, token provisioning, the
+// boot H. So this mode does not start anything, it declines to. On a desk where
+// the device is plugged into the Mac it is running against, that is the whole
+// link, and neither radio is started for it. (The BLE gamepad is a separate
+// role on a separate switch -- turn that on and the BLE controller comes up for
+// the pad, which is a choice the user made about a different thing.)
+//
+// LINK_AUTO is a MODE, NEVER AN EFFECTIVE TRANSPORT. It is stored, and it is
+// resolved to one of the real values at boot by resolveTransport(); nothing
+// downstream ever compares against it. Keeping it out of the effective set is
+// what stops every `transport == LINK_x` site in the sketch from having to know
+// that a fifth value exists.
+enum MateTransport : uint8_t {
+  LINK_WIFI = 0, LINK_BLE = 1, LINK_P2P = 2, LINK_CABLE = 3, LINK_AUTO = 4
+};
 
 class MateNet {
  public:
@@ -105,7 +141,13 @@ class MateNet {
     DIALING,      // opening the TCP connection
     AUTHING,      // nonce challenge in flight
     LINKED,       // protocol is flowing
+    HOSTING,      // P2P: our AP is up, waiting for the Mac to join it
   };
+
+  // APPENDED, NOT INSERTED. Nothing persists a State, but the sketch compares
+  // them and blelink mirrors the shape, so renumbering the existing values to
+  // put HOSTING "in order" would be a silent, wide behaviour change for a
+  // cosmetic gain.
 
   // ---- lifecycle ------------------------------------------------------------
 
@@ -123,12 +165,29 @@ class MateNet {
     }
   }
 
+  // Come up as the access point instead of joining one -- the P2P transport.
+  //
+  // Deliberately a separate entry point rather than a flag on begin(): begin()
+  // is about credentials (have them -> join, lack them -> portal) and P2P has
+  // no concept of either. Sharing one function would have meant threading a
+  // mode through every credential branch it owns.
+  void beginP2P() {
+    loadConfig();                  // the token, the port, and what `?` prints
+    WiFi.persistent(false);
+    _p2pMode = true;
+    startAP();
+  }
+
   // Advance the state machine. Must be called every loop(); never blocks for
   // more than one connect attempt.
   void poll() {
     switch (_state) {
       case SETUP:       pollPortal();     break;
       case JOINING:     pollJoin();       break;
+      // HOSTING is cheap -- it reads a lease table, it never blocks -- so
+      // unlike DIALING it is not gated on _holdReconnect. The gate exists to
+      // keep blocking calls out of the button poll; there is nothing to gate.
+      case HOSTING:     pollHost();       break;
       // The two states that BLOCK. While the user is driving a firmware-local
       // screen, reconnection waits: a menu that drops every other button press
       // is worse than a link that comes back a few seconds later, and the user
@@ -199,8 +258,21 @@ class MateNet {
                                                  : _host.c_str(), _port);
                         return _status;
       case AUTHING:     return "authenticating...";
-      case LINKED:      snprintf(_status, sizeof(_status), "wifi %s",
-                                 WiFi.localIP().toString().c_str());
+      // In P2P the interesting address is the PEER's, not ours: ours is always
+      // 192.168.4.1 and tells the user nothing they can act on.
+      case LINKED:      if (_p2pMode) {
+                          snprintf(_status, sizeof(_status), "p2p %s",
+                                   _foundIp.toString().c_str());
+                        } else {
+                          snprintf(_status, sizeof(_status), "wifi %s",
+                                   WiFi.localIP().toString().c_str());
+                        }
+                        return _status;
+      // The one screen that has to carry instructions: nothing happens in P2P
+      // until a human joins this network from the Mac, and the SSID is the
+      // whole of what they need. The password sits on the SETUP-style panel.
+      case HOSTING:     snprintf(_status, sizeof(_status), "p2p: join %s",
+                                 _apName);
                         return _status;
     }
     return "";
@@ -293,16 +365,126 @@ class MateNet {
     uint8_t v = p.getUChar("link", 0xFF);          // 0xFF = never set
     bool haveSsid = !p.getString("ssid", "").isEmpty();
     p.end();
-    if (v == LINK_BLE)  return LINK_BLE;
-    if (v == LINK_WIFI) return LINK_WIFI;
+    if (v == LINK_BLE)   return LINK_BLE;
+    if (v == LINK_WIFI)  return LINK_WIFI;
+    // P2P needs no SSID, so unlike LINK_WIFI it is honoured on a device that
+    // has never been given credentials -- which is the normal state of a device
+    // that only ever uses P2P.
+    if (v == LINK_P2P)   return LINK_P2P;
+    if (v == LINK_CABLE) return LINK_CABLE;
+    if (v == LINK_AUTO)  return LINK_AUTO;
     return haveSsid ? LINK_WIFI : LINK_BLE;        // a value from a future
   }                                                // build falls here too
+
+  // The MODE resolved to something the rest of the firmware can switch on.
+  // AUTO is the only value that needs resolving, and it resolves ONCE, at boot,
+  // in setup() -- see the note on LINK_AUTO.
+  //
+  // isPlugged() is SOF-based: it reports that a computer is talking to the USB
+  // peripheral, not merely that 5 V is present on the cable. A charger in a wall
+  // socket is therefore not mistaken for a Mac, which is the one confusion that
+  // would make AUTO pick the cable and then link to nothing.
+  static MateTransport resolveTransport(bool usbHost) {
+    MateTransport mode = storedTransport();
+    if (mode != LINK_AUTO) return mode;
+    if (usbHost) return LINK_CABLE;
+    MateTransport radio = storedRadio();
+    // AUTO MUST OBEY THE SAME GATE THE MENU DOES. The Connection row refuses to
+    // offer Wi-Fi to a device with no network, because such a device reboots
+    // into a portal that outranks the menu -- the whole trap the row was
+    // designed around. AUTO could walk straight past that gate: pick wifi while
+    // credentials exist, wipe them later, and every boot from then on resolves
+    // to a Wi-Fi transport with nothing to join. The gate belongs to the
+    // decision, not to the row that happens to present it.
+    if (radio == LINK_WIFI && !hasSsid()) return LINK_BLE;
+    return radio;
+  }
+
+  static bool hasSsid() {
+    Preferences p;
+    if (!p.begin(NET_NS, true)) return false;
+    bool has = !p.getString("ssid", "").isEmpty();
+    p.end();
+    return has;
+  }
+
+  // Which radio AUTO falls back to when there is no host on the cable. Written
+  // whenever the user picks a radio explicitly, so "auto" means "the cable when
+  // it is there, otherwise what I last chose" rather than a fixed guess.
+  static MateTransport storedRadio() {
+    Preferences p;
+    if (!p.begin(NET_NS, true)) return LINK_BLE;
+    uint8_t v = p.getUChar("radio", 0xFF);
+    if (v != LINK_WIFI && v != LINK_P2P && v != LINK_BLE) {
+      // NEVER WRITTEN, which is the state of every device that predates this
+      // key -- including one that has been happily on Wi-Fi for months. Falling
+      // straight to BLE would move it off its own network the moment its owner
+      // chose AUTO, which is the opposite of what "auto" promises.
+      uint8_t l = p.getUChar("link", 0xFF);
+      if (l == LINK_WIFI || l == LINK_P2P) {
+        v = l;
+      } else if (!p.getString("ssid", "").isEmpty()) {
+        // AND "link" IS NOT ENOUGH EITHER. A board provisioned through the
+        // setup portal never wrote "link" -- it reaches Wi-Fi through
+        // storedTransport()'s `haveSsid ? LINK_WIFI : LINK_BLE`, which is the
+        // rule this has to match or the fallback misses exactly the devices it
+        // was added for. One rule, stated in both places.
+        v = LINK_WIFI;
+      }
+    }
+    p.end();
+    if (v == LINK_WIFI || v == LINK_P2P) return (MateTransport)v;
+    return LINK_BLE;              // the cordless default, and the cheap one
+  }
+
   static void storeTransport(MateTransport t) {
     Preferences p;
-    if (p.begin(NET_NS, false)) { p.putUChar("link", (uint8_t)t); p.end(); }
+    if (p.begin(NET_NS, false)) {
+      p.putUChar("link", (uint8_t)t);
+      // Remember the radio behind an explicit choice, so a later switch to AUTO
+      // returns to it rather than to a default the user never picked.
+      if (t == LINK_BLE || t == LINK_WIFI || t == LINK_P2P)
+        p.putUChar("radio", (uint8_t)t);
+      p.end();
+    }
   }
+
   static const char *transportName(MateTransport t) {
-    return t == LINK_BLE ? "ble" : "wi-fi";
+    switch (t) {
+      case LINK_BLE:   return "ble";
+      case LINK_P2P:   return "p2p";
+      case LINK_CABLE: return "cable";
+      case LINK_AUTO:  return "auto";
+      default:         return "wi-fi";
+    }
+  }
+
+  // ---- "open the portal after the next reboot" -----------------------------
+  // A ONE-SHOT, and the one-shot is the safety property. The settings row that
+  // sets this reboots immediately; setup() reads it and CLEARS IT BEFORE the
+  // portal opens, so a power cut with the portal on screen -- or a portal
+  // nobody finishes -- costs one ordinary boot, not a device that comes back
+  // into the portal forever with the row that set it hidden behind it.
+  //
+  // WHY A REBOOT AT ALL, rather than just calling startPortalNow(). The portal
+  // is a SoftAP, so it wants the 2.4 GHz radio that BLE is holding on a BLE
+  // device, and BLE cannot be brought back up after a teardown in the same boot
+  // (see blelink.h). Opening the portal in place would therefore cost the
+  // device its link until the next power cycle -- which is precisely the
+  // "one press, no way back" trap the Link row was removed for. Rebooting
+  // reaches the portal the same way BOOT-held does: instead of the other
+  // transport, never alongside it.
+  static void requestPortalOnBoot() {
+    Preferences p;
+    if (p.begin(NET_NS, false)) { p.putUChar("portal1", 1); p.end(); }
+  }
+  static bool takePortalRequest() {
+    Preferences p;
+    if (!p.begin(NET_NS, false)) return false;
+    bool want = p.getUChar("portal1", 0) == 1;
+    if (want) p.remove("portal1");           // consumed, whatever happens next
+    p.end();
+    return want;
   }
 
   void wipe() {
@@ -312,13 +494,36 @@ class MateNet {
 
   // A dump for the USB console. Deliberately never prints the token itself --
   // only whether one is set -- so a console log cannot leak it.
-  void printConfig(Print &out) {
+  void printConfig(Print &out, MateTransport effective = LINK_AUTO) {
     out.printf("ssid  : %s\n", _ssid.isEmpty() ? "(unset)" : _ssid.c_str());
     out.printf("pass  : %s\n", _pass.isEmpty() ? "(unset)" : "(set)");
     out.printf("host  : %s\n", _host.isEmpty() ? "(mDNS discovery)" : _host.c_str());
     out.printf("port  : %u\n", _port);
     out.printf("token : %s\n", _token.isEmpty() ? "(unset)" : "(set)");
-    out.printf("link  : %s\n", transportName(storedTransport()));
+    // The stored MODE, and -- when that mode is AUTO -- what it actually chose
+    // this boot. Printing only "auto" makes the one mode that decides for you
+    // the one mode you cannot diagnose over the console you reach for when it
+    // is behaving oddly.
+    MateTransport mode = storedTransport();
+    if (mode == LINK_AUTO && effective != LINK_AUTO)
+      out.printf("link  : auto -> %s\n", transportName(effective));
+    else
+      out.printf("link  : %s\n", transportName(mode));
+    if (_p2pMode) {
+      // Everything a human needs to finish the job, on the console they are
+      // already looking at: the network to join, the password to type, and
+      // whether the Mac is on it yet. The AP password is printed in full and
+      // that is deliberate -- unlike the token it is not a capability (it
+      // guards one keypad's private segment), and a P2P device that will not
+      // tell you its password cannot be connected to at all.
+      out.printf("ap    : %s  pass %s\n", _apName, _apPass);
+      out.printf("peers : %u\n", (unsigned)WiFi.softAPgetStationNum());
+      IPAddress peer;
+      out.printf("mac   : %s\n",
+                 peerAddress(peer) ? peer.toString().c_str() : "(not joined)");
+      out.printf("state : %s\n", stateName());
+      return;                    // the STA lines below are all meaningless here
+    }
     // The driver's own verdict, verbatim. Without it a device that will never
     // join and a device that is merely slow are indistinguishable over serial.
     out.printf("wifi  : status=%d %s\n", (int)WiFi.status(),
@@ -331,12 +536,29 @@ class MateNet {
                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
   }
 
+  // The join instructions for P2P, printable BEFORE the AP is up.
+  //
+  // Called from `I|P2P`, which reboots immediately afterwards, so it must not
+  // depend on any radio state -- p2pCredentials() only reads (and on the first
+  // ever call, writes) NVS. That also means the SSID and password printed here
+  // are exactly the ones the device will come back up with.
+  void printP2PInvite(Print &out) {
+    p2pCredentials();
+    out.println("p2p: after the reboot, join this network from the Mac:");
+    out.printf("  network : %s\n", _apName);
+    out.printf("  password: %s\n", _apPass);
+    out.println("  then the device dials the daemon on its own.");
+    if (_token.isEmpty())
+      out.println("  WARNING: no token set. Send T|<token> or the daemon will "
+                  "reject the link.");
+  }
+
   const char *stateName() const {
     switch (_state) {
       case OFF: return "OFF";                 case SETUP: return "SETUP";
       case JOINING: return "JOINING";         case DISCOVERING: return "DISCOVERING";
       case DIALING: return "DIALING";         case AUTHING: return "AUTHING";
-      case LINKED: return "LINKED";
+      case LINKED: return "LINKED";           case HOSTING: return "HOSTING";
     }
     return "?";
   }
@@ -344,6 +566,11 @@ class MateNet {
   // Restart the link from the top (after a config change).
   void restart() {
     _client.stop();
+    // P2P first, and before every credential test below it: none of them apply
+    // to a device that is its own network. This is also what makes linkStart()
+    // in the sketch work unchanged -- it calls restart() for anything that is
+    // not BLE, and the mode is remembered here rather than passed in.
+    if (_p2pMode) { startAP(); return; }
     // NOTHING TO JOIN MEANS THE PORTAL, not silence -- the same rule begin()
     // follows, and it has to be the same or the two disagree about what an
     // unprovisioned device does.
@@ -429,6 +656,11 @@ class MateNet {
   void shutdown() {
     _client.stop();
     if (_state == SETUP) stopPortal();
+    // An AP is not torn down by disconnect(), which is about the STA. Without
+    // this the "radio off" path left our own network advertising itself into an
+    // empty room for the whole of a deep sleep -- the single largest current
+    // draw on the board, on a device that had just been told to save power.
+    if (_p2pMode) WiFi.softAPdisconnect(true);
     WiFi.disconnect(true);          // true: also switch the radio off
     WiFi.mode(WIFI_OFF);
     _state = OFF;
@@ -451,6 +683,7 @@ class MateNet {
   unsigned long _dropAt = 0;          // ...and when (0 = nothing has failed)
   unsigned long _portalTouched = 0;   // last portal page load, for the timeout
   bool          _fallbackLink = false;  // see setFallbackLink()
+  bool          _p2pMode = false;     // we are the AP, not a station (LINK_P2P)
   uint8_t       _fails = 0;           // consecutive dial/discover failures
   bool          _holdReconnect = false;  // UI is busy; do not block the loop
   char          _line[192];        // handshake line assembly
@@ -491,6 +724,93 @@ class MateNet {
     WiFi.begin(_ssid.c_str(), _pass.isEmpty() ? nullptr : _pass.c_str());
     go(JOINING);
   }
+
+  // ---- P2P: we are the access point ----------------------------------------
+
+  // Bring up our own AP and wait. No STA, no scan, no mDNS: in P2P the only
+  // other machine on the segment is the one we want, and its address comes from
+  // our own DHCP server rather than from a discovery protocol.
+  //
+  // WIFI_AP, not the portal's WIFI_AP_STA. The portal needs the STA half to
+  // scan for networks to show you; P2P never joins one, and leaving the STA up
+  // just gives the driver a second thing to do with a radio it is already
+  // using as an AP.
+  void startAP() {
+    p2pCredentials();
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(_apName, _apPass);
+    _lastTry = 0;
+    go(HOSTING);
+  }
+
+  // The AP's SSID and password, generated ONCE and kept.
+  //
+  // NOT the portal's random-per-session password. That is right for a captive
+  // portal you visit once from a phone, and wrong here: the Mac saves this
+  // network and is expected to rejoin it automatically at every login, which a
+  // password that changes on every boot would break on the first reboot. The
+  // SSID keeps the portal's MAC suffix so a desk with two devices on it still
+  // shows two distinct networks.
+  void p2pCredentials() {
+    Preferences p;
+    String ssid, pass;
+    if (p.begin(NET_NS, false)) {
+      ssid = p.getString("apssid", "");
+      pass = p.getString("appass", "");
+      // 8 characters is not a style rule, it is the WPA2 minimum -- softAP()
+      // silently falls back to an OPEN network on a shorter one, which would
+      // put an unauthenticated AP on the desk without saying so.
+      if (ssid.isEmpty() || pass.length() < 8) {
+        uint8_t mac[6];
+        WiFi.macAddress(mac);
+        char n[sizeof(_apName)], q[sizeof(_apPass)];
+        snprintf(n, sizeof(n), "%s%02X%02X", NET_AP_PREFIX, mac[4], mac[5]);
+        snprintf(q, sizeof(q), "%08u", (unsigned)(esp_random() % 100000000u));
+        ssid = n;
+        pass = q;
+        p.putString("apssid", ssid);
+        p.putString("appass", pass);
+      }
+      p.end();
+    }
+    snprintf(_apName, sizeof(_apName), "%s", ssid.c_str());
+    snprintf(_apPass, sizeof(_apPass), "%s", pass.c_str());
+  }
+
+  // Wait for the Mac to associate AND pick up a lease, then dial it.
+  //
+  // Association and address are two separate events and the gap between them is
+  // real (a DHCP exchange, plus whatever macOS spends deciding the network is
+  // usable). Dialling on association alone means connecting to 0.0.0.0.
+  void pollHost() {
+    IPAddress peer;
+    if (!peerAddress(peer)) return;       // nobody joined yet, or no lease yet
+    _foundIp   = peer;
+    _foundPort = _port;
+    _fails     = 0;
+    _lastTry   = 0;                       // dial immediately
+    go(DIALING);
+  }
+
+  // The address our DHCP server handed the one station on our AP.
+  //
+  // Read rather than assumed. 192.168.4.2 is what the pool hands out first and
+  // would be right almost every time -- but "almost" here means a device that
+  // silently dials the wrong host after a lease churn, with a status line
+  // claiming it is dialling the Mac. The API costs two stack structs.
+  bool peerAddress(IPAddress &out) const {
+    wifi_sta_list_t sta;
+    if (esp_wifi_ap_get_sta_list(&sta) != ESP_OK || sta.num <= 0) return false;
+    wifi_sta_mac_ip_list_t ips;
+    if (esp_wifi_ap_get_sta_list_with_ip(&sta, &ips) != ESP_OK) return false;
+    for (int i = 0; i < ips.num; i++) {
+      uint32_t ip = ips.sta[i].ip.addr;
+      if (ip) { out = IPAddress(ip); return true; }
+    }
+    return false;                          // associated, lease not issued yet
+  }
+
+  bool apUp() const { return _p2pMode && WiFi.softAPgetStationNum() > 0; }
 
   void pollJoin() {
     if (WiFi.status() == WL_CONNECTED) {
@@ -547,13 +867,26 @@ class MateNet {
   // ---- dial + handshake ----------------------------------------------------
 
   void pollDial() {
-    if (WiFi.status() != WL_CONNECTED) { startJoin(); return; }
+    // EVERY "not connected" TEST IN THIS FILE IS ABOUT THE STA. In P2P there is
+    // no STA to be connected: WiFi.status() is WL_DISCONNECTED forever and the
+    // unguarded version of this line called startJoin() -- WIFI_STA, which
+    // tears our own AP down -- on the first poll after the AP came up. The
+    // equivalent question for an AP is whether anyone is still associated.
+    if (_p2pMode) {
+      if (WiFi.softAPgetStationNum() == 0) { go(HOSTING); return; }
+    } else if (WiFi.status() != WL_CONNECTED) {
+      startJoin();
+      return;
+    }
     if (_lastTry && millis() - _lastTry < retryGap(NET_RETRY_MS)) return;
     _lastTry = millis();
 
     bool ok;
-    if (_host.isEmpty()) {
-      if (!_foundPort) { go(DISCOVERING); return; }   // lost the mDNS answer
+    // In P2P the peer is whatever our DHCP server just leased, so a stored host
+    // (left over from a Wi-Fi provisioning, or set by S|) must NOT win here --
+    // it would name an address that does not exist on this segment.
+    if (_p2pMode || _host.isEmpty()) {
+      if (!_foundPort) { go(_p2pMode ? HOSTING : DISCOVERING); return; }
       ok = _client.connect(_foundIp, _foundPort, NET_DIAL_TIMEOUT);
     } else {
       ok = _client.connect(_host.c_str(), _port, NET_DIAL_TIMEOUT);
@@ -561,7 +894,9 @@ class MateNet {
     if (!ok) {
       bumpFail();
       // A host that stops answering may have moved: re-browse rather than
-      // hammering a dead address forever.
+      // hammering a dead address forever. In P2P "moved" means a new lease, so
+      // the equivalent is to go back and re-read the lease table.
+      if (_p2pMode) { _foundPort = 0; go(HOSTING); return; }
       if (_host.isEmpty()) { _foundPort = 0; go(DISCOVERING); }
       return;
     }
@@ -640,6 +975,16 @@ class MateNet {
 
   void pollLinked() {
     if (!_client.connected() && !_client.available()) { drop("link closed"); return; }
+    // THE STA TEST IS NOT THE P2P TEST. WiFi.status() only ever describes the
+    // station interface, and a P2P device has none -- it reports
+    // WL_DISCONNECTED for its entire life. Left unguarded this dropped the link
+    // on the first poll after A|OK, every time, so P2P authenticated
+    // successfully and then tore itself down in the same breath. The equivalent
+    // liveness question for an AP is whether the Mac is still associated.
+    if (_p2pMode) {
+      if (WiFi.softAPgetStationNum() == 0) drop("peer left the network");
+      return;
+    }
     if (WiFi.status() != WL_CONNECTED) { drop("wifi lost"); return; }
   }
 
@@ -688,6 +1033,13 @@ class MateNet {
     _client.stop();
     _lineLen = 0;
     _lastTry = millis();            // honour the backoff before redialling
+    if (_p2pMode) {
+      // Our AP does not go down because the daemon hung up. Stay hosting and
+      // redial the same peer; if the Mac itself left, pollDial() sees the empty
+      // station list and comes back here anyway.
+      go(HOSTING);
+      return;
+    }
     go(WiFi.status() == WL_CONNECTED
            ? (_host.isEmpty() ? DISCOVERING : DIALING)
            : JOINING);

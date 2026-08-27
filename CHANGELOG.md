@@ -12,6 +12,268 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
+### 2026-08-27 — Pick the connection on the device: auto, cable, bt, wifi, p2p
+
+Asked for directly: *"i want be able to switch it on device, like connection
+interface auto, bt, wifi, cable."* **SETTINGS → Connection.** GO cycles, a hold
+switches and restarts.
+
+- **`cable`** is new: both radios off, the USB link carries everything. It
+  already did in every other mode — config lines, token provisioning, the boot
+  `H` — so this mode does not start anything, it declines to.
+- **`auto`** is new and is a MODE, never an effective transport. It resolves once
+  at boot: a computer on the USB port means cable, otherwise the radio you last
+  chose explicitly. Resolved from `HWCDC::isPlugged()`, which is SOF-based, so a
+  wall charger is not mistaken for a Mac. The row shows what it picked —
+  `auto (cable)` — because the one mode whose job is deciding for you should say
+  what it decided.
+- **Cycling only previews.** Reaching the fourth option costs four presses and no
+  restarts, and walking away reverts.
+
+**The gate that makes this safe.** The `Link` row was deleted because one press
+moved a **credential-less** board onto Wi-Fi, which reboots into a portal that
+outranks the menu — hiding the row you would undo it with. Every other mode
+needs no configuration and cannot start that sequence, so the whole hazard is
+one question, and the cycle answers it: **Wi-Fi is not offered until the device
+knows a network.** With credentials, a failed join sits in `JOINING`, which does
+*not* outrank the menu, so the row is still there to switch back.
+
+The interesting work was not the row, it was the twenty-two places that branched
+on the transport. Every one read `transport == LINK_BLE ? ble : net` — "anything
+that is not BLE is Wi-Fi", true while there were two radios and still true when
+P2P arrived, because P2P *is* net. `cable` broke it: a cabled device would have
+been routed to a `MateNet` whose radio is deliberately off, reporting "wifi off
+- usb only" as its status and `connected() == false` for ever — a device that
+works perfectly, saying it does not. Three predicates (`linkUsesBle`,
+`linkUsesNet`, `linkIsCable`) now make each site say which case it means.
+
+Found by auditing the change rather than running it:
+
+- **`auto` could walk straight past its own gate.** Pick Wi-Fi while credentials
+  exist, wipe them later, and every boot resolves to a Wi-Fi transport with
+  nothing to join — into the exact portal the row refuses to send you to. The
+  gate belongs to the decision, not to the row that presents it.
+- **`auto` demoted existing Wi-Fi users to BLE.** The fallback read a key that no
+  device predating this change has, then defaulted to BLE — moving a board that
+  had been on Wi-Fi for months off its own network the moment its owner chose
+  "auto". It falls back to the stored transport first.
+- **A hold on an untouched row did nothing.** `K` is excluded from the alias to
+  `G` so it can commit, which made the first long press — the gesture every
+  other confirming row teaches — silently inert.
+- **Cable drew no link indicator at all.** An early return skipped the USB badge
+  that `drawLinkGlyph()` ends with, leaving a blank corner on the mode most
+  likely to be mistaken for "not working".
+- **A no-change commit skipped the reboot**, re-introducing the early return
+  `setTransport()` documents at length: the reboot IS the repair for a wedged
+  stack, and three places tell you to perform it by re-selecting the mode you
+  are already on.
+- **The NO LINK screen led with "no token" on the cable**, sending someone to run
+  pairing they do not need for a link that is already up. The token
+  authenticates a radio; cable has none.
+
+A second audit pass, run against the finished row, confirmed twelve more and
+five were live:
+
+- **`auto` still demoted portal-provisioned boards.** The first fix fell back to
+  the stored `link` key — but a board set up through the portal never writes
+  `link` at all; it reaches Wi-Fi through `storedTransport()`'s `haveSsid` rule.
+  So the fallback missed exactly the devices it was added to protect. It uses
+  the same `ssid` rule now, stated in both places.
+- **`auto` asked about USB once, too early.** Enumeration is not instant, so a
+  single `isPlugged()` at boot answers "no host" on a device plainly on a cable,
+  and the mode whose job is noticing the cable misses it. It settles for up to
+  400 ms and exits the moment a host answers.
+- **`auto (cable)` was painted green whether or not anything was on the cable.**
+  Green means the link is up, not that the mode is clever.
+- **The row read NVS on every repaint** — flash wear and latency in the draw
+  path, for a value that cannot change without a reboot. Cached at boot.
+- **`?` printed `auto` and never what it resolved to**, making the one mode that
+  decides for you the one you cannot diagnose over the console you reach for
+  when it is behaving oddly.
+
+A build failure worth recording, because it names nothing that was edited:
+defining a function up beside the `SetRow` enum moved arduino-cli's generated
+prototypes above `struct LedStep`, and the error arrived 250 lines away as
+`'LedStep' does not name a type`.
+
+### 2026-08-27 — Wi-Fi setup is a row on the device again
+
+Reported as a flat correction: *"hold boot its wrong it should be wifi setup
+option in settings."* The instruction was accurate for the firmware as it stood
+— there was no such row, and a test asserted there could not be one — but the
+instruction being accurate is not the same as the design being right. Teaching
+the device a network is an ordinary task, and "unscrew the case and hold BOOT
+while plugging it in" is not a route to one.
+
+**Why the old reasoning did not cover this.** The row was removed on the grounds
+that "pairing replaced the only reason it existed". That was about **tokens**,
+and it is still true of tokens — BLE enrolment provisions those. It never
+covered Wi-Fi **credentials**, which pairing cannot supply and which a device
+meant to live on your network has to learn from somewhere.
+
+- **SETTINGS → Wi-Fi setup.** GO arms, a hold confirms — the same gesture
+  Factory reset uses, because the portal outranks the menu for up to five
+  minutes and a mis-press should not cost that. The row's value says whether the
+  device already knows a network (`set` / `none`).
+- **It is not the row that was removed.** It does not touch the transport, so
+  one press still cannot move a cordless board onto Wi-Fi, and it reaches the
+  portal by **restarting into it** rather than raising a SoftAP beside a live
+  BLE stack — which could not be undone until the next power cycle, because BLE
+  cannot be re-initialised after a teardown in the same boot.
+- **The request is a one-shot, cleared before the portal opens**, so an
+  abandoned setup or a power cut mid-portal costs one ordinary boot rather than
+  a device that comes back into the portal for ever with the row that sent it
+  there hidden behind the screen it opened.
+
+Two bugs found by auditing the change rather than by running it:
+
+- **The one-shot was not one-shot.** `digitalRead(BOOT) == LOW || takePortalRequest()`
+  short-circuits, so the flag went unconsumed on any boot with BOOT held — and
+  on a bare devkit BOOT *is* GO, so the long press that confirms this very row
+  is still down when `setup()` runs. The portal would open, correctly, and then
+  open again on every boot after. Consumed on its own line now.
+- **A pad-on board reached the portal with a BLE HID stack live.** The gamepad
+  tail of `setup()` sits outside the transport branch, so a SoftAP and a HID
+  GATT server shared the one 2.4 GHz radio for the portal's whole life — and at
+  portal end the link service was grafted onto the pad's server, because
+  `BLEDevice::createServer()` returns a singleton. Reachable by BOOT-held today,
+  independent of the new row. A device dragged into setup is no longer a
+  gamepad for those minutes.
+
+Also fixed while in here: the SETUP-ended hand-back tested `transport ==
+LINK_BLE`, so a **P2P** device dragged through the portal came back with its
+radio off, hosting nothing, reachable only by rebooting. It asks the right
+question now — is this device something other than a Wi-Fi station — and returns
+a P2P device to hosting its own AP.
+
+The test that forbade the row now pins what kind of row it is instead: that it
+does not switch transports, does not open a portal in place, arms before it
+acts, and consumes its flag. Each of those was checked against a deliberately
+broken version first.
+
+### 2026-08-27 — The listener only exists on networks you trust
+
+Asked plainly: *"the server on the mac should be super secure in case I
+connected not to home network."* It was not. The TCP listener bound `0.0.0.0`
+at every login on every network, and `dns-sd` announced the hostname and port to
+every peer on the segment before anyone connected. Its own docstring had said
+"use it on a network you trust" without ever checking whether you were on one.
+
+- **A network must be trusted before the listener exists on it.**
+  `claude-mate trust` / `--list` / `--remove`. Carry the Mac to a café and the
+  listener and the mDNS advert close within ~20 s; come home and they reopen.
+  A network is identified by its **gateway's MAC address** — not the SSID,
+  which macOS hides from a background daemon, and not the subnet, because every
+  other café is `192.168.1.0/24`.
+- **First run adopts the network it finds**, once and loudly, so an upgrade
+  cannot disconnect a device that worked yesterday. Never worse than listening
+  everywhere; strictly better from the second network on. `--trust-any-network`
+  restores the old behaviour.
+- **An unauthenticated peer can no longer exhaust the daemon.** The client cap
+  counted only peers that had *already* authenticated, so connections that never
+  finished the handshake were never counted — each one costing a thread, and the
+  thread list itself was appended to per connection and never pruned. There is
+  now a separate budget for in-flight handshakes, and the list is pruned.
+- **…nor hold a slot open indefinitely.** `NET_AUTH_TIMEOUT_S` was a per-*byte*
+  timeout: the reader takes one byte at a time and a socket timeout bounds the
+  gap between reads, not the read. One byte every four seconds held a thread for
+  512 × 5 s — about forty minutes — and enough of those keep the real device out
+  without ever knowing the token. The handshake now has one wall-clock deadline.
+- **The restart path was broken before anything used it.** `stop()` set an event
+  that `start()` never cleared, so a re-opened listener came back bound,
+  listening, and attached to an accept loop that had already exited. That is
+  worse than a failure because it looks exactly like success — and it is what
+  the gate does every time you come home, so it had to work.
+
+Both DoS fixes and the restart are pinned by tests that were checked against the
+unfixed code first. The first attempt at the slowloris test passed against the
+bug, because blocking on `recv` is itself the long gap the old timeout already
+caught; it polls with `select` now and fails without the deadline.
+
+**What this is not.** It is a strong practical control, not a cryptographic one:
+someone already on your LAN who knows your gateway's MAC could forge it. And the
+wire is still plaintext — session names, project paths, the account email and
+the terminal mirror's contents are readable by anyone sniffing a network you
+have trusted, and an on-path attacker can inject button events. The token is
+never sent, so nobody can impersonate your device, but that is authentication,
+not confidentiality. [`docs/USING.md`](docs/USING.md) says so in those words.
+Encrypting the channel is the next piece of work, not this one.
+
+### 2026-08-27 — A Wi-Fi link with no network in it
+
+A third transport: `p2p`. Wi-Fi with the infrastructure taken out. The **device**
+brings up its own access point, your Mac joins *it*, and the device reads the
+Mac's DHCP lease off its own AP and dials the daemon on the usual port.
+
+- **No router, no credentials, nothing else on the segment.** `wifi` needs the
+  password of a network you both trust, which is a non-starter on a guest SSID or
+  a locked-down corporate one. `p2p` needs no network at all.
+- **Every byte above the socket is the same code.** Same nonce handshake, same
+  line protocol, same `NetLink` on the Mac side — which needed **no changes**.
+  The AP's SSID and password are generated once and kept, so the Mac saves the
+  network and rejoins it at every login (unlike the setup portal's, which is
+  regenerated on every start).
+- **`claude-mate link <wifi|p2p|ble>`** moves the cabled device between
+  transports. There was previously no way to do this at all: the setting lives
+  behind the firmware's `I|` console command, and the only route to that console
+  was a hand-run `miniterm` on a port the daemon holds open — so the two readers
+  split the device's replies and a switch that had worked looked like one that
+  had not. The socket verb takes three fixed words and builds the line itself;
+  it is deliberately **not** a general relay, because the same console takes
+  `T|<token>`.
+- **The trade, stated plainly: your Mac has one Wi-Fi radio.** While it is on the
+  device's network it is not on yours. That is not fixable from this side, and
+  [`docs/USING.md`](docs/USING.md) says so rather than letting you find out.
+
+Two things a compiler cannot catch, both found by reading the states rather than
+the syntax: every "not connected" test in `netcfg.h` is about the *station*
+interface, and a P2P device has none — so `pollLinked()` dropped the link on the
+first poll after `A|OK`, and `pollDial()` called `startJoin()` (`WIFI_STA`),
+tearing down the very AP it was hosting. Both now ask the question that means
+something for an access point: is anyone still associated?
+
+The P2P join panel sits *below* the menu in the render order, unlike the setup
+portal which outranks everything. A device whose Mac never joins would otherwise
+have no way back to BLE but a cable — the "one press, no way back" trap the Link
+row was once removed to avoid.
+
+### 2026-08-27 — The daemon says why it did not start
+
+From an afternoon that started with "I can't start claude mate and connect
+device at all".
+
+**The daemon had crash-looped 1786 times.** `import serial` at the top of
+`claude_mate_daemon.py` was raising `ModuleNotFoundError` — on a machine where
+pyserial *was* installed. The LaunchAgent runs `/usr/local/bin/python3`, which
+is a symlink the python.org installer rewrites on every minor release; 3.14
+landed, the symlink moved, and the packages stayed behind in 3.12's
+`site-packages` where nothing was looking. `KeepAlive` turned that into a restart
+every five seconds and a **50 MB** log of the same traceback. The whole time,
+`claude-mate daemon` said only *"nothing is answering on the socket yet"* and
+pointed at the log the answer was already in.
+
+- **Fixed at the cause: the installer builds a virtualenv and pins the daemon to
+  it.** `.venv/bin/python3` is a symlink to a *concrete* version with its
+  packages beside it, so a Python upgrade can no longer separate the two. Where
+  a venv cannot be created, the interpreter is resolved through `realpath` and
+  pinned rather than left floating.
+- **A failed start now prints the failure.** `claude-mate daemon` reads back the
+  tail of the daemon's stderr and shows the exception — the frames included —
+  instead of the path to it. The one crash launchd *cannot* narrate (a missing
+  interpreter, where nothing is ever written to the log) is detected separately
+  and named.
+- **A crash loop can no longer eat the disk.** The daemon truncates its own
+  stderr past 8 MB (`CLAUDE_MATE_LOG_MAX`) *before* the first import that can
+  fail — a cap after the imports would never have run, because the crash was the
+  import.
+- **`pip install -r daemon/requirements.txt` now installs what the daemon needs.**
+  `bleak` was a comment in that file while the shipped plist set
+  `CLAUDE_MATE_BLE=1`, so following the daemon's own recovery instruction fixed
+  the crash and left a BLE device with nothing to connect to. The installer also
+  stops swallowing pip's stderr, drops `--user` (a third place for the same
+  package to hide), and installs `pyte` — which it never had, so the PTY wrapper
+  had been silently falling through to unwrapped Claude.
+
 ### 2026-08-14 — A dead cable no longer takes every device button with it
 
 Reported from the couch as "the daemon is stuck". It was not stuck. It was

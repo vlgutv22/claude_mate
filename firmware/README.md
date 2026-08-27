@@ -188,6 +188,19 @@ back.
 **For Wi-Fi instead**, send `W|<ssid>|<password>` and then `I|WIFI`, or use the
 setup portal — `Z` over the cable, or BOOT (or GO) held at power-on. Nothing
 Wi-Fi is on the device's menu at all; see **Settings** below for why.
+
+**For Wi-Fi with no network to join**, send `I|P2P`. The device stops being a
+client and becomes the access point: it brings up `Claude-Mate-XXXX` with a
+password generated **once and kept** (unlike the portal's, which is regenerated
+every time, because the Mac is expected to save this network and rejoin it at
+every login). Join it from the Mac and the device reads the Mac's DHCP lease off
+its own AP and dials the daemon — same handshake, same protocol, no router and
+no credentials anywhere. `I|P2P` prints the network and password before it
+reboots; `?` prints them again, along with whether the Mac has joined yet.
+
+Note that a P2P device is an AP for as long as it is on, which is the heaviest
+radio state this firmware has — see [POWER.md](../docs/POWER.md). And the Mac
+has one Wi-Fi radio: while it is on the device's network it is not on yours.
 The portal shows an access point name (`Claude-Mate-XXXX`) and a password that is
 regenerated on every portal start. Join it from a phone, open
 `http://192.168.4.1`, and fill in the network, password, **shared token**, and
@@ -225,7 +238,8 @@ Or provision over USB serial:
 W|<ssid>|<password>   set Wi-Fi credentials
 S|<host>|<port>       set the daemon address (empty host = mDNS discovery)
 T|<token>             set the shared secret (must match the daemon's)
-I|WIFI  I|BLE         which radio carries the link (takes effect at once)
+I|AUTO I|CABLE I|BLE  which link the device uses (reboots into it)
+I|WIFI I|P2P          ...wifi needs credentials stored first
 X|WIPE                clear all stored config
 R                     reboot
 Z                     start the setup portal now
@@ -332,7 +346,7 @@ spanning 260.
 | Item | What it does |
 |---|---|
 | **CONDUCTOR** | back to the triage view — the daemon's frame, unchanged since iteration 2 shipped |
-| **SETTINGS** | the eight rows below |
+| **SETTINGS** | the ten rows below |
 | **SHIP IT** | the platformer, played on a contribution graph. Runs on the device itself; the record survives a flat battery |
 | **SLEEP** | the same deep sleep the 2 s hold does, made discoverable |
 

@@ -36,6 +36,15 @@ REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 HOOK_SRC="${REPO_DIR}/hooks/claude-status.sh"
 SNIPPET_SRC="${REPO_DIR}/hooks/settings.snippet.json"
 
+# Every runtime dependency this repo has, and the only list of them. The daemon
+# needs pyserial (USB) and bleak (BLE); the PTY wrapper needs pyte. Adding one
+# means editing a requirements file, never this script -- see step 5b.
+REQ_FILES=("${REPO_DIR}/daemon/requirements.txt" "${REPO_DIR}/bin/requirements.txt")
+REQ_ARGS=()
+for _req in "${REQ_FILES[@]}"; do
+    [[ -f "${_req}" ]] && REQ_ARGS+=(-r "${_req}")
+done
+
 CLAUDE_DIR="${HOME}/.claude"
 CLAUDE_HOOKS_DIR="${CLAUDE_DIR}/hooks"
 CLAUDE_SETTINGS="${CLAUDE_DIR}/settings.json"
@@ -57,13 +66,49 @@ err()   { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; }
 info "Claude Mate installer"
 info "Repo:   ${REPO_DIR}"
 
-# --- 1. Detect python3 ------------------------------------------------------
-PYTHON_BIN="$(command -v python3 || true)"
-if [[ -z "${PYTHON_BIN}" ]]; then
+# --- 1. Detect python3, then stop depending on it ---------------------------
+# THE INTERPRETER AND ITS PACKAGES MUST TRAVEL TOGETHER. This step used to bake
+# `command -v python3` -- typically /usr/local/bin/python3 -- straight into the
+# LaunchAgent. That path is a symlink the python.org installer rewrites on every
+# minor release, so the day 3.14 landed, a daemon that had worked for months
+# began pointing at an interpreter with an empty site-packages. pyserial was
+# still installed, in 3.12's site-packages, where nothing was looking. launchd's
+# KeepAlive turned that into 1786 restarts and a 50 MB log.
+#
+# A virtualenv in the repo fixes it at the cause: .venv/bin/python3 is a symlink
+# to a CONCRETE version, and the packages live beside it. A later Python release
+# cannot move one without the other, and if the base interpreter is genuinely
+# removed the failure is a loud "bad interpreter" rather than a silent
+# ModuleNotFoundError about a package you know you installed.
+BOOTSTRAP_PYTHON="$(command -v python3 || true)"
+if [[ -z "${BOOTSTRAP_PYTHON}" ]]; then
     err "python3 not found on PATH. Install Python 3.9+ and re-run."
     exit 1
 fi
-info "Python: ${PYTHON_BIN}"
+info "Python: ${BOOTSTRAP_PYTHON}"
+
+VENV_DIR="${REPO_DIR}/.venv"
+PYTHON_BIN=""
+if "${BOOTSTRAP_PYTHON}" -m venv --help >/dev/null 2>&1; then
+    if [[ ! -x "${VENV_DIR}/bin/python3" ]]; then
+        info "Creating a virtualenv for the daemon -> ${VENV_DIR}"
+        # --upgrade-deps is 3.9+, but pointless here and slow; skip it.
+        if ! "${BOOTSTRAP_PYTHON}" -m venv "${VENV_DIR}"; then
+            warn "Could not create ${VENV_DIR}."
+        fi
+    fi
+    [[ -x "${VENV_DIR}/bin/python3" ]] && PYTHON_BIN="${VENV_DIR}/bin/python3"
+fi
+
+if [[ -z "${PYTHON_BIN}" ]]; then
+    # No venv module, or creation failed. Fall back to the system interpreter --
+    # but to its RESOLVED path, never the floating symlink, for the reason above.
+    PYTHON_BIN="$("${BOOTSTRAP_PYTHON}" -c \
+        'import os,sys; print(os.path.realpath(sys.executable))' 2>/dev/null \
+        || echo "${BOOTSTRAP_PYTHON}")"
+    warn "Running without a virtualenv; pinned to ${PYTHON_BIN}"
+fi
+info "Daemon interpreter: ${PYTHON_BIN}"
 
 # --- 2. Install the hook ----------------------------------------------------
 if [[ ! -f "${HOOK_SRC}" ]]; then
@@ -184,14 +229,35 @@ fi
 # the install, and a daemon without these still runs -- it just reports which
 # transport it cannot offer. Saying so here beats a working install that
 # silently cannot do the thing its last line tells you to do.
-info "Python dependencies (pyserial, bleak)..."
-if "${PYTHON_BIN}" -m pip install --user --quiet --disable-pip-version-check \
-        pyserial bleak 2>/dev/null; then
-    ok "Installed pyserial + bleak"
+# DRIVEN BY THE MANIFESTS, NOT BY A HAND-KEPT LIST. This used to install
+# `pyserial bleak` literally, which drifted twice: bleak sat commented out in
+# daemon/requirements.txt so the daemon's own recovery message left BLE dead,
+# and pyte -- bin/requirements.txt, the PTY wrapper's only dependency -- was
+# never installed at all, so the wrapper silently fell through to unwrapped
+# Claude and the device stopped receiving session state.
+#
+# NOT --user. That targets a per-user site directory that the venv does not even
+# consult, and on the system-python fallback it creates a THIRD place for the
+# same package to hide (3.12 framework, 3.14 framework, user-site) -- which is
+# exactly the ambiguity that made the last failure take so long to read.
+info "Python dependencies (${REQ_FILES[*]##*/})..."
+pip_log="$(mktemp)"
+if "${PYTHON_BIN}" -m pip install --quiet --disable-pip-version-check \
+        "${REQ_ARGS[@]}" >"${pip_log}" 2>&1; then
+    ok "Installed $("${PYTHON_BIN}" -m pip list --format=freeze 2>/dev/null \
+        | grep -icE '^(pyserial|bleak|pyte)=' || echo '?') runtime dependencies"
 else
-    warn "Could not install them automatically. If a device does not link:"
-    warn "  ${PYTHON_BIN} -m pip install pyserial bleak"
+    # SHOW PIP'S REASON. The old branch sent stderr to /dev/null and then said
+    # "could not install them automatically", which is the least useful half of
+    # what it knew: an externally-managed environment, a missing compiler and a
+    # network failure all produced that one sentence.
+    err "Dependency install failed. pip said:"
+    sed 's/^/      /' "${pip_log}" >&2
+    warn "The daemon will still start, but will report the transports it cannot"
+    warn "offer. To retry by hand:"
+    warn "  ${PYTHON_BIN} -m pip install ${REQ_ARGS[*]}"
 fi
+rm -f "${pip_log}"
 
 # --- 6. Put the command-line tools on PATH ----------------------------------
 # WHY THIS STEP EXISTS. `claude` is normally an alias straight into bin/, so

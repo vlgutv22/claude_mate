@@ -303,8 +303,13 @@ on the host and the peripheral is the device, so the only thing it could
 advertise about is itself.
 
 **Wi-Fi and BLE are alternatives, never simultaneous:** the ESP32-S3 has one
-2.4 GHz radio. Which one is a stored device setting (**SETTINGS → Link**, or
-`I|WIFI` / `I|BLE` over the cable), not a compile-time choice. The daemon can
+2.4 GHz radio. Which one is a stored device setting (`claude-mate link`, or
+`I|WIFI` / `I|BLE` / `I|P2P` over the cable), not a compile-time choice. `p2p`
+is a third value of that same setting: Wi-Fi with the device as the access point
+and the Mac as its only client, so the device dials a DHCP lease off its own AP
+instead of an mDNS answer off a router. **Nothing above the socket changes** —
+same nonce handshake, same frames — which is why the daemon has no notion of P2P
+at all. The daemon can
 serve both at once — a Nano on a cable, a Wi-Fi board and a BLE board all get
 every frame — because on its side they are three transports, not three
 protocols.

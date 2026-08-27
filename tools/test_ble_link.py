@@ -495,26 +495,166 @@ check("SR_PAD is still there, and is the gamepad row", "SR_PAD" in rows)
 # and does not time out for a Wi-Fi device, hiding the row you would undo it
 # with. The transport still compiles; only the glass cannot reach it, which keeps
 # that switch behind a cable you have to actually have.
-check("no Link row -- one press must not be able to move a cordless board "
-      "onto Wi-Fi", "SR_LINK" not in rows)
-check("...and no dangling case for it in the row painter or the input handler",
-      not re.search(r"case SR_LINK\b", ino))
-check("...but the transport is still switchable over the cable",
-      re.search(r'strcasecmp\(a, "ble"\)', ino)
-      and re.search(r'strcasecmp\(a, "wifi"\)', ino))
+# THE TRANSPORT IS SELECTABLE ON THE GLASS AGAIN (SR_CONN), so what is pinned is
+# no longer its absence but the gate that makes it safe. The old row was a plain
+# toggle: one press moved a CREDENTIAL-LESS board onto Wi-Fi, which reboots into
+# a portal that outranks the menu, hiding the row you would undo it with. Every
+# other mode -- auto, cable, bt, p2p -- needs no configuration and cannot start
+# that sequence, so the whole hazard reduces to one question: is Wi-Fi offered
+# to a device that has no network to join?
+check("there is a connection row, so the transport is selectable on the device",
+      "SR_CONN" in rows and re.search(r'label = "Connection";', ino))
+_cycle = re.search(r"static MateTransport connCycle\(MateTransport t\) \{.*?\n\}",
+                   ino, re.S)
+check("...whose cycle skips Wi-Fi unless credentials are stored",
+      bool(_cycle)
+      and re.search(r"if \(t != LINK_WIFI \|\| net\.configured\(\)\) return t;",
+                    _cycle.group(0)))
+check("...so the one mode that can strand a board is the one it gates",
+      bool(_cycle) and "net.configured()" in _cycle.group(0))
+# Cycling must PREVIEW. A row that applied on every press would reboot the
+# device three times on the way to the fourth option.
+check("...and cycling only previews; a hold commits",
+      re.search(r"case SR_CONN:\s*\{ connPending = connCycle", ino)
+      and re.search(r"if \(pageIdx == SR_CONN\) \{", ino)
+      and re.search(r"MateTransport want = connPending;", ino))
+check("...with an un-confirmed preview reverting on its own",
+      re.search(r"if \(connTouchedMs && \(now - connTouchedMs\) >= RESET_ARM_MS\)",
+                ino))
+# A hold on an untouched row must not be inert: 'K' is excluded from the alias
+# to 'G' so it can commit, which made the first long press -- the gesture every
+# other confirming row teaches -- do nothing at all.
+check("...and a hold on an untouched row starts the cycle instead of nothing",
+      re.search(r"if \(!connTouchedMs\) \{\s*\n\s*connPending = connCycle", ino))
+# The reboot IS the documented repair for a wedged stack (see setTransport), so
+# committing the value the device already holds must still do the work.
+check("...and committing an unchanged value still reboots, as setTransport says",
+      not re.search(r"if \(want == MateNet::storedTransport\(\)\) return;", ino))
 
-# NO SETUP-PORTAL ROW EITHER: there is no Wi-Fi anywhere on this menu.
+# AUTO OBEYS THE SAME GATE THE ROW DOES. Pick wifi while credentials exist, wipe
+# them later, and every boot would otherwise resolve to a Wi-Fi transport with
+# nothing to join -- straight into the portal the gate exists to avoid, without
+# ever touching the row that enforces it.
+_resolve = re.search(r"static MateTransport resolveTransport\(bool usbHost\) \{.*?\n  \}",
+                     netcfg, re.S)
+check("AUTO cannot resolve to a Wi-Fi transport with no network to join",
+      bool(_resolve)
+      and re.search(r"if \(radio == LINK_WIFI && !hasSsid\(\)\) return LINK_BLE;",
+                    _resolve.group(0)))
+# ...and a device that predates the "radio" key must not be demoted off Wi-Fi
+# the moment its owner selects AUTO.
+_radio = re.search(r"static MateTransport storedRadio\(\) \{.*?\n  \}", netcfg, re.S)
+check("...and AUTO falls back to the transport already stored, not to BLE",
+      bool(_radio) and 'p.getUChar("link"' in _radio.group(0))
+# ...and "link" alone is not enough: a portal-provisioned board never wrote it,
+# reaching Wi-Fi through storedTransport()'s haveSsid rule. Missing that meant
+# the fallback skipped exactly the devices it was added to protect.
+check("...including a board provisioned by the portal, which never wrote 'link'",
+      bool(_radio) and 'p.getString("ssid"' in _radio.group(0))
+# USB enumeration is not instant, so one read at boot answers "no host" on a
+# device plainly on a cable -- and AUTO picks a radio.
+check("AUTO waits for USB enumeration rather than reading isPlugged() once",
+      re.search(r"transport = MateNet::resolveTransport\(usbHostSettled\(", ino))
+check("...on a bounded budget that exits as soon as a host answers",
+      re.search(r"if \(usbHostPresent\(\)\) return true;", ino))
+# The settings row must not read flash to paint a label.
+check("the Connection row paints from a cached mode, not from NVS",
+      re.search(r"return connTouchedMs \? connPending : connModeCached;", ino))
+# `?` has to say what AUTO chose, or the mode is undiagnosable over the console.
+check("`?` reports what AUTO actually resolved to",
+      re.search(r'out\.printf\("link  : auto -> %s', netcfg)
+      and re.search(r"net\.printConfig\(Serial, transport\);", ino))
+check("...and the transport is still switchable over the cable",
+      re.search(r'strcasecmp\(a, "ble"\)', ino)
+      and re.search(r'strcasecmp\(a, "wifi"\)', ino)
+      and re.search(r'strcasecmp\(a, "cable"\)', ino)
+      and re.search(r'strcasecmp\(a, "auto"\)', ino))
+
+# AUTO IS A MODE, NEVER AN EFFECTIVE TRANSPORT. It is resolved once in setup();
+# if it ever reached the twenty-odd `transport == LINK_x` sites they would all
+# fall through their else branches and the device would behave as a Wi-Fi board.
+check("AUTO is resolved at boot rather than compared against downstream",
+      re.search(r"transport = MateNet::resolveTransport\(", ino)
+      and not re.search(r"transport == LINK_AUTO", ino))
+# ...and CABLE must not be mistaken for Wi-Fi by the old "not BLE means net"
+# idiom, which is what every one of those sites used to say.
+check("...and cable is asked about by name, not inferred from 'not BLE'",
+      not re.search(r"transport == LINK_BLE \? ble\.", ino))
+
+# THERE IS A Wi-Fi SETUP ROW, AND THESE CHECKS ARE ABOUT WHAT KIND OF ROW IT IS.
 #
-# It existed for exactly one reason -- a factory-reset board with no cable had no
-# way to be given a token -- and BLE ENROLMENT replaced that reason outright. The
-# check is worth keeping in this order: removing the row BEFORE pairing existed
-# stranded a real board within minutes, so what makes it safe now is not taste,
-# it is that `E|?` is implemented and tested above.
-check("no setup-portal row -- pairing replaced the only reason it existed",
-      "SR_SETUP" not in rows and "SR_WIFI" not in rows)
-check("...and no row paints or opens one",
-      not re.search(r"case SR_(SETUP|WIFI)\b", ino)
-      and not re.search(r'label = "Wi-Fi setup";', ino))
+# This file used to assert the row's ABSENCE, on the grounds that "pairing
+# replaced the only reason it existed". That reasoning was about TOKENS, and it
+# was right about tokens -- `E|?` below still carries that load. It never
+# covered Wi-Fi CREDENTIALS, which BLE enrolment cannot supply and which a
+# device that is meant to live on your network has to learn from somewhere. The
+# alternative on offer was "unscrew the case and hold BOOT while plugging it
+# in", which is not a route.
+#
+# So the row is back, and what is pinned now is that it is not the row that was
+# removed: it provisions, it does not switch transports, and it reaches the
+# portal by rebooting rather than by starting a SoftAP next to a live BLE stack.
+check("there is a Wi-Fi setup row, so credentials have an on-glass route",
+      "SR_WIFI" in rows and re.search(r'label = "Wi-Fi setup";', ino))
+check("...that reports whether the device knows a network, not just an arrow",
+      re.search(r"case SR_WIFI:.*?net\.configured\(\)", ino, re.S))
+
+# THE TRAP THE LINK ROW FELL INTO, asserted rather than remembered. A SoftAP
+# started in place would contend with a live BLE stack for the one 2.4 GHz
+# radio, and BLE cannot be brought back after a teardown in the same boot -- so
+# the row would cost a cordless device its link until someone power-cycled it.
+# BOUNDED TO THE ROW'S OWN CODE. A `SR_WIFI.*?startPortalNow` with re.S spans
+# the whole sketch and matches the Z console handler two thousand lines below,
+# so it fails no matter what the row does -- an assertion that cannot pass is
+# not stricter, it is broken.
+# ...and with the // comments stripped, because the row's code explains in
+# prose why it does NOT call startPortalNow(), and a substring search cannot
+# tell an explanation from a call.
+_wifi_regions = "\n".join(
+    re.sub(r"//[^\n]*", "", m.group(0))
+    for m in re.finditer(
+        r"(case SR_WIFI:.*?break;|pageIdx == SR_WIFI && wifiArmedMs\s*\)\s*\{.*?\n    \})",
+        ino, re.S))
+check("the row's own code exists to be checked", "SR_WIFI" in _wifi_regions)
+check("...and it reboots into the portal rather than opening one in place",
+      "requestPortalOnBoot" in _wifi_regions
+      and "restartWithNotice" in _wifi_regions)
+check("...never by calling startPortalNow() from the settings page",
+      "startPortalNow" not in _wifi_regions)
+check("...and it does not touch the transport, so one press cannot move a "
+      "cordless board onto Wi-Fi",
+      "setTransport" not in _wifi_regions
+      and "storeTransport" not in _wifi_regions)
+
+# A mis-press must not cost five minutes in a portal that outranks the menu, so
+# the row confirms the way Factory reset does: GO arms, a hold commits.
+check("...and it is armed then held, not a single press",
+      re.search(r"case SR_WIFI:\s*\{[^}]*wifiArmedMs = t", ino)
+      and re.search(r"pageIdx == SR_WIFI && wifiArmedMs", ino))
+check("...with K left un-aliased on that row, or the hold would be the press",
+      re.search(r"pageIdx != SR_RESET\s*\n?\s*&& pageIdx != SR_WIFI", ino))
+
+# THE ONE-SHOT IS THE SAFETY PROPERTY. Cleared when read, so an abandoned portal
+# or a power cut mid-setup costs one ordinary boot -- not a device that comes
+# back into the portal for ever, with the row that sent it there hidden behind
+# the very screen it opened.
+_take = re.search(r"static bool takePortalRequest\(\).*?\n  \}", netcfg, re.S)
+check("the portal request is consumed when it is read",
+      bool(_take) and 'remove("portal1")' in _take.group(0))
+# CONSUMED UNCONDITIONALLY, NOT BEHIND A ||. Written as
+# `digitalRead(...) == LOW || takePortalRequest()` the read short-circuits away
+# on any boot with BOOT held -- and BOOT is the only GO on a bare devkit, so the
+# long press that CONFIRMS this row is still down when setup() runs. The flag
+# would survive, and the device would re-enter the portal every boot after.
+check("the portal request is consumed on its own line, not inside a ||",
+      re.search(r"bool portalAsked = MateNet::takePortalRequest\(\);", ino)
+      and re.search(r"forcePortal = .*?\|\| portalAsked;", ino))
+check("...and nothing calls takePortalRequest() as an || operand",
+      not re.search(r"\|\|\s*MateNet::takePortalRequest\(\)", ino))
+# A device dragged into the portal must not also be a BLE gamepad: that is a
+# SoftAP and a HID GATT server sharing the one 2.4 GHz radio for five minutes.
+check("...and a pad-on board does not start HID while the portal is up",
+      re.search(r"if \(cfg\.pad\(\) && !forcePortal\) enterPad\(", ino))
 # What makes the removal safe, asserted rather than assumed.
 check("...because the device can be given a token over BLE instead",
       re.search(r'if \(!strcmp\(line, "E\|\?"\)\)', fw_ble))
@@ -556,8 +696,11 @@ check("...and read back at boot", 'p.getBool("pad"' in settings)
 check("...and written EAGERLY, not on the deferred timer, so a power cut "
       "cannot leave the switch and the device disagreeing",
       re.search(r"void setPad\(bool on\) \{.*?write\(\);", settings, re.S))
+# ...with one exception, added when the Wi-Fi setup row made the portal a place
+# you reach on purpose: a board dragged into setup is not a gamepad for those
+# minutes, because a HID GATT server and a SoftAP cannot share the one radio.
 check("boot restores the gamepad", re.search(
-    r"if \(cfg\.pad\(\)\) enterPad\(true, PAD_BLE\);", ino))
+    r"if \(cfg\.pad\(\)( && !forcePortal)?\) enterPad\(true, PAD_BLE\);", ino))
 
 # handleConfigLine() runs FIRST on USB lines, so a verb both switches claim is
 # silently unreachable over the cable -- the exact bug X| once was.
@@ -611,7 +754,7 @@ check("...and so does a wiped namespace with no SSID in it",
 check("...but a stored SSID still means Wi-Fi", 'p.getString("ssid"' in stored)
 check("...and an explicit setting outranks both",
       re.search(r"if \(v == LINK_BLE\)\s+return LINK_BLE;", stored)
-      and re.search(r"if \(v == LINK_WIFI\) return LINK_WIFI;", stored))
+      and re.search(r"if \(v == LINK_WIFI\)\s+return LINK_WIFI;", stored))
 
 # The two ways a token reaches a device that is ALREADY advertising. Both were
 # broken, both in the same way -- the secret landed in NVS and the running stack
@@ -647,8 +790,15 @@ check("no config verb restarts Wi-Fi without checking it is the live transport",
 
 # The escape hatch has to be an escape hatch in both directions: BOOT held at
 # power-on on a cordless BLE board opens a Wi-Fi portal it can never fill in.
+#
+# WIDENED FROM `== LINK_BLE` when P2P arrived, and the widening is the point:
+# the question this asks is "is there a link to fall back TO", and P2P is one
+# -- it needs no credentials, so a P2P device stuck in the portal is stranded
+# for exactly the same reason a BLE one is. Written as "anything that is not
+# Wi-Fi" rather than as a list, so a fourth transport inherits the right
+# answer instead of silently getting the wrong one.
 check("a device with another link says so, so the portal is allowed to expire",
-      "net.setFallbackLink(transport == LINK_BLE);" in ino)
+      "net.setFallbackLink(transport != LINK_WIFI);" in ino)
 check("...and the portal timeout honours it",
       re.search(r"if \(\(configured\(\) \|\| _fallbackLink\) &&",
                 netcfg))
@@ -658,16 +808,34 @@ check("...and expiring with no SSID powers the radio down rather than "
                 r"shutdown\(\);", fn_body(netcfg, "void pollPortal()")))
 # ...which strands the device unless the sketch notices SETUP ending and starts
 # the transport the Link row claims this device is on.
-check("...and the sketch hands the glass back to BLE afterwards",
-      re.search(r"transport == LINK_BLE && lastNetState == MateNet::SETUP.*?"
-                r"net\.shutdown\(\);\s*\n\s*ble\.begin\(", ino, re.S))
+check("...and the sketch hands the glass back afterwards",
+      re.search(r"transport != LINK_WIFI && lastNetState == MateNet::SETUP.*?"
+                r"net\.shutdown\(\);.*?if \(linkUsesBle\(\)\)\s+"
+                r"ble\.begin\(", ino, re.S))
+# ...and a CABLE device does neither: it comes out of the portal with both
+# radios off, which is the mode it was in when it went in. `else beginP2P()`
+# would have handed it an access point nobody asked for.
+check("...while a cabled device comes back to no radio at all",
+      re.search(r"else if \(linkIsCable\(\)\)", ino))
+# ...to WHICHEVER transport it was. The test used to say LINK_BLE, which was the
+# whole condition too: a P2P device also gets _fallbackLink, so its portal also
+# times out into shutdown(), and with no arm for it the device came back with
+# the radio off, hosting nothing, reachable only by rebooting.
+check("...including a P2P device, which comes back to hosting its own AP",
+      re.search(r"else\s+net\.beginP2P\(\);", ino))
 
 # Last: the screens a fresh board actually shows. A device with no token that
 # says "check the daemon is running with --ble" sends you to read the wrong log.
 check("the BLE status line names the missing token first",
       re.search(r"case ADVERTISING: return _token\.isEmpty\(\)", fw_ble))
-check("...and so does the NO LINK screen",
-      re.search(r"gfx->print\(!net\.hasToken\(\)", ino))
+# ...and so does the NO LINK screen -- FOR A RADIO. The token authenticates a
+# radio link; a device on the cable has no radio and needs no token, so testing
+# hasToken() first there would send someone to run pairing they do not need for
+# a link that is already up. Cable is checked before the token, everything else
+# after it.
+check("...and so does the NO LINK screen, once the cable case is out of the way",
+      re.search(r"gfx->print\(linkIsCable\(\)\s*\?[^\n]*\n\s*: !net\.hasToken\(\)",
+                ino))
 # Matched against the note() STRING, not the file: the comments around these
 # lines quote the wording they replaced, and a check that reads comments would
 # pass or fail on prose.

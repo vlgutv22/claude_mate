@@ -255,7 +255,7 @@ red/green-colourblind eye.
 Four items: **CONDUCTOR** (back to triage), **SETTINGS**, **SHIP IT** (a
 platformer that runs on the device), **SLEEP**.
 
-**SETTINGS** is eight rows:
+**SETTINGS** is ten rows:
 
 | Row | |
 |---|---|
@@ -265,14 +265,143 @@ platformer that runs on the device), **SLEEP**.
 | Alert LED | off · low · med · high — **off is genuinely dark** |
 | Mac sound | an alert sound *on the Mac*, since the device has no speaker |
 | Flip screen | applies on restart, and the row says so |
+| Connection | `auto` · `cable` · `bt` · `wifi` · `p2p`. GO cycles, hold GO switches and restarts. `wifi` is only offered once the device knows a network |
+| Wi-Fi setup | GO arms, hold GO to confirm — the device restarts into the setup portal so you can give it an SSID and password. The value says whether it already knows a network (`set` / `none`) |
 | About | which radio, whether it found the daemon, battery, boot cause, firmware |
 | Factory reset | wipes Wi-Fi, token **and** settings — asks twice, the second a long press |
 
-**Nothing to do with Wi-Fi is on that menu**, deliberately. A radio switch one
-press away moved a cordless board onto Wi-Fi, and a board with no credentials
-then rebooted into a setup portal that outranks the menu — hiding the row you
-would have used to undo it. `I|WIFI` / `I|BLE` over USB still work, which puts
-that switch behind a cable you have to physically have.
+**The transport switch is not on that menu**, deliberately, and Wi-Fi setup is
+not the same thing as the transport switch. A radio toggle one press away moved
+a cordless board onto Wi-Fi, and a board with no credentials then rebooted into
+a portal that outranks the menu — hiding the row you would have used to undo it.
+Changing *which radio carries the link* therefore lives behind a cable you have
+to physically have: `claude-mate link <wifi|p2p|ble>`, or `I|WIFI` / `I|BLE` /
+`I|P2P` at the USB console.
+
+**Wi-Fi setup** only teaches the device a network. It does not move the link
+onto it, so one press cannot strand a cordless board, and it reaches the portal
+by *restarting into it* rather than raising an access point beside a live BLE
+stack — which could not be undone until the next power cycle anyway. The request
+is a one-shot cleared before the portal opens, so an abandoned setup costs one
+boot rather than becoming permanent.
+
+---
+
+## Which radio carries the link
+
+Three transports, one protocol. The daemon cannot tell them apart, and a device
+can use exactly one at a time — the S3 has a single 2.4 GHz radio.
+
+| | what it needs | when to use it |
+|---|---|---|
+| `auto` | nothing | the cable when a Mac is on the other end, otherwise the radio you last chose. Decided at boot |
+| `cable` | a USB cable | both radios off. The quiet mode for a device that lives docked |
+| `ble` | nothing | a cordless device on a desk, no network involved |
+| `wifi` | the SSID and password of a network you and the Mac both trust | reach across a whole home or office |
+| `p2p` | **nothing** | Wi-Fi's range and speed where there is no network you can or want to join |
+
+**On the device:** SETTINGS → **Connection**. GO cycles through the modes — it
+only previews, so getting to the fourth option costs four presses and no
+restarts — and holding GO commits and reboots. Walk away without holding and it
+reverts to what it was.
+
+`wifi` is missing from that cycle until the device knows a network, and that is
+the safety gate rather than an oversight: a credential-less board switched to
+Wi-Fi reboots into the setup portal, and the portal outranks the menu, so the
+row you would undo it with would be hidden behind the thing you needed to undo.
+Use **Wi-Fi setup** first and `wifi` appears.
+
+`auto` is resolved once, at boot, from whether a computer is actually talking to
+the USB port — SOF frames, so a wall charger is not mistaken for a Mac. The row
+shows what it picked, e.g. `auto (cable)`.
+
+Switch with the cable plugged in:
+
+```sh
+claude-mate link p2p        # the device reboots into it, ~3 s
+```
+
+### P2P: the device *is* the network
+
+In `p2p` the ESP32-S3 stops being a client and becomes the access point. Your
+Mac joins **the device's** network; the device reads the Mac's DHCP lease off
+its own AP and dials the daemon on port 8787. From there it is the same nonce
+handshake and the same line protocol as `wifi` — the daemon does not know the
+difference.
+
+Nothing else is on that segment: no router, no other clients, and no network
+credentials stored on a keypad. That is the point of it — a guest SSID, a
+corporate network you cannot put a device on, a hotel, a conference, or simply
+not wanting a desk toy to hold your Wi-Fi password.
+
+`claude-mate link p2p` prints the network name and password, and the device
+shows both on its screen while it waits. Join it from the Mac once; macOS
+remembers it and rejoins at every login, because unlike the setup portal the
+P2P credentials are generated once and kept.
+
+> **Your Mac has one Wi-Fi radio.** While it is on the device's network it is
+> not on yours — no internet over Wi-Fi until you switch back, unless the Mac is
+> also on Ethernet. This cannot be fixed from the device's side; it is the price
+> of a link with no infrastructure in it. If the Mac needs to stay on your
+> network, use `ble`.
+
+`p2p` needs the daemon's TCP listener, which the shipped LaunchAgent already
+enables (`CLAUDE_MATE_TCP=1`). The device must also already have the token — it
+gets one automatically the first time it is plugged in.
+
+---
+
+## Taking the Mac off your own network
+
+The daemon's TCP listener is how a wireless device reaches it. That is fine on a
+network you control and much less fine in a café, so **the listener only exists
+on networks you have trusted.**
+
+```sh
+claude-mate trust                 # allow the network you are on now
+claude-mate trust --list          # what it will listen on
+claude-mate trust --remove 0      # revoke one
+```
+
+Move the Mac to a network that is not on that list and the listener closes
+within about twenty seconds, along with the mDNS advert. Come home and it opens
+again. Nothing to remember and nothing to switch off before you leave.
+
+**A network is identified by its gateway's MAC address.** Not the SSID: macOS
+hides that from a background daemon unless it has Location Services permission,
+which a LaunchAgent cannot prompt for. Not the subnet either — half the cafés in
+the world are `192.168.1.0/24`, and so is half of everyone's house.
+
+**First run adopts the network you are on**, once, and says so in the log. That
+is deliberate: an upgrade must not silently disconnect a device that worked
+yesterday, and it is never worse than the old behaviour, which was to listen on
+every network without asking. If that first network was a café, `--remove` it.
+
+`--trust-any-network` (or `CLAUDE_MATE_TRUST_ANY=1`) restores the old
+listen-everywhere behaviour.
+
+### What this does and does not protect
+
+It stops the daemon **offering itself** to networks you have never seen, and it
+stops `dns-sd` announcing your hostname and port to everyone on the segment
+before anyone even connects. The listener is also bounded against an
+unauthenticated peer: a fixed budget of in-flight handshakes, and one wall-clock
+deadline for each — so nobody can hold your device's slot by connecting and
+saying nothing, or by dripping one byte at a time.
+
+It is **not** a cryptographic control. Someone already on your LAN who knows
+your gateway's MAC could forge it. And on a network you *do* trust, the wire is
+still plaintext:
+
+> **The payload is not encrypted.** Anyone who can sniff a network you have
+> trusted can read session names, project paths, the account each session runs
+> as, and — if you open it — the terminal mirror's actual screen contents. An
+> on-path attacker could inject button events into an established connection.
+> The token is never sent and cannot be sniffed, so nobody can *impersonate*
+> your device; that is authentication, not confidentiality.
+
+If that matters for a given network, **use `p2p`** — a two-machine segment with
+nobody else on it — or `ble`, rather than trusting the network.
 
 ---
 
