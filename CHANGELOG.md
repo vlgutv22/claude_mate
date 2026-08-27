@@ -12,6 +12,54 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
+### 2026-08-27 — The listener only exists on networks you trust
+
+Asked plainly: *"the server on the mac should be super secure in case I
+connected not to home network."* It was not. The TCP listener bound `0.0.0.0`
+at every login on every network, and `dns-sd` announced the hostname and port to
+every peer on the segment before anyone connected. Its own docstring had said
+"use it on a network you trust" without ever checking whether you were on one.
+
+- **A network must be trusted before the listener exists on it.**
+  `claude-mate trust` / `--list` / `--remove`. Carry the Mac to a café and the
+  listener and the mDNS advert close within ~20 s; come home and they reopen.
+  A network is identified by its **gateway's MAC address** — not the SSID,
+  which macOS hides from a background daemon, and not the subnet, because every
+  other café is `192.168.1.0/24`.
+- **First run adopts the network it finds**, once and loudly, so an upgrade
+  cannot disconnect a device that worked yesterday. Never worse than listening
+  everywhere; strictly better from the second network on. `--trust-any-network`
+  restores the old behaviour.
+- **An unauthenticated peer can no longer exhaust the daemon.** The client cap
+  counted only peers that had *already* authenticated, so connections that never
+  finished the handshake were never counted — each one costing a thread, and the
+  thread list itself was appended to per connection and never pruned. There is
+  now a separate budget for in-flight handshakes, and the list is pruned.
+- **…nor hold a slot open indefinitely.** `NET_AUTH_TIMEOUT_S` was a per-*byte*
+  timeout: the reader takes one byte at a time and a socket timeout bounds the
+  gap between reads, not the read. One byte every four seconds held a thread for
+  512 × 5 s — about forty minutes — and enough of those keep the real device out
+  without ever knowing the token. The handshake now has one wall-clock deadline.
+- **The restart path was broken before anything used it.** `stop()` set an event
+  that `start()` never cleared, so a re-opened listener came back bound,
+  listening, and attached to an accept loop that had already exited. That is
+  worse than a failure because it looks exactly like success — and it is what
+  the gate does every time you come home, so it had to work.
+
+Both DoS fixes and the restart are pinned by tests that were checked against the
+unfixed code first. The first attempt at the slowloris test passed against the
+bug, because blocking on `recv` is itself the long gap the old timeout already
+caught; it polls with `select` now and fails without the deadline.
+
+**What this is not.** It is a strong practical control, not a cryptographic one:
+someone already on your LAN who knows your gateway's MAC could forge it. And the
+wire is still plaintext — session names, project paths, the account email and
+the terminal mirror's contents are readable by anyone sniffing a network you
+have trusted, and an on-path attacker can inject button events. The token is
+never sent, so nobody can impersonate your device, but that is authentication,
+not confidentiality. [`docs/USING.md`](docs/USING.md) says so in those words.
+Encrypting the channel is the next piece of work, not this one.
+
 ### 2026-08-27 — A Wi-Fi link with no network in it
 
 A third transport: `p2p`. Wi-Fi with the infrastructure taken out. The **device**

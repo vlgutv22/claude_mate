@@ -324,6 +324,60 @@ gets one automatically the first time it is plugged in.
 
 ---
 
+## Taking the Mac off your own network
+
+The daemon's TCP listener is how a wireless device reaches it. That is fine on a
+network you control and much less fine in a café, so **the listener only exists
+on networks you have trusted.**
+
+```sh
+claude-mate trust                 # allow the network you are on now
+claude-mate trust --list          # what it will listen on
+claude-mate trust --remove 0      # revoke one
+```
+
+Move the Mac to a network that is not on that list and the listener closes
+within about twenty seconds, along with the mDNS advert. Come home and it opens
+again. Nothing to remember and nothing to switch off before you leave.
+
+**A network is identified by its gateway's MAC address.** Not the SSID: macOS
+hides that from a background daemon unless it has Location Services permission,
+which a LaunchAgent cannot prompt for. Not the subnet either — half the cafés in
+the world are `192.168.1.0/24`, and so is half of everyone's house.
+
+**First run adopts the network you are on**, once, and says so in the log. That
+is deliberate: an upgrade must not silently disconnect a device that worked
+yesterday, and it is never worse than the old behaviour, which was to listen on
+every network without asking. If that first network was a café, `--remove` it.
+
+`--trust-any-network` (or `CLAUDE_MATE_TRUST_ANY=1`) restores the old
+listen-everywhere behaviour.
+
+### What this does and does not protect
+
+It stops the daemon **offering itself** to networks you have never seen, and it
+stops `dns-sd` announcing your hostname and port to everyone on the segment
+before anyone even connects. The listener is also bounded against an
+unauthenticated peer: a fixed budget of in-flight handshakes, and one wall-clock
+deadline for each — so nobody can hold your device's slot by connecting and
+saying nothing, or by dripping one byte at a time.
+
+It is **not** a cryptographic control. Someone already on your LAN who knows
+your gateway's MAC could forge it. And on a network you *do* trust, the wire is
+still plaintext:
+
+> **The payload is not encrypted.** Anyone who can sniff a network you have
+> trusted can read session names, project paths, the account each session runs
+> as, and — if you open it — the terminal mirror's actual screen contents. An
+> on-path attacker could inject button events into an established connection.
+> The token is never sent and cannot be sniffed, so nobody can *impersonate*
+> your device; that is authentication, not confidentiality.
+
+If that matters for a given network, **use `p2p`** — a two-machine segment with
+nobody else on it — or `ble`, rather than trusting the network.
+
+---
+
 ## Connecting a device
 
 An unprovisioned board comes up on **BLE**, advertising, with no token, and says

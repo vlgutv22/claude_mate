@@ -175,7 +175,36 @@ DEFAULT_TOKEN_FILE = "~/.config/claude-mate/token"
 NET_AUTH_TIMEOUT_S = 5.0    # a client must finish the handshake this fast
 NET_MAX_LINE = 512          # drop over-long lines (the longest real one is ~94B)
 NET_MAX_CLIENTS = 4         # bound the fan-out (a Nano + a few wireless devices)
+# ...and bound the peers that have NOT authenticated yet, which is the number an
+# attacker controls. Generous next to one real device, trivial next to the
+# thousands a laptop can open, and every slot is released within
+# NET_AUTH_TIMEOUT_S whatever the peer does or does not send.
+NET_MAX_PENDING = 8
 MDNS_SERVICE = "_claudemate._tcp"   # advertised via macOS dns-sd so the device
+# --- Which networks the listener is allowed to exist on -------------------- #
+# THE LISTENER USED TO BE UNCONDITIONAL, and its own docstring explained why
+# that was only ever half a design: "the payload itself is plaintext... use it
+# on a network you trust". It said nothing about what happens when you carry the
+# Mac somewhere else, and the answer was that port 8787 opened itself to a cafe
+# exactly as readily as to your living room, and dns-sd announced it to everyone
+# on the segment while it did.
+#
+# A NETWORK IS IDENTIFIED BY ITS GATEWAY'S MAC ADDRESS. Not by SSID: modern
+# macOS redacts the SSID and BSSID from every API a daemon can reach without
+# Location Services permission, which a LaunchAgent cannot raise a prompt for.
+# Not by subnet either -- half the cafes in the world are 192.168.1.0/24, and so
+# is half of everyone's house. The gateway's MAC is available from the routing
+# table plus the ARP cache, needs no permission, no sudo and no dependency, and
+# it actually distinguishes your router from a stranger's.
+#
+# BE HONEST ABOUT WHAT THIS IS. It is a strong practical control and NOT a
+# cryptographic one: someone already on your LAN who knows your home gateway's
+# MAC could forge it. It stops the daemon from offering itself to networks you
+# have never seen; it does not turn a hostile LAN into a safe one. The plaintext
+# threat model above still applies on any network you do trust.
+TRUSTED_FILE = "~/.config/claude-mate/trusted-networks"
+NET_GATE_POLL_S = 20.0      # how often to re-check which network we are on
+
 MDNS_NAME = "Claude Mate"           # finds the daemon with zero configuration
 
 # Timings (seconds).
@@ -902,12 +931,28 @@ class NetLink:
         self._clients: List[socket.socket] = []
         self._stop_evt = threading.Event()
         self._threads: List[threading.Thread] = []
+        self._pending = 0                       # connections still handshaking
         self._no_token_logged = 0.0             # throttle for _log_no_token
 
     # ---- lifecycle -------------------------------------------------------- #
 
     def start(self) -> bool:
-        """Bind + listen and start accepting. False if the port is unusable."""
+        """Bind + listen and start accepting. False if the port is unusable.
+
+        RESTARTABLE, because NetworkGate closes the listener when the Mac moves
+        to an untrusted network and opens it again when it comes home. stop()
+        sets _stop_evt and nothing used to clear it, so the second start() built
+        a listener and handed it to an accept loop whose very first `while not
+        self._stop_evt.is_set()` was already false -- a socket bound, listening,
+        and attached to nobody, which is worse than a failure because it looks
+        exactly like success.
+        """
+        self._stop_evt.clear()
+        # Drop the corpses of previous connections. This list is appended to
+        # once per accepted connection and never pruned, so on a long-lived
+        # daemon it is an unbounded list of dead Thread objects -- slow-motion
+        # memory growth that anyone able to reach the port can drive.
+        self._threads = [t for t in self._threads if t.is_alive()]
         try:
             srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -962,16 +1007,31 @@ class NetLink:
                 continue
             except OSError:
                 return                          # listener closed: we are done
+            # THE CAP USED TO COUNT THE WRONG THING. _clients holds peers that
+            # have ALREADY authenticated, so a peer that never finishes the
+            # handshake was never counted -- and every accept span a thread that
+            # lived for the full NET_AUTH_TIMEOUT_S. Anyone who could reach the
+            # port could therefore hold an unbounded number of threads open by
+            # connecting and saying nothing, without knowing the token at all.
+            # Bounding connections IN THE HANDSHAKE is the check that matters;
+            # the authenticated cap below stays as the fan-out bound it always
+            # was.
             with self._lock:
-                too_many = len(self._clients) >= NET_MAX_CLIENTS
+                too_many = (len(self._clients) >= NET_MAX_CLIENTS
+                            or self._pending >= NET_MAX_PENDING)
+                if not too_many:
+                    self._pending += 1
             if too_many:
-                log(f"TCP refused {addr[0]}: already serving {NET_MAX_CLIENTS}")
+                log(f"TCP refused {addr[0]}: {len(self._clients)} linked, "
+                    f"{self._pending} in handshake")
                 self._shutdown(conn)
                 continue
             t = threading.Thread(target=self._serve, args=(conn, addr),
                                  name="net-client", daemon=True)
             t.start()
-            self._threads.append(t)
+            with self._lock:
+                self._threads = [x for x in self._threads if x.is_alive()]
+                self._threads.append(t)
 
     def _authenticate(self, conn: socket.socket, peer: str) -> bool:
         """Nonce challenge / HMAC response. False = reject (caller closes)."""
@@ -979,9 +1039,12 @@ class NetLink:
         expect = hmac.new(self._token, nonce.encode("ascii"),
                           "sha256").hexdigest()
         try:
+            # One budget for the entire handshake, wall-clock, from before the
+            # challenge goes out. See _read_line_blocking().
+            deadline = time.monotonic() + NET_AUTH_TIMEOUT_S
             conn.settimeout(NET_AUTH_TIMEOUT_S)
             conn.sendall(f"C|{nonce}\n".encode("ascii"))
-            reply = self._read_line_blocking(conn)
+            reply = self._read_line_blocking(conn, deadline=deadline)
         except (OSError, socket.timeout):
             log(f"TCP {peer}: handshake timed out")
             return False
@@ -1035,10 +1098,29 @@ class NetLink:
         log(f"    this daemon's token is in {path}")
 
     @staticmethod
-    def _read_line_blocking(conn: socket.socket) -> Optional[str]:
-        """One newline-terminated line, bounded by NET_MAX_LINE. None on EOF."""
+    def _read_line_blocking(conn: socket.socket,
+                            deadline: Optional[float] = None) -> Optional[str]:
+        """One newline-terminated line, bounded by NET_MAX_LINE. None on EOF.
+
+        `deadline` is an absolute time.monotonic() value bounding the WHOLE
+        line, and the handshake passes one.
+
+        WHY A DEADLINE AND NOT JUST A SOCKET TIMEOUT. This reads one byte at a
+        time, and a socket timeout re-arms on every successful recv -- so it
+        bounds the gap between bytes, not the read. A peer dripping one byte
+        every four seconds beat a five-second timeout indefinitely: 512 bytes
+        of drip is roughly forty minutes of held thread, per connection, for an
+        attacker who never has to know the token. Bounding how MANY such peers
+        there can be (NET_MAX_PENDING) does not help if each one holds its slot
+        for forty minutes -- together they simply keep the real device out.
+        """
         buf = bytearray()
         while len(buf) < NET_MAX_LINE:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise socket.timeout("handshake deadline exceeded")
+                conn.settimeout(remaining)
             chunk = conn.recv(1)
             if not chunk:
                 return None
@@ -1051,7 +1133,16 @@ class NetLink:
 
     def _serve(self, conn: socket.socket, addr) -> None:
         peer = f"{addr[0]}:{addr[1]}"
-        if not self._authenticate(conn, peer):
+        # try/finally around the handshake ALONE: the slot being released here
+        # is the pre-auth one, and holding it for the lifetime of an established
+        # link would mean four healthy devices exhausted the handshake budget
+        # and nothing could ever connect again.
+        try:
+            ok = self._authenticate(conn, peer)
+        finally:
+            with self._lock:
+                self._pending = max(0, self._pending - 1)
+        if not ok:
             self._shutdown(conn)
             return
         try:
@@ -1212,6 +1303,190 @@ class LinkHub:
 
 # Anything the rest of the daemon needs from a device link.
 Link = Union[SerialLink, LinkHub]
+
+
+def _run_quiet(argv: List[str], timeout: float = 3.0) -> str:
+    """Run a read-only system tool and return stdout, or "" if anything fails."""
+    try:
+        out = subprocess.run(argv, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return out.stdout.decode("utf-8", "replace")
+
+
+def default_gateway() -> Optional[str]:
+    """The default route's gateway IP, or None when there is no route at all."""
+    for line in _run_quiet(["route", "-n", "get", "default"]).splitlines():
+        line = line.strip()
+        if line.startswith("gateway:"):
+            gw = line.split(":", 1)[1].strip()
+            return gw or None
+    return None
+
+
+def current_network_id() -> Optional[str]:
+    """A stable fingerprint for the network this Mac is on, or None if offline.
+
+    The gateway's MAC address, normalised. See the note at TRUSTED_FILE for why
+    it is the MAC and not the SSID or the subnet.
+    """
+    gw = default_gateway()
+    if not gw:
+        return None
+    # `arp -n 192.168.68.1` -> "? (192.168.68.1) at 60:32:b1:1a:ee:40 on en0 ..."
+    # ...or "? (192.168.68.1) -- no entry" when the cache is cold, which is not
+    # an error: it happens for a second or two after joining, and the caller
+    # simply re-checks on the next poll.
+    out = _run_quiet(["arp", "-n", gw])
+    if " at " not in out:
+        return None
+    mac = out.split(" at ", 1)[1].split()[0]
+    return normalise_mac(mac)
+
+
+def normalise_mac(mac: str) -> Optional[str]:
+    """Lowercase, zero-padded, colon-separated -- or None if it is not a MAC.
+
+    macOS `arp` drops leading zeros ("0:1a:2b:3c:4d:5e"), so the SAME network
+    fingerprints two different ways depending on which octets happen to be
+    small. Comparing the raw strings would quietly stop matching the file the
+    user trusted, which presents as "my trusted network is not trusted any
+    more" -- so normalise on the way in AND on the way out.
+    """
+    parts = mac.strip().lower().split(":")
+    if len(parts) != 6:
+        return None
+    try:
+        return ":".join(f"{int(p, 16):02x}" for p in parts)
+    except ValueError:
+        return None
+
+
+def trusted_networks() -> Dict[str, str]:
+    """Trusted gateway MAC -> the label the user gave it. Missing file = {}."""
+    path = os.path.expanduser(os.environ.get("CLAUDE_MATE_TRUSTED_FILE",
+                                             TRUSTED_FILE))
+    out: Dict[str, str] = {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                mac, _, label = line.partition(" ")
+                norm = normalise_mac(mac)
+                if norm:
+                    out[norm] = label.strip() or "(unnamed)"
+    except OSError:
+        pass
+    return out
+
+
+def trust_network(net_id: str, label: str) -> bool:
+    """Add a network to the trusted file. True if it was written."""
+    path = os.path.expanduser(os.environ.get("CLAUDE_MATE_TRUSTED_FILE",
+                                             TRUSTED_FILE))
+    norm = normalise_mac(net_id)
+    if not norm:
+        return False
+    if norm in trusted_networks():
+        return True
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # 0600: this file decides who the daemon will talk to. It is not a
+        # secret, but it is a policy, and a policy anything can append to is
+        # not one.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as fh:
+            fh.write(f"{norm} {label}\n")
+        return True
+    except OSError as exc:
+        log(f"could not write {path}: {exc}")
+        return False
+
+
+class NetworkGate(threading.Thread):
+    """Keeps the TCP listener and the mDNS advert off untrusted networks.
+
+    Polls which network we are on and opens or closes the listener to match.
+    Runs even when the answer never changes, because the interesting case is
+    precisely the one nobody is watching: the laptop that was closed at home and
+    opened somewhere else.
+
+    TRUST ON FIRST USE, ONCE. An upgrade must not silently disconnect a device
+    that worked yesterday, so if the trusted file does not exist yet the first
+    network seen is adopted and loudly logged. That is never worse than the old
+    behaviour -- which was to listen on every network without asking -- and from
+    the second network onwards it is strictly better. `claude-mate trust --list`
+    shows what was adopted and `--remove` undoes it.
+    """
+
+    def __init__(self, net: "NetLink", mdns: Optional["MdnsAdvertiser"],
+                 poll_s: float = NET_GATE_POLL_S) -> None:
+        super().__init__(name="net-gate", daemon=True)
+        self._net = net
+        self._mdns = mdns
+        self._poll_s = poll_s
+        self._stop_evt = threading.Event()
+        self._open = False
+        self._last_id: Optional[str] = ""      # "" = nothing evaluated yet
+
+    def is_open(self) -> bool:
+        return self._open
+
+    def stop(self) -> None:
+        self._stop_evt.set()
+
+    def run(self) -> None:
+        while not self._stop_evt.is_set():
+            try:
+                self.evaluate()
+            except Exception as exc:                        # noqa: BLE001
+                # A gate that crashes must fail CLOSED, and must say so. The
+                # alternative -- a dead thread and a listener nobody is
+                # re-evaluating -- is the one outcome worse than either state.
+                log(f"network gate error ({exc}); closing the listener")
+                self._apply(False, "gate error")
+            self._stop_evt.wait(self._poll_s)
+
+    def evaluate(self) -> None:
+        net_id = current_network_id()
+        if net_id is None:
+            self._apply(False, "no network")
+            self._last_id = None
+            return
+        known = trusted_networks()
+        if not known and not os.path.exists(
+                os.path.expanduser(os.environ.get("CLAUDE_MATE_TRUSTED_FILE",
+                                                  TRUSTED_FILE))):
+            if trust_network(net_id, "first-seen"):
+                log(f"trusting the network you are on ({net_id}) -- first run. "
+                    f"`claude-mate trust --list` to review, `--remove` to undo.")
+                known = trusted_networks()
+        if net_id in known:
+            self._apply(True, f"{known[net_id]} ({net_id})")
+        else:
+            self._apply(False, f"untrusted network {net_id}")
+        self._last_id = net_id
+
+    def _apply(self, want_open: bool, why: str) -> None:
+        if want_open == self._open:
+            return
+        self._open = want_open
+        if want_open:
+            if self._net.start():
+                log(f"TCP listener open: {why}")
+                if self._mdns:
+                    self._mdns.start()
+            else:
+                self._open = False
+        else:
+            self._net.stop()
+            if self._mdns:
+                self._mdns.stop()
+            log(f"TCP listener closed: {why}. "
+                f"`claude-mate trust` to allow this network.")
 
 
 class MdnsAdvertiser:
@@ -3166,6 +3441,13 @@ def main(argv: Optional[List[str]] = None) -> int:
              "keep it on this machine)",
     )
     parser.add_argument(
+        "--trust-any-network",
+        action="store_true",
+        default=os.environ.get("CLAUDE_MATE_TRUST_ANY", "") == "1",
+        help="open the TCP listener on every network, not only trusted ones "
+             "(the pre-gate behaviour; see `claude-mate trust`)",
+    )
+    parser.add_argument(
         "--ble",
         action="store_true",
         default=os.environ.get("CLAUDE_MATE_BLE", "") == "1",
@@ -3223,6 +3505,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     net: Optional[NetLink] = None
     ble: Optional[Any] = None
     mdns: Optional[MdnsAdvertiser] = None
+    net_gate: Optional[NetworkGate] = None
 
     # Both wireless transports are opt-in AND fail closed: an unauthenticated
     # link would let anyone in range read session names and raise windows, so a
@@ -3241,11 +3524,23 @@ def main(argv: Optional[List[str]] = None) -> int:
             # The cable can now provision the radio. See SerialLink._provision().
             serial_link.set_provision_token(token)
             if args.tcp:
-                candidate = NetLink(args.tcp_bind, args.tcp_port, token, rx)
-                if candidate.start():
-                    net = candidate
-                    mdns = MdnsAdvertiser(args.tcp_port)
-                    mdns.start()
+                # BUILT HERE, OPENED BY THE GATE. The listener's existence is
+                # now a function of which network the Mac is on, and that answer
+                # changes while the daemon runs -- a laptop closed at home and
+                # opened in a cafe never restarts anything. NetworkGate owns
+                # start()/stop() from here on; LinkHub gets the object either
+                # way, and a closed listener simply has no clients to write to.
+                net = NetLink(args.tcp_bind, args.tcp_port, token, rx)
+                mdns = MdnsAdvertiser(args.tcp_port)
+                if args.trust_any_network:
+                    if net.start():
+                        mdns.start()
+                    else:
+                        net = None
+                else:
+                    net_gate = NetworkGate(net, mdns)
+                    net_gate.evaluate()   # settle it before the banner prints
+                    net_gate.start()
             if args.ble:
                 # Imported here, not at module scope: bleak is optional, and
                 # tools/test_net_link.py exec_modules this file by path, where a
@@ -3263,8 +3558,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             if net or ble:
                 link = LinkHub(serial_link, [net, ble], rx)
         if args.tcp:
-            log(f"  tcp    : {args.tcp_bind}:{args.tcp_port} "
-                f"({'on' if net else 'DISABLED'})")
+            # Say which of the three states this is, because "on" and "waiting
+            # for a network you trust" are very different things to read at
+            # 2 a.m. when a device will not link.
+            if net is None:
+                where = "DISABLED"
+            elif net_gate is not None:
+                where = "on" if net_gate.is_open() else "closed (untrusted net)"
+            else:
+                where = "on (gate off)"
+            log(f"  tcp    : {args.tcp_bind}:{args.tcp_port} ({where})")
         if args.ble:
             log(f"  ble    : {'scanning' if ble else 'DISABLED'}"
                 f"{' for ' + args.ble_address if args.ble_address else ''}")

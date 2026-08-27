@@ -18,6 +18,8 @@ Run:   python3 tools/test_net_link.py      (needs pyserial)
 import hmac
 import os
 import pty
+import queue
+import select
 import socket
 import stat
 import subprocess
@@ -598,6 +600,215 @@ _t.join(timeout=5.0)
 check("a throwing dispatch does not kill the button reader -- the next press "
       "still lands", _dispatched == ["B|G", "B|N"])
 check("...and the reader stops cleanly when asked", not _t.is_alive())
+
+
+# --------------------------------------------------------------------------- #
+# The network gate: the listener must not exist on a network nobody trusted.
+# --------------------------------------------------------------------------- #
+# WHY THIS IS TESTED BY BEHAVIOUR AND NOT BY READING THE SOURCE. The property is
+# "nothing can connect", and the only honest way to assert that is to try to
+# connect. Every check below opens a real socket at a real port.
+print("\n== the TCP listener is gated on the network ==")
+
+_gate_dir = tempfile.mkdtemp(prefix="cm-trust-")
+_trust_file = os.path.join(_gate_dir, "trusted-networks")
+os.environ["CLAUDE_MATE_TRUSTED_FILE"] = _trust_file
+_gate_port = free_port()
+
+
+def _serving(port):
+    """Is something actually ACCEPTING here -- not merely bound?
+
+    CONNECT IS NOT ENOUGH, and this is the whole trap the restart bug hid in.
+    A listening socket completes the TCP handshake from the kernel backlog even
+    when nothing ever calls accept(), so a dead accept loop answers connect()
+    exactly like a live one. The daemon speaks first (C|<nonce>), so reading
+    that challenge is the cheapest proof that a thread is really on the other
+    end. A test written against connect() alone passes against the bug.
+    """
+    s = socket.socket()
+    s.settimeout(1.5)
+    try:
+        s.connect(("127.0.0.1", port))
+    except OSError:
+        return False
+    try:
+        return s.recv(64).startswith(b"C|")
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def _reachable(port):
+    s = socket.socket()
+    s.settimeout(0.5)
+    try:
+        s.connect(("127.0.0.1", port))
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
+# current_network_id() shells out to route/arp. On a CI box with no default
+# route it returns None, which is itself a state worth pinning -- but the
+# trusted/untrusted transitions need a STABLE id, so stub it.
+_real_netid = _cmd.current_network_id
+_cmd.current_network_id = lambda: "aa:bb:cc:00:11:22"
+
+_gnet = _cmd.NetLink("127.0.0.1", _gate_port, TOKEN, queue.Queue())
+_gate = _cmd.NetworkGate(_gnet, None, poll_s=0.2)
+
+# An EMPTY-but-present file means "the user has a policy and this net is not in
+# it" -- distinct from no file at all, which is first run. Getting these two
+# confused would either strand every upgrading user or silently trust anything.
+open(_trust_file, "w").close()
+_gate.evaluate()
+check("an untrusted network gets no listener at all",
+      not _reachable(_gate_port))
+
+with open(_trust_file, "w") as fh:
+    fh.write("aa:bb:cc:00:11:22 home\n")
+_gate.evaluate()
+check("...and a trusted one gets one", _serving(_gate_port))
+
+with open(_trust_file, "w") as fh:
+    fh.write("99:99:99:99:99:99 somewhere-else\n")
+_gate.evaluate()
+check("...moving to an untrusted network closes it again",
+      not _reachable(_gate_port))
+
+# THE REGRESSION THIS EXISTS FOR: stop() sets _stop_evt and start() did not
+# clear it, so the listener came back bound, listening and attached to an
+# accept loop that had already exited -- indistinguishable from working.
+with open(_trust_file, "w") as fh:
+    fh.write("aa:bb:cc:00:11:22 home\n")
+_gate.evaluate()
+check("...and coming home opens it a SECOND time (restartable)",
+      _serving(_gate_port))
+_gnet.stop()
+check("...and stop() really closes it", not _reachable(_gate_port))
+
+# No file at all = first run. Adopt once, so an upgrade cannot disconnect a
+# device that worked yesterday -- never worse than the old listen-everywhere.
+os.remove(_trust_file)
+_tofu_port = free_port()
+_tnet = _cmd.NetLink("127.0.0.1", _tofu_port, TOKEN, queue.Queue())
+_tgate = _cmd.NetworkGate(_tnet, None, poll_s=0.2)
+_tgate.evaluate()
+check("first run adopts the network it finds, rather than stranding the user",
+      _tgate.is_open() and "aa:bb:cc:00:11:22" in open(_trust_file).read())
+_tnet.stop()
+
+# Offline is not trusted. A laptop with no route has nothing to serve and
+# nothing to serve it to.
+_cmd.current_network_id = lambda: None
+_off_port = free_port()
+_onet = _cmd.NetLink("127.0.0.1", _off_port, TOKEN, queue.Queue())
+_ogate = _cmd.NetworkGate(_onet, None, poll_s=0.2)
+_ogate.evaluate()
+check("no network means no listener", not _ogate.is_open())
+_onet.stop()
+
+# A gate that throws must fail CLOSED, not leave the port open behind it.
+_cmd.current_network_id = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+_err_port = free_port()
+_enet = _cmd.NetLink("127.0.0.1", _err_port, TOKEN, queue.Queue())
+_egate = _cmd.NetworkGate(_enet, None, poll_s=0.2)
+_et = threading.Thread(target=_egate.run, daemon=True)
+_et.start()
+time.sleep(0.5)
+_egate.stop()
+check("a gate that raises fails closed", not _reachable(_err_port))
+_enet.stop()
+
+_cmd.current_network_id = _real_netid
+os.environ.pop("CLAUDE_MATE_TRUSTED_FILE", None)
+
+# MAC normalisation: macOS arp drops leading zeros, so the same router
+# fingerprints two ways and a trusted network silently stops being trusted.
+check("a MAC with dropped leading zeros normalises to the padded form",
+      _cmd.normalise_mac("0:1a:2B:3c:4d:5e") == "00:1a:2b:3c:4d:5e")
+check("...and a non-MAC is rejected rather than half-parsed",
+      _cmd.normalise_mac("nope") is None
+      and _cmd.normalise_mac("aa:bb:cc") is None
+      and _cmd.normalise_mac("gg:bb:cc:dd:ee:ff") is None)
+
+# --------------------------------------------------------------------------- #
+# Pre-auth connections are bounded -- the cap used to count only peers that had
+# ALREADY authenticated, so anyone who could reach the port could hold an
+# unbounded number of threads by connecting and saying nothing.
+# --------------------------------------------------------------------------- #
+print("\n== an unauthenticated peer cannot exhaust the daemon ==")
+_dos_port = free_port()
+_dnet = _cmd.NetLink("127.0.0.1", _dos_port, TOKEN, queue.Queue())
+assert _dnet.start()
+_silent = []
+for _ in range(_cmd.NET_MAX_PENDING + 6):
+    _s = socket.socket()
+    _s.settimeout(1.0)
+    try:
+        _s.connect(("127.0.0.1", _dos_port))
+        _silent.append(_s)
+    except OSError:
+        break
+time.sleep(0.6)
+check("connections beyond the handshake budget are refused, not queued "
+      "forever", _dnet._pending <= _cmd.NET_MAX_PENDING)
+check("...and the thread list does not grow without bound",
+      len(_dnet._threads) <= _cmd.NET_MAX_PENDING + 2)
+for _s in _silent:
+    try:
+        _s.close()
+    except OSError:
+        pass
+_dnet.stop()
+
+# SLOWLORIS. The handshake timeout used to re-arm on every byte, because the
+# reader takes one byte at a time and a socket timeout bounds the GAP between
+# recvs, not the read. Dripping a byte just under that gap held a thread for
+# NET_MAX_LINE x NET_AUTH_TIMEOUT_S -- about forty minutes -- and enough of
+# those keep the owner's real device out without ever knowing the token.
+#
+# NEVER BLOCK ON recv() IN THIS TEST. The daemon says nothing between the
+# challenge and its verdict, so a blocking read is itself a long silent gap --
+# which the OLD per-byte timeout also punished. A test written that way passes
+# against the bug it is meant to catch. Poll with select instead, and keep
+# every gap comfortably inside the per-recv timeout.
+_slow_port = free_port()
+_orig_auth_timeout = _cmd.NET_AUTH_TIMEOUT_S
+_cmd.NET_AUTH_TIMEOUT_S = 1.0          # keep it quick; the bug is scale-free
+_snet = _cmd.NetLink("127.0.0.1", _slow_port, TOKEN, queue.Queue())
+assert _snet.start()
+_drip = socket.socket()
+_drip.settimeout(5.0)
+_drip.connect(("127.0.0.1", _slow_port))
+_drip.recv(64)                          # the C|<nonce> challenge
+_drip.setblocking(False)
+_t0 = time.time()
+_dropped_after = None
+for _ in range(12):                     # 12 x 0.4s = 4.8s, well past the 1s cap
+    time.sleep(0.4)                     # gap < NET_AUTH_TIMEOUT_S on purpose
+    try:
+        _drip.sendall(b"a")
+    except OSError:
+        _dropped_after = time.time() - _t0
+        break
+    r, _, _ = select.select([_drip], [], [], 0)
+    if r:
+        try:
+            if not _drip.recv(16):      # server hung up: deadline enforced
+                _dropped_after = time.time() - _t0
+                break
+        except OSError:
+            _dropped_after = time.time() - _t0
+            break
+_drip.close()
+_cmd.NET_AUTH_TIMEOUT_S = _orig_auth_timeout
+check("a drip-feeding peer is dropped on a deadline, not kept alive by each "
+      "byte", _dropped_after is not None and _dropped_after < 3.0)
+_snet.stop()
 
 # --------------------------------------------------------------------------- #
 print()
