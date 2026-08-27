@@ -379,8 +379,8 @@ hooks are the zero-dependency feed. Use whichever fits each session.
   switch specifically:** one
   press used to be enough to move a cordless board onto Wi-Fi, and a board with
   no credentials then reboots into a portal that outranks the menu — hiding the
-  row you would use to undo it. `I|WIFI` / `I|BLE` over USB still do it, which
-  puts that switch behind a cable you have to actually have. About lives here
+  row you would use to undo it. `claude-mate link <wifi|p2p|ble>` over USB still
+  does it, which puts that switch behind a cable you have to actually have. About lives here
   rather than on the top strip because it is not a place you go: it is something
   you read. Entirely
   **firmware-local**: while it is up PREV/GO/NEXT are handled on

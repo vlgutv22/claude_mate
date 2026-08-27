@@ -12,6 +12,81 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
+### 2026-08-27 — A Wi-Fi link with no network in it
+
+A third transport: `p2p`. Wi-Fi with the infrastructure taken out. The **device**
+brings up its own access point, your Mac joins *it*, and the device reads the
+Mac's DHCP lease off its own AP and dials the daemon on the usual port.
+
+- **No router, no credentials, nothing else on the segment.** `wifi` needs the
+  password of a network you both trust, which is a non-starter on a guest SSID or
+  a locked-down corporate one. `p2p` needs no network at all.
+- **Every byte above the socket is the same code.** Same nonce handshake, same
+  line protocol, same `NetLink` on the Mac side — which needed **no changes**.
+  The AP's SSID and password are generated once and kept, so the Mac saves the
+  network and rejoins it at every login (unlike the setup portal's, which is
+  regenerated on every start).
+- **`claude-mate link <wifi|p2p|ble>`** moves the cabled device between
+  transports. There was previously no way to do this at all: the setting lives
+  behind the firmware's `I|` console command, and the only route to that console
+  was a hand-run `miniterm` on a port the daemon holds open — so the two readers
+  split the device's replies and a switch that had worked looked like one that
+  had not. The socket verb takes three fixed words and builds the line itself;
+  it is deliberately **not** a general relay, because the same console takes
+  `T|<token>`.
+- **The trade, stated plainly: your Mac has one Wi-Fi radio.** While it is on the
+  device's network it is not on yours. That is not fixable from this side, and
+  [`docs/USING.md`](docs/USING.md) says so rather than letting you find out.
+
+Two things a compiler cannot catch, both found by reading the states rather than
+the syntax: every "not connected" test in `netcfg.h` is about the *station*
+interface, and a P2P device has none — so `pollLinked()` dropped the link on the
+first poll after `A|OK`, and `pollDial()` called `startJoin()` (`WIFI_STA`),
+tearing down the very AP it was hosting. Both now ask the question that means
+something for an access point: is anyone still associated?
+
+The P2P join panel sits *below* the menu in the render order, unlike the setup
+portal which outranks everything. A device whose Mac never joins would otherwise
+have no way back to BLE but a cable — the "one press, no way back" trap the Link
+row was once removed to avoid.
+
+### 2026-08-27 — The daemon says why it did not start
+
+From an afternoon that started with "I can't start claude mate and connect
+device at all".
+
+**The daemon had crash-looped 1786 times.** `import serial` at the top of
+`claude_mate_daemon.py` was raising `ModuleNotFoundError` — on a machine where
+pyserial *was* installed. The LaunchAgent runs `/usr/local/bin/python3`, which
+is a symlink the python.org installer rewrites on every minor release; 3.14
+landed, the symlink moved, and the packages stayed behind in 3.12's
+`site-packages` where nothing was looking. `KeepAlive` turned that into a restart
+every five seconds and a **50 MB** log of the same traceback. The whole time,
+`claude-mate daemon` said only *"nothing is answering on the socket yet"* and
+pointed at the log the answer was already in.
+
+- **Fixed at the cause: the installer builds a virtualenv and pins the daemon to
+  it.** `.venv/bin/python3` is a symlink to a *concrete* version with its
+  packages beside it, so a Python upgrade can no longer separate the two. Where
+  a venv cannot be created, the interpreter is resolved through `realpath` and
+  pinned rather than left floating.
+- **A failed start now prints the failure.** `claude-mate daemon` reads back the
+  tail of the daemon's stderr and shows the exception — the frames included —
+  instead of the path to it. The one crash launchd *cannot* narrate (a missing
+  interpreter, where nothing is ever written to the log) is detected separately
+  and named.
+- **A crash loop can no longer eat the disk.** The daemon truncates its own
+  stderr past 8 MB (`CLAUDE_MATE_LOG_MAX`) *before* the first import that can
+  fail — a cap after the imports would never have run, because the crash was the
+  import.
+- **`pip install -r daemon/requirements.txt` now installs what the daemon needs.**
+  `bleak` was a comment in that file while the shipped plist set
+  `CLAUDE_MATE_BLE=1`, so following the daemon's own recovery instruction fixed
+  the crash and left a BLE device with nothing to connect to. The installer also
+  stops swallowing pip's stderr, drops `--user` (a third place for the same
+  package to hide), and installs `pyte` — which it never had, so the PTY wrapper
+  had been silently falling through to unwrapped Claude.
+
 ### 2026-08-14 — A dead cable no longer takes every device button with it
 
 Reported from the couch as "the daemon is stuck". It was not stuck. It was

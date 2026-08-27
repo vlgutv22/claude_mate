@@ -91,12 +91,63 @@ import wave
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+# --------------------------------------------------------------------------- #
+# Crash-loop damage control -- BEFORE the first import that can fail
+# --------------------------------------------------------------------------- #
+# THIS RUNS FIRST ON PURPOSE. launchd opens our stderr (StandardErrorPath) and
+# restarts us forever (KeepAlive), so a daemon that dies during import writes
+# the same traceback every ThrottleInterval seconds with nothing to stop it. One
+# machine reached 1786 restarts and a 50 MB log that way. A cap placed after the
+# imports would never have run: the crash was `import serial` itself.
+#
+# TRUNCATE, DO NOT RENAME. launchd holds the fd, so renaming the file just means
+# we keep writing to the same inode under its new name and the visible log stays
+# empty forever. ftruncate on the fd we were handed is the only thing that works,
+# and with O_APPEND the next write restarts at zero.
+LOG_MAX_BYTES = int(os.environ.get("CLAUDE_MATE_LOG_MAX", 8 * 1024 * 1024))
+
+
+def _cap_crash_log() -> None:
+    """Keep a crash loop from eating the disk. Best effort, never fatal."""
+    if LOG_MAX_BYTES <= 0:                      # opt out with CLAUDE_MATE_LOG_MAX=0
+        return
+    try:
+        import stat
+        st = os.fstat(2)
+        if not stat.S_ISREG(st.st_mode) or st.st_size <= LOG_MAX_BYTES:
+            return
+        os.ftruncate(2, 0)
+        os.lseek(2, 0, os.SEEK_SET)
+        sys.stderr.write(
+            f"[claude-mate] log passed {LOG_MAX_BYTES} bytes and was truncated. "
+            f"If this keeps happening the daemon is crash-looping -- the error "
+            f"is whatever follows this line.\n"
+        )
+    except Exception:                           # a pipe, a closed fd, a tty: fine
+        pass
+
+
+_cap_crash_log()
+
 try:
     import serial  # pyserial
 except ImportError:  # pragma: no cover - friendly error if dependency missing
+    # NAME THE INTERPRETER. The failure this message used to produce was
+    # "pyserial is not installed" on a machine where pyserial *was* installed --
+    # in the site-packages of the Python the LaunchAgent no longer runs, because
+    # /usr/local/bin/python3 is a floating symlink that a python.org update
+    # repointed at a fresh version. Without sys.executable in the message there
+    # is nothing to tell those two situations apart.
     sys.stderr.write(
-        "[claude-mate] ERROR: pyserial is not installed. "
-        "Run: pip install -r daemon/requirements.txt\n"
+        "[claude-mate] ERROR: pyserial is not installed for this interpreter.\n"
+        f"[claude-mate]   interpreter: {sys.executable}\n"
+        f"[claude-mate]   fix:         {sys.executable} -m pip install -r "
+        "daemon/requirements.txt\n"
+        "[claude-mate] If you installed it before and it worked, a Python "
+        "upgrade probably\n"
+        "[claude-mate] moved the interpreter out from under the LaunchAgent. "
+        "Re-run install/install.sh,\n"
+        "[claude-mate] which pins the daemon to a virtualenv it owns.\n"
     )
     raise
 
@@ -2074,6 +2125,7 @@ class SocketServer(threading.Thread):
         self.on_press = None              # inject a device button code
         self.on_select = None             # move the selection; returns the name
         self.on_accounts_refresh = None   # re-read ~/.claude-accounts
+        self.on_device_link = None        # switch the cabled device's transport
         self.screen = None                # for queue_snapshot()
         self._stop_evt = threading.Event()  # NOT `_stop`: Thread.join() calls its own _stop()
         self._srv: Optional[socket.socket] = None
@@ -2221,6 +2273,28 @@ class SocketServer(threading.Thread):
             log(f"press {code!r} from the terminal")
             self.on_press(code)
             return "ok\n"
+        if line.startswith("link|"):
+            # Switch which radio the CABLED device uses. This exists because
+            # there was no way to do it at all: the transport is set by the
+            # firmware's `I|` console command, and the only route to that
+            # console was a hand-run miniterm on /dev/cu.usbmodemN -- a port
+            # this daemon holds open and reads from, non-exclusively, so the two
+            # readers split the device's replies between them and the switch
+            # that had worked looked like one that had not.
+            #
+            # A NARROW VERB, NOT A RELAY. The obvious shape here is "forward an
+            # arbitrary config line", and it is the wrong one: the same console
+            # takes `T|<token>`, so a general relay would let anything that can
+            # write to this socket re-provision the device's shared secret. This
+            # accepts three fixed words and builds the line itself.
+            want = line[5:].strip().lower()
+            if want not in ("wifi", "ble", "p2p"):
+                return "error: link| takes wifi, ble or p2p\n"
+            if not self.on_device_link:
+                return "error: no device on the cable\n"
+            log(f"link {want!r} from the terminal")
+            return "ok\n" if self.on_device_link(want) else \
+                   "error: could not write to the device\n"
         if line.startswith("select|"):
             want = line[7:].strip()
             if not self.on_select:
@@ -3364,6 +3438,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     socket_server.on_press = lambda code: button_reader.press(code)
     socket_server.on_select = screen.select_by
     socket_server.on_accounts_refresh = refresh_accounts
+    # SERIAL ONLY, NEVER THE HUB. link.write_line() fans a line out to every
+    # connected device, and `I|` is the one line that must not be broadcast:
+    # sending it to the fleet would move a Wi-Fi device and a BLE device onto
+    # whichever transport the person at the cable happened to pick, rebooting
+    # both. The device being reconfigured is by definition the one on the cable.
+    socket_server.on_device_link = \
+        lambda mode: serial_link.write_line(f"I|{mode.upper()}")
     button_reader = ButtonReader(link, screen)
     button_reader.on_ack = on_ack
     button_reader.bridge = web

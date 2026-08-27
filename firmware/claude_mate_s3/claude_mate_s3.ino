@@ -1147,11 +1147,18 @@ static void drawSplash() {
 
 // Firmware-local: the setup portal is up. Everything needed to join it is on
 // the glass, because there is nowhere else to read it from.
-static void drawSetup() {
+// The AP-credentials panel, shared by the setup portal and the P2P link.
+//
+// FACTORED OUT RATHER THAN COPIED because the two screens have the same job --
+// "here is a network, here is its password, join it" -- and a second copy of
+// this layout would be a second place to forget the battery chip on the one
+// screen where the radio is heaviest. Only three strings differ.
+static void drawJoinPanel(const char *title, const char *lead,
+                          const String &foot) {
   gfx->setTextSize(2);
   gfx->setTextColor(C_WORK);
   gfx->setCursor(PAD_X, 30);
-  gfx->print("WIFI SETUP");
+  gfx->print(title);
   // AP mode is the heaviest radio state this firmware has, and the portal can
   // sit here for its whole timeout. The one screen where the cell is most at
   // risk was the one with nothing to say about it.
@@ -1159,7 +1166,7 @@ static void drawSetup() {
   gfx->setTextSize(1);
   gfx->setTextColor(C_DIM);
   gfx->setCursor(PAD_X, 58);
-  gfx->print("join this network from a phone:");
+  gfx->print(lead);
   gfx->setTextSize(2);
   gfx->setTextColor(C_TEXT);
   gfx->setCursor(PAD_X, 74);
@@ -1175,8 +1182,21 @@ static void drawSetup() {
   gfx->setTextSize(1);
   gfx->setTextColor(C_DIM);
   gfx->setCursor(PAD_X, LINK_Y);
-  gfx->print("then open http://" + net.apIp());
+  gfx->print(foot);
   gfx->fillRect(0, ACCENT_Y, SCREEN_W, ACCENT_H, C_WORK);
+}
+
+static void drawSetup() {
+  drawJoinPanel("WIFI SETUP", "join this network from a phone:",
+                "then open http://" + net.apIp());
+}
+
+// P2P, waiting for the Mac. Same panel, different ending: there is no page to
+// open, because the device dials the daemon itself the moment a lease is issued.
+static void drawP2PWait() {
+  drawJoinPanel("P2P LINK", "join this network from the Mac:",
+                net.hasToken() ? String("then it connects on its own")
+                               : String("no token - send T|<token> over usb"));
 }
 
 // The terminal view: a title strip, then the rows exactly as the daemon clipped
@@ -1670,6 +1690,15 @@ static void render() {
     // check for that reason; SETUP now wins, because a portal is only ever up
     // when the device is NOT linked, so the two cannot both be legitimate.)
     drawMirror();
+  } else if (net.state() == MateNet::HOSTING) {
+    // BELOW THE MENU, UNLIKE SETUP, AND THAT IS THE WHOLE POINT. The portal
+    // outranks everything because it is a five-minute modal state you entered
+    // on purpose. HOSTING is not: a P2P device whose Mac never joins sits here
+    // indefinitely, so if this covered the menu the only way back to BLE would
+    // be a cable -- the exact "one press, no way back" trap the Link row was
+    // once removed to avoid. Everything above still opens; this is only what
+    // the device shows when you are not asking it for anything else.
+    drawP2PWait();
   } else {
     drawStatusBar();
     if      (linkLost)   drawLinkLost();
@@ -2192,7 +2221,17 @@ static bool handleConfigLine(char *line) {
       MateTransport t;
       if (!strcasecmp(a, "ble"))       t = LINK_BLE;
       else if (!strcasecmp(a, "wifi")) t = LINK_WIFI;
-      else { Serial.println("usage: I|WIFI or I|BLE"); return true; }
+      else if (!strcasecmp(a, "p2p"))  t = LINK_P2P;
+      else { Serial.println("usage: I|WIFI, I|BLE or I|P2P"); return true; }
+      // SAY WHERE TO GO NEXT, before the reboot takes the console away. I|WIFI
+      // at least leaves the device joining a network the user configured;
+      // I|P2P brings up a network only this device knows the name of, and
+      // without printing it here the next thing the user sees is a keypad
+      // asking them to join an AP they have no password for. `?` prints it too,
+      // but `?` is not reachable in the two seconds before we reboot.
+      if (t == LINK_P2P) {
+        net.printP2PInvite(Serial);
+      }
       setTransport(t);
       Serial.printf("link: %s\n", MateNet::transportName(t));
       return true;
@@ -3202,9 +3241,17 @@ void setup() {
   // The portal is not the only way out of here on a BLE device, so it is
   // allowed to time out and hand the glass back. Without this a BOOT-held
   // portal on a cordless BLE board is a one-way door.
-  net.setFallbackLink(transport == LINK_BLE);
+  // P2P counts as a fallback for the same reason BLE does: it is a link that
+  // works without the portal, so a BOOT-held portal on a P2P device is allowed
+  // to time out and hand the glass back rather than being a one-way door.
+  net.setFallbackLink(transport != LINK_WIFI);
   if (forcePortal || transport == LINK_WIFI) {
     net.begin(forcePortal);
+  } else if (transport == LINK_P2P) {
+    // Our own AP, and nothing else: no STA, no join, no mDNS. Wi-Fi owns the
+    // radio here exactly as it does for LINK_WIFI, so BLE must stay down --
+    // which is why this is a branch beside the BLE arm and not before it.
+    net.beginP2P();
   } else {
     net.loadConfigOnly();                   // the token, and what `?` prints
     net.radioOff();                         // and nothing else about Wi-Fi

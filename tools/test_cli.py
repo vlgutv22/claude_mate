@@ -215,11 +215,28 @@ try:
     check("the socket's command surface has no delete in it",
           not any(w in body for w in ("shutil.rmtree", "os.remove", "os.unlink",
                                       "os.rmdir")))
+    # THIS LIST IS A LOCK, NOT AN OBSERVATION. Adding a verb should mean coming
+    # here and saying why it is safe on a socket every one of the user's shells
+    # can write to. `link` is here because it retunes the device's radio and
+    # nothing else: it takes three fixed words, builds the `I|` line itself, and
+    # deliberately cannot be talked into forwarding an arbitrary console line --
+    # the same console also takes `T|<token>`, so a general relay would have
+    # handed the device's shared secret to anything that could open the socket.
     check("...and the commands it does have are read-or-press only",
           sorted(re.findall(r'line == "([a-z-]+)"', body))
           == ["accounts", "accounts-refresh", "pair", "queue"]
           and sorted(re.findall(r'line\.startswith\("([a-z-]+)\|"\)', body))
-          == ["press", "select"])
+          == ["link", "press", "select"])
+
+    # The narrowness above is the security property, so pin it by behaviour too
+    # and not only by reading the source.
+    check("link| refuses a transport it does not know",
+          talk("link|telepathy").startswith("error:"))
+    check("...and refuses a console line dressed up as one",
+          talk("link|T|stolen-token").startswith("error:"))
+    for mode in ("wifi", "p2p", "ble"):
+        check(f"...but accepts {mode}", not talk(f"link|{mode}")
+              .startswith("error: link|"))
     # 0600, and this check used to assert 0666 -- it pinned the over-permission
     # as though it were a requirement. Hooks run in the user's own shells, same
     # uid, so owner-only always sufficed; 0666 only stopped being free when this
@@ -241,8 +258,63 @@ try:
           rc != 0 and "will not delete" in out)
     rc, out = cli("accounts", "rm", "nosuch")
     check("...and says so for an account that does not exist", rc != 0)
+    rc, out = cli("link")
+    check("`claude-mate link` explains the transports",
+          rc == 0 and "p2p" in out and "wifi" in out and "ble" in out)
+    rc, out = cli("link", "telepathy")
+    check("...and rejects one that does not exist", rc != 0)
     rc, out = cli("--help")
     check("`--help` explains itself", rc == 0 and "press" in out.lower())
+
+    # --- a failed start says WHY --------------------------------------------- #
+    # THE REGRESSION THIS EXISTS FOR. On a real machine the daemon crash-looped
+    # 1786 times on a one-line ModuleNotFoundError while `claude-mate daemon`
+    # said only "nothing is answering on the socket yet" and pointed at the log
+    # the answer was already sitting in. These are the two functions that turn
+    # that into a message, so they are worth pinning even though the paths that
+    # call them need a broken launchd job to reach.
+    print("\n== a daemon that will not start explains itself ==")
+    import importlib.machinery
+    import importlib.util
+    _ldr = importlib.machinery.SourceFileLoader("cm_cli_under_test", CLI)
+    cm = importlib.util.module_from_spec(
+        importlib.util.spec_from_loader("cm_cli_under_test", _ldr))
+    _ldr.exec_module(cm)
+
+    crash = os.path.join(tmp, "crash.log")
+    with open(crash, "w") as fh:
+        fh.write("[claude-mate] starting\n"
+                 "Traceback (most recent call last):\n"
+                 '  File "daemon/claude_mate_daemon.py", line 95, in <module>\n'
+                 "    import serial  # pyserial\n"
+                 "ModuleNotFoundError: No module named 'serial'\n")
+    said = cm.why_the_daemon_died(crash) or ""
+    check("the traceback's exception reaches the message",
+          "ModuleNotFoundError" in said and "serial" in said)
+    check("...with the frames that led to it, not just the last line",
+          "Traceback (most recent call last)" in said)
+
+    plain = os.path.join(tmp, "plain.log")
+    with open(plain, "w") as fh:
+        fh.write("[claude-mate] ERROR: could not bind 8787\n"
+                 "[claude-mate] running.\n")
+    check("...and an ERROR line is found when there is no traceback",
+          "could not bind 8787" in (cm.why_the_daemon_died(plain) or ""))
+    check("...while a log that is not there is not an exception",
+          cm.why_the_daemon_died(os.path.join(tmp, "absent.log")) is None)
+    check("...nor is an empty one",
+          cm.why_the_daemon_died(os.devnull) is None)
+
+    # The one crash launchd cannot narrate: no interpreter, so nothing is ever
+    # written to the log why_the_daemon_died() would read.
+    good = os.path.join(tmp, "good.plist")
+    with open(good, "wb") as fh:
+        import plistlib
+        plistlib.dump({"ProgramArguments": ["/usr/bin/true", "x.py"]}, fh)
+    check("the LaunchAgent's interpreter is readable",
+          cm.daemon_interpreter(good) == "/usr/bin/true")
+    check("...and an unreadable plist is None, not a crash",
+          cm.daemon_interpreter(os.path.join(tmp, "absent.plist")) is None)
     rc, out = cli("nonsense")
     check("an unknown command is an error with a hint", rc != 0 and "help" in out)
 

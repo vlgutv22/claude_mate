@@ -26,6 +26,7 @@ the glass. There is no second implementation to drift.
   claude-mate select <n|name> point at a row instead of stepping to it
   claude-mate accounts        the saved logins
   claude-mate accounts rm <name|n> delete one, after saying its name back
+  claude-mate link <wifi|p2p|ble>  move the cabled device to another transport
   claude-mate daemon          start (or restart) the daemon via launchd
   claude-mate --version       what this is
 
@@ -71,6 +72,9 @@ if HERE not in sys.path:
 LAUNCHD_LABEL = "com.claudemate.daemon"
 LAUNCHD_PLIST = os.path.expanduser(
     f"~/Library/LaunchAgents/{LAUNCHD_LABEL}.plist")
+# Where launchd sends the daemon's stderr (StandardErrorPath in the plist). We
+# read it when a start fails -- see why_the_daemon_died().
+LAUNCHD_ERR_LOG = os.path.expanduser("~/Library/Logs/claude-mate.err.log")
 
 VERSION_FILE = os.path.join(os.path.dirname(HERE), "packaging", "VERSION")
 
@@ -202,6 +206,57 @@ def cmd_press(name):
     # a key in PRESSES, so cmd_press never sees it.)
     if name in ("prev", "next", "follow"):
         render(json.loads(need("queue")))
+    return 0
+
+
+LINKS = {
+    "wifi": "joins the network you configured, and reaches the daemon over it",
+    "p2p":  "the DEVICE becomes the access point and your Mac joins it -- no "
+            "router, no credentials, nothing else on the segment",
+    "ble":  "Bluetooth LE, no network at all",
+}
+
+
+def cmd_link(rest):
+    """Move the cabled device onto another transport.
+
+    The device has always been able to do this -- `I|WIFI` on its USB console --
+    and there has never been a way to say it from here. The console is a port
+    this daemon holds open, so the honest instruction used to be "stop the
+    daemon, run miniterm, type a line, start the daemon again", and the halfway
+    version of it (leave the daemon up) silently split the device's replies
+    between two readers.
+    """
+    if not rest or rest[0] in ("-h", "--help"):
+        print("usage: claude-mate link <wifi|p2p|ble>\n")
+        for name, what in LINKS.items():
+            print(f"  {B}{name:5}{OFF} {D}{what}{OFF}")
+        print(f"\n  {D}The device reboots into the new transport (~3 s). It is "
+              f"stored,\n  so it survives power cycles -- and a reflash.{OFF}")
+        if "p2p" not in rest:
+            print(f"\n  {D}p2p prints the network name and password to join; "
+                  f"they are also\n  on the device's screen while it waits.{OFF}")
+        return 0
+    want = rest[0].strip().lower()
+    if want not in LINKS:
+        die(f"claude-mate link: unknown transport {rest[0]!r} "
+            f"(wifi, p2p or ble)")
+    reply = talk(f"link|{want}")
+    if reply is None:
+        die(f"claude-mate: no daemon on {SOCK}\n"
+            f"  start it:  claude-mate daemon")
+    if reply.startswith("error:"):
+        # The common one is "no device on the cable", and it deserves better
+        # than being echoed: the transport is set over USB and only over USB,
+        # which is not obvious from a command that otherwise works over the air.
+        detail = reply[6:].strip()
+        die(f"claude-mate link: {detail}\n"
+            f"  The transport is set over the USB cable. Plug the device in "
+            f"and try again.")
+    print(f"link: {want}. The device is rebooting into it.")
+    if want == "p2p":
+        print(f"  {D}Join the network shown on its screen from this Mac; it "
+              f"dials the daemon itself.{OFF}")
     return 0
 
 
@@ -383,6 +438,21 @@ def start_daemon():
     if not os.path.exists(LAUNCHD_PLIST):
         return (f"no LaunchAgent at {LAUNCHD_PLIST}\n"
                 f"  run the installer first:  ./install/install.sh")
+    # THE ONE FAILURE launchd CANNOT NARRATE. Every other crash writes something
+    # to StandardErrorPath, so why_the_daemon_died() can read it back. A missing
+    # or non-executable ProgramArguments[0] is different: launchd never gets far
+    # enough to open our stderr, so it retries forever and the log stays empty.
+    # Pinning the daemon to a virtualenv (which the installer now does, so a
+    # Python upgrade cannot separate the interpreter from its packages) makes
+    # this the failure mode you hit if the base Python is later REMOVED --
+    # cheap to detect here, and invisible everywhere else.
+    interp = daemon_interpreter()
+    if interp and not os.access(interp, os.X_OK):
+        return (f"the LaunchAgent's interpreter is gone:\n"
+                f"    {interp}\n"
+                f"  Its Python was probably removed or upgraded. Re-run the "
+                f"installer to rebuild it:\n"
+                f"    ./install/install.sh")
     dom = f"gui/{os.getuid()}"
     run = lambda *a: subprocess.call(list(a), stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL)
@@ -398,8 +468,78 @@ def start_daemon():
         if daemon_alive():
             return None
         time.sleep(0.1)
+    # SAY WHY, DO NOT POINT AT A LOG. "check the log" is what this returned for
+    # 1786 consecutive crash-loop restarts on a real machine, while the reason --
+    # a one-line ModuleNotFoundError -- sat in that log the whole time. If we
+    # know how to find the answer, printing the path instead of the answer is
+    # just making the user do our job.
+    reason = why_the_daemon_died()
+    if reason:
+        return ("started it, but it exited immediately:\n"
+                + reason
+                + f"\n  full log:  tail -f {LAUNCHD_ERR_LOG}")
     return ("started it, but nothing is answering on the socket yet.\n"
-            f"  check the log:  tail -f ~/Library/Logs/claude-mate.err.log")
+            f"  check the log:  tail -f {LAUNCHD_ERR_LOG}")
+
+
+def daemon_interpreter(plist_path=None):
+    """ProgramArguments[0] from the LaunchAgent, or None if it cannot be read.
+
+    Forgiving on purpose: a plist we cannot parse must not stop a start we could
+    otherwise have made.
+    """
+    try:
+        import plistlib
+        with open(plist_path or LAUNCHD_PLIST, "rb") as fh:
+            argv = plistlib.load(fh).get("ProgramArguments") or []
+        return argv[0] if argv else None
+    except Exception:
+        return None
+
+
+def why_the_daemon_died(log_path=None, max_lines=12):
+    """The tail of the daemon's stderr, trimmed to the part that explains a death.
+
+    Returns an indented block ready to print, or None if the log says nothing
+    useful. Deliberately forgiving: this runs on an error path, and a diagnostic
+    that can itself raise turns a bad message into no message at all.
+    """
+    path = log_path or LAUNCHD_ERR_LOG
+    try:
+        with open(path, "rb") as fh:
+            # The log is capped at 8 MB by the daemon, but read from the end
+            # anyway -- the cap is best-effort and this must stay cheap.
+            try:
+                fh.seek(-16384, os.SEEK_END)
+            except OSError:
+                fh.seek(0)
+            tail = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+
+    lines = [ln.rstrip() for ln in tail.splitlines() if ln.strip()]
+    if not lines:
+        return None
+
+    # A Python traceback is the interesting case and it reads bottom-up: the
+    # exception is the LAST line, the "Traceback (most recent call last):" that
+    # starts it may be far above. Take from the last traceback header onwards so
+    # the exception keeps the frames that led to it.
+    start = 0
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].startswith("Traceback (most recent call last)"):
+            start = i
+            break
+    else:
+        # No traceback: show the trailing ERROR lines if there are any, else the
+        # plain tail. Either way the last few lines are what just happened.
+        errs = [ln for ln in lines if "ERROR" in ln or "Error" in ln]
+        if errs:
+            lines = errs
+        start = max(0, len(lines) - max_lines)
+
+    block = lines[start:][-max_lines:]
+    return "\n".join("    " + ln for ln in block)
 
 
 # ---------------------------------------------------------------------------
@@ -763,6 +903,8 @@ def main(argv):
         return cmd_select(rest[0])
     if cmd in ("accounts", "account"):
         return cmd_accounts(rest)
+    if cmd == "link":
+        return cmd_link(rest)
     if cmd in ("app", "ui", "menu"):
         # The app by name, for when stdin is not a terminal but you want it
         # anyway -- and so the thing has a name to put in the documentation.

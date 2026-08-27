@@ -271,8 +271,56 @@ platformer that runs on the device), **SLEEP**.
 **Nothing to do with Wi-Fi is on that menu**, deliberately. A radio switch one
 press away moved a cordless board onto Wi-Fi, and a board with no credentials
 then rebooted into a setup portal that outranks the menu — hiding the row you
-would have used to undo it. `I|WIFI` / `I|BLE` over USB still work, which puts
-that switch behind a cable you have to physically have.
+would have used to undo it. The switch lives behind a cable you have to
+physically have: `claude-mate link <wifi|p2p|ble>`, or `I|WIFI` / `I|BLE` /
+`I|P2P` typed at the USB console directly.
+
+---
+
+## Which radio carries the link
+
+Three transports, one protocol. The daemon cannot tell them apart, and a device
+can use exactly one at a time — the S3 has a single 2.4 GHz radio.
+
+| | what it needs | when to use it |
+|---|---|---|
+| `ble` | nothing | the default. A cordless device on a desk, no network involved |
+| `wifi` | the SSID and password of a network you and the Mac both trust | reach across a whole home or office |
+| `p2p` | **nothing** | Wi-Fi's range and speed where there is no network you can or want to join |
+
+Switch with the cable plugged in:
+
+```sh
+claude-mate link p2p        # the device reboots into it, ~3 s
+```
+
+### P2P: the device *is* the network
+
+In `p2p` the ESP32-S3 stops being a client and becomes the access point. Your
+Mac joins **the device's** network; the device reads the Mac's DHCP lease off
+its own AP and dials the daemon on port 8787. From there it is the same nonce
+handshake and the same line protocol as `wifi` — the daemon does not know the
+difference.
+
+Nothing else is on that segment: no router, no other clients, and no network
+credentials stored on a keypad. That is the point of it — a guest SSID, a
+corporate network you cannot put a device on, a hotel, a conference, or simply
+not wanting a desk toy to hold your Wi-Fi password.
+
+`claude-mate link p2p` prints the network name and password, and the device
+shows both on its screen while it waits. Join it from the Mac once; macOS
+remembers it and rejoins at every login, because unlike the setup portal the
+P2P credentials are generated once and kept.
+
+> **Your Mac has one Wi-Fi radio.** While it is on the device's network it is
+> not on yours — no internet over Wi-Fi until you switch back, unless the Mac is
+> also on Ethernet. This cannot be fixed from the device's side; it is the price
+> of a link with no infrastructure in it. If the Mac needs to stay on your
+> network, use `ble`.
+
+`p2p` needs the daemon's TCP listener, which the shipped LaunchAgent already
+enables (`CLAUDE_MATE_TCP=1`). The device must also already have the token — it
+gets one automatically the first time it is plugged in.
 
 ---
 
