@@ -2625,8 +2625,8 @@ class SocketServer(threading.Thread):
             # write to this socket re-provision the device's shared secret. This
             # accepts three fixed words and builds the line itself.
             want = line[5:].strip().lower()
-            if want not in ("wifi", "ble", "p2p"):
-                return "error: link| takes wifi, ble or p2p\n"
+            if want not in ("auto", "cable", "wifi", "ble", "p2p"):
+                return ("error: link| takes auto, cable, wifi, ble or p2p\n")
             if not self.on_device_link:
                 return "error: no device on the cable\n"
             log(f"link {want!r} from the terminal")

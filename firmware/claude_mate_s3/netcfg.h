@@ -113,7 +113,20 @@
 // WHAT IT COSTS: the Mac has one Wi-Fi radio, so while it is on the device's AP
 // it is not on yours. That is the trade, it is not fixable from this side, and
 // docs/USING.md says so plainly rather than letting people discover it.
-enum MateTransport : uint8_t { LINK_WIFI = 0, LINK_BLE = 1, LINK_P2P = 2 };
+// LINK_CABLE is "no radio at all": the USB serial link carries everything, which
+// it already does in every other mode -- config lines, token provisioning, the
+// boot H. So this mode does not start anything, it declines to. On a desk where
+// the device is plugged into the Mac it is running against, that is the whole
+// link, and both radios stay dark.
+//
+// LINK_AUTO is a MODE, NEVER AN EFFECTIVE TRANSPORT. It is stored, and it is
+// resolved to one of the real values at boot by resolveTransport(); nothing
+// downstream ever compares against it. Keeping it out of the effective set is
+// what stops every `transport == LINK_x` site in the sketch from having to know
+// that a fifth value exists.
+enum MateTransport : uint8_t {
+  LINK_WIFI = 0, LINK_BLE = 1, LINK_P2P = 2, LINK_CABLE = 3, LINK_AUTO = 4
+};
 
 class MateNet {
  public:
@@ -349,23 +362,88 @@ class MateNet {
     uint8_t v = p.getUChar("link", 0xFF);          // 0xFF = never set
     bool haveSsid = !p.getString("ssid", "").isEmpty();
     p.end();
-    if (v == LINK_BLE)  return LINK_BLE;
-    if (v == LINK_WIFI) return LINK_WIFI;
+    if (v == LINK_BLE)   return LINK_BLE;
+    if (v == LINK_WIFI)  return LINK_WIFI;
     // P2P needs no SSID, so unlike LINK_WIFI it is honoured on a device that
     // has never been given credentials -- which is the normal state of a device
     // that only ever uses P2P.
-    if (v == LINK_P2P)  return LINK_P2P;
+    if (v == LINK_P2P)   return LINK_P2P;
+    if (v == LINK_CABLE) return LINK_CABLE;
+    if (v == LINK_AUTO)  return LINK_AUTO;
     return haveSsid ? LINK_WIFI : LINK_BLE;        // a value from a future
   }                                                // build falls here too
+
+  // The MODE resolved to something the rest of the firmware can switch on.
+  // AUTO is the only value that needs resolving, and it resolves ONCE, at boot,
+  // in setup() -- see the note on LINK_AUTO.
+  //
+  // isPlugged() is SOF-based: it reports that a computer is talking to the USB
+  // peripheral, not merely that 5 V is present on the cable. A charger in a wall
+  // socket is therefore not mistaken for a Mac, which is the one confusion that
+  // would make AUTO pick the cable and then link to nothing.
+  static MateTransport resolveTransport(bool usbHost) {
+    MateTransport mode = storedTransport();
+    if (mode != LINK_AUTO) return mode;
+    if (usbHost) return LINK_CABLE;
+    MateTransport radio = storedRadio();
+    // AUTO MUST OBEY THE SAME GATE THE MENU DOES. The Connection row refuses to
+    // offer Wi-Fi to a device with no network, because such a device reboots
+    // into a portal that outranks the menu -- the whole trap the row was
+    // designed around. AUTO could walk straight past that gate: pick wifi while
+    // credentials exist, wipe them later, and every boot from then on resolves
+    // to a Wi-Fi transport with nothing to join. The gate belongs to the
+    // decision, not to the row that happens to present it.
+    if (radio == LINK_WIFI && !hasSsid()) return LINK_BLE;
+    return radio;
+  }
+
+  static bool hasSsid() {
+    Preferences p;
+    if (!p.begin(NET_NS, true)) return false;
+    bool has = !p.getString("ssid", "").isEmpty();
+    p.end();
+    return has;
+  }
+
+  // Which radio AUTO falls back to when there is no host on the cable. Written
+  // whenever the user picks a radio explicitly, so "auto" means "the cable when
+  // it is there, otherwise what I last chose" rather than a fixed guess.
+  static MateTransport storedRadio() {
+    Preferences p;
+    if (!p.begin(NET_NS, true)) return LINK_BLE;
+    uint8_t v = p.getUChar("radio", 0xFF);
+    if (v != LINK_WIFI && v != LINK_P2P && v != LINK_BLE) {
+      // NEVER WRITTEN, which is the state of every device that predates this
+      // key -- including one that has been happily on Wi-Fi for months. Falling
+      // straight to BLE would move it off its own network the moment its owner
+      // chose AUTO, which is the opposite of what "auto" promises.
+      uint8_t l = p.getUChar("link", 0xFF);
+      if (l == LINK_WIFI || l == LINK_P2P) v = l;
+    }
+    p.end();
+    if (v == LINK_WIFI || v == LINK_P2P) return (MateTransport)v;
+    return LINK_BLE;              // the cordless default, and the cheap one
+  }
+
   static void storeTransport(MateTransport t) {
     Preferences p;
-    if (p.begin(NET_NS, false)) { p.putUChar("link", (uint8_t)t); p.end(); }
+    if (p.begin(NET_NS, false)) {
+      p.putUChar("link", (uint8_t)t);
+      // Remember the radio behind an explicit choice, so a later switch to AUTO
+      // returns to it rather than to a default the user never picked.
+      if (t == LINK_BLE || t == LINK_WIFI || t == LINK_P2P)
+        p.putUChar("radio", (uint8_t)t);
+      p.end();
+    }
   }
+
   static const char *transportName(MateTransport t) {
     switch (t) {
-      case LINK_BLE: return "ble";
-      case LINK_P2P: return "p2p";
-      default:       return "wi-fi";
+      case LINK_BLE:   return "ble";
+      case LINK_P2P:   return "p2p";
+      case LINK_CABLE: return "cable";
+      case LINK_AUTO:  return "auto";
+      default:         return "wi-fi";
     }
   }
 

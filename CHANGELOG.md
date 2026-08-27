@@ -12,6 +12,70 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
+### 2026-08-27 — Pick the connection on the device: auto, cable, bt, wifi, p2p
+
+Asked for directly: *"i want be able to switch it on device, like connection
+interface auto, bt, wifi, cable."* **SETTINGS → Connection.** GO cycles, a hold
+switches and restarts.
+
+- **`cable`** is new: both radios off, the USB link carries everything. It
+  already did in every other mode — config lines, token provisioning, the boot
+  `H` — so this mode does not start anything, it declines to.
+- **`auto`** is new and is a MODE, never an effective transport. It resolves once
+  at boot: a computer on the USB port means cable, otherwise the radio you last
+  chose explicitly. Resolved from `HWCDC::isPlugged()`, which is SOF-based, so a
+  wall charger is not mistaken for a Mac. The row shows what it picked —
+  `auto (cable)` — because the one mode whose job is deciding for you should say
+  what it decided.
+- **Cycling only previews.** Reaching the fourth option costs four presses and no
+  restarts, and walking away reverts.
+
+**The gate that makes this safe.** The `Link` row was deleted because one press
+moved a **credential-less** board onto Wi-Fi, which reboots into a portal that
+outranks the menu — hiding the row you would undo it with. Every other mode
+needs no configuration and cannot start that sequence, so the whole hazard is
+one question, and the cycle answers it: **Wi-Fi is not offered until the device
+knows a network.** With credentials, a failed join sits in `JOINING`, which does
+*not* outrank the menu, so the row is still there to switch back.
+
+The interesting work was not the row, it was the twenty-two places that branched
+on the transport. Every one read `transport == LINK_BLE ? ble : net` — "anything
+that is not BLE is Wi-Fi", true while there were two radios and still true when
+P2P arrived, because P2P *is* net. `cable` broke it: a cabled device would have
+been routed to a `MateNet` whose radio is deliberately off, reporting "wifi off
+- usb only" as its status and `connected() == false` for ever — a device that
+works perfectly, saying it does not. Three predicates (`linkUsesBle`,
+`linkUsesNet`, `linkIsCable`) now make each site say which case it means.
+
+Found by auditing the change rather than running it:
+
+- **`auto` could walk straight past its own gate.** Pick Wi-Fi while credentials
+  exist, wipe them later, and every boot resolves to a Wi-Fi transport with
+  nothing to join — into the exact portal the row refuses to send you to. The
+  gate belongs to the decision, not to the row that presents it.
+- **`auto` demoted existing Wi-Fi users to BLE.** The fallback read a key that no
+  device predating this change has, then defaulted to BLE — moving a board that
+  had been on Wi-Fi for months off its own network the moment its owner chose
+  "auto". It falls back to the stored transport first.
+- **A hold on an untouched row did nothing.** `K` is excluded from the alias to
+  `G` so it can commit, which made the first long press — the gesture every
+  other confirming row teaches — silently inert.
+- **Cable drew no link indicator at all.** An early return skipped the USB badge
+  that `drawLinkGlyph()` ends with, leaving a blank corner on the mode most
+  likely to be mistaken for "not working".
+- **A no-change commit skipped the reboot**, re-introducing the early return
+  `setTransport()` documents at length: the reboot IS the repair for a wedged
+  stack, and three places tell you to perform it by re-selecting the mode you
+  are already on.
+- **The NO LINK screen led with "no token" on the cable**, sending someone to run
+  pairing they do not need for a link that is already up. The token
+  authenticates a radio; cable has none.
+
+A build failure worth recording, because it names nothing that was edited:
+defining a function up beside the `SetRow` enum moved arduino-cli's generated
+prototypes above `struct LedStep`, and the error arrived 250 lines away as
+`'LedStep' does not name a type`.
+
 ### 2026-08-27 — Wi-Fi setup is a row on the device again
 
 Reported as a flat correction: *"hold boot its wrong it should be wifi setup

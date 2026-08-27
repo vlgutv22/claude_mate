@@ -308,8 +308,25 @@ static uint8_t pageIdx = 0;          // selected row within the page
 //     mis-press should not cost that.
 enum SetRow : uint8_t {
   SR_PAD, SR_SLEEP, SR_BRIGHT, SR_LED, SR_SOUND, SR_FLIP,
-  SR_WIFI, SR_ABOUT, SR_RESET, SR_COUNT
+  SR_CONN, SR_WIFI, SR_ABOUT, SR_RESET, SR_COUNT
 };
+
+// SR_CONN IS THE ROW THAT WAS DELETED, BROUGHT BACK WITH THE TRAP DESIGNED OUT.
+// The old `Link` toggle moved a cordless board onto Wi-Fi in one press; a board
+// with no credentials then rebooted into a portal that outranks the menu, so the
+// row you would undo it with was hidden behind the thing you needed to undo.
+// Cable or nothing.
+//
+// Three differences, and the first is the one that matters:
+//   * Wi-Fi IS NOT OFFERED unless credentials are stored (connCycle skips it),
+//     so the portal-lands-on-top sequence cannot start. Every other value --
+//     auto, cable, bt, p2p -- needs no configuration and cannot strand anything.
+//   * with credentials, a failed join sits in JOINING, which does NOT outrank
+//     the menu, so this row is still there to switch back.
+//   * cycling only previews; a hold commits. Walk away and it reverts.
+static MateTransport connPending = LINK_AUTO;   // what the row is showing
+static unsigned long connTouchedMs = 0;         // 0 = showing the live value
+
 // Which row is at the top of the visible window. Five rows fit and there are
 // more than five, so the page scrolls -- and the scrollbar in
 // drawSettingsPage() is what says the rest exist, since a cut list otherwise
@@ -787,11 +804,45 @@ static void drawRow(int16_t y, uint8_t size, const char *text, uint16_t colour) 
 // Everything above the wire asks these four questions and never which radio
 // answered. That is the same promise the device already made about USB versus
 // Wi-Fi -- "two transports, one protocol" -- extended to a third.
+// ASK WHAT THE TRANSPORT IS, NOT WHAT IT IS NOT. Every site here used to read
+// `transport == LINK_BLE ? ble : net`, which quietly means "anything that is not
+// BLE is Wi-Fi". That was true while there were two radios and stayed true when
+// P2P arrived, because P2P *is* net. LINK_CABLE broke it: a cabled device would
+// have been routed to a MateNet whose radio is deliberately off, so the glass
+// would have reported "wifi off - usb only" as its link status and `connected()`
+// would have been permanently false -- a device that works perfectly, saying it
+// does not. These three predicates make each site say which case it means.
+static bool linkUsesBle()   { return transport == LINK_BLE; }
+static bool linkUsesNet()   { return transport == LINK_WIFI
+                                  || transport == LINK_P2P; }
+static bool linkIsCable()   { return transport == LINK_CABLE; }
+
+// Is a computer actually on the other end of the cable? SOF-based, so a wall
+// charger does not count -- see the note on battUsbHost.
+static bool usbHostPresent() {
+#if ARDUINO_USB_MODE && ARDUINO_USB_CDC_ON_BOOT
+  return HWCDC::isPlugged();
+#else
+  // No CDC peripheral to ask, and `(bool)Serial` is TRUE unconditionally on a
+  // UART build -- which would make AUTO pick the cable on every boot, forever,
+  // including on a board across the room with nothing plugged into it. Better
+  // to answer "no host" and let AUTO fall to a radio that can actually reach
+  // something. This build ships CDCOnBoot=cdc, so it is the branch above.
+  return false;
+#endif
+}
+
 static bool linkConnected() {
-  return transport == LINK_BLE ? ble.connected() : net.connected();
+  // On the cable the link IS the USB port, and the honest question is whether
+  // a host is on it. There is no handshake to have completed: the daemon opens
+  // the port and starts talking.
+  if (linkIsCable()) return usbHostPresent();
+  return linkUsesBle() ? ble.connected() : net.connected();
 }
 static const char *linkStatusText() {
-  return transport == LINK_BLE ? ble.statusText() : net.statusText();
+  if (linkIsCable())
+    return usbHostPresent() ? "usb cable" : "cable - nothing plugged in";
+  return linkUsesBle() ? ble.statusText() : net.statusText();
 }
 
 // The name this device answers to on both BLE roles -- the status link and the
@@ -803,8 +854,13 @@ static const char *linkStatusText() {
 // Bring up whichever transport this build is configured for. Safe to call when
 // it is already up.
 static void linkStart() {
-  if (transport == LINK_BLE) ble.begin(DEVICE_BLE_NAME, net.token());
-  else                       net.restart();
+  // Cable starts nothing, and that is the mode, not an omission: the USB link
+  // is already up before this is ever called. Falling through to net.restart()
+  // would have raised the Wi-Fi stack on a device whose whole point is that
+  // both radios stay dark.
+  if (linkIsCable())    return;
+  if (linkUsesBle())    ble.begin(DEVICE_BLE_NAME, net.token());
+  else                  net.restart();
 }
 
 // Hand the radio to the HID gamepad.
@@ -843,7 +899,12 @@ static void drawBleGlyph(int16_t x, int16_t y, uint16_t col) {
 }
 
 static void drawLinkGlyph(int16_t x, int16_t y) {
-  if (transport == LINK_BLE) {
+  // Cable falls THROUGH to the USB badge at the bottom of this function --
+  // which is the correct indicator for it, and is the only one it has. An early
+  // return here (the first version of this) left cable mode as the single mode
+  // that drew no link indicator at all: a blank corner where every other mode
+  // says something, on the mode most likely to be mistaken for "not working".
+  if (linkUsesBle()) {
     // Lit when the daemon is on the other end, dim while the device is still
     // advertising into an empty room. USB stays the fallback badge either way:
     // a cabled device with no daemon on BLE is still perfectly usable.
@@ -892,7 +953,7 @@ static void drawBatteryChip(int16_t right, int16_t y) {
     // space. There is no equivalent on BLE -- a peripheral does not learn the
     // central's signal strength -- so that build simply leaves the corner empty
     // rather than inventing a number for it.
-    if (transport == LINK_BLE || !net.connected()) return;
+    if (!linkUsesNet() || !net.connected()) return;
     char buf[12];
     snprintf(buf, sizeof(buf), "%ddBm", (int)net.rssi());
     gfx->setTextSize(1);
@@ -1148,10 +1209,15 @@ static void drawLinkLost() {
   // shortest route from here: run it, then press GO on this device. A cable is
   // a dead end on a board sitting on its cell across the room, and the local
   // menu row is the long way -- an access point, a phone, a typed secret.
-  gfx->print(!net.hasToken()        ? "no token: claude-mate-connect"
-             : transport == LINK_BLE ? "check it is running with --ble"
-             : net.configured()      ? "check it is running with --tcp"
-                                     : "hold BOOT at power-on to set up wifi");
+  // CABLE IS TESTED BEFORE THE TOKEN, and the order is the point: the token
+  // authenticates a RADIO, and a device on the cable has no radio and needs no
+  // token. Leading with "no token" would send someone to run pairing they do
+  // not need, for a link that is already up.
+  gfx->print(linkIsCable()     ? "check the daemon is running"
+             : !net.hasToken() ? "no token: claude-mate-connect"
+             : linkUsesBle()   ? "check it is running with --ble"
+             : net.configured()? "check it is running with --tcp"
+                               : "SETTINGS > Wi-Fi setup to add a network");
   drawFooter(C_BAD);
 }
 
@@ -1368,6 +1434,37 @@ static void drawMenu() {
 }
 
 // One settings row: label left, value right in the accent colour.
+// DEFINED DOWN HERE, NOT BESIDE ITS VARIABLES. arduino-cli injects every
+// generated prototype just above the FIRST function definition in the .ino,
+// so a function defined up with the SetRow enum drags that insertion point
+// above `struct LedStep` -- and the prototype for startPattern(const LedStep*)
+// then names a type that does not exist yet. The build fails 250 lines from
+// anything that was edited.
+// auto -> cable -> bt -> wifi -> p2p -> auto, with wifi skipped when the device
+// has no network to join. Offering a value that reboots into a modal portal is
+// how the old row earned its removal.
+static MateTransport connCycle(MateTransport t) {
+  for (int i = 0; i < 6; i++) {
+    switch (t) {
+      case LINK_AUTO:  t = LINK_CABLE; break;
+      case LINK_CABLE: t = LINK_BLE;   break;
+      case LINK_BLE:   t = LINK_WIFI;  break;
+      case LINK_WIFI:  t = LINK_P2P;   break;
+      default:         t = LINK_AUTO;  break;
+    }
+    if (t != LINK_WIFI || net.configured()) return t;
+  }
+  return LINK_AUTO;
+}
+
+// What the row is offering right now: the previewed value while one is pending,
+// the stored mode otherwise. Deliberately the stored MODE and not the resolved
+// transport -- a device showing "cable" because AUTO resolved that way this boot
+// would be a row that lies about what it is set to.
+static MateTransport connShown() {
+  return connTouchedMs ? connPending : MateNet::storedTransport();
+}
+
 static void drawSetRow(uint8_t row, int16_t y, bool sel) {
   const char *label = "";
   const char *value = "";
@@ -1423,6 +1520,27 @@ static void drawSetRow(uint8_t row, int16_t y, bool sel) {
         vcol  = cfg.flipped() ? C_DONE : C_DIM;
       }
       break;
+    case SR_CONN: {
+      label = "Connection";
+      MateTransport shown = connShown();
+      if (connTouchedMs) {
+        snprintf(buf, sizeof(buf), "%s?", MateNet::transportName(shown));
+        value = buf;
+        vcol  = C_WAIT;
+      } else if (shown == LINK_AUTO) {
+        // Say what AUTO actually chose this boot, or the one mode whose whole
+        // job is deciding for you is the one that will not tell you what it
+        // decided.
+        snprintf(buf, sizeof(buf), "auto (%s)",
+                 MateNet::transportName(transport));
+        value = buf;
+        vcol  = C_DONE;
+      } else {
+        value = MateNet::transportName(shown);
+        vcol  = linkConnected() ? C_DONE : C_DIM;
+      }
+      break;
+    }
     case SR_WIFI:
       label = "Wi-Fi setup";
       // The STATE, not an arrow, for the reason SR_PAD gives: this row is the
@@ -1471,11 +1589,13 @@ static void drawSettingsPage() {
     gfx->fillRect(SCREEN_W - 3, thumbY, 2, thumbH, C_DIM);
   }
   gfx->setTextSize(1);
-  gfx->setTextColor(resetArmedMs ? C_ERROR : (wifiArmedMs ? C_WAIT : C_DIM));
+  gfx->setTextColor(resetArmedMs ? C_ERROR
+                    : (wifiArmedMs || connTouchedMs) ? C_WAIT : C_DIM);
   gfx->setCursor(PAD_X, MENU_HINT_Y);
-  gfx->print(resetArmedMs ? "hold GO to wipe wifi + token + settings"
-             : wifiArmedMs ? "hold GO to restart into wifi setup"
-                           : "PREV/NEXT row   GO select   4th back");
+  gfx->print(resetArmedMs   ? "hold GO to wipe wifi + token + settings"
+             : wifiArmedMs  ? "hold GO to restart into wifi setup"
+             : connTouchedMs? "GO cycles   hold GO to switch and restart"
+                            : "PREV/NEXT row   GO select   4th back");
 }
 
 // About: a readout, at size 1, because these are numbers you lean in for and
@@ -1489,7 +1609,9 @@ static void drawAboutPage() {
   // the signal" has no answer a peripheral can give. What it can say is which
   // radio it is on and whether the pad has taken it over -- which is what you
   // came to this page to find out on a device that is behaving oddly.
-  if (transport == LINK_BLE)
+  if (linkIsCable())
+    snprintf(rssiBuf, sizeof(rssiBuf), "usb  pad %s", cfg.pad() ? "on" : "off");
+  else if (linkUsesBle())
     snprintf(rssiBuf, sizeof(rssiBuf), "ble  pad %s", cfg.pad() ? "on" : "off");
   else if (net.connected())
     snprintf(rssiBuf, sizeof(rssiBuf), "%d dBm", net.rssi());
@@ -1512,7 +1634,7 @@ static void drawAboutPage() {
   snprintf(sleepBuf, sizeof(sleepBuf), "screen %s  led %s",
            cfg.hibLabel(), cfg.ledLabel());
 
-  const char *k[] = {"link", transport == LINK_BLE ? "mode" : "wifi",
+  const char *k[] = {"link", linkUsesNet() ? "wifi" : "mode",
                      "batt", "boot", "sleep", "fw"};
   const char *v[] = {
       linkStatusText(),
@@ -2252,10 +2374,13 @@ static bool handleConfigLine(char *line) {
       if (!a) return false;
       a++;
       MateTransport t;
-      if (!strcasecmp(a, "ble"))       t = LINK_BLE;
-      else if (!strcasecmp(a, "wifi")) t = LINK_WIFI;
-      else if (!strcasecmp(a, "p2p"))  t = LINK_P2P;
-      else { Serial.println("usage: I|WIFI, I|BLE or I|P2P"); return true; }
+      if (!strcasecmp(a, "ble"))        t = LINK_BLE;
+      else if (!strcasecmp(a, "wifi"))  t = LINK_WIFI;
+      else if (!strcasecmp(a, "p2p"))   t = LINK_P2P;
+      else if (!strcasecmp(a, "cable")) t = LINK_CABLE;
+      else if (!strcasecmp(a, "auto"))  t = LINK_AUTO;
+      else { Serial.println("usage: I|AUTO, I|CABLE, I|BLE, I|WIFI or I|P2P");
+             return true; }
       // SAY WHERE TO GO NEXT, before the reboot takes the console away. I|WIFI
       // at least leaves the device joining a network the user configured;
       // I|P2P brings up a network only this device knows the name of, and
@@ -2818,7 +2943,7 @@ static void menuButton(char ev) {
         case MI_CONDUCTOR: uiMode = UI_CONDUCTOR; break;
         case MI_SETTINGS:  uiMode = UI_PAGE; pageId = PG_SETTINGS; pageIdx = 0;
                            pageTop = 0; resetArmedMs = 0;
-                           wifiArmedMs = 0; break;
+                           wifiArmedMs = 0; connTouchedMs = 0; break;
         case MI_GAME:      uiMode = UI_GAME; game.open(); break;
         case MI_SLEEP:     cfg.flush();      // the deferred commit will not run
                            powerOff();       // never returns
@@ -2834,10 +2959,10 @@ static void menuButton(char ev) {
 
   if (ev == 'P') { pageIdx = (uint8_t)((pageIdx + SR_COUNT - 1) % SR_COUNT);
                    scrollToSelection(); resetArmedMs = 0;
-                   wifiArmedMs = 0; return; }
+                   wifiArmedMs = 0; connTouchedMs = 0; return; }
   if (ev == 'N') { pageIdx = (uint8_t)((pageIdx + 1) % SR_COUNT);
                    scrollToSelection(); resetArmedMs = 0;
-                   wifiArmedMs = 0; return; }
+                   wifiArmedMs = 0; connTouchedMs = 0; return; }
 
   // 'K' is GO's long press. On the three rows that only cycle a value it means
   // the same as 'G': LONGPRESS_MS is 500 ms, easy to overshoot, and a press that
@@ -2845,7 +2970,7 @@ static void menuButton(char ev) {
   // FLIP and RESET the long press keeps its own meaning -- it is the confirming
   // gesture -- so this is not a blanket alias.
   if (ev == 'K' && pageIdx != SR_FLIP && pageIdx != SR_RESET
-                && pageIdx != SR_WIFI) ev = 'G';
+                && pageIdx != SR_WIFI && pageIdx != SR_CONN) ev = 'G';
 
   if (ev == 'G') {                            // short press: change the value
     switch (pageIdx) {
@@ -2890,11 +3015,43 @@ static void menuButton(char ev) {
       // Same sentinel rule as above -- a stamp of 0 reads as "not armed".
       case SR_WIFI:   { unsigned long t = millis(); wifiArmedMs = t ? t : 1UL; }
                       break;
+      // PREVIEW, NOT APPLY. Every press moves to the next mode without doing
+      // anything; the hold below is what reboots. So cycling past three values
+      // to reach the fourth costs three presses, not three reboots.
+      case SR_CONN:   { connPending = connCycle(connShown());
+                        unsigned long t = millis();
+                        connTouchedMs = t ? t : 1UL; }
+                      break;
     }
     return;
   }
 
   if (ev == 'K') {                            // long press: confirm / commit
+    if (pageIdx == SR_CONN) {
+      // A HOLD ON AN UNTOUCHED ROW STARTS THE CYCLE rather than doing nothing.
+      // 'K' is excluded from the alias to 'G' above so the hold can commit, and
+      // the first consequence of that was a row where the very first long press
+      // -- the gesture every other confirming row in this menu teaches -- was
+      // silently inert. Now the first press does the same thing whichever way
+      // you make it.
+      if (!connTouchedMs) {
+        connPending = connCycle(connShown());
+        unsigned long t = millis();
+        connTouchedMs = t ? t : 1UL;
+        return;
+      }
+      MateTransport want = connPending;
+      connTouchedMs = 0;
+      // NO EARLY RETURN ON "no change", for the reason setTransport() spells
+      // out at length: a reboot is the documented repair for a stack that has
+      // wedged, and `I|BLE` on a device already set to BLE is how three places
+      // tell you to perform it. Skipping the work because the value matches
+      // would take that repair away from the one surface a cordless user has.
+      // Storing a value the device already holds is idempotent.
+      MateNet::storeTransport(want);
+      restartWithNotice("CONNECTION", MateNet::transportName(want));
+      return;                                 // never reached; restart reboots
+    }
     if (pageIdx == SR_WIFI && wifiArmedMs) {
       // Ask for the portal on the NEXT boot and go there now. Not
       // startPortalNow(): on a BLE device that would put a SoftAP up beside a
@@ -2953,6 +3110,7 @@ static void fourthTap() {
     if (pageId == PG_ABOUT) { pageId = PG_SETTINGS; pageIdx = SR_ABOUT;
                               scrollToSelection(); requestRender(); return; }
     uiMode = UI_MENU; resetArmedMs = 0; wifiArmedMs = 0;
+    connTouchedMs = 0;
     requestRender(); return;
   }
   // CONDUCTOR: open the ACTIONS sheet. This used to toggle the mirror directly;
@@ -3129,7 +3287,9 @@ static void pollPadButtons() {
 static void pollPadRadio() {
   if (uiMode != UI_PAD || padVia != PAD_BLE) return;
   blepad.poll();                            // re-advertise if the host went away
-  if (transport == LINK_BLE) return;
+  // Only a Wi-Fi stack gets parked for the pad. BLE shares one controller and
+  // is handled by linkParkForPad(); cable has no radio in the fight at all.
+  if (!linkUsesNet()) return;
 
   unsigned long now = millis();
   bool playing = (now - padLastInput) < PAD_PLAY_IDLE_MS;
@@ -3301,7 +3461,13 @@ void setup() {
   // hatch for a device whose config is wrong, and a device that could not be
   // reconfigured because of the setting you were trying to fix would be bricked
   // in every sense that matters to the person holding it.
-  transport = MateNet::storedTransport();
+  // RESOLVED, not just read. AUTO is a stored mode and never an effective
+  // transport, so this is the one place it turns into something the twenty-odd
+  // `transport == LINK_x` sites below can switch on. Resolved from isPlugged()
+  // rather than battUsbHost, which is only set by a battery poll that has not
+  // run yet -- reading it here would answer the question with the value it was
+  // initialised to, on every boot, which is exactly when it matters.
+  transport = MateNet::resolveTransport(usbHostPresent());
   // The portal is not the only way out of here on a BLE device, so it is
   // allowed to time out and hand the glass back. Without this a BOOT-held
   // portal on a cordless BLE board is a one-way door.
@@ -3311,6 +3477,13 @@ void setup() {
   net.setFallbackLink(transport != LINK_WIFI);
   if (forcePortal || transport == LINK_WIFI) {
     net.begin(forcePortal);
+  } else if (transport == LINK_CABLE) {
+    // The quiet mode: read the config so `?` and the token still work, then
+    // leave both radios alone. Nothing to start -- the USB link has been up
+    // since the host enumerated us, which is what makes this a mode at all
+    // rather than a way of being disconnected.
+    net.loadConfigOnly();
+    net.radioOff();
   } else if (transport == LINK_P2P) {
     // Our own AP, and nothing else: no STA, no join, no mDNS. Wi-Fi owns the
     // radio here exactly as it does for LINK_WIFI, so BLE must stay down --
@@ -3425,6 +3598,13 @@ void loop() {
     wifiArmedMs = 0;
     requestRender();
   }
+  // An un-confirmed connection preview reverts. A row left reading "wifi?" on a
+  // device that is still on BLE is a lie that survives until someone presses
+  // something, and the someone is usually not the person who left it there.
+  if (connTouchedMs && (now - connTouchedMs) >= RESET_ARM_MS) {
+    connTouchedMs = 0;
+    requestRender();
+  }
 
   // ---- pairing ------------------------------------------------------------
   // A daemon asked to enrol us. Raise the question on the glass; the buttons
@@ -3508,8 +3688,13 @@ void loop() {
     if (transport != LINK_WIFI && lastNetState == MateNet::SETUP &&
         ns != MateNet::SETUP) {
       net.shutdown();
-      if (transport == LINK_BLE) ble.begin(DEVICE_BLE_NAME, net.token());
-      else                       net.beginP2P();   // back to hosting our own AP
+      // ...and back to whatever this device actually is. `else beginP2P()` was
+      // right while the only non-Wi-Fi transports were BLE and P2P; a cabled
+      // device landing in that else would have come out of the portal hosting
+      // an access point nobody asked for.
+      if (linkUsesBle())      ble.begin(DEVICE_BLE_NAME, net.token());
+      else if (linkIsCable()) { /* radios stay off; the cable never left */ }
+      else                    net.beginP2P();      // back to hosting our own AP
       ns = net.state();                     // OFF (or HOSTING); see below
     }
     if (ns == MateNet::LINKED) {

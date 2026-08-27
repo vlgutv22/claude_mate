@@ -26,7 +26,7 @@ the glass. There is no second implementation to drift.
   claude-mate select <n|name> point at a row instead of stepping to it
   claude-mate accounts        the saved logins
   claude-mate accounts rm <name|n> delete one, after saying its name back
-  claude-mate link <wifi|p2p|ble>  move the cabled device to another transport
+  claude-mate link <auto|cable|ble|wifi|p2p>  the device's connection mode
   claude-mate trust           allow the TCP listener on the network you are on
   claude-mate trust --list    which networks it will listen on
   claude-mate daemon          start (or restart) the daemon via launchd
@@ -212,10 +212,13 @@ def cmd_press(name):
 
 
 LINKS = {
-    "wifi": "joins the network you configured, and reaches the daemon over it",
-    "p2p":  "the DEVICE becomes the access point and your Mac joins it -- no "
-            "router, no credentials, nothing else on the segment",
-    "ble":  "Bluetooth LE, no network at all",
+    "auto":  "the cable when a Mac is on the other end of it, otherwise the "
+             "radio you last chose. Decided at boot",
+    "cable": "USB only, both radios off -- the quiet mode for a docked device",
+    "ble":   "Bluetooth LE, no network at all",
+    "wifi":  "joins the network you configured, and reaches the daemon over it",
+    "p2p":   "the DEVICE becomes the access point and your Mac joins it -- no "
+             "router, no credentials, nothing else on the segment",
 }
 
 
@@ -230,7 +233,7 @@ def cmd_link(rest):
     between two readers.
     """
     if not rest or rest[0] in ("-h", "--help"):
-        print("usage: claude-mate link <wifi|p2p|ble>\n")
+        print("usage: claude-mate link <auto|cable|ble|wifi|p2p>\n")
         for name, what in LINKS.items():
             print(f"  {B}{name:5}{OFF} {D}{what}{OFF}")
         print(f"\n  {D}The device reboots into the new transport (~3 s). It is "
@@ -242,7 +245,7 @@ def cmd_link(rest):
     want = rest[0].strip().lower()
     if want not in LINKS:
         die(f"claude-mate link: unknown transport {rest[0]!r} "
-            f"(wifi, p2p or ble)")
+            f"({', '.join(LINKS)})")
     reply = talk(f"link|{want}")
     if reply is None:
         die(f"claude-mate: no daemon on {SOCK}\n"

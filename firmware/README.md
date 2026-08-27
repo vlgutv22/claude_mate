@@ -238,7 +238,8 @@ Or provision over USB serial:
 W|<ssid>|<password>   set Wi-Fi credentials
 S|<host>|<port>       set the daemon address (empty host = mDNS discovery)
 T|<token>             set the shared secret (must match the daemon's)
-I|WIFI  I|BLE  I|P2P  which radio carries the link (reboots into it)
+I|AUTO I|CABLE I|BLE  which link the device uses (reboots into it)
+I|WIFI I|P2P          ...wifi needs credentials stored first
 X|WIPE                clear all stored config
 R                     reboot
 Z                     start the setup portal now
@@ -345,7 +346,7 @@ spanning 260.
 | Item | What it does |
 |---|---|
 | **CONDUCTOR** | back to the triage view — the daemon's frame, unchanged since iteration 2 shipped |
-| **SETTINGS** | the nine rows below |
+| **SETTINGS** | the ten rows below |
 | **SHIP IT** | the platformer, played on a contribution graph. Runs on the device itself; the record survives a flat battery |
 | **SLEEP** | the same deep sleep the 2 s hold does, made discoverable |
 

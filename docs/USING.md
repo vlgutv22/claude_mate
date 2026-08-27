@@ -255,7 +255,7 @@ red/green-colourblind eye.
 Four items: **CONDUCTOR** (back to triage), **SETTINGS**, **SHIP IT** (a
 platformer that runs on the device), **SLEEP**.
 
-**SETTINGS** is nine rows:
+**SETTINGS** is ten rows:
 
 | Row | |
 |---|---|
@@ -265,6 +265,7 @@ platformer that runs on the device), **SLEEP**.
 | Alert LED | off · low · med · high — **off is genuinely dark** |
 | Mac sound | an alert sound *on the Mac*, since the device has no speaker |
 | Flip screen | applies on restart, and the row says so |
+| Connection | `auto` · `cable` · `bt` · `wifi` · `p2p`. GO cycles, hold GO switches and restarts. `wifi` is only offered once the device knows a network |
 | Wi-Fi setup | GO arms, hold GO to confirm — the device restarts into the setup portal so you can give it an SSID and password. The value says whether it already knows a network (`set` / `none`) |
 | About | which radio, whether it found the daemon, battery, boot cause, firmware |
 | Factory reset | wipes Wi-Fi, token **and** settings — asks twice, the second a long press |
@@ -293,9 +294,26 @@ can use exactly one at a time — the S3 has a single 2.4 GHz radio.
 
 | | what it needs | when to use it |
 |---|---|---|
-| `ble` | nothing | the default. A cordless device on a desk, no network involved |
+| `auto` | nothing | the cable when a Mac is on the other end, otherwise the radio you last chose. Decided at boot |
+| `cable` | a USB cable | both radios off. The quiet mode for a device that lives docked |
+| `ble` | nothing | a cordless device on a desk, no network involved |
 | `wifi` | the SSID and password of a network you and the Mac both trust | reach across a whole home or office |
 | `p2p` | **nothing** | Wi-Fi's range and speed where there is no network you can or want to join |
+
+**On the device:** SETTINGS → **Connection**. GO cycles through the modes — it
+only previews, so getting to the fourth option costs four presses and no
+restarts — and holding GO commits and reboots. Walk away without holding and it
+reverts to what it was.
+
+`wifi` is missing from that cycle until the device knows a network, and that is
+the safety gate rather than an oversight: a credential-less board switched to
+Wi-Fi reboots into the setup portal, and the portal outranks the menu, so the
+row you would undo it with would be hidden behind the thing you needed to undo.
+Use **Wi-Fi setup** first and `wifi` appears.
+
+`auto` is resolved once, at boot, from whether a computer is actually talking to
+the USB port — SOF frames, so a wall charger is not mistaken for a Mac. The row
+shows what it picked, e.g. `auto (cable)`.
 
 Switch with the cable plugged in:
 
