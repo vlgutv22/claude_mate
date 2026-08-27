@@ -647,8 +647,15 @@ check("no config verb restarts Wi-Fi without checking it is the live transport",
 
 # The escape hatch has to be an escape hatch in both directions: BOOT held at
 # power-on on a cordless BLE board opens a Wi-Fi portal it can never fill in.
+#
+# WIDENED FROM `== LINK_BLE` when P2P arrived, and the widening is the point:
+# the question this asks is "is there a link to fall back TO", and P2P is one
+# -- it needs no credentials, so a P2P device stuck in the portal is stranded
+# for exactly the same reason a BLE one is. Written as "anything that is not
+# Wi-Fi" rather than as a list, so a fourth transport inherits the right
+# answer instead of silently getting the wrong one.
 check("a device with another link says so, so the portal is allowed to expire",
-      "net.setFallbackLink(transport == LINK_BLE);" in ino)
+      "net.setFallbackLink(transport != LINK_WIFI);" in ino)
 check("...and the portal timeout honours it",
       re.search(r"if \(\(configured\(\) \|\| _fallbackLink\) &&",
                 netcfg))
