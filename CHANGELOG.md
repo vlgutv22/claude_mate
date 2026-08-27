@@ -12,6 +12,61 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
+### 2026-08-27 — Wi-Fi setup is a row on the device again
+
+Reported as a flat correction: *"hold boot its wrong it should be wifi setup
+option in settings."* The instruction was accurate for the firmware as it stood
+— there was no such row, and a test asserted there could not be one — but the
+instruction being accurate is not the same as the design being right. Teaching
+the device a network is an ordinary task, and "unscrew the case and hold BOOT
+while plugging it in" is not a route to one.
+
+**Why the old reasoning did not cover this.** The row was removed on the grounds
+that "pairing replaced the only reason it existed". That was about **tokens**,
+and it is still true of tokens — BLE enrolment provisions those. It never
+covered Wi-Fi **credentials**, which pairing cannot supply and which a device
+meant to live on your network has to learn from somewhere.
+
+- **SETTINGS → Wi-Fi setup.** GO arms, a hold confirms — the same gesture
+  Factory reset uses, because the portal outranks the menu for up to five
+  minutes and a mis-press should not cost that. The row's value says whether the
+  device already knows a network (`set` / `none`).
+- **It is not the row that was removed.** It does not touch the transport, so
+  one press still cannot move a cordless board onto Wi-Fi, and it reaches the
+  portal by **restarting into it** rather than raising a SoftAP beside a live
+  BLE stack — which could not be undone until the next power cycle, because BLE
+  cannot be re-initialised after a teardown in the same boot.
+- **The request is a one-shot, cleared before the portal opens**, so an
+  abandoned setup or a power cut mid-portal costs one ordinary boot rather than
+  a device that comes back into the portal for ever with the row that sent it
+  there hidden behind the screen it opened.
+
+Two bugs found by auditing the change rather than by running it:
+
+- **The one-shot was not one-shot.** `digitalRead(BOOT) == LOW || takePortalRequest()`
+  short-circuits, so the flag went unconsumed on any boot with BOOT held — and
+  on a bare devkit BOOT *is* GO, so the long press that confirms this very row
+  is still down when `setup()` runs. The portal would open, correctly, and then
+  open again on every boot after. Consumed on its own line now.
+- **A pad-on board reached the portal with a BLE HID stack live.** The gamepad
+  tail of `setup()` sits outside the transport branch, so a SoftAP and a HID
+  GATT server shared the one 2.4 GHz radio for the portal's whole life — and at
+  portal end the link service was grafted onto the pad's server, because
+  `BLEDevice::createServer()` returns a singleton. Reachable by BOOT-held today,
+  independent of the new row. A device dragged into setup is no longer a
+  gamepad for those minutes.
+
+Also fixed while in here: the SETUP-ended hand-back tested `transport ==
+LINK_BLE`, so a **P2P** device dragged through the portal came back with its
+radio off, hosting nothing, reachable only by rebooting. It asks the right
+question now — is this device something other than a Wi-Fi station — and returns
+a P2P device to hosting its own AP.
+
+The test that forbade the row now pins what kind of row it is instead: that it
+does not switch transports, does not open a portal in place, arms before it
+acts, and consumes its flag. Each of those was checked against a deliberately
+broken version first.
+
 ### 2026-08-27 — The listener only exists on networks you trust
 
 Asked plainly: *"the server on the mac should be super secure in case I

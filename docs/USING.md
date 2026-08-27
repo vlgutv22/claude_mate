@@ -255,7 +255,7 @@ red/green-colourblind eye.
 Four items: **CONDUCTOR** (back to triage), **SETTINGS**, **SHIP IT** (a
 platformer that runs on the device), **SLEEP**.
 
-**SETTINGS** is eight rows:
+**SETTINGS** is nine rows:
 
 | Row | |
 |---|---|
@@ -265,15 +265,24 @@ platformer that runs on the device), **SLEEP**.
 | Alert LED | off · low · med · high — **off is genuinely dark** |
 | Mac sound | an alert sound *on the Mac*, since the device has no speaker |
 | Flip screen | applies on restart, and the row says so |
+| Wi-Fi setup | GO arms, hold GO to confirm — the device restarts into the setup portal so you can give it an SSID and password. The value says whether it already knows a network (`set` / `none`) |
 | About | which radio, whether it found the daemon, battery, boot cause, firmware |
 | Factory reset | wipes Wi-Fi, token **and** settings — asks twice, the second a long press |
 
-**Nothing to do with Wi-Fi is on that menu**, deliberately. A radio switch one
-press away moved a cordless board onto Wi-Fi, and a board with no credentials
-then rebooted into a setup portal that outranks the menu — hiding the row you
-would have used to undo it. The switch lives behind a cable you have to
-physically have: `claude-mate link <wifi|p2p|ble>`, or `I|WIFI` / `I|BLE` /
-`I|P2P` typed at the USB console directly.
+**The transport switch is not on that menu**, deliberately, and Wi-Fi setup is
+not the same thing as the transport switch. A radio toggle one press away moved
+a cordless board onto Wi-Fi, and a board with no credentials then rebooted into
+a portal that outranks the menu — hiding the row you would have used to undo it.
+Changing *which radio carries the link* therefore lives behind a cable you have
+to physically have: `claude-mate link <wifi|p2p|ble>`, or `I|WIFI` / `I|BLE` /
+`I|P2P` at the USB console.
+
+**Wi-Fi setup** only teaches the device a network. It does not move the link
+onto it, so one press cannot strand a cordless board, and it reaches the portal
+by *restarting into it* rather than raising an access point beside a live BLE
+stack — which could not be undone until the next power cycle anyway. The request
+is a one-shot cleared before the portal opens, so an abandoned setup costs one
+boot rather than becoming permanent.
 
 ---
 

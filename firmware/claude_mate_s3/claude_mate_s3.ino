@@ -288,9 +288,27 @@ static uint8_t pageIdx = 0;          // selected row within the page
 // The portal itself still exists and is still reachable -- `Z` over USB, or BOOT
 // (or GO) held at power-on -- because a board whose BLE will not start needs
 // something, and both of those need physical access this menu does not.
+// THERE IS A Wi-Fi SETUP ROW AGAIN, AND IT IS NOT THE ROW THAT WAS REMOVED.
+// The two deleted rows were a TRANSPORT SWITCH and a TOKEN route. This is
+// neither. It does not touch the transport, so it cannot move a cordless board
+// onto Wi-Fi; it exists to type in an SSID and a password, which is the one
+// thing BLE enrolment cannot do for you and the reason the old justification --
+// "pairing replaced its only purpose" -- does not cover it. A device that wants
+// to live on your network has to learn your network from somewhere, and
+// "unscrew the case and hold BOOT while plugging it in" is not a route.
+//
+// Three things keep it out of the trap the Link row fell into:
+//   * it REBOOTS into the portal rather than opening one in place, so the
+//     SoftAP never contends with a live BLE stack (which could not be restarted
+//     afterwards in the same boot),
+//   * the request is a one-shot cleared before the portal opens, so an
+//     abandoned portal costs one boot and not the device,
+//   * arming with GO and confirming with a hold, the same gesture Factory reset
+//     uses, because the portal outranks the menu for up to five minutes and a
+//     mis-press should not cost that.
 enum SetRow : uint8_t {
   SR_PAD, SR_SLEEP, SR_BRIGHT, SR_LED, SR_SOUND, SR_FLIP,
-  SR_ABOUT, SR_RESET, SR_COUNT
+  SR_WIFI, SR_ABOUT, SR_RESET, SR_COUNT
 };
 // Which row is at the top of the visible window. Five rows fit and there are
 // more than five, so the page scrolls -- and the scrollbar in
@@ -310,6 +328,11 @@ static_assert(PAGE_ROWS_VIS >= 1, "the settings window needs at least one row");
 // way into wiping the token by accident. It disarms itself if you walk away.
 #define RESET_ARM_MS 6000UL
 static unsigned long resetArmedMs = 0;
+// The Wi-Fi setup row arms the same way and for a milder reason: the portal is
+// not destructive, but it outranks the menu for up to five minutes, so a
+// mis-press on a row next to About should not cost that. Same timeout, so both
+// confirmations behave identically under the thumb.
+static unsigned long wifiArmedMs = 0;
 // A daemon has asked to enrol this device (BLE E|?); the glass is showing the
 // question and the buttons are answering it. 0 = nothing pending. Times out on
 // its own, because a prompt left standing on a device nobody is near would be a
@@ -1400,6 +1423,15 @@ static void drawSetRow(uint8_t row, int16_t y, bool sel) {
         vcol  = cfg.flipped() ? C_DONE : C_DIM;
       }
       break;
+    case SR_WIFI:
+      label = "Wi-Fi setup";
+      // The STATE, not an arrow, for the reason SR_PAD gives: this row is the
+      // only place on the glass that can answer "does this thing know a
+      // network?", and that is the question you came to the row with.
+      if (wifiArmedMs)          { value = "HOLD GO"; vcol = C_WAIT; }
+      else if (net.configured()){ value = "set";     vcol = C_DONE; }
+      else                      { value = "none";    vcol = C_DIM; }
+      break;
     case SR_ABOUT:
       label = "About";
       value = "\x10";
@@ -1439,10 +1471,11 @@ static void drawSettingsPage() {
     gfx->fillRect(SCREEN_W - 3, thumbY, 2, thumbH, C_DIM);
   }
   gfx->setTextSize(1);
-  gfx->setTextColor(resetArmedMs ? C_ERROR : C_DIM);
+  gfx->setTextColor(resetArmedMs ? C_ERROR : (wifiArmedMs ? C_WAIT : C_DIM));
   gfx->setCursor(PAD_X, MENU_HINT_Y);
   gfx->print(resetArmedMs ? "hold GO to wipe wifi + token + settings"
-                          : "PREV/NEXT row   GO select   4th back");
+             : wifiArmedMs ? "hold GO to restart into wifi setup"
+                           : "PREV/NEXT row   GO select   4th back");
 }
 
 // About: a readout, at size 1, because these are numbers you lean in for and
@@ -2784,7 +2817,8 @@ static void menuButton(char ev) {
       switch (menuIdx) {
         case MI_CONDUCTOR: uiMode = UI_CONDUCTOR; break;
         case MI_SETTINGS:  uiMode = UI_PAGE; pageId = PG_SETTINGS; pageIdx = 0;
-                           pageTop = 0; resetArmedMs = 0; break;
+                           pageTop = 0; resetArmedMs = 0;
+                           wifiArmedMs = 0; break;
         case MI_GAME:      uiMode = UI_GAME; game.open(); break;
         case MI_SLEEP:     cfg.flush();      // the deferred commit will not run
                            powerOff();       // never returns
@@ -2799,16 +2833,19 @@ static void menuButton(char ev) {
   if (pageId != PG_SETTINGS) return;
 
   if (ev == 'P') { pageIdx = (uint8_t)((pageIdx + SR_COUNT - 1) % SR_COUNT);
-                   scrollToSelection(); resetArmedMs = 0; return; }
+                   scrollToSelection(); resetArmedMs = 0;
+                   wifiArmedMs = 0; return; }
   if (ev == 'N') { pageIdx = (uint8_t)((pageIdx + 1) % SR_COUNT);
-                   scrollToSelection(); resetArmedMs = 0; return; }
+                   scrollToSelection(); resetArmedMs = 0;
+                   wifiArmedMs = 0; return; }
 
   // 'K' is GO's long press. On the three rows that only cycle a value it means
   // the same as 'G': LONGPRESS_MS is 500 ms, easy to overshoot, and a press that
   // changed nothing because you held it a beat too long reads as a dead row. On
   // FLIP and RESET the long press keeps its own meaning -- it is the confirming
   // gesture -- so this is not a blanket alias.
-  if (ev == 'K' && pageIdx != SR_FLIP && pageIdx != SR_RESET) ev = 'G';
+  if (ev == 'K' && pageIdx != SR_FLIP && pageIdx != SR_RESET
+                && pageIdx != SR_WIFI) ev = 'G';
 
   if (ev == 'G') {                            // short press: change the value
     switch (pageIdx) {
@@ -2850,11 +2887,24 @@ static void menuButton(char ev) {
       // the row looked broken.
       case SR_RESET:  { unsigned long t = millis(); resetArmedMs = t ? t : 1UL; }
                       break;
+      // Same sentinel rule as above -- a stamp of 0 reads as "not armed".
+      case SR_WIFI:   { unsigned long t = millis(); wifiArmedMs = t ? t : 1UL; }
+                      break;
     }
     return;
   }
 
   if (ev == 'K') {                            // long press: confirm / commit
+    if (pageIdx == SR_WIFI && wifiArmedMs) {
+      // Ask for the portal on the NEXT boot and go there now. Not
+      // startPortalNow(): on a BLE device that would put a SoftAP up beside a
+      // live BLE stack, and taking BLE down to avoid that cannot be undone
+      // until a reboot anyway. See requestPortalOnBoot() in netcfg.h.
+      wifiArmedMs = 0;
+      MateNet::requestPortalOnBoot();
+      restartWithNotice("WI-FI SETUP", "join the AP shown");
+      return;                                 // never reached; restart reboots
+    }
     if (pageIdx == SR_RESET && resetArmedMs) {
       cfg.factoryResetAll();
       rebootAfterRelease();                   // never returns
@@ -2902,7 +2952,7 @@ static void fourthTap() {
     // the top-level strip would skip a level and lose your place in the list.
     if (pageId == PG_ABOUT) { pageId = PG_SETTINGS; pageIdx = SR_ABOUT;
                               scrollToSelection(); requestRender(); return; }
-    uiMode = UI_MENU; resetArmedMs = 0;
+    uiMode = UI_MENU; resetArmedMs = 0; wifiArmedMs = 0;
     requestRender(); return;
   }
   // CONDUCTOR: open the ACTIONS sheet. This used to toggle the mirror directly;
@@ -3227,7 +3277,21 @@ void setup() {
   // it is the most-pressed button on the device, and with pairing and USB
   // provisioning the portal is a last resort rather than a route. BOOT is on
   // the board, under the enclosure, which is the right amount of deliberate.
-  bool forcePortal = (digitalRead(PIN_BTN_BOOT) == LOW);
+  // ...OR THE SETTINGS ROW ASKED FOR IT. Same destination, reached without
+  // knowing that a button under the enclosure does something at power-on.
+  // takePortalRequest() consumes the flag here, before the portal opens, so an
+  // unfinished portal costs one boot rather than becoming permanent -- see the
+  // note on it in netcfg.h.
+  // CONSUMED FIRST, ON ITS OWN LINE, AND THE ORDER IS THE WHOLE POINT. Written
+  // as `digitalRead(...) == LOW || takePortalRequest()` the || short-circuits,
+  // so the flag is NOT consumed on any boot where BOOT happens to be held --
+  // and on a bare devkit BOOT is the only GO, so confirming this very row is a
+  // long press that is still down when setup() runs. The portal would open,
+  // correctly, and then open again on the next boot, and the next, with the
+  // row that set it hidden behind the screen it opened. A one-shot that is not
+  // consumed is not a one-shot.
+  bool portalAsked = MateNet::takePortalRequest();
+  bool forcePortal = (digitalRead(PIN_BTN_BOOT) == LOW) || portalAsked;
 
   // Which radio this boot is going to be. Read before either stack is touched,
   // because starting one and then discovering it was the wrong one means the
@@ -3281,7 +3345,16 @@ void setup() {
   //
   // Last in setup, after the panel and the settings are up, because entering
   // takes the link down and redraws the glass.
-  if (cfg.pad()) enterPad(true, PAD_BLE);
+  // ...BUT NOT INTO A PORTAL. This tail sits outside the transport branch
+  // above, so on a board whose gamepad switch is on it used to start a BLE HID
+  // stack while the SoftAP was already up -- both radios, plus a GATT server
+  // half HID and half link protocol, for the whole five minutes the portal can
+  // last. That is the contention every other path in this file goes out of its
+  // way to avoid, and it is reachable by exactly the person most likely to want
+  // the portal: someone whose pad will not pair. A device dragged into setup is
+  // not a gamepad for those few minutes; the switch is still in NVS and it
+  // comes back as one on the next boot.
+  if (cfg.pad() && !forcePortal) enterPad(true, PAD_BLE);
 }
 
 void loop() {
@@ -3346,6 +3419,10 @@ void loop() {
   // the battery percentage.
   if (resetArmedMs && (now - resetArmedMs) >= RESET_ARM_MS) {
     resetArmedMs = 0;
+    requestRender();
+  }
+  if (wifiArmedMs && (now - wifiArmedMs) >= RESET_ARM_MS) {
+    wifiArmedMs = 0;
     requestRender();
   }
 
@@ -3420,11 +3497,20 @@ void loop() {
     // never asked for would mean the Link row saying "ble" while the glass
     // showed an IP address, which is the sort of disagreement that costs an
     // evening.
-    if (transport == LINK_BLE && lastNetState == MateNet::SETUP &&
+    // ...AND THE SAME IS TRUE OF P2P, which this used to miss. The test was
+    // `transport == LINK_BLE`, written when BLE was the only thing the portal
+    // could strand. A P2P device also gets _fallbackLink, so its portal also
+    // times out into shutdown() -- and with no arm here it came back to a radio
+    // that was off, hosting nothing, with no way to its own AP but a reboot.
+    // The question is not "is this BLE", it is "is this device something other
+    // than a Wi-Fi station", because that is exactly who the portal borrowed
+    // the radio from.
+    if (transport != LINK_WIFI && lastNetState == MateNet::SETUP &&
         ns != MateNet::SETUP) {
       net.shutdown();
-      ble.begin(DEVICE_BLE_NAME, net.token());
-      ns = net.state();                     // OFF now; do not re-trigger below
+      if (transport == LINK_BLE) ble.begin(DEVICE_BLE_NAME, net.token());
+      else                       net.beginP2P();   // back to hosting our own AP
+      ns = net.state();                     // OFF (or HOSTING); see below
     }
     if (ns == MateNet::LINKED) {
       net.write("H");

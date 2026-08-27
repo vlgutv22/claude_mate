@@ -345,7 +345,7 @@ spanning 260.
 | Item | What it does |
 |---|---|
 | **CONDUCTOR** | back to the triage view — the daemon's frame, unchanged since iteration 2 shipped |
-| **SETTINGS** | the eight rows below |
+| **SETTINGS** | the nine rows below |
 | **SHIP IT** | the platformer, played on a contribution graph. Runs on the device itself; the record survives a flat battery |
 | **SLEEP** | the same deep sleep the 2 s hold does, made discoverable |
 

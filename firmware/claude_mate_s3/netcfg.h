@@ -369,6 +369,34 @@ class MateNet {
     }
   }
 
+  // ---- "open the portal after the next reboot" -----------------------------
+  // A ONE-SHOT, and the one-shot is the safety property. The settings row that
+  // sets this reboots immediately; setup() reads it and CLEARS IT BEFORE the
+  // portal opens, so a power cut with the portal on screen -- or a portal
+  // nobody finishes -- costs one ordinary boot, not a device that comes back
+  // into the portal forever with the row that set it hidden behind it.
+  //
+  // WHY A REBOOT AT ALL, rather than just calling startPortalNow(). The portal
+  // is a SoftAP, so it wants the 2.4 GHz radio that BLE is holding on a BLE
+  // device, and BLE cannot be brought back up after a teardown in the same boot
+  // (see blelink.h). Opening the portal in place would therefore cost the
+  // device its link until the next power cycle -- which is precisely the
+  // "one press, no way back" trap the Link row was removed for. Rebooting
+  // reaches the portal the same way BOOT-held does: instead of the other
+  // transport, never alongside it.
+  static void requestPortalOnBoot() {
+    Preferences p;
+    if (p.begin(NET_NS, false)) { p.putUChar("portal1", 1); p.end(); }
+  }
+  static bool takePortalRequest() {
+    Preferences p;
+    if (!p.begin(NET_NS, false)) return false;
+    bool want = p.getUChar("portal1", 0) == 1;
+    if (want) p.remove("portal1");           // consumed, whatever happens next
+    p.end();
+    return want;
+  }
+
   void wipe() {
     Preferences p;
     if (p.begin(NET_NS, false)) { p.clear(); p.end(); }
