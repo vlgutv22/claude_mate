@@ -973,6 +973,20 @@ class NetLink:
     def stop(self) -> None:
         self._stop_evt.set()
         if self._srv is not None:
+            # SHUTDOWN BEFORE CLOSE, and it is not belt-and-braces. close() on
+            # a listening socket does not wake a thread already blocked in
+            # accept() on Linux, and the kernel keeps the socket serving until
+            # that thread lets go -- so "the listener is closed" was true of our
+            # bookkeeping and false of the port for up to one accept timeout.
+            # For a control whose whole job is to shut the door when the Mac
+            # joins a network you do not trust, "closed in a moment" is not the
+            # same promise as "closed". shutdown() wakes the accept immediately;
+            # it is meaningless on a listening socket on some platforms, hence
+            # the guard rather than a check.
+            try:
+                self._srv.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             try:
                 self._srv.close()
             except OSError:
@@ -1315,8 +1329,53 @@ def _run_quiet(argv: List[str], timeout: float = 3.0) -> str:
     return out.stdout.decode("utf-8", "replace")
 
 
+# PROC FIRST, THEN THE BSD TOOLS. This is a macOS product, but the daemon is
+# plain Python that people run and test on Linux -- CI does, on every push --
+# and `route -n get default` is a BSD-ism that Linux's route(8) does not
+# understand. It failed the way an unparseable answer always does: silently, as
+# "no gateway", which the gate correctly read as "unidentifiable network" and
+# correctly refused to listen on. Correct, and completely useless: the wireless
+# link simply never came up, with a security feature quietly holding the door.
+# Reading /proc costs no subprocess at all, so it is also the faster path where
+# it exists.
+def _gateway_from_proc() -> Optional[str]:
+    """Linux: the default route's gateway from /proc/net/route, or None."""
+    try:
+        with open("/proc/net/route", encoding="ascii") as fh:
+            next(fh, None)                       # header
+            for line in fh:
+                parts = line.split()
+                if len(parts) < 3 or parts[1] != "00000000":
+                    continue                     # not the default route
+                # Little-endian hex, so 010011AC is 172.17.0.1.
+                raw = int(parts[2], 16)
+                if not raw:
+                    continue
+                return ".".join(str((raw >> (8 * i)) & 0xFF) for i in range(4))
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _mac_from_proc(gw: str) -> Optional[str]:
+    """Linux: the gateway's MAC from /proc/net/arp, or None if not cached."""
+    try:
+        with open("/proc/net/arp", encoding="ascii") as fh:
+            next(fh, None)                       # header
+            for line in fh:
+                parts = line.split()
+                if len(parts) >= 4 and parts[0] == gw:
+                    return normalise_mac(parts[3])
+    except OSError:
+        pass
+    return None
+
+
 def default_gateway() -> Optional[str]:
     """The default route's gateway IP, or None when there is no route at all."""
+    gw = _gateway_from_proc()
+    if gw:
+        return gw
     for line in _run_quiet(["route", "-n", "get", "default"]).splitlines():
         line = line.strip()
         if line.startswith("gateway:"):
@@ -1334,6 +1393,9 @@ def current_network_id() -> Optional[str]:
     gw = default_gateway()
     if not gw:
         return None
+    from_proc = _mac_from_proc(gw)
+    if from_proc:
+        return from_proc
     # `arp -n 192.168.68.1` -> "? (192.168.68.1) at 60:32:b1:1a:ee:40 on en0 ..."
     # ...or "? (192.168.68.1) -- no entry" when the cache is cold, which is not
     # an error: it happens for a second or two after joining, and the caller

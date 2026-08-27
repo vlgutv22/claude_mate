@@ -173,7 +173,14 @@ print("\n-- phase 0: --tcp with no token generates one --")
 tmp = tempfile.mkdtemp(prefix="cm-net-")
 port_gen = free_port()
 gen_token_path = os.path.join(tmp, "generated", "token")
+# THE GATE IS OFF FOR THESE PHASES, ON PURPOSE. Everything below tests the
+# LINK -- handshake, framing, fan-out, reconnect -- and none of it is about
+# which network the daemon is willing to listen on. Left on, every check here
+# would depend on the ARP cache of whatever box CI happens to run on, which is
+# a flake, not a test. The gate has its own tests further down, with the
+# fingerprint stubbed so they assert the policy rather than the network.
 env = dict(os.environ)
+env["CLAUDE_MATE_TRUST_ANY"] = "1"
 env["CLAUDE_MATE_SOCK"] = os.path.join(tmp, "gen.sock")
 env["CLAUDE_MATE_PORT"] = "/dev/null/nope"      # never opens; that is fine
 env["CLAUDE_MATE_TOKEN"] = ""
@@ -275,6 +282,7 @@ with open(token_file, "w") as fh:
     fh.write(TOKEN + "\n")          # exercise the token-FILE path, not just env
 
 env = dict(os.environ)
+env["CLAUDE_MATE_TRUST_ANY"] = "1"          # see the note in phase 0
 env["CLAUDE_MATE_SOCK"] = hook_sock
 env["CLAUDE_MATE_PORT"] = slave_name
 env["CLAUDE_MATE_TOKEN_FILE"] = token_file
@@ -651,6 +659,22 @@ def _reachable(port):
         return False
 
 
+def _closed(port, timeout=3.0):
+    """Poll until the port refuses connections. True if it got there.
+
+    NOT an instant assertion. stop() shuts the listening socket down before
+    closing it precisely so this is prompt, but "prompt" still crosses a thread
+    and a kernel: on Linux the accept loop has to notice. Asserting closure in
+    the same microsecond tests the scheduler, not the gate.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _reachable(port):
+            return True
+        time.sleep(0.05)
+    return False
+
+
 # current_network_id() shells out to route/arp. On a CI box with no default
 # route it returns None, which is itself a state worth pinning -- but the
 # trusted/untrusted transitions need a STABLE id, so stub it.
@@ -666,7 +690,7 @@ _gate = _cmd.NetworkGate(_gnet, None, poll_s=0.2)
 open(_trust_file, "w").close()
 _gate.evaluate()
 check("an untrusted network gets no listener at all",
-      not _reachable(_gate_port))
+      _closed(_gate_port))
 
 with open(_trust_file, "w") as fh:
     fh.write("aa:bb:cc:00:11:22 home\n")
@@ -677,7 +701,7 @@ with open(_trust_file, "w") as fh:
     fh.write("99:99:99:99:99:99 somewhere-else\n")
 _gate.evaluate()
 check("...moving to an untrusted network closes it again",
-      not _reachable(_gate_port))
+      _closed(_gate_port))
 
 # THE REGRESSION THIS EXISTS FOR: stop() sets _stop_evt and start() did not
 # clear it, so the listener came back bound, listening and attached to an
@@ -688,7 +712,7 @@ _gate.evaluate()
 check("...and coming home opens it a SECOND time (restartable)",
       _serving(_gate_port))
 _gnet.stop()
-check("...and stop() really closes it", not _reachable(_gate_port))
+check("...and stop() really closes it", _closed(_gate_port))
 
 # No file at all = first run. Adopt once, so an upgrade cannot disconnect a
 # device that worked yesterday -- never worse than the old listen-everywhere.
@@ -720,7 +744,7 @@ _et = threading.Thread(target=_egate.run, daemon=True)
 _et.start()
 time.sleep(0.5)
 _egate.stop()
-check("a gate that raises fails closed", not _reachable(_err_port))
+check("a gate that raises fails closed", _closed(_err_port))
 _enet.stop()
 
 _cmd.current_network_id = _real_netid
