@@ -12,4 +12,4 @@ pyserial>=3.5
 # that started, stopped crash-looping, looked fixed -- and left a BLE device
 # with nothing to connect to, because the transport had quietly logged
 # "Continuing without BLE" and carried on.
-bleak>=0.22
+bleak>=3.0.2
