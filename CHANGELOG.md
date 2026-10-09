@@ -12,6 +12,48 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
+### 2026-10-09 — The two readings survive their own audit
+
+The two fixes below were handed to adversarial reviewers before anything was
+built on them, with Claude Code 2.1.295's render code to check against. They
+broke both, every time with a real frame through the real wrapper.
+
+- **Watching a run in its detail view read DONE after 100 s.** Every dialog
+  draws a full-width rule, and the wrapper took that rule for the prompt box —
+  so "no prompt box, hold indefinitely" never happened, and the hidden-row
+  countdown ran instead. Help, shell mode and the "/" list did the same with
+  the box still up. The wrapper now recognises Claude's **normal prompt footer**
+  (two rules with the input line between them, the ordinary hint row under
+  them) and holds for as long as anything else has it out of view; with that
+  footer back and still no row, the run really is gone, and the hold lets go
+  after 20 s instead of 90.
+- **A custom theme read a running run as completed** — the original bug, at
+  the turn's end. A running row's bullet is not uncoloured: Claude draws it in
+  the theme's dimmed colour, grey in the built-in themes but a tinted grey in
+  Dracula- or Nord-style ones, which the hue rule called "success". A bullet the
+  colour of its own name is now running, whatever the hue.
+- **A retired banner came back.** "Seen to end" had included rows that were
+  merely out of view long enough; now only an outcome on screen settles them.
+- **Error phrases in coloured text that is not an error** — a code block's red
+  string literals, a diff's Monokai-yellow strings, the spinner's task text in
+  Claude's orange, a failed command's red output, an agent's description —
+  still read ERR. A phrase now counts only where it **opens** a row, as every
+  error row Claude draws does, and an old error row stops counting once you
+  have submitted another prompt (the regression: "You've hit your" kept a
+  recovered session on ERR for five exchanges).
+- **With Claude's colour off** (`NO_COLOR`, `TERM=dumb`) every error above the
+  prompt box was missed; the rule now drops the colour test when the screen has
+  none. The other limit rows 2.1.295 can end a turn with ("You're out of usage
+  credits", "You've reached your … limit", …) join the strong list.
+- Smaller: two runs with one name kept resetting each other's clock; Claude's
+  narrowest paused row ("⏸ name", amber) counts again, told from the mode
+  indicator by its colour; the box's labelled top rule ("── ultracode ─") put
+  the line you are typing into the transcript, where "↓ 600.8k tokens" read as
+  live work; a 300-digit token count no longer throws.
+
+Each of these is a case in `tools/test_workflow_rows.py` or
+`tools/test_error_colour.py`, and each failed against the previous commit.
+
 ### 2026-10-09 — A reply that mentions an error is not an error
 
 Reported with a screenshot minutes after the entry below: *"device saying its

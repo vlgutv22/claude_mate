@@ -123,14 +123,6 @@ NOT_ROWS = [
     ("a bar followed by prose", f"  ◯ {NAME}  ▰▰▱▱▱▱▱▱  and then some words"),
     ("a bar followed by an unknown segment", f"  ◯ {NAME}  ▰▰▱▱▱▱▱▱  2/5 · soon"),
     ("indented one column too far", f"   ◯ {NAME}  ▰▰▱▱▱▱▱▱  2/5"),
-    # The hint row's permission-mode indicator draws the paused glyph too. A ⏸
-    # line therefore needs the word "paused" -- which costs the narrowest
-    # paused row, the name alone, and buys never reading a mode as a workflow.
-    ("the plan-mode indicator (same ⏸ glyph)", "  ⏸ plan mode on (shift+tab to cycle) · ← for agents"),
-    ("the default-mode indicator", "  ⏸ manual mode on (shift+tab to cycle)"),
-    ("a mode indicator with the chip after it",
-     "  ⏸ plan mode on (shift+tab to cycle) · 1 shell · ← for agents · ↓ to manage"),
-    ("a paused row cut down to its name (given up, see above)", f"  ⏸ {NAME}"),
 ]
 for what, line in NOT_ROWS:
     got = cmw.parse_wf_row(line)
@@ -325,6 +317,104 @@ w.observe(live, True, 0.0)
 check("settled: a live row on screen -> not settled", w.settled is False)
 w.observe([(R("2m44s"), "success")], True, 5.0)
 check("settled: the row turned green -> settled", w.settled is True)
+
+# --------------------------------------------------------------------------- #
+# 5. The footer around the rows, as Claude 2.1.295 really draws it
+# --------------------------------------------------------------------------- #
+# Claude draws dimmed text in the theme's "inactive" colour, not with SGR 2, so
+# these frames do too: a running row's bullet and name are the same grey.
+print("\nbare ⏸ lines: a paused run, or the mode indicator?")
+GREY = "\x1b[38;2;153;153;153m"                # dark theme "inactive"
+TEAL = "\x1b[38;2;72;150;140m"                 # dark theme "planMode"
+for line in ("  ⏸ plan mode on (shift+tab to cycle) · ← for agents",
+             "  ⏸ manual mode on (shift+tab to cycle)", f"  ⏸ {NAME}"):
+    got = cmw.parse_wf_row(line)
+    check(f"parses structurally, marked bare: {line.strip()[:40]}", bool(got and got["bare"]), str(got))
+plan = f"  {TEAL}⏸ plan mode on (shift+tab to cycle){OFF}{GREY} · ← for agents{OFF}"
+check("the plan-mode indicator (glyph and words one colour) is not a run",
+      state([], hint=plan) == "idle")
+check("...nor the manual-mode indicator in grey",
+      state([], hint=f"  {GREY}⏸ manual mode on (shift+tab to cycle){OFF}") == "idle")
+bare = f"  {AMBER}⏸ {OFF}{GREY}{NAME}{OFF}"
+check("Claude's narrowest paused row (amber ⏸, grey name) is a paused run", state([bare]) == "working")
+check("...the same line with no colour to go on is not trusted",
+      cmw.detect_state(frame([f"  ⏸ {NAME}"])[0])[0] == "idle")
+
+print("\na running row's colour is its NAME's colour, in any theme")
+for theme, ink in (("built-in grey", GREY), ("Dracula comment", "\x1b[38;2;98;114;164m"),
+                   ("Nord", "\x1b[38;2;76;86;106m"), ("Tokyo Night", "\x1b[38;2;86;95;137m")):
+    run = f"  {ink}◯ {OFF}{ink}{NAME}{OFF}  {ink}{'▱' * 20}{OFF}  {ink}0/5 · 2m39s · ↓ 542.8k tokens{OFF}"
+    done_ = f"  {GREEN}◯ {OFF}{ink}{NAME}{OFF}  {'▰' * 20}  {ink}5/5 · 3m02s · ↓ 611.4k tokens{OFF}"
+    check(f"{theme}: running (bullet = name colour) -> working", state([run]) == "working", state([run]))
+    check(f"{theme}: completed (green bullet) -> idle", state([done_]) == "idle", state([done_]))
+
+print("\nrows hidden by a dialog, help, shell mode or a suggestion list")
+LIVE = [f"  {GREY}◯ {OFF}{GREY}{NAME}{OFF}  {'▱' * 20}  0/5 · 2m39s · ↓ 542.8k tokens"]
+
+
+def held(hidden_lines, seconds):
+    """Rows live at t=0, then `hidden_lines` (a whole screen) for `seconds`."""
+    w = cmw.WorkflowWatch()
+    state(LIVE, w, now=0.0)
+    out = []
+    for t in range(1, seconds + 1):
+        scr = pyte.Screen(110, len(hidden_lines) + 2)
+        pyte.ByteStream(scr).feed("\r\n".join(hidden_lines).encode())
+        d = scr.display
+        out.append(cmw.detect_state("\n".join(d), cmw.wf_bullet_colours(scr, d), w, float(t))[0])
+    return out
+
+
+TRANS = ["⏺ Launched the sweep; I will report back."]
+long_ = int(cmw.WorkflowWatch.GONE_S) * 4
+DETAIL = TRANS + ["", "─" * 104, " deployment-risk-sweep-3802",
+                  " Sweep deployment risk                          0/5 agents · 2m49s",
+                  "", "❯ 1 Find      0/5", "",
+                  " ↑↓ select · x stop workflow · p pause · esc back · s save"]
+check("the workflow's own detail view (one rule, no prompt box): working throughout",
+      set(held(DETAIL, long_)) == {"working"})
+HELP = TRANS + [RULE, "❯ ", RULE, "  ! for shell mode         double tap esc to clear input",
+                "  / for commands           shift+tab to auto-accept edits",
+                "  @ for file paths         ctrl+o for verbose output"]
+check("help ('?') in the panel's place: working throughout", set(held(HELP, long_)) == {"working"})
+SHELL = TRANS + [RULE, "! git log --oneline -20 | grep", RULE, "  ! for shell mode"]
+check("shell mode ('!'): working throughout", set(held(SHELL, long_)) == {"working"})
+SLASH = TRANS + [RULE, "❯ /", RULE, "  /workflows      Show dynamic workflow runs",
+                 "  /tasks          List and manage background tasks"]
+check("the '/' suggestion list: working throughout", set(held(SLASH, long_)) == {"working"})
+GONE = TRANS + [RULE, "❯ ", RULE, HINT]
+after = held(GONE, int(cmw.WorkflowWatch.GONE_S) + 2)
+check("the normal footer back with no row: released after GONE_S",
+      after[0] == "working" and after[-1] == "idle", str(after))
+w = cmw.WorkflowWatch()
+state(LIVE, w, now=0.0)
+for t in range(1, long_):
+    state([], w, now=float(t))
+check("a hold that ran out is NOT 'seen to end' (a banner it names stays true)", w.settled is False)
+
+print("\nthe prompt box, told from a dialog")
+for name_, lines, want in (
+        ("a plain box", ["⏺ hi", RULE, "❯ ", RULE, HINT], True),
+        ("a box whose top rule carries a label", ["⏺ hi", "─" * 60 + " ultracode ─", "❯\xa0", RULE, HINT], True),
+        ("one rule (a dialog's header)", ["⏺ hi", RULE, " deployment-risk-sweep-3802", " 0/5 agents · 2m49s"], False),
+        ("shell mode", ["⏺ hi", RULE, "! ls", RULE, "  ! for shell mode"], False),
+        ("help in the panel's place", ["⏺ hi", RULE, "❯ ", RULE, "  / for commands    ctrl+z to suspend"], False),
+        ("exit-confirm", ["⏺ hi", RULE, "❯ ", RULE, "  Press Ctrl-C again to exit"], False)):
+    check(f"prompt_footer_up: {name_}", cmw.prompt_footer_up(lines) is want)
+labelled = ["⏺ Anything else?", "─" * 60 + " ultracode ─", "❯\xa0why does the footer say ↓ 600.8k tokens?",
+            RULE, HINT]
+check("a labelled top rule keeps the line you type out of the transcript (idle)",
+      cmw.detect_state("\n".join(labelled))[0] == "idle")
+
+print("\nodd rows that must not throw")
+check("a 300-digit token count is not a row (and no OverflowError)",
+      cmw.parse_wf_row("  ◯ x  ▱  ↓ " + "9" * 297 + "t") is None)
+w = cmw.WorkflowWatch()
+same = [(dict(R("3m02s"), done=2, total=5), "error"), (dict(R("1m10s"), done=1, total=5), "error")]
+w.observe(same, True, 0.0)
+w.observe(same, True, cmw.WF_FROZEN_S + 1)
+check("two red rows with the SAME name both settle once their clocks stop",
+      [st for _r, st in w.rows] == ["F", "F"] and w.active is False, str(w.rows))
 
 print("\n================", "ALL PASSED" if not fails else f"{fails} FAILED", "================")
 sys.exit(1 if fails else 0)

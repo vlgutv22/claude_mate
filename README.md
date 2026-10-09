@@ -908,18 +908,22 @@ must **persist a couple of seconds** before it reports — so a config dialog yo
 open and dismiss (the `/effort` or `/model` slider, whose footer is
 `… · Esc to cancel`) no longer alerts the instant you open it.
 
-**An error phrase counts only in an error colour.** The bottom 20 lines are
-mostly conversation, and a reply that merely *mentions* "api error" used to put
-the device on ERR. Claude Code draws every error it reports in a colour — an
-API-error row (`⏺ API Error: 529 …`, or `⏺ You've hit your 5-hour limit ·
-resets 3pm`) in the warning colour, the live retry line's error in the error
-colour — and its replies, quoted logs and the line you type in the plain text
-colour. So above the prompt box an `error` / `error_footer` phrase counts only
-where it starts on an error- or warning-coloured cell, read off the emulator in
-every theme; below it, in Claude's own chrome, it is a plain substring as
-before. A grey *notice* ("Usage limit reached · continuing automatically at
-3pm") is a notice, not an error: the warning-coloured limit row above it is
-what reads ERR.
+**An error phrase counts only where Claude's own error UI would put it.** The
+bottom 20 lines are mostly conversation, and a reply that merely *mentions*
+"api error" used to put the device on ERR. Claude Code's error rows **open**
+with the phrase, right after their glyph (`⏺ API Error: 529 …`,
+`⎿  You've hit your 5-hour limit · resets 3pm`, `✻ API error · Retrying in 5s ·
+attempt 1/10`), and are drawn in its warning or error colour; a reply, a quoted
+log, the line you type, a code block's red string literals, a diff's yellow
+ones, the spinner's task text and a failed command's red output all have the
+phrase somewhere else on the row. So a phrase counts only where it opens a row;
+above the prompt box it must also start on an error- or warning-coloured cell —
+read off the emulator, in every theme — and still be **current**: once you
+submit another prompt, an old error row is behind you. Below the prompt box, in
+Claude's own chrome, opening a row is enough. A grey *notice* ("Usage limit
+reached · continuing automatically at 3pm") is a notice, not an error: the limit
+row above it is what reads ERR. With Claude's colour off (`NO_COLOR`,
+`TERM=dumb`) there is no colour to ask for, and the rest of the rule stands.
 
 **Background work is not tunable there — and deliberately so.** A turn can end
 while a dynamic workflow, background agents, a backgrounded shell, a monitor or
@@ -954,16 +958,21 @@ about 30 seconds, clock frozen — and the status is the bullet: no colour while
 it runs, green once it completed, red once it failed or was stopped (or, while
 its clock still ticks, when one agent failed and the run goes on), amber with ⏸
 while it waits out a usage limit. So the wrapper reads the bullet's colour off
-the emulator's cells, in every theme Claude ships, and counts the row only while
-it is live; with no colour to read, a clock that has stopped settles it. A row
-that **vanishes** while still live was hidden, not finished — a run always shows
-its outcome first — so the reading holds while a menu or a dialog covers the
-panel, and lets go 90 s after the prompt is back without it. Once a row has been
-seen to end, a *"Waiting for 1 dynamic workflow"* banner that names nothing else
-stops counting too: a run you stop yourself prints no completion line, and that
-banner used to hold the session on WORK for good. The hint row's mode indicator
-draws the same ⏸ glyph as a paused run (`⏸ plan mode on`), so a ⏸ row needs the
-word *paused* after its name.
+the emulator's cells and counts the row only while it is live. A running row's
+bullet is not uncoloured: Claude draws it, and the name beside it, in the
+theme's dimmed colour — grey in the built-in themes, anything in a custom one —
+so a bullet the colour of its own name is running, and only a bullet coloured
+apart from it carries a status. With no colour to read at all, a clock that has
+stopped settles it. A row that **vanishes** while still live was hidden, not
+finished — a run always shows its outcome first: the reading holds for as long
+as a dialog (the workflow's own detail view among them), help, shell mode or a
+suggestion list has Claude's normal prompt footer out of view, and lets go 20 s
+after that footer is back without the row. Once a row has been *seen* to end, a
+*"Waiting for 1 dynamic workflow"* banner that names nothing else stops counting
+too: a run you stop yourself prints no completion line, and that banner used to
+hold the session on WORK for good. The hint row's mode indicator draws the same
+⏸ glyph as a paused run (`⏸ plan mode on`); only a paused run's bullet is amber
+apart from its name, and that is what tells them apart.
 
 Three guards come with it. A to-do left `in progress` in the task panel is
 **not** counted — it is a plan item, not a running task, and keying off it would
@@ -1096,9 +1105,13 @@ claude_mate/
   tweak — which you can do live, no restart. Two readings also depend on
   **colour** — an error phrase above the prompt box, and a dynamic workflow's
   status — classified by hue, which holds in the six themes Claude Code ships. A
-  terminal that strips colour loses both: a workflow's finished row then holds
-  WORK for its ~30 s linger, and an error Claude prints above the prompt box no
-  longer reads ERR (one in the footer still does).
+  **custom theme** whose error or warning colour is not a red-to-yellow hue
+  (blue, purple, a near-grey pastel) loses the error reading above the prompt
+  box. With Claude's **colour off** altogether the error rule falls back to the
+  row's shape alone, and a workflow's finished row holds WORK through its ~30 s
+  linger. And from the **third retry attempt** on, Claude's retry line names the
+  raw error ("529 Overloaded") rather than a phrase, so a long outage reads WORK,
+  not ERR, until the turn gives up.
 - **The wireless link is authenticated, not encrypted.** The handshake is
   nonce/HMAC and the token never crosses the wire, but the session itself is
   **plaintext** — so session names, states and, with the mirror open, raw
