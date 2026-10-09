@@ -395,6 +395,83 @@ CASES = [
      '⏺ Which of these should I stop?\n'
      + BOX + '\n❯ kill the 3 shells and the 2 monitors\n' + BOX + '\n'
      '  ⏵⏵ bypass permissions on · ? for shortcuts', "idle"),
+
+    # ---- dynamic workflows: the footer row is the live tell ----------------- #
+    # Reported: "workflow not done but device saying its done". The turn that
+    # launched the workflow had ended; the hint-row chip never names a LOCAL
+    # workflow and no "Waiting for 1 dynamic workflow" banner was printed, so
+    # the frame read idle and the daemon buzzed DONE one minute into the run.
+    # Verbatim rows (Claude Code 2.1.295); only the conversation is shortened.
+    ("captured: turn over, workflow still running, no banner (the reported DONE)",
+     '⏺ I created the branch feat/workflow-status, and the five design critics\n'
+     '  are reviewing the spec.\n'
+     + BOX + ' ultracode ─\n❯\xa0\n' + BOX + '\n'
+     '  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n'
+     '\n'
+     '  ◯ workflow-status-design-revi…  ▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  0/5 · 1m01s · ↓ 491.6k tokens',
+     "working"),
+    ("captured: a turn in progress with the same workflow row under it",
+     '✢ Frosting… (49s · ↓ 3.4k tokens)\n'
+     '  ⎿ \xa0Tip: Use /permissions to pre-approve and pre-deny bash, edit, and MCP tools\n'
+     + BOX + ' ultracode ─\n❯\xa0\n' + BOX + '\n'
+     '  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents\n'
+     '\n'
+     '  ◯ workflow-status-design-revi…  ▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  0/5 · 2m09s · ↓ 600.8k tokens',
+     "working"),
+    # The row degrades as the terminal narrows -- done/total goes first, the bar
+    # never does -- and every width must still read as a running workflow.
+    ("workflow row at 72 columns (no done/total, no 'tokens')",
+     '⏺ Launched the sweep.\n' + BOX + '\n❯\n' + BOX + '\n'
+     '  ⏵⏵ bypass permissions on · ? for shortcuts\n'
+     '  ◯ deployment-risk-sweep-3802  ▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  2m39s · ↓ 542.8k', "working"),
+    ("workflow row at 50 columns (the bar alone)",
+     '⏺ Launched the sweep.\n' + BOX + '\n❯\n' + BOX + '\n'
+     '  ⏵⏵ bypass permissions on · ? for shortcuts\n'
+     '  ◯ deployment-risk-sweep-3802  ▰▰▱▱▱▱▱▱', "working"),
+    ("workflow row on Ghostty (█░ bar), selected with the arrow keys",
+     '⏺ Launched the sweep.\n' + BOX + '\n❯\n' + BOX + '\n'
+     '  enter to view · x to stop\n'
+     '❯ ◯ deployment-risk-sweep-3802  ████████░░░░░░░░░░░░  2/5 · 1m05s · ↓ 98.8k tokens',
+     "working"),
+    ("workflow paused on a usage limit is still in flight",
+     '⏺ Launched the sweep.\n' + BOX + '\n❯\n' + BOX + '\n'
+     '  ⏵⏵ bypass permissions on · ? for shortcuts\n'
+     '  ⏸ nightly-triage  paused · usage limit resets at 3:30pm', "working"),
+    # The row is a name the user or the model chose, in the bottom lines the
+    # error/waiting windows scan: it must never be read as Claude's own words.
+    ("a running workflow named after an API error reads working, not error",
+     '⏺ Launched the fix.\n' + BOX + '\n❯\n' + BOX + '\n'
+     '  ⏵⏵ bypass permissions on · ? for shortcuts\n'
+     '  ◯ fix the api error  ▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  1/4 · 45s · ↓ 12.0k tokens', "working"),
+    # Only Claude's chrome can say it: the same text anywhere else is not a run.
+    ("idle, a workflow row QUOTED in the conversation above the prompt box",
+     '⏺ The footer showed:\n'
+     '  ◯ deployment-risk-sweep-3802  ▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  0/5 · 2m39s · ↓ 542.8k tokens\n'
+     + BOX + '\n❯\n' + BOX + '\n'
+     '  ⏵⏵ bypass permissions on · ? for shortcuts', "idle"),
+    ("idle, a workflow row pasted into the line you are TYPING",
+     '⏺ Anything else?\n'
+     + BOX + '\n❯ ◯ deployment-risk-sweep-3802  ▱▱▱▱▱▱▱▱  0/5 · 2m39s\n' + BOX + '\n'
+     '  ⏵⏵ bypass permissions on · ? for shortcuts', "idle"),
+    # The permission-mode indicator in the hint row draws the paused glyph (⏸)
+    # too. Read as a paused workflow it would hold every plan-mode session on
+    # WORK for good -- and strip the real hint row out of the idle gate.
+    ("idle, the plan-mode hint row is not a paused workflow",
+     '⏺ Here is the plan.\n' + BOX + '\n❯\xa0\n' + BOX + '\n'
+     '  ⏸ plan mode on (shift+tab to cycle) · ← for agents', "idle"),
+    ("idle, the default-mode indicator is not one either",
+     '⏺ Done.\n' + BOX + '\n❯\xa0\n' + BOX + '\n'
+     '  ⏸ manual mode on (shift+tab to cycle) · ? for shortcuts', "idle"),
+    ("a real paused workflow under a plan-mode hint row still reads working",
+     '⏺ Here is the plan.\n' + BOX + '\n❯\xa0\n' + BOX + '\n'
+     '  ⏸ plan mode on (shift+tab to cycle) · ← for agents\n'
+     '\n'
+     '  ⏸ nightly-triage  paused · usage limit resets at 3:30pm', "working"),
+    ("idle, an agent row is not a workflow row (no bar after the name)",
+     '⏺ All done.\n' + BOX + '\n❯\n' + BOX + '\n'
+     '  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents · ↓ to manage\n'
+     '  ⏺ main\n'
+     '  ◯ Explore  50% faster builds            12s · ↓ 7.5k tokens', "idle"),
 ]
 
 fails = 0

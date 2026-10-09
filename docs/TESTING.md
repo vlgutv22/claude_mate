@@ -78,6 +78,23 @@ python3 tools/test_detect.py          # the wrapper's screen scrape: which rende
                                       # must STOP reading working once it finishes
                                       # (real captured frames) (needs pyte)
 
+python3 tools/test_workflow_rows.py   # a dynamic workflow's footer row: every
+                                      # layout Claude draws (widths, Ghostty, paused,
+                                      # selected) and the lines that only look like
+                                      # one; its bullet colour in all six themes as
+                                      # pyte reports it; ANSI frames through a real
+                                      # pyte screen (running reads working, a
+                                      # finished row lingering reads idle); and the
+                                      # frozen-clock and hidden-row memory (needs pyte)
+
+python3 tools/test_error_colour.py    # an error phrase counts only in Claude's error
+                                      # colours above the prompt box: a reply that
+                                      # MENTIONS "api error" reads idle, a real
+                                      # warning-coloured API-error row (four themes /
+                                      # colour depths) and the red retry line read
+                                      # error, a limit notice in the chrome still does
+                                      # (needs pyte)
+
 python3 tools/test_hook_state.py      # the hook's wire line per Stop payload —
                                       # incl. "the turn ended but work is still in
                                       # flight" reporting working instead of done

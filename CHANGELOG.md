@@ -12,6 +12,82 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
+### 2026-10-09 — A reply that mentions an error is not an error
+
+Reported with a screenshot minutes after the entry below: *"device saying its
+error"*. The reply on screen explained that fix — including the words *"the api
+error"* — and the strong error phrases are matched in the bottom 20 lines, which
+are mostly conversation. Any reply about an API, or a log quoted near the bottom,
+could do the same.
+
+- **Claude's own errors are coloured; its prose is not.** In 2.1.295's render
+  code an API-error row is drawn in the warning colour, glyph and text, and the
+  live retry line's error in the error colour; a reply, a quoted log and the line
+  you type are in the plain text colour. Above the prompt box an `error` /
+  `error_footer` phrase now counts only where it starts on an error- or
+  warning-coloured cell, read off the emulator (`colour_phrases`), with wide
+  characters mapped to their cells. Below the prompt box — Claude's chrome, where
+  its limit notices live — and with no colours to go on, a substring as before.
+- **`you've hit your` joins the strong list.** It is how 2.1.295 ends a turn on
+  a limit (*"You've hit your 5-hour limit · resets 3pm"*); `usage limit reached`
+  now only appears on the retry line, which still reads ERR, and on the grey
+  auto-continue *notice*, which on its own no longer does.
+
+`tools/test_error_colour.py` runs real ANSI frames through pyte: the reported
+reply reads idle (and, read as text alone, the ERR that was reported); API-error
+rows in four themes and colour depths, the red retry line and the limit row read
+error.
+
+### 2026-10-09 — A workflow that is still running no longer reads DONE
+
+Reported flatly, with a screenshot of the running row under the prompt: *"issue
+workflow not done but device saying its done"*. The turn that launched a
+dynamic workflow had ended; the workflow had a minute behind it and five agents
+in flight; the device buzzed DONE.
+
+- **Why nothing caught it.** Claude Code 2.1.287+ leaves local workflows out of
+  the hint-row chip that names every other kind of background work, and the
+  *"Waiting for 1 dynamic workflow to finish"* banner is not always printed — it
+  was not, here. That left the workflow's own row under the hint row as the only
+  thing on screen saying the session was busy, and the wrapper did not read it.
+- **The wrapper now reads it** — below the prompt box only, in every layout
+  Claude draws: the three bar widths and the bar alone, Ghostty's `█░`, the
+  screen reader's `NN%`, the selected row's `❯`, a usage-limit pause's `⏸`.
+- **By colour, because its text cannot say.** A finished row stays up about 30
+  seconds with its clock frozen and reads exactly like a running one; the
+  status is the bullet. No colour = running, amber = paused on a usage limit
+  (both keep the session working), green = completed (does not). Red means
+  failed or stopped — or one agent failed and the run goes on — so a red row
+  counts until its clock stops, and "stops" is judged at the clock's own
+  resolution (`2m39s` ticks every second, `1h02m` every minute). The colours
+  are classified by hue, which holds in all six themes as truecolor, 256-colour
+  and ANSI-named, including the colour-blind ones whose "success" is blue.
+- **A row that vanishes while live was hidden, not finished** — a run always
+  shows its outcome first. The reading holds while a dialog covers the prompt,
+  and lets go 90 s after the prompt is back without a row (a run paused from
+  `/workflows` drops its row while still live). With no colour to read at all,
+  a clock that has stopped settles a row the same way a frozen red one does.
+- **A run you stop no longer leaves WORK behind.** Stopping prints no
+  completion line, so a *"Waiting for 1 dynamic workflow to finish"* banner stayed
+  Claude's last word and held the session on WORK indefinitely. Once the row
+  has been seen to end, a banner that names only workflows stops counting; one
+  that also names an agent still does (an agent finishing prints a line).
+- **Not every ⏸ is a paused run.** The hint row's permission-mode indicator
+  draws the same glyph — `⏸ plan mode on (shift+tab to cycle)` — and, read as a
+  paused workflow, would have held every plan-mode session on WORK and pulled
+  the real hint row out of the idle gate. A ⏸ row now needs the word *paused*
+  after its name. Found by the design review before this shipped.
+- **The rows are taken out of the other windows.** They are names the user or
+  the model chose, sitting in the bottom lines the error and picker phrases are
+  matched in — a run named after "the api error" read ERROR — and a stack of
+  them pushed `? for shortcuts` out of the footer window, and the idle gate
+  with it.
+
+The reported frame is a fixture in `tools/test_detect.py`, beside a live capture
+of the same session; it failed against the unfixed wrapper, and so did the
+narrow, Ghostty, selected, paused and "api error" variants. The colour path runs
+through a real pyte screen in the new `tools/test_workflow_rows.py`.
+
 ### 2026-08-27 — Pick the connection on the device: auto, cable, bt, wifi, p2p
 
 Asked for directly: *"i want be able to switch it on device, like connection

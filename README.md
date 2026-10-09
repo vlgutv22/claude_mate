@@ -269,7 +269,7 @@ You can drive the daemon from **either or both** of these — mix freely:
 | Path | What it is | What it can see |
 |------|-----------|-----------------|
 | **(a) Claude Code hooks** | `hooks/claude-status.sh`, wired to `UserPromptSubmit` / `Notification` / `Stop` / `StopFailure`. Fire-and-forget; never blocks or fails a turn. | Turn boundaries: started, needs-input, finished OK, finished on error — plus the **background work Claude reports on `Stop`** (`background_tasks` entries whose own `status` is still in flight, plus one-shot `session_crons`), so a turn that ends with work still running reports `working`, not a premature DONE — while a task listed as already finished is not counted, because the next `Stop` that would correct it may never come. Works in the VS Code extension and the CLI. |
-| **(b) PTY wrapper** `bin/claude-mate-wrap` | Run `claude` *through* a wrapper (`alias claude=claude-mate-wrap`). It forks a pseudo-terminal, relays stdin/stdout transparently, and mirrors the TUI into a headless terminal emulator to read the **live screen**. | Everything on screen the hooks can't report: the spinner, **API errors/retries**, **permission prompts**, interactive option-pickers, and every **background-work** tell — the *"Waiting for N dynamic workflow to finish"* banner, the turn recap's *"· 1 shell still running"* suffix and the **live in-flight chip** in the hint row — i.e. it knows a session is **still busy after the turn "ends"**, including work that is only queued, and knows when it has stopped being busy. |
+| **(b) PTY wrapper** `bin/claude-mate-wrap` | Run `claude` *through* a wrapper (`alias claude=claude-mate-wrap`). It forks a pseudo-terminal, relays stdin/stdout transparently, and mirrors the TUI into a headless terminal emulator to read the **live screen**. | Everything on screen the hooks can't report: the spinner, **API errors/retries**, **permission prompts**, interactive option-pickers, and every **background-work** tell — the *"Waiting for N dynamic workflow to finish"* banner, the turn recap's *"· 1 shell still running"* suffix, the **live in-flight chip** in the hint row and a **dynamic workflow's own row** under it — i.e. it knows a session is **still busy after the turn "ends"**, including work that is only queued, and knows when it has stopped being busy. |
 
 The wrapper is the more capable feed (true live state, plus terminal focus); the
 hooks are the zero-dependency feed. Use whichever fits each session.
@@ -908,11 +908,24 @@ must **persist a couple of seconds** before it reports — so a config dialog yo
 open and dismiss (the `/effort` or `/model` slider, whose footer is
 `… · Esc to cancel`) no longer alerts the instant you open it.
 
+**An error phrase counts only in an error colour.** The bottom 20 lines are
+mostly conversation, and a reply that merely *mentions* "api error" used to put
+the device on ERR. Claude Code draws every error it reports in a colour — an
+API-error row (`⏺ API Error: 529 …`, or `⏺ You've hit your 5-hour limit ·
+resets 3pm`) in the warning colour, the live retry line's error in the error
+colour — and its replies, quoted logs and the line you type in the plain text
+colour. So above the prompt box an `error` / `error_footer` phrase counts only
+where it starts on an error- or warning-coloured cell, read off the emulator in
+every theme; below it, in Claude's own chrome, it is a plain substring as
+before. A grey *notice* ("Usage limit reached · continuing automatically at
+3pm") is a notice, not an error: the warning-coloured limit row above it is
+what reads ERR.
+
 **Background work is not tunable there — and deliberately so.** A turn can end
 while a dynamic workflow, background agents, a backgrounded shell, a monitor or
 an MCP task keep going, and the session must stay `working` until they finish
 (otherwise the device buzzes DONE mid-flight and then shows IDLE for work that
-is still running). Claude renders four tells for it, and the wrapper matches
+is still running). Claude renders five tells for it, and the wrapper matches
 them with **structural regexes** in code, because a substring loose enough to
 catch them would fire on ordinary prose:
 
@@ -921,7 +934,8 @@ catch them would fire on ordinary prose:
 | Banner | `✻ Waiting for 2 background agents and 1 dynamic workflow to finish` | Turn end; also matched when it **wraps** in a narrow terminal |
 | Turn recap suffix | `✻ Crunched for 1m 56s · 1 shell still running` | Turn end, for work the banner doesn't name |
 | Task-panel counter | a dim, right-aligned *`N` in background* | The same fact on Claude's task panel |
-| **In-flight chip** (hint row) | `⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage` | **Everything, including queued work and scheduled loops.** Read only *below the prompt box*, where neither the conversation nor the line you are typing can reach |
+| **In-flight chip** (hint row) | `⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage` | **Everything except a dynamic workflow, including queued work and scheduled loops.** Read only *below the prompt box*, where neither the conversation nor the line you are typing can reach |
+| **Workflow row** (under the hint row) | `◯ deployment-risk-sweep  ▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  2/5 · 2m39s · ↓ 542.8k tokens` | **A dynamic workflow** — the one kind of work the chip leaves out, and once its turn has ended often the only tell on screen. Read below the prompt box, with its bullet's **colour** |
 
 **The first three are transcript text, so they expire.** Claude prints them
 once and never rewrites them — a recap still reads *"1 shell still running"*
@@ -933,6 +947,23 @@ anything that supersedes it (`⏺ Background command … completed (exit code 0)
 chip needs no such gate — it lives in Claude's live chrome and disappears on its
 own. Verified against two 200-second recordings of real sessions, one per tell;
 the frames are the fixtures in `tools/test_detect.py`.
+
+**A workflow row says what state it is in only with colour.** Its text is the
+same whether the run is going or finished — Claude keeps a finished row up for
+about 30 seconds, clock frozen — and the status is the bullet: no colour while
+it runs, green once it completed, red once it failed or was stopped (or, while
+its clock still ticks, when one agent failed and the run goes on), amber with ⏸
+while it waits out a usage limit. So the wrapper reads the bullet's colour off
+the emulator's cells, in every theme Claude ships, and counts the row only while
+it is live; with no colour to read, a clock that has stopped settles it. A row
+that **vanishes** while still live was hidden, not finished — a run always shows
+its outcome first — so the reading holds while a menu or a dialog covers the
+panel, and lets go 90 s after the prompt is back without it. Once a row has been
+seen to end, a *"Waiting for 1 dynamic workflow"* banner that names nothing else
+stops counting too: a run you stop yourself prints no completion line, and that
+banner used to hold the session on WORK for good. The hint row's mode indicator
+draws the same ⏸ glyph as a paused run (`⏸ plan mode on`), so a ⏸ row needs the
+word *paused* after its name.
 
 Three guards come with it. A to-do left `in progress` in the task panel is
 **not** counted — it is a plan item, not a running task, and keying off it would
@@ -1062,7 +1093,12 @@ claude_mate/
 - **Detection is screen-scrape-based (wrapper).** State is inferred from the
   rendered TUI using `patterns.json`. It is scoped to the live status region to
   avoid false positives, but unusual terminal themes/locales may need a pattern
-  tweak — which you can do live, no restart.
+  tweak — which you can do live, no restart. Two readings also depend on
+  **colour** — an error phrase above the prompt box, and a dynamic workflow's
+  status — classified by hue, which holds in the six themes Claude Code ships. A
+  terminal that strips colour loses both: a workflow's finished row then holds
+  WORK for its ~30 s linger, and an error Claude prints above the prompt box no
+  longer reads ERR (one in the footer still does).
 - **The wireless link is authenticated, not encrypted.** The handshake is
   nonce/HMAC and the token never crosses the wire, but the session itself is
   **plaintext** — so session names, states and, with the mirror open, raw
