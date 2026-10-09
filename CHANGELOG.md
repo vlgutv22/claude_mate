@@ -12,6 +12,172 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
+### 2026-10-09 — The device shows a running workflow, not just WORK
+
+Asked for once the entries below had the wrapper reading a workflow's row, with
+a screenshot of one: *"after updates device and deamon reporting what satuses
+exaple [screenshot of a running workflow footer row] if its sych scenarion it
+means we can display workflows status as well on our device update deamon and
+firmaware"*. The row said `0/5 · 2m39s · ↓ 542.8k tokens`; all the device
+could say was `WORK` and how long the session had been in it. Everything you
+would walk back to the terminal to read was already on the screen the wrapper
+scrapes.
+
+- **The wrapper sends what the row says.** The rows it already reads to keep a
+  session on WORK now also go to the daemon, as field 8 of the socket line: up
+  to three workflows (one that has just ended first, then the running ones),
+  each with its status — `R` running, `E` running with a failed agent, `P`
+  paused on a usage limit, `D` completed, `F` ended — done/total or the bar's
+  percentage, the run's clock, its tokens, a usage-limit note cut to fit
+  (`til 3:30pm`, `til Oct 11 3pm`) and the name.
+  Empty keeps what the daemon has; `-` clears it. The wrapper now always sends
+  nine fields, and sanitises the session name like the rest: a `|` in a
+  directory name used to shift every field after it.
+- **No new traffic.** A change of shape — a status, a count, a name — sends at
+  once; the clock and the tokens ride the 20 s keepalive that was already there,
+  and the daemon runs the clock in between. The wrapper sends the clock as it
+  stands *now*, not as it last read it, so a run past an hour, whose text ticks
+  once a minute, is not reported a minute behind. No refresh timer and no new
+  environment variable: every timing is a module constant.
+- **The daemon keeps it per session, and never lets it touch the state.** A
+  workflow never changes a session's state, its time in state, its
+  acknowledgement or the LED: the DONE you acknowledge is still the session's.
+  A wrapper's running record goes stale 90 s after the last line that listed
+  it, so a crashed wrapper cannot leave a run on the glass. A finished one stays
+  at most 60 s, and a hidden tombstone stops the next keepalive from bringing it
+  back for another minute — without it a finished run would flap for as long as
+  Claude kept its row. The run's clock is anchored so that it never steps back
+  when a scrape lags. One log line per start or finish
+  (`workflow: aladdin "deployment-risk-sweep-3802" R -> D`), never one per
+  keepalive.
+- **`J|`, and bit2 of `F|` to gate it.** `J|<st>|<done>|<failed>|<total>|<info>|<name>`
+  carries the counts the bar is drawn from, the name, and an info string the
+  daemon has already laid out: the most of done/total, the clock in Claude's
+  own units (`2m39s`, `1h02m` — never `10:23`, which could be ten hours or ten
+  minutes), tokens (`543k`) and `+N` that fits 14 characters. **J because W, T
+  and S belong to the S3's USB config console**, where `W|<ssid>|<password>`
+  would have written a workflow's name over the Wi-Fi credentials. Seven
+  fields, frozen; the firmware accepts one grammar and nothing else, and rejects
+  a name with a `|` in it, which can only be the next line spliced on through a
+  lost newline.
+- **`F|` is the commit.** A `J|` is only staged; the `F|` behind it makes it
+  visible, the way `M|END` commits a mirror page. The daemon writes the `J|`
+  before every frame that carries bit2, writes that `F|` whether it changed or
+  not, rewrites the pair every second or so while the band is up, and puts a
+  `J|-` ahead of a different session's `J|` — so a lost `J|` costs a second or
+  two of band instead of leaving the wrong one up for a whole usage-limit
+  pause, and never puts one session's band under another's name. Device
+  sockets on TCP have Nagle off, so the `F|` does not wait behind its `J|` for
+  an ACK.
+- **The Nano** trades r2 for the band while it is up: a bar with the info
+  right-aligned (`2/5 2m39s 543k`), a `!` after a shorter bar while an agent has
+  failed, and `paused`, `done` or `ended` where a bar would say nothing. Model,
+  effort and the limit chip come back when the band goes.
+- **The S3** draws it under the fleet strip, in the link line's place: the name
+  and a status word in the state colours it already uses, a bar with one
+  segment per agent when they fit, and the info at row size. A dropped link
+  still shows, in place of the name. Firmware `s3-2.3`.
+- **Nothing blinks, nothing alerts.** On this device a blink means an
+  unacknowledged alert that GO clears, and a usage-limit pause can last until a
+  weekly reset with nothing to acknowledge — so a paused run is a hollow amber
+  bullet and a word, not a flash. A running workflow does not keep the S3's
+  screen awake either.
+- **Old firmware is untouched.** Both builds ignore `J|` and bit2, and r2 still
+  carries model, effort and limit, so a device that is never reflashed looks
+  exactly as it did. The *same information model* rule in the docs now names
+  the band as its one exception.
+- **`--mock`** walks one demo session through running, an agent failing,
+  paused, done and ended, then clears it, re-sending at every step so nothing
+  goes stale.
+- **`claude-mate status`** prints a sub-line per workflow under its session,
+  its clock and tokens written as the band writes them, and the `queue` JSON
+  gives every session a `workflows` list.
+
+New tests: `tools/test_workflow_daemon.py` — field 8, staleness, the linger and
+its tombstone, the clock, the primary record, the `J|`/`F|` order and the
+commit, bit2's gating, `H`, the queue JSON — and `tools/test_workflow_fw.py`,
+pure Python first, so the two byte-identical copies of `workflow.h` and their
+caps are checked even without a compiler, then `tools/wf_harness.cpp` built for
+both the Nano's name size and the S3's. `tools/test_workflow_rows.py` gains the
+wire records; `tools/test_wrapper.py` a fake Claude frame whose workflow arrives
+in field 8, and then `-`; `tools/test_net_link.py` the pair over TCP and Nagle
+off; `tools/test_cli.py` and `tools/test_app.py` the sub-lines — their clock
+and tokens held to the daemon's own, and no line of the app wider than an
+80-column terminal.
+[`docs/PROTOCOL.md`](docs/PROTOCOL.md) has `J|`, field 8 and the per-session
+model.
+
+Found by review before it shipped — the real wrapper around a fake Claude, a
+real daemon on a private socket, and both firmwares' headers built on the host:
+
+- **A finished band blinked off and on.** The wrapper sent `-` for finished
+  rows the moment anything covered them — the dialog of the turn Claude starts
+  on a completion, or a single half-redrawn frame — and each return reached the
+  daemon as a new ending, with a fresh ten seconds and a fresh minute. Finished
+  rows are now held behind a dialog or a menu, and for ~1.5 s with the footer
+  up and no row drawn; `-` goes only once Claude has really dropped them.
+- **A fourth run hid an ending.** The three records went out running-first in
+  screen order, so a run finishing beside three running ones never reached the
+  daemon as done, and an older finished one came back later announced as the
+  one that had just ended. A run that ended in the last ten seconds now goes
+  first, then the running ones, then the other finished ones, most recent first
+  — so the band follows at most three runs per session, and `+N` stops at `+2`.
+  And the daemon spotlights only an end it saw: a record that arrives already
+  finished lingers, but never takes the band from a running one.
+- **A prompt of eight lines or more hid the rows.** The wrapper took the tall
+  input box for the prompt footer being away, so a run that finished under it
+  read `running`, its clock counting, until the prompt shrank.
+- **A lost `J|` could show another session's band** — for a second, or for up
+  to a minute when nothing on the glass changed, because the pair went out only
+  when something in it did. Now it goes again whenever the last one is a second
+  old, and a `J|-` ahead of a different session's `J|` makes a lost one cost no
+  band rather than the wrong one.
+- **`paused … paused`.** A paused band with nothing else to say got its own
+  word as the info, beside the word both devices draw. A paused, finished or
+  ended band with no numbers now has an empty info (or `+N`); `running` keeps
+  the word, which the Nano does not draw.
+- **`claude-mate status` printed a run's clock as `62:01`** where Claude and
+  the band say `1h02m`. It writes the clock in Claude's units and the tokens
+  compact, as the band does.
+- **The app's lines wrapped in an 80-column terminal.** A failing run with a
+  long name made a sub-line of over 100 columns, and the app paints one row per
+  line: the terminal scrolled the header and the cursor's row off the top, and
+  Enter acted on a row nobody could see. Every line fits now — a session row
+  gives up its meta from the end, a workflow's line its name first, then its
+  tokens, `+N more`, its clock.
+- **Two procedures in the docs blamed sound firmware.** TESTING.md's hand-typed
+  `J|` lines carried their notes on the same line, so three of five were
+  refused and the previous band stayed up; and "listed by `claude-mate status`
+  but not on the glass" pointed at the firmware for runs the band only counts,
+  or that belong to another tab. `tools/test_workflow_fw.py` now puts every
+  `J|` the docs tell you to type through both builds' real parser, and checks
+  that every example frame boxes its own state's letter.
+
+Each code fix is a case in `tools/test_workflow_rows.py`,
+`tools/test_wrapper.py`, `tools/test_workflow_daemon.py`, `tools/test_cli.py`
+or `tools/test_app.py`, and each failed against the code before it.
+
+Documented rather than fixed: a run you stop, or one that fails, reads
+`running` for about 10 s more — a minute past the hour — with its clock still
+counting, then `ended`, its clock stepping back to where it stopped. Red with a
+moving clock is a run with a failed agent that goes on; only a clock that has
+stopped tells them apart, and the wrapper calls it stopped after ten seconds of
+stillness — beyond its tick, on a clock that moves once a minute.
+
+**Not in this change**, deliberately, each with its reason:
+
+- **Hook forwarding.** `hooks/claude-status.sh` is byte-identical, so a
+  hook-only session shows no band — and neither does a `.pkg` install, which
+  ships no wrapper. A hook payload carries a workflow's name and nothing else —
+  no progress, no outcome — and a change to the hook reaches nobody until they
+  re-install it.
+- **Reading Claude Code's own files** — the run's journal and snapshot — for the
+  counts a narrow terminal drops and the failed count it never shows. That is
+  four undocumented formats for numbers the bar already approximates; below
+  ~85 columns the band shows a percentage instead.
+- **Transliterating the mirror's glyphs.** The mirror clips at 52 columns,
+  before a workflow row's counts begin.
+
 ### 2026-10-09 — The two readings survive their own audit
 
 The two fixes below were handed to adversarial reviewers before anything was

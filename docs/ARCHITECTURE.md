@@ -10,12 +10,18 @@ identical protocol and may be connected at once:
   WS2812, and a Li-ion cell. It reaches the daemon over TCP (mDNS-discovered,
   HMAC-authenticated) instead of a cable. It renders the *same* pre-rendered
   frame; the extra pixels buy typography and colour, never a different
-  information model. Its one extra capability is the
+  information model — with one exception, the
+  [workflow band](#screen-behaviour), where both devices get the same numbers
+  and each draws them in its own geometry: the Nano a bar and an info string in
+  place of r2's model/effort/limit, the S3 the workflow's name and a status word
+  as well. Its one extra capability is the
   [terminal mirror](#the-terminal-mirror-esp32-s3-only). See
   [`firmware/README.md`](../firmware/README.md).
 
 The daemon is written so that anything the Nano cannot do sits behind a verb the
 Nano never sends, which is why iteration 2 required no change to iteration 1.
+The workflow band's `J|` goes to both devices, and is harmless to a firmware of
+either kind that predates it: unknown verbs and unknown flag bits are ignored.
 
 The Nano drives a small I2C OLED, three buttons, and an **indication LED**. The daemon
 keeps ONE **stable, alphabetically-ordered** **triage queue** of sessions (tabs
@@ -24,7 +30,9 @@ never shuffle as their states change) and the OLED shows ONE screen — the
 it): four size-1 rows — the session name, the
 state + time-in-state (+ the account the session runs as), the model + effort
 (+ a remaining-limit chip, e.g. `5h82%` = 82% of the 5-hour window left), and a
-whole-fleet letter strip (with the queue position). The LED blinks a
+whole-fleet letter strip (with the queue position). While the selected session
+runs a dynamic workflow, the model row gives way to that run's progress bar
+(see [Screen behaviour](#screen-behaviour)). The LED blinks a
 status-distinct pattern (driven by the daemon) for the worst unacknowledged
 alert, looping until you acknowledge it. It shows the live status of one or
 more Claude Code sessions running in the VS Code native extension (and/or the
@@ -60,6 +68,9 @@ Python daemon  (daemon/claude_mate_daemon.py)
         |   - urgency (worst unacked: error > waiting > done, oldest
         |     first) is separate: drives the LED + fleet blink only
         |   - pre-renders ONE screen:  F|<flags>|<sel>|<r0>|<r1>|<r2>|<r3>
+        |   - and, while the shown session runs a dynamic workflow, the band
+        |     just before it:  J|<st>|<done>|<failed>|<total>|<info>|<name>
+        |     (F| flags bit2 = "the band is up"; that F| commits the J|)
         |   - drives the LED:  V|<kind> for the worst unacked alert class
         v
 USB serial  (115200 8N1, ASCII lines, '|' delimited, '\n' terminated)
@@ -72,7 +83,9 @@ Arduino Nano (ATmega328P)
         |                                            rows — name (flashing ~2.5 Hz
         |                                            while unacked), state+time
         |                                            +account, model+effort
-        |                                            +remaining-limit, fleet strip
+        |                                            +remaining-limit (or, with
+        |                                            bit2, the workflow's bar +
+        |                                            info), fleet strip
         +--> indication LED (D8)                    plays V|<kind>: START one-shot;
                                                      INPUT/DONE/ERROR loop until V|OFF
 
@@ -94,9 +107,17 @@ Buttons back (return path) -- layout PREV | GO | NEXT:
 
 A handshake byte closes the loop after every reset. Opening the USB serial port
 resets the Nano (~1.5 s), so on boot the Arduino emits `H`; the daemon answers
-`H` by **re-sending the full current state** (the current frame + re-arming the
-LED loop), and the OLED redraws it. This keeps the display correct across
-reconnects without any persistent storage on the device.
+`H` by **re-sending the full current state** (the workflow band's `J|` — or
+`J|-` — then the current frame, and the LED loop re-armed), and the OLED
+redraws it. This keeps the display correct across reconnects without any
+persistent storage on the device.
+
+The diagram shows the hook. The **PTY wrapper** (`bin/claude-mate-wrap`) writes
+to the same socket, with a longer line: the control socket, model, effort,
+account and remaining limit, and — field 8 — the session's dynamic workflows,
+read off the row Claude Code draws under the prompt box for each one. That
+field is what the workflow band is drawn from, so only a wrapped session has a
+band; the hook does not carry it. See [PROTOCOL.md §2](PROTOCOL.md#wf-field).
 
 ---
 
@@ -134,7 +155,7 @@ reconnects without any persistent storage on the device.
  |                                     |               |         |
  +-------------------------------------|---------------|---------+
                                        | USB           | B|P / B|N / B|G / B|K
-                             F|.. V|.. P | CDC          | H
+                      J|.. F|.. V|.. P | CDC           | H
                                        v               |
                               +-----------------------------------+
                               |        Arduino Nano (328P)        |
@@ -152,10 +173,12 @@ reconnects without any persistent storage on the device.
 
 The daemon is the brain. The Arduino is a thin display + input device: it holds
 no session model, makes no policy decisions, and simply renders the one frame
-the daemon last sent and reports button presses. The only screens it draws on
-its own are the boot **splash** (`MATE / starting...`) and the **LINK LOST**
-screen (`NO LINK / waiting for daemon`) after ~30 s of daemon silence; on every
-accepted press it also inverts the whole panel for ~80 ms as instant feedback.
+the daemon last sent — with, while that frame's bit2 is set, the workflow band
+from the `J|` it committed — and reports button presses. The only screens it
+draws on its own are the boot **splash** (`MATE / starting...`) and the **LINK
+LOST** screen (`NO LINK / waiting for daemon`) after ~30 s of daemon silence; on
+every accepted press it also inverts the whole panel for ~80 ms as instant
+feedback.
 
 ---
 
@@ -218,7 +241,9 @@ LINK LOST screen** if the daemon goes fully silent for ~30 s. See
 ## Screen behaviour
 
 The screen is **daemon-driven**: the Arduino only ever shows the single frame
-it was last told to show via an `F|<flags>|<sel>|<r0>|<r1>|<r2>|<r3>` line.
+it was last told to show via an `F|<flags>|<sel>|<r0>|<r1>|<r2>|<r3>` line —
+and, while that frame's bit2 is set, the workflow band the `J|` before it
+described.
 
 - **What a frame shows:** four size-1 rows (≤ 21 chars each) — **r0** the
   selected session's name (full width, ~21 chars, inverting ~2.5 Hz while its
@@ -231,6 +256,23 @@ it was last told to show via an `F|<flags>|<sel>|<r0>|<r1>|<r2>|<r3>` line.
   `+` when it doesn't fit). An unacknowledged alert's letter is sent **lowercase**
   so the firmware **blinks** it — the acked/unacked state of every tab is
   visible in the strip.
+- **The workflow band:** while the shown session has a visible dynamic
+  workflow, the daemon sets `F|` flags **bit2** and writes a `J|` line just
+  before the frame: the run's status, done/failed/total, and a pre-rendered
+  info string of at most 14 characters (`2/5 2m39s 543k`). The Nano then draws
+  r2 as a bar plus that info — or the word `paused`, `done` or `ended` — and
+  gives up model/effort/limit until the band goes; the S3 draws the workflow's
+  name and a status word, a bar with one segment per agent, and the info, under
+  the fleet strip. It is the one place the devices lay something out
+  themselves — the daemon sends numbers, each draws them in its own geometry —
+  and the `F|` is the commit: a `J|` alone is only staged, so a frame is always
+  drawn from a `J|` and the `F|` that followed it. While the band is up the
+  daemon rewrites that pair every second or so, changed or not, and puts a
+  `J|-` ahead of a different session's `J|`, so a lost `J|` costs a second or
+  two of band at most and never shows one session's run under another's name.
+  Display only: no state, no LED, nothing blinks. The band's clock is the
+  run's own, in Claude's units (`2m39s`, `1h02m`), while r1 keeps counting
+  time in state.
 - **Screen ownership:** the display NEVER changes subject on its own — only
   PREV/NEXT/GO move the selection (it falls back to the first tab only when
   the selected session ends). A GO/ACK **stays on the tab** it acted on — the
@@ -250,8 +292,10 @@ it was last told to show via an `F|<flags>|<sel>|<r0>|<r1>|<r2>|<r3>` line.
   terminal whose name the user is actually looking at.
 - The daemon sends an `F` line whenever the rendered bytes change: immediately
   on any state change or button, and ~1/s while a displayed time ticks.
-  Identical frames are not re-sent (except on handshake). With **zero
-  sessions** it sends `F|0|-1|MATE|no sessions||`.
+  Identical frames are not re-sent (except on handshake, and while a workflow
+  band is up, when the `J|` and the `F|` that commits it go out again whenever
+  the last pair is a second old). With **zero sessions** it sends
+  `F|0|-1|MATE|no sessions||`.
 
 Long sibling names that collide at the row width are disambiguated with a
 middle squeeze (first 9 + `~` + last 10, e.g. `webapp-ba~ervice-one`). The
@@ -277,7 +321,8 @@ It reuses plumbing that already existed rather than adding a channel:
    there is no new socket, no streaming, and **zero cost when nobody is
    looking** — polling runs only while the view is open.
 3. The daemon clips rows to the device's geometry and pushes them as `M|` lines,
-   exactly as it pre-renders `F|` frames. The firmware stays a dumb renderer.
+   exactly as it pre-renders `F|` frames. The firmware stays a dumb renderer
+   here; the workflow band is the one place it lays anything out itself.
 
 Three details are load-bearing:
 
@@ -363,7 +408,15 @@ GO (~0.5 s, `B|K`) acknowledges *without* any window op.
 - The **Arduino** tolerates partial/garbled lines, caps its input buffer
   (96 bytes), ignores malformed lines, and debounces buttons (~40 ms,
   immediate-fire). If the daemon goes silent for ~30 s it stops any LED loop
-  and shows the **LINK LOST** screen instead of a frozen display.
+  and shows the **LINK LOST** screen instead of a frozen display. A `J|` that
+  does not match its grammar exactly is ignored too. The `F|` behind a lost or
+  rejected one commits whatever was staged before it — the same run's previous
+  reading, or, on a change of session, the `J|-` the daemon writes ahead of the
+  new session's `J|` — and the pair is rewritten every second or so while the
+  band is up. So it costs a second or two of band at most, never another
+  session's band, and never the rest of the run.
+- The wrapper's **workflow code is fenced**: if it fails, field 8 falls back to
+  *keep* and the state report still goes out.
 
 ---
 
@@ -385,6 +438,19 @@ These are deliberate, documented boundaries — not bugs:
   polled from Anthropic's OAuth usage endpoint with the session's own token
   (read-only — refreshing credentials stays claude's job) and shows the more
   depleted of the 5-hour / weekly windows. Hook-only sessions show neither.
+- **The workflow band is a best-effort scrape of an undocumented footer.** It is
+  drawn from the row Claude Code puts under the prompt box for each dynamic
+  workflow, read by the PTY wrapper — an interface Claude Code does not
+  document, which a release can change. Hook-only sessions — every session on a
+  `.pkg` install, which ships no wrapper — show no band. Below ~85 columns
+  Claude drops done/total, so the band shows the bar's percentage instead; the
+  number of failed agents is never on screen; and a run that failed and one
+  that was stopped look the same, so both read `ended` — after about 10 s of
+  reading `running` with the clock still counting (a minute past the hour),
+  since only a clock that has stopped tells them from a run with a failed
+  agent. The wrapper reports three runs per session at most, so a fourth is
+  never on the band and its `+N` stops at `+2`. Workflow names cross the same
+  plaintext TCP/BLE link as session names.
 - **Focus depends on the deep link (hook-only sessions).** A wrapped session
   raises its own terminal via its control socket. Hook-only sessions use the
   VS Code deep link derived from the session id (VERIFIED FACTS:

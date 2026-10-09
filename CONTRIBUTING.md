@@ -60,6 +60,16 @@ a change to the daemon or the wrapper has to keep working for the Nano. Anything
 the Nano cannot do (colour, the terminal mirror) belongs behind a verb it simply
 never sends.
 
+The **workflow band** is the one exception, and a deliberate one. `J|` goes to
+both devices and carries numbers rather than rows, so each draws the band in
+its own geometry: the Nano gives up r2's model/effort/limit for a bar and an
+info string while it is up, and the S3 adds the workflow's name and a status
+word. Even there the daemon composes the text — the info string and the name;
+the firmware adds only four fixed status words. Keep it the only exception —
+and whatever you add must stay harmless to a firmware that has never heard of
+it: unknown verbs and unknown `F|` flag bits are ignored, which is what lets an
+old Nano and a new S3 share one daemon.
+
 ---
 
 ## Building the firmware
@@ -137,7 +147,8 @@ For end-to-end setup including the hooks, follow
   render/refresh loop. No busy-wait spinning.
 - Keep the serial port open continuously; auto-detect and auto-reconnect; never
   crash on a missing port.
-- The `--mock` flag must keep working — it is how reviewers demo the device.
+- The `--mock` flag must keep working — it is how reviewers demo the device,
+  workflow band included.
 
 ### Arduino (firmware)
 
@@ -145,6 +156,10 @@ For end-to-end setup including the hooks, follow
   `F()` macro, and avoid heavy `String` churn inside `loop()`.
 - Tolerate partial/garbled serial lines, cap the input buffer length, and ignore
   malformed lines.
+- Logic both sketches need lives in one header copied **byte-identical** into
+  each sketch folder (`workflow.h`), because arduino-cli cannot include from
+  outside a sketch. Change both copies together: `tools/test_workflow_fw.py`
+  fails the moment they differ.
 - Debounce buttons (~200 ms).
 - Emit `H` on boot so the daemon can resend full state after the USB reset.
 
@@ -171,7 +186,7 @@ Validate changes from the bottom up, the same ladder used in
 1. **Daemon in `--mock` mode** — exercises the triage-queue, screen-rendering,
    and LED-policy logic with fake sessions and no hardware or Claude.
 2. **Serial loopback / protocol** — verify the `|`-delimited lines the daemon
-   emits (`F|…`, `V|…`, `M|…`, `P`) and the `H` / `B|P` / `B|N` / `B|G` /
+   emits (`F|…`, `J|…`, `V|…`, `M|…`, `P`) and the `H` / `B|P` / `B|N` / `B|G` /
    `B|K` / `B|M` lines it consumes (see
    [docs/PROTOCOL.md](docs/PROTOCOL.md)).
 3. **Firmware on the bench** — flash the device, confirm the display renders the

@@ -148,6 +148,10 @@ try:
               for k in ("state", "secs", "acked", "shown", "i")))
     check("...and an alert arrives unacknowledged, as it does on the device",
           any(not s["acked"] for s in snap["queue"]))
+    # ALWAYS PRESENT, so a client can iterate it without asking first. A hook
+    # line carries no workflows, so here every list is empty.
+    check("...and a 'workflows' list on every entry, [] when it has none",
+          all(s.get("workflows") == [] for s in snap["queue"]))
 
     # --- pressing the same buttons ------------------------------------------ #
     print("\n== a press from the terminal is a press ==")
@@ -250,6 +254,36 @@ try:
     check("`claude-mate` prints the queue", rc == 0 and "alpha" in out
           and "zeta" in out)
     check("...marking the row that is on the glass", ">" in out)
+
+    # A dynamic workflow, the way the PTY wrapper reports one: field 8 of an
+    # ordinary state line. The device shows it as a band; the terminal has the
+    # room to print it in words, under the session it belongs to.
+    feed("working|s-zeta|zeta||||||R;2;5;;40;75;542800;;deploy-sweep")
+    ok = wait_for(lambda: any(
+        s["workflows"] for s in json.loads(talk("queue"))["queue"]), 5.0)
+    zeta = {s["name"]: s for s in json.loads(talk("queue"))["queue"]}["zeta"]
+    check("a wrapper line's workflow reaches the queue JSON",
+          ok and [w["name"] for w in zeta["workflows"]] == ["deploy-sweep"]
+          and zeta["workflows"][0]["status"] == "running"
+          and (zeta["workflows"][0]["done"], zeta["workflows"][0]["total"])
+          == (2, 5))
+    rc, out = cli("status")
+    lines = out.splitlines()
+    row = next((i for i, l in enumerate(lines)
+                if "zeta" in l and "workflow" not in l), -1)
+    sub = lines[row + 1] if 0 <= row < len(lines) - 1 else ""
+    check("`claude-mate status` prints it on the line under its session",
+          rc == 0 and "workflow deploy-sweep" in sub and "running" in sub
+          and "2/5" in sub and "543k tokens" in sub)
+    # The run's own clock, which carries on through every state change, in
+    # Claude's units like the band -- never m:ss, which is r1's time in STATE
+    # (the session row above it) and turns a ten-hour run into '622:55'.
+    check("...its clock in Claude's units (1m15s), as the device's band "
+          "writes it, not m:ss", bool(re.search(r"\b1m[12]\ds\b", sub))
+          and not re.search(r"\b\d+:\d\d\b", sub))
+    check("...indented, so it reads as part of that session",
+          sub.startswith("        "))
+    check("...and with no ANSI colour on a pipe", "\x1b[" not in out)
     rc, out = cli("accounts")
     check("`claude-mate accounts` lists them with their logins",
           rc == 0 and "work" in out and "me@example.com" in out)
@@ -304,6 +338,53 @@ try:
           cm.why_the_daemon_died(os.path.join(tmp, "absent.log")) is None)
     check("...nor is an empty one",
           cm.why_the_daemon_died(os.devnull) is None)
+
+    # A CLI newer than the daemon it talks to: the queue has no 'workflows' key
+    # at all. It must print the queue it was given, not a traceback.
+    import contextlib
+    import io
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            cm.render({"queue": [{"i": 0, "key": "k", "name": "elder",
+                                  "state": "idle", "secs": 3, "model": "",
+                                  "effort": "", "account": "", "limit": "",
+                                  "cwd": "", "acked": True, "shown": True}],
+                       "follow": False})
+        rendered = buf.getvalue()
+    except Exception as exc:                  # noqa: BLE001
+        rendered = f"raised {exc!r}"
+    check("render() prints an older daemon's queue (no 'workflows' key)",
+          "elder" in rendered and "workflow" not in rendered)
+
+    # ONE READING OF A RUN, on the glass and in the terminal. The CLI's clock
+    # and token helpers are copies of the daemon's -- it cannot import a module
+    # that needs pyserial -- so here they are held to the originals, at every
+    # boundary either one has. (getattr: a CLI without them fails these checks,
+    # not the rest of the file.)
+    print("\n== a run's clock and tokens, written as the device's band does ==")
+    _dspec = importlib.util.spec_from_file_location("cm_cli_daemon", DAEMON)
+    dmod = importlib.util.module_from_spec(_dspec)
+    sys.modules["cm_cli_daemon"] = dmod      # @dataclass resolves through it
+    _dspec.loader.exec_module(dmod)
+    clk, tok = getattr(cm, "wf_clock", None), getattr(cm, "wf_tokens", None)
+    check("the run's clock: 45s, 2m39s, 1h02m, 1d03h -- Claude's units",
+          clk is not None and [clk(s) for s in (45, 159, 3720, 97200)]
+          == ["45s", "2m39s", "1h02m", "1d03h"])
+    secs = sorted(set(list(range(0, 7300)) + list(range(0, 400000, 59))
+                      + [86399, 86400, 97200, 10 ** 7, 10 ** 9]))
+    check("...exactly the daemon's, at every boundary",
+          clk is not None and all(clk(s) == dmod._wf_clock(s) for s in secs))
+    check("tokens compact: 999, 1.2k, 543k (never 542.8k), 1.0M (never 1000k)",
+          tok is not None and [tok(n) for n in (999, 1240, 542800, 999950)]
+          == ["999", "1.2k", "543k", "1.0M"])
+    toks = sorted(set([0, 999, 1000, 9949, 9950, 99_950, 542_800, 999_499,
+                       999_950, 1_400_000, 9_960_000, 12_000_000, 999_600_000,
+                       1_200_000_000, 10 ** 13]
+                      + list(range(0, 3_000_000, 977))
+                      + list(range(990_000_000, 1_010_000_000, 99_991))))
+    check("...exactly the daemon's, at every boundary",
+          tok is not None and all(tok(n) == dmod._wf_tokens(n) for n in toks))
 
     # The one crash launchd cannot narrate: no interpreter, so nothing is ever
     # written to the log why_the_daemon_died() would read.

@@ -32,6 +32,7 @@ import sys
 import tempfile
 import termios
 import time
+import unicodedata
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CLI = os.path.join(REPO, "bin", "claude-mate")
@@ -247,6 +248,163 @@ check("...and says which one skips permissions",
       "skip permissions" in menu)
 check("...and offers to start the daemon, saying start rather than restart "
       "when it is down", "start daemon" in menu)
+
+# --------------------------------------------------------------------------- #
+# A session's workflow, drawn under it
+# --------------------------------------------------------------------------- #
+# The sub-line is DISPLAY ONLY: not a row, never selectable -- and it must never
+# carry the '▸' the cursor row is marked with, which is exactly how selected()
+# above (and a person) finds the cursor. A workflow is named by whoever wrote
+# it, so the name is the attack: one made of '▸'s.
+print("\n== a session's workflow, under it in the app ==")
+
+
+class _Term:
+    def size(self):
+        return (110, 40)
+
+
+_wf_snap = {"queue": [
+    {"i": 0, "key": "a", "name": "alpha", "state": "working", "secs": 12,
+     "model": "", "effort": "", "account": "", "limit": "", "cwd": "",
+     "acked": True, "shown": True,
+     "workflows": [
+         {"name": "▸sneaky▸", "st": "R", "status": "running", "done": 1,
+          "total": 4, "failed": None, "pct": 25, "secs": 75, "tokens": 9000,
+          "note": "til ▸3:30pm"},
+         {"name": "second", "st": "D", "status": "done", "done": 4,
+          "total": 4, "failed": None, "pct": 100, "secs": 60, "tokens": 12,
+          "note": ""}]},
+    # An older daemon's entry: no 'workflows' key at all.
+    {"i": 1, "key": "b", "name": "bravo", "state": "idle", "secs": 3,
+     "model": "", "effort": "", "account": "", "limit": "", "cwd": "",
+     "acked": True, "shown": False}],
+    "follow": False, "shown": "a", "selected": "a"}
+_rows_ = M._rows(_wf_snap)
+
+
+def _plain(lines):
+    return [re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", ln) for ln in lines]
+
+
+_drawn = _plain(M._draw(_Term(), _wf_snap, 0, _rows_, None, True))
+_row = next((i for i, ln in enumerate(_drawn) if "alpha" in ln), -1)
+_sub = _drawn[_row + 1] if 0 <= _row < len(_drawn) - 1 else ""
+check("the session's workflow is drawn on the line under it",
+      "sneaky" in _sub and "running" in _sub and "1/4" in _sub
+      and "til >3:30pm" in _sub, repr(_sub))
+# The run's clock is not a time in state: the band writes it in Claude's
+# units, so the line beside it does too -- 1m15s, not r1's 1:15.
+check("...its clock in Claude's units and its tokens as the band writes them",
+      "1m15s" in _sub and "9.0k tokens" in _sub and "1:15" not in _sub,
+      repr(_sub))
+check("...ONE line however many it runs, the rest as '+N more'",
+      "+1 more" in _sub and not any("second" in ln for ln in _drawn))
+_brow = next((i for i, ln in enumerate(_drawn) if "bravo" in ln), -1)
+check("...and no line at all for a session from an older daemon",
+      _brow >= 0 and not any("↳" in ln for ln in _drawn[_brow + 1:]))
+_clean = True
+for _sel in range(len(_rows_)):
+    _lines = _plain(M._draw(_Term(), _wf_snap, _sel, _rows_, None, True))
+    _marked = [ln for ln in _lines if "▸" in ln]
+    _want = (_rows_[_sel]["s"]["name"] if _rows_[_sel]["kind"] == "session"
+             else _rows_[_sel]["label"])
+    if len(_marked) != 1 or _want not in _marked[0]:
+        _clean = False
+        print(f"        sel={_sel}: {_marked!r}")
+check("a workflow named with '▸' never puts one on its line -- the only '▸' "
+      "is the cursor's, on every row", _clean)
+check("...so selected() still finds the cursor row",
+      selected("\n".join(M._draw(_Term(), _wf_snap, 0, _rows_, None, True)))
+      .lstrip("▸• ").startswith("alpha"))
+
+# AN 80x24 TERMINAL, the size a new one opens at. The app paints one terminal
+# row per line, so a line wider than the terminal WRAPS: every row below moves
+# down, the terminal scrolls, and the header and the cursor row go off the top
+# -- Enter then acts on a row nobody can see. A failing run with a 40-character
+# name (the most the wire carries) made a 108-column sub-line; a waiting
+# session's model, effort, account and limit, a 104-column row.
+print("\n== at 80 columns, nothing wraps ==")
+
+
+def _cols(line):
+    """Columns a painted line takes: colour codes none, East Asian wide
+    characters two. The test's own count, so the app is not measured by the
+    rule it is being checked against."""
+    plain = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", line)
+    return sum(0 if unicodedata.category(c) in ("Mn", "Me", "Cf")
+               else 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+               for c in plain)
+
+
+class _TermOf:
+    def __init__(self, cols):
+        self.cols = cols
+
+    def size(self):
+        return (self.cols, 24)
+
+
+_LONG = "nightly-dependency-upgrade-risk-sweep-42"
+_E = {"st": "E", "status": "running", "done": 3, "total": 7, "failed": None,
+      "pct": 42, "secs": 37375, "tokens": 23065249, "note": ""}
+_snap80 = {"queue": [
+    {"i": i, "key": f"k{i}", "name": name, "state": state, "secs": 754,
+     "model": "Opus 4.8 (1M context)", "effort": "xhigh",
+     "account": "work-account", "limit": "5h82%", "cwd": "",
+     "acked": state == "working", "shown": i == 0,
+     "workflows": [dict(_E, name=wf), dict(_E, name="b", st="R"),
+                   dict(_E, name="c", st="D", status="done")]}
+    for i, (name, state, wf) in enumerate((
+        ("api-gateway", "working", _LONG),
+        ("billing-reconciliation", "waiting", _LONG),
+        ("checkout", "working", "名前" * 10),       # 40 columns of CJK
+        ("docs-site", "error", _LONG),
+        ("edge-cache", "working", _LONG),
+        ("frontend", "working", _LONG)))],
+    "follow": False, "shown": "k0", "selected": "k0"}
+_rows80 = M._rows(_snap80)
+_wide, _marks = [], True
+for _sel in range(len(_rows80)):
+    _lines = M._draw(_TermOf(80), _snap80, _sel, _rows80, None, True)
+    _wide += [(_cols(ln), ln) for ln in _lines if _cols(ln) > 79]
+    _marked = [ln for ln in _plain(_lines) if "▸" in ln]
+    _want = (_rows80[_sel]["s"]["name"] if _rows80[_sel]["kind"] == "session"
+             else _rows80[_sel]["label"])
+    _marks = _marks and len(_marked) == 1 and _want in _marked[0]
+check("no painted line is wider than 79 columns, on any row the cursor is on",
+      not _wide, repr(_wide[:2]))
+check("...and the cursor's '▸' is still on exactly the selected row", _marks)
+
+
+def _row_of(lines, name):
+    """Where a session's own row is (not its sub-line); -1 if nowhere."""
+    return next((i for i, ln in enumerate(lines)
+                 if f" {name} " in ln and "↳" not in ln), -1)
+
+
+_d80 = _plain(M._draw(_TermOf(80), _snap80, 0, _rows80, None, True))
+_sub80 = _d80[_row_of(_d80, "api-gateway") + 1]
+check("the name gives first -- cut, with an ellipsis -- and every fact after "
+      "it stays", "nightly-dep" in _sub80 and "…" in _sub80
+      and _LONG not in _sub80 and all(
+          x in _sub80 for x in ("running", "an agent failed", "3/7", "10h22m",
+                                "23M tokens", "+2 more")), repr(_sub80))
+_cjk = _d80[_row_of(_d80, "checkout") + 1]
+check("...counting a wide character as the two columns it takes",
+      "名前" in _cjk and "…" in _cjk and _cols(_cjk) <= 79, repr(_cjk))
+_row = _d80[_row_of(_d80, "billing-reconciliation")]
+check("a session row that does not fit drops its meta from the end, so "
+      "'needs you' outlasts the limit chip and the account",
+      "needs you" in _row and "Opus 4.8" in _row and "5h82%" not in _row
+      and "work-account" not in _row and _cols(_row) <= 79, repr(_row))
+_d60 = _plain(M._draw(_TermOf(60), _snap80, 0, _rows80, None, True))
+_sub60 = _d60[_row_of(_d60, "api-gateway") + 1]
+check("narrower still (60): then the tokens and '+N more' go, and the word, "
+      "the failing agent and the count stay", "23M tokens" not in _sub60
+      and "+2 more" not in _sub60 and _cols(_sub60) <= 59 and all(
+          x in _sub60 for x in ("running", "an agent failed", "3/7")),
+      repr(_sub60))
 
 # --------------------------------------------------------------------------- #
 # The shared chooser, and the picker every session goes through

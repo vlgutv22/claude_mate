@@ -48,6 +48,14 @@ You get a full-screen app. Arrow keys move, Enter chooses, `q` quits.
 Every level under the top one works the same way: **Accounts** and **Device**
 are arrow-driven menus, not a dumped `--help`, and `esc` always means back.
 
+**Every line fits the window.** The app paints one terminal row per line, so a
+line wider than the window would wrap, push every row under it down, and
+scroll the header and the cursor's row off the top — and Enter would act on a
+row you cannot see. So a session's row that is too wide gives up its limit,
+account, effort and model from the end, and `needs you` stays; the workflow
+line under it cuts the name first, then drops the tokens, `+N more`, the clock
+and the note, so the status word, a failed agent and the counts go last.
+
 **Start new session** is the reason the app exists. It runs `claude` through the
 wrapper in this terminal — the app hands the terminal over and gets out of the
 way, exactly as if you had typed the command yourself. The second entry adds
@@ -57,8 +65,9 @@ one it is about to make. Anything else you want on the command line goes in
 `CLAUDE_MATE_NEW_ARGS`.
 
 **On a pipe it is not an app.** Redirect it anywhere — a hook, cron, a script,
-a test — and `claude-mate` is the same one-shot queue print it always was, with
-no colour and no escape codes. The app appears only when stdin *and* stdout are
+a test — and `claude-mate` is the same one-shot queue print it always was (plus
+a sub-line per workflow the daemon has, [below](#what-status-prints)), with no
+colour and no escape codes. The app appears only when stdin *and* stdout are
 both terminals. `claude-mate status` gets you the plain print on purpose.
 
 ### Everything it accepts
@@ -88,6 +97,33 @@ convenience: profile names come from whatever was typed at the picker, and an
 arrow key types an escape sequence — so a real accounts directory can contain a
 profile literally called `\033`, which prints as nothing and cannot be typed
 back at a prompt. The index is how you delete it.
+
+### What `status` prints
+
+One row per session, in the device's order: its state and time in state, then
+model, effort, account and remaining limit, with `>` on the row that is on the
+glass and `<-- needs you` on an unacknowledged alert. Under a session running a
+**dynamic workflow** comes an indented sub-line per workflow the daemon has for
+it: its name, its status word — `running`, `paused`, `done`, `ended` — and
+whatever progress is known, with the run's clock and tokens written the way the
+band writes them: the clock in Claude's own units, `2m39s` or `1h02m` — never
+the session rows' minutes and seconds, where a run of an hour would read
+`62:01` — and the tokens compact, `543k`. The app puts one such line under a
+session however many it runs: the workflow the band shows for that session —
+or would, were it on the glass — and `+N more`.
+
+The first sub-line under a session is the record the device's
+[workflow band](USING.md#the-workflow-band) shows for it; the others are what
+the band counts as `+N`. The glass shows one session, the `>` row, so its first
+sub-line is a diagnosis: listed there, but no band on the glass, points at the
+firmware. Look where the band is drawn first: on neither device for the ~4 s a
+notice is up; on the S3 only on the main screen, not under the menu, the
+mirror, the pad or the game; and on the Nano there is no name to look for, only
+a bar or a word, with the info, in r2's place. A session running a workflow
+with no sub-line at all points at the wrapper (or a session that is not
+wrapped). Workflows under other rows, and the second and third under `>`, are
+not drawn by design. A script that wants the numbers should not parse the
+print; the `queue` JSON has them ([below](#the-socket-if-you-are-scripting)).
 
 ### The menus underneath
 
@@ -228,3 +264,8 @@ The full command surface is six verbs — see
 deliberately *not* one of them: a hook in any of your shells can write to this
 socket, and a hook firing a malformed line should not be able to remove a login,
 so `accounts rm` deletes in the CLI's own process.
+
+`queue` is the one to read. Every session in its JSON carries a `workflows`
+list — `[]` when there are none — with each visible workflow's name, status
+letter and word, counts, percentage, clock in seconds, tokens and usage-limit
+note ([PROTOCOL.md §3](PROTOCOL.md#per-session-workflows)).

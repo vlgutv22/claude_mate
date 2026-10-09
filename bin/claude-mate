@@ -48,11 +48,13 @@ this process, and only asks the daemon to re-read afterwards.
 """
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
 import sys
 import time
+import unicodedata
 
 SOCK = os.environ.get("CLAUDE_MATE_SOCK", "/tmp/claude-mate.sock")
 
@@ -159,8 +161,185 @@ def read_version():
         return "(from a source checkout)"
 
 
+# A WORKFLOW READS HERE AS IT READS ON THE GLASS. These two are the daemon's
+# _wf_clock and _wf_tokens, line for line -- copied, not imported, because the
+# CLI must run where the daemon's own imports (pyserial) do not -- and
+# tools/test_cli.py holds the copies to the originals over every boundary.
+def wf_clock(secs):
+    """A run's clock in Claude's own units: 45s, 2m39s, 1h02m, 1d03h. Not
+    mmss(): that is r1's time in STATE, and a ten-hour run printed '622:55'
+    reads like a lot of minutes where the band beside it says 10h22m."""
+    s = int(max(0, secs))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    if s < 86400:
+        return f"{s // 3600}h{s % 3600 // 60:02d}m"
+    return f"{s // 86400}d{s % 86400 // 3600:02d}h"
+
+
+def wf_tokens(n):
+    """Compact tokens, as the band prints them: 999, 1.2k, 543k, 1.4M, 12M,
+    1.2B. Rounded half up in integers, and a value that rounds past its unit
+    moves up one -- 999_950 is '1.0M', never '1000k'."""
+    n = max(0, int(n))
+    if n < 1000:
+        return str(n)
+    for div, unit in ((10 ** 3, "k"), (10 ** 6, "M"), (10 ** 9, "B")):
+        tenths = (10 * n + div // 2) // div       # n / div to one decimal
+        if tenths < 100:
+            return f"{tenths // 10}.{tenths % 10}{unit}"
+        whole = (n + div // 2) // div
+        if whole < 1000 or unit == "B":
+            return f"{whole}{unit}"
+    return str(n)                                 # unreachable
+
+
+# A workflow's status word, coloured like the session state it reads as.
+WF_COLOUR = {"running": "working", "paused": "waiting", "done": "done",
+             "ended": "error"}
+
+
+def _wf_text(text):
+    """Text from a workflow, safe to print. Through printable() because a
+    workflow is named by whoever wrote it -- and never with a '▸' in it, which
+    the app uses to mark the selected row and which its tests find it by."""
+    return printable(str(text or "")).replace("▸", ">")
+
+
+def wf_name(w):
+    return _wf_text(w.get("name"))
+
+
+def wf_parts(w, more=0):
+    """A workflow after its name, as (kind, text) in the order it prints:
+    'running  3/5  2m39s  543k tokens', and '+N more' last.
+
+    The same facts the device's band shows, in its units -- the run's clock
+    in Claude's, tokens compact -- and plain text on a pipe: every colour is
+    one of the TTY-gated constants above. Kinds, so a line that does not fit
+    can give up the parts that matter least first (see _wf_line)."""
+    word = _wf_text(w.get("status")) or "running"
+    col = COLOUR.get(WF_COLOUR.get(word, ""), "")
+    parts = [("word", f"{col}{word}{OFF}")]
+    failed = w.get("failed")
+    if w.get("st") == "E" and not failed:
+        # E is "running, but an agent failed"; the count itself is not
+        # something the screen shows, so say it without one.
+        parts.append(("failing", f"{COLOUR['error']}an agent failed{OFF}"))
+    done, total, pct = w.get("done"), w.get("total"), w.get("pct")
+    if done is not None and total is not None:
+        parts.append(("count", f"{done}/{total}"))
+    elif pct is not None:
+        parts.append(("count", f"{pct}%"))
+    if failed:
+        parts.append(("failed", f"{COLOUR['error']}{failed} failed{OFF}"))
+    if w.get("secs") is not None:
+        parts.append(("clock", wf_clock(w["secs"])))
+    if w.get("tokens") is not None:
+        parts.append(("tokens", f"{wf_tokens(w['tokens'])} tokens"))
+    if w.get("note"):
+        parts.append(("note", _wf_text(w["note"])))
+    if more:
+        parts.append(("more", f"{D}+{more} more{OFF}"))
+    return parts
+
+
+def wf_summary(w, more=0):
+    """wf_parts() as one string: what `status` prints after the name."""
+    return "  ".join(text for _kind, text in wf_parts(w, more))
+
+
+# ---- fitting a line to the app's width ------------------------------------ #
+# THE APP PAINTS ONE TERMINAL ROW PER LINE (Term.paint: home, then each line
+# and an erase), so a line wider than the terminal is not just cut off -- it
+# wraps, every row below it moves down one, and once they pass the bottom the
+# terminal scrolls: the header and the cursor row go off the top, and Enter
+# acts on a row nobody can see. So the lines that carry data are fitted here,
+# in COLUMNS: colour codes take none, an East Asian wide character two.
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def _cells(ch):
+    if unicodedata.category(ch) in ("Mn", "Me", "Cf"):
+        return 0                              # combining marks, joiners
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def vis_width(text):
+    """The columns `text` takes on a terminal."""
+    return sum(_cells(ch) for ch in _ANSI.sub("", text))
+
+
+def clip(text, room):
+    """`text` in at most `room` columns. A cut ends in '…' -- so '3/12' cut
+    short cannot pass for a whole '3/1' -- and in a colour reset, so the
+    colour of the half that went cannot run on into the next line. Colour
+    codes are kept, and cost nothing."""
+    if vis_width(text) <= room:
+        return text
+    out, used, i = [], 0, 0
+    while i < len(text):
+        m = _ANSI.match(text, i)
+        if m:
+            out.append(m.group())
+            i = m.end()
+            continue
+        w = _cells(text[i])
+        if used + w > room - 1:
+            break
+        out.append(text[i])
+        used += w
+        i += 1
+    kept = "".join(out)
+    mark = "" if (room <= 0 or _ANSI.sub("", kept).endswith("…")) else "…"
+    return kept + mark + OFF
+
+
+WF_NAME_MIN = 12          # columns a name is cut to before anything else goes
+
+
+def _wf_line(w, more, room):
+    """The app's line under a session -- '    ↳ name  running  3/5  2m39s
+    543k tokens  +1 more' -- in at most `room` columns.
+
+    What gives, in order: the name, down to WF_NAME_MIN columns (Claude's own
+    footer already cuts names at 28, and a cut name still tells two runs
+    apart); then the parts at the end -- the tokens, '+N more', the clock, the
+    note -- with any room a dropped part frees going back to the name; last a
+    plain cut. The status word, a failing agent and the counts are what the
+    line is for, and stay longest."""
+    lead = f"    {D}↳{OFF} "
+    full, parts = wf_name(w), wf_parts(w, more)
+    name = full
+
+    def line():
+        return f"{lead}{name}  " + "  ".join(t for _k, t in parts)
+
+    over = vis_width(line()) - room
+    if over > 0:
+        name = clip(full, max(WF_NAME_MIN, vis_width(full) - over))
+    for kind in ("tokens", "more", "clock", "note"):
+        if vis_width(line()) <= room:
+            break
+        parts = [p for p in parts if p[0] != kind]
+    spare = room - vis_width(line())
+    if spare > 0 and name != full:
+        name = clip(full, vis_width(name) + spare)  # what a dropped part freed
+    return clip(line(), room)
+
+
+def session_workflows(s):
+    """The workflows a queue entry lists, or [] -- an older daemon sends none,
+    and a CLI newer than its daemon must still print the queue."""
+    wfs = s.get("workflows") or []
+    return [w for w in wfs if isinstance(w, dict)] if isinstance(wfs, list) else []
+
+
 def render(snap):
-    """The queue, laid out like the glass: the shown row marked, alerts loud."""
+    """The queue, laid out like the glass: the shown row marked, alerts loud,
+    and under each session the dynamic workflows it is running."""
     q = snap.get("queue", [])
     if not q:
         print(f"{D}no sessions. start one with `claude` in a project.{OFF}")
@@ -176,6 +355,10 @@ def render(snap):
                                       s["account"], s["limit"]) if x)
         print(f" {here} {s['i']}  {col}{s['name']:<{width}}  "
               f"{s['state']:<7}{OFF} {mmss(s['secs']):>6}  {D}{right}{OFF}{flag}")
+        # EVERY visible workflow, one indented line each -- a terminal has the
+        # room the glass does not, so it lists what the band sums up as "+N".
+        for w in session_workflows(s):
+            print(f"        {D}workflow{OFF} {wf_name(w)}  {wf_summary(w)}")
     if snap.get("follow"):
         print(f"\n {D}FOLLOW is on: prev/next also raise the terminal{OFF}")
 
@@ -782,11 +965,24 @@ def _draw(term, snap, sel, rows, note, alive):
             col = COLOUR.get(s["state"], "")
             glass = f"{B}•{OFF}" if s.get("shown") else " "
             flag = "" if s.get("acked") else f"  {col}{B}needs you{OFF}"
-            right = "  ".join(x for x in (s.get("model"), s.get("effort"),
-                                          s.get("account"), s.get("limit")) if x)
-            out.append(f" {here}{glass} {col}{s['name']:<{width}}  "
-                       f"{s['state']:<7}{OFF} {mmss(s['secs']):>6}  "
-                       f"{D}{right}{OFF}{flag}")
+            meta = [x for x in (s.get("model"), s.get("effort"),
+                                s.get("account"), s.get("limit")) if x]
+            head = (f" {here}{glass} {col}{s['name']:<{width}}  "
+                    f"{s['state']:<7}{OFF} {mmss(s['secs']):>6}  ")
+            line = f"{head}{D}{'  '.join(meta)}{OFF}{flag}"
+            # Too wide: the meta goes from the end before anything is cut, so
+            # "needs you" outlasts the account and the limit chip.
+            while meta and vis_width(line) > cols - 1:
+                meta.pop()
+                line = f"{head}{D}{'  '.join(meta)}{OFF}{flag}"
+            out.append(clip(line, cols - 1))
+            # ONE line per session, however many runs it has: the one the
+            # device's band shows (the daemon lists it first) and "+N more".
+            # Display-only -- not a row, never selectable, and never carrying
+            # the '▸' that marks the selected row.
+            wfs = session_workflows(s)
+            if wfs:
+                out.append(_wf_line(wfs[0], len(wfs) - 1, cols - 1))
         else:
             if rows[i - 1]["kind"] == "session":
                 out.append("")

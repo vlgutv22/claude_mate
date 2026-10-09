@@ -6,7 +6,15 @@ Claude Mate daemon
 The "brain" of the Claude Mate USB hardware companion. It:
 
   1. Listens on a Unix-domain socket (CLAUDE_MATE_SOCK) for status lines emitted
-     by Claude Code hooks / the PTY wrapper: "<state>|<session_id>|<name>[|...]".
+     by Claude Code hooks / the PTY wrapper:
+
+         <state>|<session_id>|<name>[|<ctrl_sock>|<model>|<effort>|<account>
+          |<limit>|<wf>]
+
+     Hooks send the first three fields, the wrapper all nine. <wf> is the
+     session's dynamic workflows: up to three records joined by '~', each
+     st;done;total;failed;pct;elapsed_s;tokens;note;name with st one of
+     R E P D F -- or '-' for none, or empty for "no change" (parse_wf).
   2. Manages the device link(s). By default that is a single, continuously-open
      USB serial connection to the Arduino Nano: it auto-detects the port
      (/dev/cu.usbserial* then /dev/cu.usbmodem*), opens it once, keeps it open,
@@ -26,7 +34,15 @@ The "brain" of the Claude Mate USB hardware companion. It:
 
      (account = which login the session runs as, limit = its remaining-limit
      chip, both right-aligned; empty for hook-driven sessions.) The firmware
-     is a dumb renderer; ALL layout/ordering/selection lives here.
+     is a dumb renderer; ALL layout/ordering/selection lives here -- with one
+     exception, the workflow band. When the shown session has a workflow, the
+     frame sets flags bit2 and is preceded by
+
+         J|<st>|<done>|<failed>|<total>|<info>|<name>
+
+     whose counts each device draws as a bar in its own geometry (info and
+     name are still composed here); 'J|-' is sent once when there is none.
+     The F commits the J: the firmware draws nothing from a J alone.
   4. Reads button events from the Arduino on a background thread. The buttons
      mean the same thing at all times (no modes):
         H     -> handshake; the daemon resends the full current state.
@@ -89,7 +105,8 @@ import traceback
 import urllib.parse
 import wave
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import (Any, Callable, Dict, List, NamedTuple, Optional, Tuple,
+                    Union)
 
 # --------------------------------------------------------------------------- #
 # Crash-loop damage control -- BEFORE the first import that can fail
@@ -252,6 +269,27 @@ SESSION_IDLE_TTL = 600.0    # drop any stale session after this long
 # Screen text geometry (must match the firmware's fixed 4-row layout, all
 # size-1: r0 name / r1 state+time / r2 model+effort / r3 position + fleet).
 ROW_CHARS = 21              # size-1 rows are 21 chars wide (128 / 6px)
+
+# ---- Workflows (Claude Code's dynamic workflows, read off its footer) ----- #
+# The wrapper lists a session's workflows in field 8 of its line (parse_wf);
+# the device draws the shown session's primary one as a band, from a J| line
+# the frame commits (Screen._wf_view). Every knob is a module constant on
+# purpose: there is nothing here a user should have to configure.
+WF_INFO_CHARS = 14          # J| info: the firmware's WF_INFO_MAX (workflow.h)
+WF_NAME_CHARS = 40          # J| name: the S3's WF_NAME_MAX (workflow.h)
+WF_RECORDS = 3              # the wire's cap: field 8 lists at most this many
+WF_STALE_S = 90.0           # a wrapper's running/paused record nobody has
+                            # re-listed for this long is gone -- its 20 s
+                            # keepalive missed four times over
+WF_LINGER_S = 60.0          # a finished record stays visible this long...
+WF_SPOTLIGHT_S = 10.0       # ...and takes the band from a running one for
+                            # this long, so a run ending beside another one is
+                            # seen to end rather than vanishing under it
+WF_RESEND_S = 1.0           # while the band is up, its J+F pair goes out at
+                            # least this often, changed or not: a lost J then
+                            # costs a second or two (the 1 Hz Ticker's next
+                            # call past this age), not the minute a frame at
+                            # h:mm and a finished run's J can sit unchanged
 
 # 4-char state tag shown on the state row.
 STATE_TAG = {"working": "WORK", "waiting": "WAIT", "error": "ERR",
@@ -432,6 +470,262 @@ def log(msg: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Workflows: what a session's dynamic workflows are doing
+# --------------------------------------------------------------------------- #
+# A WORKFLOW IS AN ATTRIBUTE OF A SESSION, NOT A STATE. The session stays WORK
+# (or WAIT, or whatever it is) and the workflow rides beside it: nothing in
+# here touches state, state_since, acked, the haptic return or the LED, so a
+# run finishing can never buzz, and a stale record can never hold a session
+# on anything.
+
+_WF_STATES = "REPDF"        # R running, E running with a failed agent, P paused
+                            # on a usage limit, D completed, F ended without
+                            # completing (failed or stopped: the screen cannot
+                            # tell which)
+_WF_LIVE = "REP"            # still in flight
+_WF_CLOCKED = "RE"          # ...with a clock that is still running
+_WF_ENDED = "DF"
+_WF_WORD = {"R": "running", "E": "running", "P": "paused", "D": "done",
+            "F": "ended"}
+
+
+class WfRec(NamedTuple):
+    """One workflow, as the session's line last listed it. Immutable: a
+    session's tuple of these is replaced whole under Registry._lock and read
+    without it, like every other field _compose reads."""
+    st: str                             # one of _WF_STATES
+    done: Optional[int] = None          # agents finished      } None =
+    total: Optional[int] = None         # agents in the run    } the screen
+    failed: Optional[int] = None        # agents that failed   } did not say
+    pct: Optional[int] = None           # the bar's fill, 0..100
+    elapsed_s: Optional[int] = None     # the run's own clock when listed
+    tokens: Optional[int] = None
+    note: str = ""                      # a paused run's "til 3:30pm"
+    name: str = ""
+    live: bool = False                  # listed by a wrapper (ctrl socket set)
+    seen_ts: float = 0.0                # the last line that listed it
+    anchor: Optional[float] = None      # R/E: when its clock read zero
+    ended_ts: Optional[float] = None    # D/F: when it was first seen ended
+    ended_seen: bool = False            # D/F: and the end itself was seen --
+                                        # the line before listed it R/E/P
+
+
+def _wf_clean(text: str) -> str:
+    """Control characters out, everything else kept. The name is stored as the
+    session named it (the CLI prints it); the device's ASCII is made at render
+    time, by _wf_ascii."""
+    return "".join(ch for ch in (text or "")
+                   if ch >= " " and not ("\x7f" <= ch <= "\x9f")).strip()
+
+
+def _wf_num(text: str) -> Optional[int]:
+    """A record's number: '' is unknown (None), ASCII digits are a value, and
+    anything else raises -- a record with a garbled count is a malformed
+    record, not one with a zero in it. Bounded so a hostile line cannot make
+    int() do quadratic work."""
+    text = text.strip()
+    if not text:
+        return None
+    if len(text) > 18 or not (text.isascii() and text.isdigit()):
+        raise ValueError(f"not a count: {text!r}")
+    return int(text)
+
+
+def parse_wf(text: Optional[str]) -> Optional[List[WfRec]]:
+    """Field 8 of a session line -> its workflow records.
+
+        wf  := '-' | rec ('~' rec){0,2}
+        rec := st;done;total;failed;pct;elapsed_s;tokens;note;name
+
+    Returns None for KEEP (no field, an empty one, or one with no valid record
+    in it -- the same "empty means no change" rule every other trailing field
+    follows), [] for CLEAR ('-'), and otherwise up to WF_RECORDS records with
+    only the producer's fields set; Registry.update fills in the rest.
+
+    A record with an unknown status letter or a malformed count is skipped,
+    not guessed at: a newer producer's new letter must not draw as something
+    it is not. The name is the LAST sub-field and is split off with
+    maxsplit=8, so it may contain ';'."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    if text == "-":
+        return []
+    out: List[WfRec] = []
+    for raw in text.split("~"):
+        parts = raw.split(";", 8)
+        if len(parts) != 9:
+            continue
+        st = parts[0].strip()
+        if len(st) != 1 or st not in _WF_STATES:
+            continue
+        try:
+            done, total, failed, pct, elapsed, tokens = (
+                _wf_num(p) for p in parts[1:7])
+        except ValueError:
+            continue
+        out.append(WfRec(
+            st=st, done=done, total=total, failed=failed,
+            pct=None if pct is None else min(pct, 100),
+            elapsed_s=elapsed, tokens=tokens,
+            note=_wf_clean(parts[7])[:WF_INFO_CHARS],
+            # A bound on memory, not a display rule: the producer sends <= 40
+            # characters, and every renderer cuts to its own width.
+            name=_wf_clean(parts[8])[:4 * WF_NAME_CHARS]))
+        if len(out) == WF_RECORDS:
+            break
+    return out or None
+
+
+def _wf_keyed(recs) -> List[Tuple[Tuple[str, int], WfRec]]:
+    """[((name, k), rec)] where k counts earlier records of the same name.
+
+    THE NAME ALONE IS NOT AN IDENTITY: two runs of one script are two
+    workflows with one name, and each needs its own clock and its own linger.
+    The k-th 'sweep' in this line is the k-th 'sweep' in the last one."""
+    seen: Dict[str, int] = {}
+    out = []
+    for r in recs:
+        k = seen.get(r.name, 0)
+        seen[r.name] = k + 1
+        out.append(((r.name, k), r))
+    return out
+
+
+def wf_merge(prev, recs: List[WfRec], now: float,
+             live: bool) -> Tuple[WfRec, ...]:
+    """The session's new tuple: `recs` as listed, carrying over what only the
+    daemon knows about each one.
+
+    ANCHOR (the clock of a running record). Every line re-lists the run's
+    elapsed time, and the wrapper only reads it off the screen, which repaints
+    once a second -- so a fresh `now - elapsed_s` jitters by up to a second
+    from line to line. Keeping the EARLIEST anchor while a record stays R/E
+    makes the shown clock monotonic: a lagging scrape can never step it back.
+    Re-entering R/E from P/D/F, or appearing new, starts a fresh anchor.
+
+    ENDED_TS (when a record was first seen D/F) is carried for as long as it
+    stays D/F -- including after its linger has expired, which is what keeps
+    a finished row Claude is still showing from reappearing for another
+    minute on every keepalive.
+
+    ENDED_SEEN says the END itself was seen: the same key was R/E/P in the
+    last line, and is D/F in this one. Only such a record may take the
+    spotlight (wf_primary). One that arrives already finished -- after a
+    daemon restart, a fourth run the wire's three-record window kept off
+    until another one ended, a name Claude cut afresh with '…' on a resize
+    -- ended at a moment nobody here saw, possibly long ago, and announcing
+    it as "just finished" would name the wrong run. It still lingers
+    WF_LINGER_S from first sight, like any finished record."""
+    old = dict(_wf_keyed(prev))
+    out = []
+    for key, r in _wf_keyed(recs):
+        p = old.get(key)
+        anchor = ended = None
+        seen_end = False
+        if r.st in _WF_CLOCKED:
+            base = p.anchor if (p is not None and p.st in _WF_CLOCKED) else None
+            if r.elapsed_s is not None:
+                fresh = now - r.elapsed_s
+                anchor = fresh if base is None else min(base, fresh)
+            else:
+                anchor = base       # a clock the screen dropped (it narrowed)
+                                    # is still running
+        elif r.st in _WF_ENDED:
+            if p is not None and p.st in _WF_ENDED and p.ended_ts is not None:
+                # Still the same ending (D -> F included): when it was first
+                # seen, and whether the end itself was, carry over.
+                ended, seen_end = p.ended_ts, p.ended_seen
+            else:
+                ended = now
+                seen_end = p is not None and p.st in _WF_LIVE
+        out.append(r._replace(live=live, seen_ts=now, anchor=anchor,
+                              ended_ts=ended, ended_seen=seen_end))
+    return tuple(out)
+
+
+def _wf_changes(prev, new) -> List[Tuple[str, str, str]]:
+    """(name, old st, new st) for every record that started, finished or
+    changed status -- '-' for one that was not there. What the log says, so
+    a keepalive that only moved a clock says nothing."""
+    old = dict(_wf_keyed(prev))
+    cur = dict(_wf_keyed(new))
+    out = []
+    for key, r in _wf_keyed(new):
+        p = old.get(key)
+        if p is None or p.st != r.st:
+            out.append((r.name, p.st if p is not None else "-", r.st))
+    for key, p in _wf_keyed(prev):
+        if key not in cur:
+            out.append((p.name, p.st, "-"))
+    return out
+
+
+def wf_visible(rec: WfRec, now: float) -> bool:
+    """Whether a record is shown anywhere: the band, bit2, the queue JSON.
+
+    Pure, and the only place this is decided, so the frame, its J, the CLI
+    and prune() can never disagree about it.
+
+      * R/E/P from a wrapper: until WF_STALE_S after the last line that listed
+        it. A wrapper re-lists every 20 s, so a record that stops being listed
+        without a '-' belongs to a wrapper that died.
+      * R/E/P from anything else (a hook): no keepalive to go stale against,
+        so it stands until a line replaces it, or its session goes.
+      * D/F: for WF_LINGER_S after it was first seen ended. Past that it stays
+        in the tuple as a hidden tombstone while the producer still lists it,
+        so the next keepalive cannot resurrect it with a fresh ended_ts."""
+    if rec.st in _WF_LIVE:
+        return (not rec.live) or (now - rec.seen_ts <= WF_STALE_S)
+    return rec.ended_ts is not None and now - rec.ended_ts <= WF_LINGER_S
+
+
+def wf_elapsed(rec: WfRec, now: float) -> Optional[float]:
+    """The run's clock as shown: still ticking for R/E (from its anchor, so
+    the daemon needs no per-second line), frozen for P/D/F, None if the screen
+    never showed one."""
+    if rec.st in _WF_CLOCKED:
+        return None if rec.anchor is None else max(0.0, now - rec.anchor)
+    return None if rec.elapsed_s is None else float(rec.elapsed_s)
+
+
+def wf_primary(recs, now: float) -> Tuple[Optional[WfRec], int]:
+    """(the record the band shows, how many other visible records there are).
+
+    A record that ENDED in the last WF_SPOTLIGHT_S takes the band first -- the
+    most recently ended one -- or a run finishing beside a running one would
+    be over before anyone saw it end. Only an end the daemon SAW counts
+    (ended_seen): a record that turned up already finished has no moment of
+    ending to announce, and spotlighting it would put a stale run over a live
+    one as though it had just finished. Then the first one still in flight,
+    in the producer's (on-screen) order; then the first finished one."""
+    vis = [r for r in recs if wf_visible(r, now)]
+    if not vis:
+        return (None, 0)
+    fresh = [r for r in vis if r.st in _WF_ENDED and r.ended_seen
+             and r.ended_ts is not None and now - r.ended_ts <= WF_SPOTLIGHT_S]
+    if fresh:
+        pick = max(fresh, key=lambda r: r.ended_ts)
+    else:
+        going = [r for r in vis if r.st in _WF_LIVE]
+        pick = going[0] if going else vis[0]
+    return (pick, len(vis) - 1)
+
+
+_wf_fault_count = [0]
+
+
+def _wf_fault(where: str, exc: BaseException) -> None:
+    """A workflow bug costs the workflow, never the frame or the session line.
+    Every caller fences its workflow code and lands here, and this says so --
+    a few times, with the traceback, and then stops repeating itself."""
+    _wf_fault_count[0] += 1
+    if _wf_fault_count[0] <= 5:
+        log(f"workflow {where} failed ({type(exc).__name__}: {exc}); "
+            f"carrying on without it\n{traceback.format_exc()}")
+
+
+# --------------------------------------------------------------------------- #
 # Session model + thread-safe registry
 # --------------------------------------------------------------------------- #
 
@@ -454,6 +748,10 @@ class Session:
     acked: bool = True             # alert (done/waiting/error) seen by the human?
     last_ack_state: str = ""       # alert class most recently acknowledged...
     last_ack_ts: float = 0.0       # ...and when (re-alert flap suppression)
+    # Its dynamic workflows (PTY wrapper), as last listed. Replaced WHOLE under
+    # Registry._lock and read without it: one reference read of an immutable
+    # tuple, which is how _compose reads every other field here.
+    workflows: Tuple[WfRec, ...] = ()
 
     def display_seconds(self) -> float:
         """The time shown on the info row: time in the current state.
@@ -478,7 +776,8 @@ class Registry:
     def update(self, state: str, sid: str, name: str, cwd: str = "",
                focus_ctrl: str = "", model: str = "",
                effort: str = "", account: str = "",
-               limit: str = "") -> Optional[str]:
+               limit: str = "", wf: Optional[str] = None,
+               now: Optional[float] = None) -> Optional[str]:
         """Apply a status update from a hook, the PTY wrapper, or the mock injector.
 
         Returns the one-shot LED KIND for this session's own transition
@@ -487,12 +786,25 @@ class Registry:
         Models "finished but not yet acknowledged": a turn ending (working ->
         idle) becomes 'done' and STAYS 'done' (alerting) until the user
         acknowledges it; later idle keepalives must not clear it.
+
+        `wf` is the line's field 8 (see parse_wf): None or '' keeps the
+        session's workflows, '-' clears them, records replace them. It never
+        touches anything else here -- not the state, not the ack, not the
+        return value. `now` exists for tests; everything else passes nothing.
         """
         if state not in VALID_STATES:
             log(f"ignoring update with invalid state: {state!r}")
             return None
         key = sid if sid else (name if name else "unknown")
-        now = time.time()
+        now = time.time() if now is None else now
+        # Parsed before the lock (it is pure) and fenced: a workflow field
+        # nobody anticipated costs the workflows, never the state report.
+        try:
+            recs = parse_wf(wf)
+        except Exception as exc:
+            _wf_fault("parse", exc)
+            recs = None
+        changes: List[Tuple[str, str, str]] = []
         with self._lock:
             sess = self._sessions.get(key)
             if sess is None:
@@ -515,6 +827,14 @@ class Registry:
                 sess.account = account
             if limit:
                 sess.limit = limit
+            if recs is not None:
+                try:
+                    new = (wf_merge(sess.workflows, recs, now,
+                                    live=bool(focus_ctrl)) if recs else ())
+                    changes = _wf_changes(sess.workflows, new)
+                    sess.workflows = new
+                except Exception as exc:
+                    _wf_fault("update", exc)
             prev_state = sess.state
             sess.last_update_ts = now
 
@@ -551,7 +871,12 @@ class Registry:
                     haptic = "START"             # job (re)started: calm tick
                 else:                            # idle
                     sess.acked = True
-            return haptic
+        # ONE line per start or finish, never per keepalive: the per-line
+        # 'socket update' log is already most of the log file, and a workflow
+        # line every 20 s for a 28-minute median run would be the rest of it.
+        for wname, was, now_st in changes:
+            log(f'workflow: {sess.name} "{wname}" {was} -> {now_st}')
+        return haptic
 
     def remove(self, key: str) -> None:
         with self._lock:
@@ -582,9 +907,16 @@ class Registry:
         items.sort(key=lambda s: (STATE_ORDER.get(s.state, 99), s.state_since))
         return items[0] if items else None
 
-    def prune(self) -> None:
-        """Drop stale/finished sessions so the queue stays tidy."""
-        now = time.time()
+    def prune(self, now: Optional[float] = None) -> None:
+        """Drop stale/finished sessions so the queue stays tidy -- and the
+        running workflows of a wrapper that stopped listing them.
+
+        Only stale R/E/P records go here. A finished record past its linger
+        is a tombstone that stays for as long as its producer lists it (see
+        wf_visible), so dropping it here would let the next keepalive bring it
+        back as new."""
+        now = time.time() if now is None else now
+        stale: List[Tuple[str, WfRec]] = []
         with self._lock:
             dead: List[str] = []
             for key, s in self._sessions.items():
@@ -599,6 +931,16 @@ class Registry:
                 self._sessions.pop(key, None)
             if dead:
                 log(f"pruned {len(dead)} stale session(s)")
+            for s in self._sessions.values():
+                gone = [r for r in s.workflows
+                        if r.st in _WF_LIVE and not wf_visible(r, now)]
+                if gone:
+                    s.workflows = tuple(r for r in s.workflows
+                                        if not any(r is g for g in gone))
+                    stale.extend((s.name, r) for r in gone)
+        for sname, r in stale:
+            log(f'workflow: {sname} "{r.name}" {r.st} -> - (not listed for '
+                f'{int(now - r.seen_ts)} s)')
 
     def queue(self) -> List[Session]:
         """The display/navigation order: STABLE, alphabetical by name (then key
@@ -1166,6 +1508,17 @@ class NetLink:
             conn.settimeout(None)               # blocking reads from here on
         except OSError:
             pass
+        try:
+            # NO NAGLE. A workflow band is a J| line written immediately before
+            # the F| that commits it, and with Nagle on, that small F waits in
+            # the kernel until the device ACKs the J -- which the ESP32's lwIP
+            # delays by up to ~250 ms. Every frame would reach a Wi-Fi device
+            # a quarter-second late. These are interactive, line-sized writes:
+            # exactly what TCP_NODELAY exists for. Its own try, so a stack
+            # without it cannot cost the settimeout above.
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
         with self._lock:
             self._clients.append(conn)
         log(f"TCP device connected: {peer}")
@@ -1685,6 +2038,158 @@ def _display_names(sessions: List[Session]) -> Dict[str, str]:
     return out
 
 
+# ---- the workflow band: J|<st>|<done>|<failed>|<total>|<info>|<name> ------ #
+# THE ONE PLACE THE DEVICES DO NOT SHARE A RENDERING. Everything else on the
+# glass is a row the daemon composes and both firmwares print; the band carries
+# numbers each device draws a bar from in its own geometry, plus two strings
+# composed here so the firmware still never decides what a word says: `info`
+# (what fits in 14 characters) and `name`. Both are ASCII before they leave,
+# and neither can hold a '|' -- the firmware rejects any J with one in it.
+
+def _wf_ascii(text: str) -> str:
+    """A string the J| line can carry: '|' -> '/', the ellipsis Claude cuts
+    names with -> '~', control characters dropped, anything else outside
+    ASCII -> '?' (one for one, as the transports' own ascii/replace would)."""
+    out = []
+    for ch in text or "":
+        if ch == "|":
+            out.append("/")
+        elif ch == "…":
+            out.append("~")
+        elif ch < " " or "\x7f" <= ch <= "\x9f":
+            continue
+        elif ch > "~":
+            out.append("?")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _wf_clock(seconds: float) -> str:
+    """A run's clock in Claude's own units -- 45s, 2m39s, 1h02m, 1d03h -- so
+    the band reads like the footer it came from, and so a ten-hour run never
+    reads like the ten-minute "10:23" that r1's mm:ss would make of it."""
+    s = int(max(0, seconds))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    if s < 86400:
+        return f"{s // 3600}h{s % 3600 // 60:02d}m"
+    return f"{s // 86400}d{s % 86400 // 3600:02d}h"
+
+
+def _wf_tokens(n: int) -> str:
+    """Compact tokens: 999, 1.2k, 543k, 1.4M, 12M, 1.2B. Rounded half up in
+    integers, and a value that rounds past its unit moves up one -- 999_950
+    is "1.0M", never "1000k" (likewise 9_960 is "10k", not "10.0k")."""
+    n = max(0, int(n))
+    if n < 1000:
+        return str(n)
+    for div, unit in ((10 ** 3, "k"), (10 ** 6, "M"), (10 ** 9, "B")):
+        tenths = (10 * n + div // 2) // div       # n / div to one decimal
+        if tenths < 100:
+            return f"{tenths // 10}.{tenths % 10}{unit}"
+        whole = (n + div // 2) // div
+        if whole < 1000 or unit == "B":
+            return f"{whole}{unit}"
+    return str(n)                                 # unreachable
+
+
+def wf_info(rec: WfRec, extra: int, now: float) -> str:
+    """The band's text, at most WF_INFO_CHARS ASCII characters.
+
+    Parts: COUNT ("3/5", or "40%" when only the bar is known), CLK (the run's
+    clock), TOK (tokens), PLUS ("+1": other workflows). The first candidate
+    that fits wins, so a count is the last thing given up and "+N" outranks
+    tokens -- on the Nano, which never shows the name, it is the only sign a
+    second run exists. A paused run with a note says when it resumes instead.
+
+    When nothing about the run fits (a hook's record, a paused row the
+    terminal cut short), what stands in depends on who draws the word. A
+    running run (R/E) gets its word: the Nano draws a bar for it and no word,
+    and an empty info beside an empty bar would say nothing at all. A paused,
+    finished or ended one gets only "+N", or nothing: both firmwares draw
+    "paused"/"done"/"ended" themselves -- the Nano where the bar would be, the
+    S3 on the band's first line -- and the word again in the info would read
+    "paused ... paused"."""
+    plus = f"+{extra}" if extra > 0 else ""
+    note = _wf_ascii(rec.note).strip()[:WF_INFO_CHARS]
+    if rec.st == "P" and note:
+        return note
+    if rec.done is not None and rec.total is not None:
+        count = f"{rec.done}/{rec.total}"
+    elif rec.pct is not None:
+        count = f"{rec.pct}%"
+    else:
+        count = ""
+    secs = wf_elapsed(rec, now)
+    clk = "" if secs is None else _wf_clock(secs)
+    tok = "" if rec.tokens is None else _wf_tokens(rec.tokens)
+    if count or clk or tok:
+        for parts in ((count, clk, tok, plus), (count, clk, plus),
+                      (count, plus), (count, clk, tok), (count, clk),
+                      (count, tok), (count,), (clk, tok), (clk,), (tok,)):
+            text = " ".join(p for p in parts if p)
+            if text and len(text) <= WF_INFO_CHARS:
+                return text
+    if rec.st not in _WF_CLOCKED:
+        return plus if len(plus) <= WF_INFO_CHARS else ""
+    word = _WF_WORD.get(rec.st, "")
+    text = f"{word} {plus}".strip()
+    return text if len(text) <= WF_INFO_CHARS else word[:WF_INFO_CHARS]
+
+
+def _wf_j_name(name: str, extra: int) -> str:
+    """The name the S3 prints, at most WF_NAME_CHARS. With other workflows
+    visible it ends " +N" -- inside the 40, never past it -- and a name cut to
+    make room ends in '~', the way Claude's own '…' arrives."""
+    text = _wf_ascii(name).strip()
+    tail = f" +{extra}" if extra > 0 else ""
+    room = WF_NAME_CHARS - len(tail)
+    if len(text) > room:
+        text = text[:room - 1].rstrip() + "~"
+    return text + tail
+
+
+def wf_j_line(rec: WfRec, extra: int, now: float) -> str:
+    """J|<st>|<done>|<failed>|<total>|<info>|<name> -- note the ORDER of the
+    counts, which is not the socket's. They drive the bar and nothing else:
+    with no counts but a bar fraction the bar is done=pct of total=100, and
+    with neither it is 0|0|0, which both firmwares draw as no bar at all.
+    Saturated at 65535, the firmware's own ceiling (and five digits)."""
+    if rec.done is not None and rec.total is not None:
+        nums = (rec.done, rec.failed or 0, rec.total)
+    elif rec.pct is not None:
+        nums = (rec.pct, 0, 100)
+    else:
+        nums = (0, 0, 0)
+    counts = "|".join(str(min(max(0, int(v)), 65535)) for v in nums)
+    return (f"J|{rec.st}|{counts}|{wf_info(rec, extra, now)}"
+            f"|{_wf_j_name(rec.name, extra)}")
+
+
+def wf_snapshot(recs, now: float) -> List[Dict[str, Any]]:
+    """A session's visible workflows for the CLI: the band's own record FIRST
+    (the spotlight rule needs times the JSON does not carry, so the order is
+    how a client shows what the device shows), then the rest in the producer's
+    order. 'status' is a word; 'st' tells a running-with-failures E from R."""
+    vis = [r for r in recs if wf_visible(r, now)]
+    primary, _extra = wf_primary(recs, now)
+    if primary is not None:
+        vis = [primary] + [r for r in vis if r is not primary]
+    out = []
+    for r in vis:
+        secs = wf_elapsed(r, now)
+        out.append({"name": r.name, "st": r.st,
+                    "status": _WF_WORD.get(r.st, ""),
+                    "done": r.done, "total": r.total, "failed": r.failed,
+                    "pct": r.pct,
+                    "secs": None if secs is None else int(secs),
+                    "tokens": r.tokens, "note": r.note})
+    return out
+
+
 class Screen:
     """Owns everything the device shows: the selection, the pre-rendered frame,
     and the LED loop tracker."""
@@ -1705,6 +2210,13 @@ class Screen:
         # the raised terminal always matches the name the user is looking at.
         self._last_frame = ""
         self._shown_key: Optional[str] = None
+        # Last J| line actually sent ("" = none yet), the session whose band
+        # it was (None = none yet, or 'J|-' since), and when the last whole
+        # J+F pair went out (monotonic). Read and written only by refresh(),
+        # never by _compose -- see _wf_view for why.
+        self._last_j = ""
+        self._last_j_key: Optional[str] = None
+        self._last_pair_at = float("-inf")
         # FOLLOW mode: when on, PREV/NEXT auto-raise the selected terminal. The
         # active tab's fleet letter is boxed either way; the box is FILLED while
         # following (the on-screen "switch"), an outline when not.
@@ -1885,19 +2397,52 @@ class Screen:
 
     # ---- frame composition -------------------------------------------------- #
 
+    @staticmethod
+    def _wf_view(subject: Optional[Session], now: float) -> Tuple[str, bool]:
+        """(the J| line for the subject's workflow band, whether it is up).
+
+        Computed ONCE per refresh, with the same `now` the frame uses, and
+        handed to _compose -- so bit2 and the J it commits are decided by one
+        visibility check and can never disagree at a stale or linger
+        boundary. Static: it reads the subject's immutable tuple and nothing on
+        the Screen.
+
+        Fenced. This runs under the Screen lock on the ticker, the socket
+        thread and the button reader, and an exception escaping it would kill
+        whichever one it was on; a workflow nobody anticipated must cost the
+        band, never the frame."""
+        if subject is None:
+            return ("J|-", False)
+        try:
+            rec, extra = wf_primary(subject.workflows, now)
+            if rec is None:
+                return ("J|-", False)
+            return (wf_j_line(rec, extra, now), True)
+        except Exception as exc:
+            _wf_fault("band", exc)
+            return ("J|-", False)
+
     def _compose(self, queue: List[Session],
-                 subject: Optional[Session]) -> Tuple[str, Optional[str], bool]:
+                 subject: Optional[Session],
+                 wf_show: bool = False) -> Tuple[str, Optional[str], bool]:
         """Build the F| line for the current state:
             F|<flags>|<sel>|<r0>|<r1>|<r2>|<r3>
         with four size-1 rows (r0 name / r1 state+time + account / r2
         model+effort + remaining-limit chip / r3 position + fleet letters).
         `flags` is a bitfield
-        (bit0 = flash the name, bit1 = FOLLOW mode -> draw the play marker);
+        (bit0 = flash the name, bit1 = FOLLOW mode -> draw the play marker,
+        bit2 = the workflow band is live for this session -- `wf_show`, from
+        _wf_view, unless a notice owns r1/r2);
         `sel` is the character column WITHIN r3 of the active tab's fleet
         letter to box (-1 = none). Returns (line, subject_key, flash). r3 is
         LAST and may contain literal '|' (the firmware stops tokenizing at the
         6th bar and takes the rest verbatim), which is what lets the strip use
-        '|' as its visual divider."""
+        '|' as its visual divider.
+
+        The band changes NOTHING else in the frame: r0..r3, sel, bit0 and bit1
+        are byte-for-byte what they would be without it, and r2 keeps its
+        model+effort+limit -- so firmware that predates the band (which reads
+        only bits 0 and 1) draws exactly what it always did."""
         follow = self._follow
         note = self._notice_rows()
         if subject is None:
@@ -1968,6 +2513,11 @@ class Screen:
         # being talked about would make the message ambiguous.
         if note:
             r1, r2 = note
+        elif wf_show:
+            # ...and the band gives way to it too: on the Nano the band IS r2,
+            # and a message about a press outranks a progress bar for the four
+            # seconds it is up.
+            flags |= 4
         line = f"F|{flags}|{sel}|{r0}|{r1}|{r2}|{r3}"
         return (line, subject.key, flash)
 
@@ -1977,8 +2527,36 @@ class Screen:
         The queue snapshot is taken INSIDE the Screen lock so snapshot-time and
         commit-time are ordered -- a preempted caller can never commit a stale
         frame over a newer one (Screen -> Registry lock nesting is safe: the
-        registry never takes the Screen lock)."""
+        registry never takes the Screen lock).
+
+        THE WORKFLOW BAND RIDES THE FRAME. Its J| line goes out immediately
+        BEFORE the F that commits it, and the firmware only stages a J -- it
+        draws nothing until the F arrives. So while the band is up, anything
+        worth writing (a changed frame, a changed J, a forced resend) is
+        written as the pair, and the F goes even when its own bytes are
+        unchanged: it is the commit. That is also the loss recovery. A lost F
+        is healed by the next one a second later, and pairing extends that to
+        J -- a J that only went out when its bytes changed would leave a
+        dropped one wrong for a whole linger or a whole usage-limit pause,
+        because a finished run's J never changes. With no band, 'J|-' goes out
+        once, ahead of the frame, and on every forced resend.
+
+        "The next one" has to come, though, and a frame does not always move:
+        r1 past an hour reads h:mm, and a paused or finished run's J is
+        constant, so nothing changes for up to a minute. So the pair also goes
+        out whenever the last one is WF_RESEND_S old -- the Ticker calls in
+        once a second -- and a lost J or F costs a second or two, whatever is
+        on the glass.
+
+        And a band for a DIFFERENT session goes out over a cleared stage:
+        'J|-', then its J, then the F. The firmware's staged J survives the
+        commit, so if the new session's J were lost, its F would commit the
+        PREVIOUS session's band under the new session's name. With the stage
+        cleared first, a lost J means no band until the next pair instead. No
+        J yet counts as different: a device that outlived the last daemon may
+        still hold a J it staged."""
         with self._lock:
+            now = time.time()
             queue = self._reg.queue()
             subject = self._subject(queue)
             if subject is not None:
@@ -1989,8 +2567,34 @@ class Screen:
                 # Alerts elsewhere signal via the LED and their blinking fleet
                 # letters only.
                 self._sel_key = subject.key
-            line, key, flash = self._compose(queue, subject)
+            j_line, show = self._wf_view(subject, now)
+            line, key, flash = self._compose(queue, subject, wf_show=show)
             changed = (line != self._last_frame)
+            if show:
+                sent_at = time.monotonic()
+                other = key != self._last_j_key
+                if not (changed or force or other or j_line != self._last_j
+                        or sent_at - self._last_pair_at >= WF_RESEND_S):
+                    return
+                # Committed only on a successful write, like the frame: a J
+                # nobody took is retried with its F on the next tick, and an F
+                # is never sent without the J it commits. Another session's
+                # band goes out over a cleared stage (see above).
+                if other and self._last_j != "J|-":
+                    if not self._link.write_line("J|-"):
+                        return
+                    self._last_j, self._last_j_key = "J|-", None
+                if not self._link.write_line(j_line):
+                    return
+                self._last_j, self._last_j_key = j_line, key
+                if self._link.write_line(line):
+                    self._last_frame = line
+                    self._shown_key = key
+                    self._last_pair_at = sent_at
+                return
+            if force or self._last_j != "J|-":
+                if self._link.write_line("J|-"):
+                    self._last_j, self._last_j_key = "J|-", None
             if changed or force:
                 if self._link.write_line(line):
                     self._last_frame = line
@@ -2446,7 +3050,9 @@ def _which(prog: str) -> bool:
 
 
 class SocketServer(threading.Thread):
-    """Unix-domain socket server: parses '<state>|<session_id>|<name>' lines."""
+    """Unix-domain socket server: parses '<state>|<session_id>|<name>[|...]'
+    lines (the wrapper's nine fields end with its workflows; see
+    _process_line) and answers the CLI's few commands."""
 
     def __init__(self, sock_path: str, registry: Registry, on_update,
                  on_haptic=None) -> None:
@@ -2640,9 +3246,10 @@ class SocketServer(threading.Thread):
             return f"ok {got}\n" if got else f"error: no session matching {want!r}\n"
 
         # Expected: "<state>|<session_id>|<name>|<ctrl_sock?>|<model?>|<effort?>
-        # |<account?>|<limit?>". The hook path sends only the first three
-        # fields; the PTY wrapper adds the control socket, the scraped model +
-        # effort, the account it runs as, and the remaining-limit chip.
+        # |<account?>|<limit?>|<wf?>". The hook path sends only the first three
+        # fields; the PTY wrapper sends all nine: the control socket, the
+        # scraped model + effort, the account it runs as, the remaining-limit
+        # chip, and the session's dynamic workflows (parse_wf).
         # state may be "end" (from the PTY wrapper) to remove the session.
         parts = line.split("|")
         state = parts[0].strip() if len(parts) > 0 else ""
@@ -2653,6 +3260,11 @@ class SocketServer(threading.Thread):
         effort = parts[5].strip() if len(parts) > 5 else ""
         account = parts[6].strip() if len(parts) > 6 else ""
         limit = parts[7].strip() if len(parts) > 7 else ""
+        # A PLAIN split, not split('|', 8). The workflow grammar already keeps
+        # '|' out of field 8, so a maxsplit would buy nothing -- and it would
+        # glue any field a later producer adds after it onto the last
+        # workflow's name. Fields past 8 are ignored, as past 7 always were.
+        wf = parts[8].strip() if len(parts) > 8 else ""
         if not state:
             log(f"ignoring malformed socket line: {line!r}")
             return
@@ -2666,7 +3278,7 @@ class SocketServer(threading.Thread):
         log(f"socket update: state={state} sid={sid or '-'} name={name or '-'}")
         haptic = self._reg.update(state, sid, name, focus_ctrl=ctrl,
                                   model=model, effort=effort,
-                                  account=account, limit=limit)
+                                  account=account, limit=limit, wf=wf)
         self._on_update()
         if haptic and self._on_haptic:
             log(f"LED: {haptic} transition for {name or sid} ({state})")
@@ -2696,7 +3308,16 @@ class SocketServer(threading.Thread):
             shown = shown_s.key if shown_s else None
             follow = scr.is_follow()
         out = []
+        now = time.time()
         for i, sess in enumerate(self._reg.queue()):
+            # ALWAYS a list, [] when there are none, so a client can iterate
+            # it without asking -- and the same visibility the device uses,
+            # so the terminal never lists a run the glass has stopped showing.
+            try:
+                wfs = wf_snapshot(sess.workflows, now)
+            except Exception as exc:
+                _wf_fault("queue", exc)
+                wfs = []
             out.append({
                 "i": i,
                 "key": sess.key,
@@ -2710,6 +3331,7 @@ class SocketServer(threading.Thread):
                 "cwd": sess.cwd,
                 "acked": sess.acked,
                 "shown": sess.key == shown,
+                "workflows": wfs,
             })
         return {"queue": out, "follow": follow, "shown": shown, "selected": sel}
 
@@ -3365,8 +3987,9 @@ class SerialMaintainer(threading.Thread):
 
 class Ticker(threading.Thread):
     """1 Hz housekeeping: prunes stale sessions, keeps the displayed times
-    ticking (the frame is re-sent only when its bytes actually change), and
-    keeps the LED honest."""
+    ticking (the frame is re-sent only when its bytes actually change -- or,
+    while a workflow band is up, with its J once a second regardless, which
+    is what bounds a lost J: see Screen.refresh), and keeps the LED honest."""
 
     def __init__(self, screen: Screen, registry: Registry,
                  on_slow_tick: Optional[Callable[[], None]] = None) -> None:
@@ -3405,6 +4028,38 @@ class Ticker(threading.Thread):
 class MockInjector(threading.Thread):
     """Injects a few fake sessions cycling through states for demos."""
 
+    # THE WORKFLOW BAND'S DEMO. One session carries a run that walks through
+    # every rendering the band has, one mock step (4 s) at a time: running
+    # with the count advancing 0..5, running with a failed agent, paused on a
+    # usage limit, done, ended -- then none, and round again. (st, done,
+    # failed); None is '-'.
+    WF_DEMO_NAME = "release-risk-sweep"
+    WF_DEMO_TOTAL = 5
+    WF_DEMO = (("R", 0, None), ("R", 1, None), ("R", 2, None), ("R", 3, None),
+               ("R", 4, None), ("R", 5, None), ("E", 4, 1), ("P", 4, None),
+               ("D", 5, None), ("F", 3, 2), None)
+
+    @classmethod
+    def demo_wf(cls, step: int) -> str:
+        """Field 8 for mock step `step`, exactly as a wrapper would send it.
+
+        The clock advances 4 s a step while the run is going and then holds,
+        as a finished run's does; tokens grow. A running record's clock is
+        anchored by the daemon, so between steps it ticks on its own."""
+        i = step % len(cls.WF_DEMO)
+        spec = cls.WF_DEMO[i]
+        if spec is None:
+            return "-"
+        st, done, failed = spec
+        total = cls.WF_DEMO_TOTAL
+        lived = min(i, 6)                       # the run stops at its E step
+        pct = "" if st == "P" else str(100 * done // total)   # P: no bar
+        note = "til 3:30pm" if st == "P" else ""
+        return ";".join((st, str(done), str(total),
+                         "" if failed is None else str(failed), pct,
+                         str(37 + 4 * lived), str(18400 + 97300 * lived),
+                         note, cls.WF_DEMO_NAME))
+
     def __init__(self, registry: Registry, on_update) -> None:
         super().__init__(name="mock-injector", daemon=True)
         self._reg = registry
@@ -3421,9 +4076,14 @@ class MockInjector(threading.Thread):
         ]
         cycle = ["working", "waiting", "error", "done", "idle"]
         log("MOCK mode: injecting fake sessions")
-        # Seed initial states covering every queue class at once.
+        # Seed initial states covering every queue class at once -- in QUEUE
+        # (alphabetical) order. The ticker is already running and anchors the
+        # selection to whatever it renders, so a tick landing between two seeds
+        # pins the screen to the first one; seeded in this order that is always
+        # the head, api, which is where the demo workflow is.
         seeds = ["working", "waiting", "error", "done"]
-        for (sid, name, cwd), st in zip(fakes, seeds):
+        for (sid, name, cwd), st in sorted(zip(fakes, seeds),
+                                           key=lambda x: x[0][1]):
             self._reg.update(st, sid, name, cwd)
         demo_meta = {
             "webapp": ("Opus 4.8", "xhigh", "work", "5h82%"),
@@ -3437,12 +4097,33 @@ class MockInjector(threading.Thread):
                     s.model, s.effort, s.account, s.limit = demo_meta[s.name]
         self._on_update()
 
+        # The workflow rides on api: alphabetically first, so it is the queue
+        # head and therefore what a freshly started --mock device shows.
+        demo_sid, demo_name, demo_cwd = fakes[1]
+        # What each session last SAID, which is what a wrapper re-sends with
+        # every keepalive.
+        said = {sid: st for (sid, _n, _c), st in zip(fakes, seeds)}
         step = 0
         while not self._stop_evt.is_set():
             # Advance one session's state every ~4s so the screen/LED move.
             sid, name, cwd = fakes[step % len(fakes)]
             new_state = cycle[(step // len(fakes)) % len(cycle)]
-            self._reg.update(new_state, sid, name, cwd)
+            said[sid] = new_state
+            # EVERY step re-lists the demo workflow, through Registry.update
+            # and the parser like a real line, so it is exercised end to end
+            # and never goes stale.
+            wf = self.demo_wf(step)
+            if sid == demo_sid:
+                self._reg.update(new_state, sid, name, cwd, wf=wf)
+            else:
+                self._reg.update(new_state, sid, name, cwd)
+                # A keepalive repeats what it said -- except that a finished
+                # turn is said as "idle" (the daemon is what makes it DONE
+                # until acknowledged); repeating "done" would re-raise an
+                # alert the user had just acknowledged, every four seconds.
+                st = said[demo_sid]
+                self._reg.update("idle" if st == "done" else st, demo_sid,
+                                 demo_name, demo_cwd, wf=wf)
             self._on_update()
             step += 1
             self._stop_evt.wait(4.0)

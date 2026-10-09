@@ -4,7 +4,8 @@
  * firmware that is neither the daemon's nor the network's.
  *
  * WHY THESE LIVE HERE AT ALL. The rule everywhere else is that the daemon owns
- * every word on the glass and this firmware is a dumb renderer. These settings
+ * every word on the glass (bar the workflow band's four status words) and this
+ * firmware is a dumb renderer. These settings
  * break none of that, because none of them is about a session: they are about
  * the piece of hardware -- how bright it is, when it turns its own screen off,
  * which way up it is. The daemon has no business knowing, and asking it would
