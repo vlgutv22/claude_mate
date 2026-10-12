@@ -61,6 +61,14 @@ and the remaining-limit chip (e.g. '5h82%' = 82% of the 5-hour window left,
 'wk31%' = 31% of the week left -- whichever window is more depleted) on the
 model+effort row.
 
+Dynamic workflows on the device: a workflow (the Workflow tool) runs on after
+the turn that launched it has ended, and its row in the panel under the prompt
+box is the one live sign of it. The wrapper reads those rows -- the status from
+the bullet's colour, the progress, the run's own clock, the tokens, a
+usage-limit pause -- and every report carries up to three of them, or '-' when
+there are none (see wf_field). It is a scrape of an undocumented footer, so it
+is best effort: a row it cannot read is a row it does not report.
+
 Carrying a conversation to another account: an account is a $CLAUDE_CONFIG_DIR,
 read once at startup, so a session can never change account in place -- and each
 profile keeps its own projects/ tree, so a new one cannot see the old one's
@@ -83,7 +91,7 @@ Requires: pyte  (pip install pyte)
 """
 import os, sys, pty, tty, termios, fcntl, struct, signal, select, socket, \
        threading, time, re, json, uuid, subprocess, shutil, atexit, hashlib, \
-       tempfile
+       tempfile, colorsys, unicodedata
 
 try:
     import pyte
@@ -123,10 +131,19 @@ DEFAULT_PATTERNS = {
     # the others are unambiguous UI strings. (Bare "rate limit" / "rate_limit_error"
     # are deliberately NOT here: they are ordinary code/doc tokens that show up on
     # screen as content and would false-trigger the whole-screen scrape.)
+    # The last five are how 2.1.295 ends a turn on a limit -- its own list of
+    # limit-row openings: "You've hit your 5-hour limit · resets 3pm", "You've
+    # reached your Fable limit.", "You're out of usage credits", "Your org is
+    # out of usage · add funds to continue". "usage limit reached" now appears
+    # only on a retry line and on the grey auto-continue notice. Above the
+    # prompt box every phrase counts only where it OPENS a row in Claude's error
+    # colours (colour_phrases), so a reply that says them is safe.
     "error": [
         "api error", "overloaded_error",
         "service is temporarily",
-        "usage limit reached",
+        "usage limit reached", "you've hit your", "you've reached your",
+        "you're out of usage credits", "you're out of extra usage",
+        "your org is out of usage",
     ],
     # CONTENT-PRONE error PHRASES -- specific enough to mean a real failure but
     # still possible in ordinary output, so matched ONLY in the tight live status
@@ -263,23 +280,43 @@ def set_winsize(fd, rows, cols):
 # --------------------------------------------------------------------------- #
 # Daemon reporting
 # --------------------------------------------------------------------------- #
+def _field(value):
+    """One field of a report. A '|' would split it in two -- shifting every
+    field after it, the workflows into the limit's place -- and a CR or LF
+    would end the line early, so neither survives. Anything not text is ''."""
+    if not isinstance(value, str):
+        return ""
+    return value.replace("|", "/").replace("\r", "").replace("\n", "")
+
 def send_daemon(state):
     """Best-effort one-line report to the daemon. Never raises.
 
-    Wire format: state|SID|NAME|CTRL_SOCK|MODEL|EFFORT|ACCOUNT|LIMIT
+    Wire format, always all nine fields:
+        state|SID|NAME|CTRL_SOCK|MODEL|EFFORT|ACCOUNT|LIMIT|WF
     (model/effort are empty until captured from the screen; account/limit are
-    empty until known. The daemon treats ALL trailing fields as optional, so
-    older peers stay compatible)."""
-    model = g_meta["model"].replace("|", "/")
-    effort = g_meta["effort"].replace("|", "/")
-    account = g_meta["account"].replace("|", "/")
-    limit = g_meta["limit"].replace("|", "/")
+    empty until known. WF is this session's dynamic workflows: '-' for none,
+    or up to three '~'-joined records
+        st;done;total;failed;pct;elapsed_s;tokens;note;name
+    -- see wf_field -- or '' when they could not be read this time, which the
+    daemon takes as "keep what you have". The daemon treats ALL trailing fields
+    as optional, so older peers stay compatible.) NAME is the directory's own
+    name, so it is sanitised like the rest: a '|' in it used to shift every
+    field after it."""
+    head = "|".join([state, SID, _field(NAME), CTRL_SOCK]
+                    + [_field(g_meta[k]) for k in ("model", "effort",
+                                                   "account", "limit")])
+    try:
+        wf = _field(g_meta.get("wf", ""))
+    except Exception:                  # never at the cost of the state report
+        wf = ""
     try:
         c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         c.settimeout(0.5)
         c.connect(DAEMON_SOCK)
-        c.sendall(f"{state}|{SID}|{NAME}|{CTRL_SOCK}|{model}|{effort}"
-                  f"|{account}|{limit}\n".encode())
+        # errors="replace": a directory name that is not valid UTF-8 reaches
+        # Python as lone surrogates, which a strict encode refuses -- and a
+        # refused report is a session the device never hears from again.
+        c.sendall(f"{head}|{wf}\n".encode("utf-8", errors="replace"))
         c.close()
     except OSError:
         pass
@@ -625,9 +662,11 @@ _EFFORT_RE = re.compile(
     r'◉\s*(low|medium|high|xhigh|max|ultracode)\b', re.I)
 
 # Last-known model/effort for THIS session (sticky cache), plus the account
-# it runs as (set once at startup) and the remaining-limit chip (refreshed by
-# the usage poller thread). All four ride along on every daemon report.
-g_meta = {"model": "", "effort": "", "account": "", "limit": ""}
+# it runs as (set once at startup), the remaining-limit chip (refreshed by
+# the usage poller thread) and the workflow field (rebuilt by evaluate() on
+# every pass; '-' until a workflow has been seen). All of them ride along on
+# every daemon report.
+g_meta = {"model": "", "effort": "", "account": "", "limit": "", "wf": "-"}
 
 # The rendered TUI as plain text, republished by evaluate() on every pass. The
 # device's mirror view is served from THIS rather than by reaching into the pyte
@@ -855,8 +894,14 @@ _BG_COUNT_RE = re.compile(r'^[ \t]*\d+ in background[ \t]*$', re.I | re.M)
 #     agents panel. Claude redraws it every frame, so it stops asserting a fact
 #     the moment the fact stops being true, and no conversation text can reach it.
 # Each background-work tell is read against the half it actually lives in.
-_RULE_RE = re.compile(r'^[ \t]*[╭╰┌└├]?[─━═╌┄┈╍]{8,}[╮╯┐┘┤]?[ \t]*$')
-PROMPT_BOX_MAX_LINES = 8      # widest gap between the box's two rules (multi-line input)
+# The prompt box's TOP rule can carry a label at its right end -- captured live
+# in 2.1.295: "──────…────── ultracode ─". Unmatched, the box's top was missed,
+# the line you are typing landed in the transcript and in the meter region, and
+# a "↓ 600.8k tokens" typed there read as live work.
+_RULE_RE = re.compile(r'^[ \t]*[╭╰┌└├]?[─━═╌┄┈╍]{8,}'
+                      r'(?:[ ][^─━═\n]{1,40}?[ ][─━═╌┄┈╍]{1,4})?'
+                      r'[╮╯┐┘┤]?[ \t]*$')
+PROMPT_BOX_MAX_LINES = 8      # widest gap split_screen walks up between the box's rules
 
 def split_screen(nonblank):
     """(transcript, chrome) — the screen either side of Claude's prompt box.
@@ -876,6 +921,43 @@ def split_screen(nonblank):
             break
         top = i
     return nonblank[:top], nonblank[bottom + 1:]
+
+# Whether Claude's NORMAL prompt footer is on screen -- the one place a missing
+# workflow row means the panel really has no rows. split_screen() accepts any
+# rule, and every dialog draws one (a permission prompt's top border, the
+# workflow detail view's header), so on its own it cannot tell a dialog from
+# the prompt. The prompt box is two rules with the input line between them
+# ("❯ ...", "! ..." in shell mode). And with the box up, the panel under it can
+# still be swapped out: help ("? "), shell mode, the "/" and "@" suggestion
+# lists, exit-confirm -- each replaces the hint row, and the workflow rows go
+# with it while the runs go on.
+_INPUT_RE = re.compile(r'^[ \t]*[❯>!][ \t\xa0]')
+_FOOTER_SWAPPED_RE = re.compile(
+    r'! for (?:shell|bash) mode|/ for commands|@ for file paths|again to exit'
+    r'|^[ \t]{2}[/@][\w:./-]+[ \t]{2,}\S', re.M)
+
+def prompt_footer_up(nonblank):
+    """True when the frame shows the prompt box (two rules, the input line
+    between them) with Claude's ordinary footer below it.
+
+    At any height: the box grows with what you type -- a long prompt wraps,
+    a pasted list keeps its lines -- so the input line right under the top
+    rule is what makes two rules the box, not how close together they are.
+    Held to PROMPT_BOX_MAX_LINES, a prompt of eight lines or more read as the
+    footer away: the workflow rows under it were held instead of read, and a
+    run that finished there went on being reported as running, its clock
+    ticking, for as long as the prompt stayed that long. A pair of rules
+    with anything else under the top one is no box, however close."""
+    rules = [i for i, ln in enumerate(nonblank) if _RULE_RE.match(ln)]
+    for k in range(len(rules) - 1, 0, -1):
+        top, bottom = rules[k - 1], rules[k]
+        inner = nonblank[top + 1:bottom]
+        if not inner or not _INPUT_RE.match(inner[0]):
+            continue
+        if inner[0].lstrip().startswith("!"):
+            return False                       # shell mode: rows hidden
+        return not _FOOTER_SWAPPED_RE.search("\n".join(nonblank[bottom + 1:]))
+    return False
 
 # A transcript tell is only true while it is still Claude's LAST word on the
 # subject. Both end-of-turn tells above are printed INTO the transcript, so they
@@ -916,7 +998,632 @@ def _fresh(pattern, transcript_text):
     return (last is not None
             and not _NEW_OUTPUT_RE.search(transcript_text[last.end():]))
 
-def detect_state(screen_text):
+# --------------------------------------------------------------------------- #
+# Dynamic-workflow rows — the one live tell a running workflow leaves
+# --------------------------------------------------------------------------- #
+# A dynamic workflow (the Workflow tool) keeps running after the turn that
+# launched it has ended, and from then on exactly ONE thing on screen says so:
+# its row in the panel Claude draws BELOW the prompt box. Captured from the live
+# session that was reported (Claude Code 2.1.295), device on DONE:
+#
+#   "  ◯ workflow-status-design-revi…  ▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  0/5 · 1m01s · ↓ 491.6k tokens"
+#
+# Nothing else fired. The hint-row chip that names every other kind of
+# background work (_BG_CHIP_RE) leaves local workflows out -- Claude filters them
+# from it -- and the "Waiting for 1 dynamic workflow to finish" banner had not
+# been printed at all. So the turn's end read IDLE, and the daemon turned that
+# into DONE one minute into the run.
+#
+# The layout, from Claude Code's footer code: a 2-column pointer field ("  ", or
+# "❯ " on the row you have selected), the bullet (◯; ⏸ while the run waits out a
+# usage limit), the name padded to a shared column (<= 28 columns, cut with "…"),
+# two spaces, a 20/12/8-cell bar (▰▱; █░ on Ghostty; "NN%" for a screen reader),
+# two spaces, then " · "-joined segments: "done/total", the run's clock ("45s",
+# "2m39s", "1h02m", "1d03h"), "↓ 542.8k tokens". They drop out as the terminal
+# narrows -- done/total FIRST (gone below ~85 columns for a long name), then the
+# word "tokens", the clock, the count -- until only the bar is left. A paused row
+# has no bar at all:
+#   "  ⏸ nightly-triage  paused · usage limit resets at 3:30pm"
+# A row counts only with a bar directly after the name (or, for ⏸, the word
+# "paused") and nothing but known segments after that -- an agent row
+# ("◯ Explore  Count .h files ...") has neither, and nor has the hint row's
+# permission-mode indicator, which draws the SAME glyph: "⏸ plan mode on
+# (shift+tab to cycle)". And only BELOW the prompt box (split_screen's chrome),
+# where no conversation text and no line you are typing can reach.
+#
+# The row's STATUS is not in its text at all. It is the bullet's colour: none
+# while running; success = completed; error = failed or stopped, OR still
+# running with a failed agent; warning (with ⏸) = paused on a usage limit. A
+# finished row lingers ~30 s, clock frozen, before Claude drops it -- read as
+# text alone it would hold a finished session on WORK for that long -- so
+# evaluate() reads the bullet's colour off the emulator cells
+# (wf_bullet_colours) and hands it in.
+_WF_ROW_RE = re.compile(
+    r'^(?P<sel>[ ]{2}|[❯>][ ])'                    # pointer field: "  " or "❯ "
+    r'(?:(?P<pz>⏸)|[◯○]|\( \))[ ]+'                # bullet: ⏸ paused, ◯ otherwise
+    r'(?P<name>\S+(?: \S+)*?)'                     # name: never two spaces in a row
+    r'(?(pz)'
+      r'(?:[ ]{2,}(?P<paused>paused(?: · .*?)?))?'  # "paused · usage limit resets …"
+    r'|'
+      r'[ ]{2,}(?P<bar>[▰▱]{1,20}|[█░]{1,20}|\d{1,3}%)(?P<cut>…)?'
+      r'(?:[ ]{2}(?P<segs>\S.*?))?'
+    r')'
+    r'[ ]*$')
+_WF_SEG_DONE = re.compile(r'^(\d{1,6})/(\d{1,6})$')
+_WF_SEG_CLOCK = re.compile(r'^(?:(\d{1,4})d(\d{2})h|(\d{1,2})h(\d{2})m|(\d{1,2})m(\d{2})s'
+                           r'|(\d{1,2})s)$')
+_WF_SEG_TOKENS = re.compile(r'^↓ (\d{1,9}(?:\.\d{1,3})?)([kmbt]?)(?: tokens)?$')
+_WF_MULT = {"": 1, "k": 10 ** 3, "m": 10 ** 6, "b": 10 ** 9, "t": 10 ** 12}
+_WF_BULLET_COL = 2        # "  ◯ name" / "❯ ◯ name": the bullet always sits here
+_WF_LIVE = "REP"          # statuses that are still in flight (see wf_status)
+WF_FROZEN_S = 10.0        # a red row's clock this still -> it has ended (see below)
+WF_REDRAW_S = 1.5         # rows missing this briefly under the footer were being
+                          # redrawn, not dropped (WorkflowWatch, 5)
+# What the daemon is sent about them (wf_field): a report must stay one short
+# line, and the device has 14 characters for a note and 40 for a name.
+WF_MAX_RECORDS = 3        # workflows per report: the device shows one, counts the rest
+WF_NAME_MAX = 40          # characters of a name
+WF_NOTE_MAX = 14          # characters of a usage-limit note
+WF_FIELD_MAX = 300        # UTF-8 bytes of the whole field
+WF_JUST_ENDED_S = 10.0    # a run seen to end this recently goes out first: the
+                          # daemon's WF_SPOTLIGHT_S, the time its band shows it
+_WF_TZ_RE = re.compile(r'[ ]*\([^()]*\)?[ ]*$')   # " (Europe/Madrid)", even cut short
+
+def _wf_note(text):
+    """A paused row's segments -> its note, short enough for the device.
+
+    The device has 14 characters for it, and Claude's wording does not fit:
+        "paused · usage limit resets at 3:30pm"                 -> "til 3:30pm"
+        "paused · usage limit resets at 3:30pm (Europe/Madrid)" -> "til 3:30pm"
+        "paused · usage limit resets Oct 11, 3pm"               -> "til Oct 11 3pm"
+        "paused · usage limit"                                  -> "usage limit"
+        "paused"                                                -> ""
+    When the pause ends is the part worth keeping, so the time zone goes
+    first, then the "til", and only then the end of the time itself. ASCII
+    only -- the device draws nothing else -- and never one of the wire's own
+    separators (; ~ |)."""
+    if "resets" not in text:
+        return "usage limit" if "usage limit" in text else ""
+    when = "".join(" " if c.isspace() else c
+                   for c in text.split("resets", 1)[1]
+                   if c.isspace() or (" " < c < "\x7f" and c not in ";~|"))
+    when = when.strip()
+    if when.startswith("at "):
+        when = when[3:]
+    when = " ".join(_WF_TZ_RE.sub("", when).replace(",", "").split())
+    if not when:                               # "resets" and nothing after it
+        return "usage limit"
+    note = "til " + when
+    return (note if len(note) <= WF_NOTE_MAX else when)[:WF_NOTE_MAX]
+
+def parse_wf_row(line):
+    """One footer line -> the workflow row it is, or None.
+
+    Returns {name, paused, done, total, pct, clock, elapsed_s, tokens, note};
+    any field the row does not show (the terminal was too narrow, or the run is
+    paused) is None. `pct` is read off the bar when done/total has been dropped.
+    `note` is a paused row's usage-limit note, already cut down for the device
+    (_wf_note); '' on every other row.
+    """
+    m = _WF_ROW_RE.match(line)
+    if m is None:
+        return None
+    row = {"name": m.group("name"), "paused": m.group("pz") is not None,
+           "done": None, "total": None, "pct": None, "clock": None,
+           "elapsed_s": None, "tokens": None, "note": "",
+           # "⏸ name" with nothing after it: Claude's narrowest paused row --
+           # and the exact shape of the hint row's mode indicator ("⏸ plan mode
+           # on (shift+tab to cycle)"). Only its amber bullet tells them apart,
+           # so detect_state takes a bare row only with that colour in hand.
+           "bare": False}
+    if row["paused"]:
+        row["bare"] = m.group("paused") is None
+        row["note"] = _wf_note(m.group("paused") or "")
+        return row
+    bar = m.group("bar")
+    if bar.endswith("%"):
+        row["pct"] = min(100, int(bar[:-1]))
+    else:
+        width = len(bar) + (1 if m.group("cut") else 0)
+        row["pct"] = (100 * sum(1 for c in bar if c in "▰█")) // width
+    segs = m.group("segs")
+    for seg in (segs.split(" · ") if segs else ()):
+        seg = seg.strip()
+        if seg.startswith("⚠") or seg == "/workflows to stop":
+            continue                           # the size warning, in its own colour
+        d = _WF_SEG_DONE.match(seg)
+        if d:
+            row["done"], row["total"] = int(d.group(1)), int(d.group(2))
+            continue
+        c = _WF_SEG_CLOCK.match(seg)
+        if c:
+            g = [int(x) if x else 0 for x in c.groups()]
+            row["clock"] = seg
+            row["elapsed_s"] = (g[0] * 86400 + g[1] * 3600 + g[2] * 3600
+                                + g[3] * 60 + g[4] * 60 + g[5] + g[6])
+            continue
+        t = _WF_SEG_TOKENS.match(seg)
+        if t:
+            try:
+                row["tokens"] = int(round(float(t.group(1)) * _WF_MULT[t.group(2)]))
+            except (ValueError, OverflowError):
+                return None
+            continue
+        return None                            # an unknown segment: not a workflow row
+    if row["done"] is not None and row["total"]:
+        row["pct"] = (100 * row["done"]) // row["total"]
+    return row
+
+# Claude Code's bullet colours are theme colours, and the six themes draw them
+# as truecolor, 256-colour or the 16 named ANSI colours (pyte reports those by
+# name, yellow as "brown"). Hue bands separate the three roles in every one of
+# them -- including the colour-blind themes, whose "success" is blue -- and
+# anything grey or unset is "no colour", which is what a running row has.
+_WF_NAMED = {"red": "error", "brightred": "error", "magenta": "error",
+             "brightmagenta": "error", "green": "success",
+             "brightgreen": "success", "blue": "success", "brightblue": "success",
+             "cyan": "success", "brightcyan": "success", "brown": "warning",
+             "brightbrown": "warning", "yellow": "warning",
+             "brightyellow": "warning"}
+
+def _wf_role(fg):
+    """A pyte fg -> 'success' | 'error' | 'warning' | '' (no colour)."""
+    if not fg or fg == "default":
+        return ""
+    role = _WF_NAMED.get(fg)
+    if role is not None:
+        return role
+    try:
+        r, g, b = (int(fg[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+    except (ValueError, TypeError):
+        return ""
+    hue, sat, _val = colorsys.rgb_to_hsv(r, g, b)
+    if sat < 0.25:
+        return ""
+    deg = hue * 360.0
+    if deg < 15 or deg >= 300:
+        return "error"
+    if deg < 75:
+        return "warning"
+    return "success"
+
+def wf_status(row, role):
+    """R running | E running, an agent failed | P paused | D completed | F ended
+    without completing. From one frame an error-coloured row is taken as still
+    running (E); only WorkflowWatch, which sees its clock stop, can say F."""
+    if row["paused"] or role == "warning":
+        return "P"
+    if role == "success":
+        return "D"
+    if role == "error":
+        return "E"
+    return "R"
+
+def wf_bullet_colours(screen, display):
+    """{display line: (bullet fg, name fg)} for every line that could be a
+    workflow row. Call under screen_lock -- the buffer is live. Two cell reads
+    per candidate row, so it costs nothing on the 0.25 s tick.
+
+    Both cells, because a running row is not uncoloured: Claude draws its
+    bullet and its name in the same dimmed colour -- the theme's "inactive",
+    grey in every built-in theme but any colour a custom theme likes -- and
+    only a status (success, error, warning) gives the bullet a colour of its
+    own. So a bullet the colour of its own name is a running row, whatever
+    the hue (_wf_bullet_role)."""
+    out = {}
+    buf = screen.buffer
+    for y, line in enumerate(display):
+        if len(line) > _WF_BULLET_COL and line[_WF_BULLET_COL] in "◯○⏸(":
+            name_col = _WF_BULLET_COL + (4 if line[_WF_BULLET_COL] == "(" else 2)
+            try:
+                out[line] = (buf[y][_WF_BULLET_COL].fg, buf[y][name_col].fg)
+            except Exception:
+                pass
+    return out
+
+def _wf_bullet_role(entry):
+    """wf_bullet_colours' entry for a row -> its bullet's role. A bare fg (no
+    name colour to compare with) is classified on its own."""
+    if isinstance(entry, tuple):
+        bullet, name = entry
+        if bullet == name:
+            return ""                          # dimmed with its name: running
+        return _wf_role(bullet)
+    return _wf_role(entry)
+
+# --------------------------------------------------------------------------- #
+# Error phrases: Claude's own error UI is coloured, prose that mentions it is not
+# --------------------------------------------------------------------------- #
+# The strong "error" phrases are matched in the bottom 20 lines, and those lines
+# are mostly CONVERSATION. Reported: the device sat on ERR because the reply on
+# screen explained, in so many words, that "a workflow named after 'the api
+# error' read ERROR" -- any reply about an API, or a log quoted near the bottom,
+# could do the same.
+#
+# Claude Code draws every error it reports in a colour: an API-error row
+# ("⏺ API Error: 529 {...}") in the warning colour, glyph and text; the live
+# retry line's error in the error colour ("✻ API error · Retrying in 5s ·
+# attempt 1/10" -- from the third attempt on it shows the error itself, "529
+# Overloaded", which none of the phrases names); a limit row ("⎿  You've hit
+# your session limit · resets 3pm") in either. A reply, a quoted log or the line
+# you are typing is in the plain text colour -- but colour alone is not enough:
+# a code block's string literals are red, a diff's strings Monokai yellow, the
+# spinner draws the current task in Claude's orange, failed tool output is red.
+# What none of those does is START a row with the phrase: an error row opens
+# with it, right after its glyph, while code, diffs, spinner text and agent rows
+# open with something else. So a phrase counts only at the start of a row's
+# text (after the indent and at most one glyph); above the prompt box's lower
+# rule it must also start on an error- or warning-coloured cell (unless the
+# screen has no colour at all), and the row must still be current: a prompt you
+# have submitted since (its echo, "❯ continue") puts an old error behind you.
+# Below the box is Claude's own chrome (its limit notices live there): the
+# start-of-row rule alone.
+_ALERT_ROLES = ("error", "warning")
+_ROW_START_RE = re.compile(r'^[ \t\xa0]*(?:[^\w\s][ \t\xa0]+)?$')   # indent + one glyph
+_PROMPT_ECHO_RE = re.compile(r'^[ \t]*[❯>][ \t\xa0]+\S')
+
+def _display_columns(screen, y):
+    """String index in pyte's display line y -> its cell column. A wide
+    character takes two cells but one string position; mirrors Screen.display."""
+    try:
+        from wcwidth import wcwidth
+    except ImportError:                        # pyte's own dependency; never here
+        return list(range(screen.columns))
+    row = screen.buffer[y]
+    cols, stub = [], False
+    for x in range(screen.columns):
+        if stub:
+            stub = False
+            continue
+        data = row[x].data
+        cols.extend([x] * len(data))
+        stub = bool(data) and wcwidth(data[0]) == 2
+    return cols
+
+def screen_has_colour(screen):
+    """Does anything on screen carry a colour? Claude with colour off (NO_COLOR,
+    TERM=dumb, a CI environment) draws none at all, and then an error row looks
+    exactly like prose: detect_state must not demand a colour that cannot be
+    there. With colour on, its prompt box and hint row are coloured, so a scan
+    from the bottom stops within a line or two."""
+    buf = screen.buffer
+    for y in range(screen.lines - 1, -1, -1):
+        row = buf[y]
+        for x in range(screen.columns):
+            fg = row[x].fg
+            if fg and fg != "default":
+                return True
+    return False
+
+def colour_phrases(screen, display, phrases):
+    """{display line: {phrase: coloured}} for every phrase that OPENS its row
+    (after the indent and at most one glyph); `coloured` says whether it
+    starts on a cell Claude coloured as an error or a warning. Call under
+    screen_lock. Only lines that contain a phrase at all are looked at, so a
+    frame without one costs a substring test per line. A pattern's own
+    surrounding spaces do not move where it anchors."""
+    out = {}
+    phrases = [(p, p.strip()) for p in phrases if p and p.strip()]
+    if not phrases:
+        return out
+    buf = screen.buffer
+    for y, line in enumerate(display):
+        # Lower-case one character at a time so indices still line up with
+        # the cells ("İ".lower() is two characters).
+        low = "".join(c.lower() if len(c.lower()) == 1 else c for c in line)
+        found = [(p, core) for p, core in phrases if core in low]
+        if not found:
+            continue
+        cols = _display_columns(screen, y)
+        for p, core in found:
+            i = low.find(core)
+            if i >= 0 and _ROW_START_RE.match(line[:i]):
+                x = cols[i] if i < len(cols) else i
+                out.setdefault(line, {})[p] = _wf_role(buf[y][x].fg) in _ALERT_ROLES
+    return out
+
+class WorkflowWatch:
+    """What one frame cannot say about workflow rows. Monitor thread only.
+
+    1. Whether a row has ENDED while its text still looks live. An error-
+       coloured row is either still going with one failed agent (its clock
+       ticks) or has ended badly and is only lingering (its clock froze); a row
+       whose colour cannot be read at all (a terminal that drops it) is judged
+       the same way. The clock's resolution drops as a run ages -- "2m39s"
+       ticks every second, "1h02m" every minute, "1d03h" every hour -- so
+       "still" means still for longer than one tick.
+    2. Whether rows that VANISHED took their workflows with them. A run always
+       shows its outcome before its row goes (green, or frozen red, for ~30 s),
+       so rows that disappear while still live were usually HIDDEN: a dialog
+       replaced the prompt box (the workflow's own detail view among them), or
+       help, shell mode, a suggestion list or exit-confirm took the panel's
+       place. While Claude's normal prompt footer is away (prompt_footer_up)
+       the reading holds for as long as that lasts. With the footer back and
+       still no row, the run really is gone -- evicted before its colour could
+       be read, or paused from /workflows -- and the reading lets go after
+       GONE_S, a margin for a paste or a redraw.
+    3. Whether the workflows it has watched were SEEN to end (`settled`), which
+       is what retires a "Waiting for 1 dynamic workflow to finish" banner that
+       nothing will ever supersede: a run you stop prints no completion line.
+       Rows merely gone from view for a while settle nothing.
+    4. What each run's clock reads NOW (`elapsed`), for the device: the text
+       on screen is a floor that only moves once a tick, and while the rows are
+       held out of view there is no text at all. Hence it keeps when each row's
+       clock text last changed, and when the rows were last on screen.
+    5. Which rows the daemon is told about (`rows`, for wf_field): kept longer
+       than the verdict above, and finished ones too. The daemon shows a
+       finished run for a minute from the first line that lists it ended, and
+       keeps it hidden after that for as long as lines still list it -- but a
+       record missing from one line and back in the next is a NEW run there:
+       its minute starts over, and the device's band blinks.
+       Finished rows go out of view just as live ones do, and for one reason
+       more: a frame caught mid-redraw, the footer drawn and the rows not yet.
+       So whatever their status the rows are kept while the footer is away,
+       and for WF_REDRAW_S after it is back without them -- with all the watch
+       knows of each, so a red row it had read as stopped is not taken for a
+       running one again after a blink. None of this keeps the session
+       working: only `active` does that, as above.
+    6. When each run was SEEN to end (`ended`), for a panel with more rows
+       than a report carries (wf_field): the frame that first read finished a
+       row it had read running. A run that ends beside three running ones is
+       never shown as ended unless it goes out as ended. A row first read
+       already finished gets no stamp: it ended before anyone looked, and has
+       no claim to have just ended.
+
+    Rows are told apart by name AND position among rows of that name, not by
+    name alone: a run launched again while its failed predecessor still
+    lingers shows the same name twice, and two clocks filed under one key
+    took turns resetting each other, so neither could ever read as stopped.
+    """
+    GONE_S = 20.0
+
+    def __init__(self):
+        self._clock = {}          # (name, n-th such name) -> (clock text, when it changed)
+        self._ended = {}          # ...-> when it was seen to end (None: it never was)
+        self._live = False        # were the rows live the last time any showed?
+        self._last = 0.0          # ...and when they last showed, or the footer was away
+        self._seen = False        # has any workflow row ever been on screen?
+        self._outcome = False     # did the rows, last seen, show every run ENDED?
+        self.active = False       # the last observe() verdict
+        self.rows = []            # [(row, status)] from the last frame with rows, kept (5)
+        self.ticked = []          # ...when each one's clock text last changed
+        self.ended = []           # ...when each one was seen to end, if it was (6)
+        self.read_at = 0.0        # ...and when that frame was
+        self.lost = False         # did the last frame's reading fail? (detect_state)
+
+    @property
+    def settled(self):
+        """Every run the rows showed was SEEN to end -- not merely gone from
+        the screen for a while, which is what a menu or a dialog does too."""
+        return self._seen and self._outcome and not self.active
+
+    @staticmethod
+    def _still_after(clock):
+        if clock.endswith("h"):
+            return 3600.0 + WF_FROZEN_S       # "1d03h": ticks every hour
+        if clock.endswith("m"):
+            return 60.0 + WF_FROZEN_S         # "1h02m": ticks every minute
+        return WF_FROZEN_S                    # "2m39s" / "45s": every second
+
+    @staticmethod
+    def _tick(clock):
+        """How long the clock's text stands still while the run goes on."""
+        if clock.endswith("h"):
+            return 3600.0
+        if clock.endswith("m"):
+            return 60.0
+        return 1.0
+
+    @staticmethod
+    def _keys_of(rows):
+        """[(row, anything)] -> each row's key: (name, rows of that name above it)."""
+        keys, count = [], {}
+        for r, _x in rows:
+            keys.append((r["name"], count.get(r["name"], 0)))
+            count[r["name"]] = keys[-1][1] + 1
+        return keys
+
+    def _status(self, row, role, now, key):
+        st = wf_status(row, role)
+        clock = row["clock"]
+        if clock is not None:
+            seen = self._clock.get(key)
+            if seen is None or seen[0] != clock:
+                self._clock[key] = (clock, now)
+            elif now - seen[1] >= self._still_after(clock):
+                if st == "E":
+                    st = "F"                  # red, clock stopped: failed/stopped
+                elif st == "R" and not role:  # no colour to go on, clock stopped
+                    st = "D" if row["total"] and row["done"] == row["total"] else "F"
+        return st
+
+    def observe(self, rows, box, now):
+        """rows: [(row, role)] read from this frame's chrome; box: whether
+        Claude's normal prompt footer is on screen (prompt_footer_up), the only
+        frame in which missing rows can count down. True while a workflow should
+        keep the session working."""
+        self.lost = False
+        self.active = self._observe(rows, box, now)
+        return self.active
+
+    def _observe(self, rows, box, now):
+        if not box:
+            self._last = now                  # footer away: every countdown waits
+            return self._live
+        if rows:
+            self._seen = True
+            keys = self._keys_of(rows)
+            was_live = {k for k, (_r, st) in zip(self._keys_of(self.rows), self.rows)
+                        if st in _WF_LIVE}
+            stats = [(r, self._status(r, role, now, key))
+                     for (r, role), key in zip(rows, keys)]
+            kept = set(keys)
+            for key in [k for k in self._clock if k not in kept]:
+                del self._clock[key]
+            # An end is stamped once, by the frame that first reads the row
+            # finished -- and only if the rows read before it showed it
+            # running (6).
+            self._ended = {k: (self._ended[k] if k in self._ended
+                               else now if k in was_live else None)
+                           for (_r, st), k in zip(stats, keys) if st not in _WF_LIVE}
+            self.rows = stats
+            self.ticked = [self._clock[k][1] if r["clock"] is not None else None
+                           for (r, _st), k in zip(stats, keys)]
+            self.ended = [self._ended.get(k) for k in keys]
+            self.read_at = now
+            self._live = any(st in _WF_LIVE for _r, st in stats)
+            self._outcome = not self._live
+            self._last = now
+            return self._live
+        if self._live and now - self._last < self.GONE_S:
+            return True
+        self._live = False
+        if self.rows and now - self._last < WF_REDRAW_S:
+            return False                      # likely mid-redraw: keep them (5)
+        self.rows = []
+        self.ticked = []
+        self.ended = []
+        self._clock.clear()
+        self._ended.clear()
+        return False
+
+    def elapsed(self, i, now):
+        """Row i's run clock at `now`, in whole seconds; None if it shows none.
+
+        "2m39s" means 159 s and some fraction, "1h02m" anything up to 3779 s.
+        A running row's clock has moved on since its text last changed: by up
+        to one tick while it is on screen -- a text later than that has simply
+        not ticked yet, and one that stays late reads as ended (above) -- and by
+        all the time since it was last seen while it is held out of view, where
+        nobody can watch it tick. A row that is not running (P/D/F) shows a
+        clock that has stopped, so it is taken as it reads."""
+        row, st = self.rows[i]
+        secs, clock = row.get("elapsed_s"), row.get("clock")
+        changed = self.ticked[i] if i < len(self.ticked) else None
+        if secs is None or clock is None or changed is None or st not in ("R", "E"):
+            return secs
+        return int(secs + min(self.read_at - changed, self._tick(clock))
+                   + max(0.0, now - self.read_at))
+
+def _wf_name(name):
+    """A workflow name as the wire carries it. It is a record's LAST
+    sub-field, so a ';' in it is harmless; a '|' would end the whole field
+    and a '~' the record, and a control character -- or one that some reader
+    would take for a line break -- has no business on a device."""
+    out = []
+    for ch in name if isinstance(name, str) else "":
+        if ch == "|":
+            ch = "/"
+        elif ch == "~":
+            ch = "-"
+        elif unicodedata.category(ch) in ("Cc", "Cs", "Zl", "Zp"):
+            continue
+        out.append(ch)
+    return "".join(out)[:WF_NAME_MAX]
+
+def _wf_record(row, st, secs):
+    """One record: st;done;total;failed;pct;elapsed_s;tokens;note;name."""
+    def num(v):
+        return "" if v is None else str(int(v))
+    pct = row.get("pct")
+    note = "".join(c for c in (row.get("note") or "")
+                   if " " <= c < "\x7f" and c not in ";~|")[:WF_NOTE_MAX]
+    return ";".join((st, num(row.get("done")), num(row.get("total")), "",
+                     num(None if pct is None else min(100, pct)), num(secs),
+                     num(row.get("tokens")), note, _wf_name(row.get("name"))))
+
+def wf_field(watch, now):
+    """Field 8 of a report: the workflows `watch` can see, or is holding.
+
+    '-' when there are none -- and before any was ever seen; '' ("keep what
+    you have", to the daemon) when this frame's reading failed. Otherwise up
+    to WF_MAX_RECORDS records joined by '~', each
+        st;done;total;failed;pct;elapsed_s;tokens;note;name
+    st is R E P D or F (wf_status, WorkflowWatch) and elapsed_s the run's
+    clock NOW (WorkflowWatch.elapsed). A number the row does not show is ''
+    -- `failed` always is: no row shows it.
+
+    With more rows than that, which go: first a run seen to end in the last
+    WF_JUST_ENDED_S, the latest first -- for that long the daemon gives the
+    band to a run that has just ended, and a run ending beside three running
+    ones, left off, was never shown as ended at all; then the running ones,
+    since a run that ended a minute ago must not push a live one off the
+    wire; then the other finished ones, the most recently ended first -- the
+    oldest are the next Claude drops anyway, and one dropped here only to be
+    listed again later would be a new run to the daemon, its minute started
+    over. The
+    picked ones go out in the panel's own (start-time) order. The field
+    stays within WF_FIELD_MAX bytes by leaving out the last-picked records
+    whole: a record cut short would name a different workflow."""
+    if watch.lost:
+        return ""
+    if not watch.rows:                         # none -- or no longer kept
+        return "-"
+    rows = watch.rows
+    ended = [watch.ended[i] if i < len(watch.ended) else None for i in range(len(rows))]
+    over = sorted((i for i, (_r, st) in enumerate(rows) if st not in _WF_LIVE),
+                  key=lambda i: float("inf") if ended[i] is None else -ended[i])
+    fresh = [i for i in over if ended[i] is not None and now - ended[i] <= WF_JUST_ENDED_S]
+    order = (fresh + [i for i, (_r, st) in enumerate(rows) if st in _WF_LIVE]
+             + [i for i in over if i not in fresh])
+    picked, size = [], -1                      # -1: n records, n - 1 '~'
+    for i in order[:WF_MAX_RECORDS]:
+        row, st = rows[i]
+        rec = _wf_record(row, st, watch.elapsed(i, now))
+        size += len(rec.encode("utf-8", errors="replace")) + 1
+        if size > WF_FIELD_MAX:
+            break
+        picked.append((i, rec))
+    if not picked:                             # not even one fits: no news
+        return ""
+    return "~".join(rec for _i, rec in sorted(picked))
+
+def wf_shape(field):
+    """What a report has to go out for at once: each record minus its clock
+    and its tokens, and how many records there are. Those two move every
+    second, and a report per tick would bury the daemon's log, so they ride
+    the KEEPALIVE_S report instead (the daemon keeps the clock running in
+    between)."""
+    if field in ("", "-"):
+        return field
+    return tuple(tuple(p[:5] + p[7:])
+                 for p in (rec.split(";", 8) for rec in field.split("~")))
+
+def wf_report(watch, now):
+    """(field 8, its shape) for one pass of evaluate(). Fenced: whatever goes
+    wrong in here costs the workflow field -- ('', None): the daemon keeps
+    what it has, and there is nothing new to report -- never the state
+    report it rides on."""
+    try:
+        field = wf_field(watch, now)
+        return field, (wf_shape(field) if field else None)
+    except Exception:
+        return "", None
+
+def _banner_live(transcript_text, wf_watch):
+    """_fresh(_BG_WORK_RE, ...) -- except for a banner that names ONLY dynamic
+    workflows once WorkflowWatch has watched them all end.
+
+    A finished workflow normally supersedes its banner itself: Claude prints the
+    completion line and starts a turn on it. A run you STOP prints nothing, so
+    "Waiting for 1 dynamic workflow to finish" stayed Claude's last word and held
+    the session on WORK for good, its row long gone. The row is the better
+    witness: once it has been seen to end, a banner that is only about
+    workflows is over too. One that also names agents still counts -- an agent
+    finishing does print a line."""
+    last = None
+    for last in _BG_WORK_RE.finditer(transcript_text):
+        pass
+    if last is None or _NEW_OUTPUT_RE.search(transcript_text[last.end():]):
+        return False
+    if wf_watch is not None and wf_watch.settled:
+        said = last.group(0).lower()
+        if "workflow" in said and not re.search(r"agent|tool|task", said):
+            return False
+    return True
+
+def detect_state(screen_text, wf_fg=None, wf_watch=None, now=None,
+                 err_cells=None, err_colour=True):
     # Read only Claude's LIVE STATUS REGION (the bottom of the visible screen),
     # not the whole scrollback. Error/prompt/generating chrome renders there, so
     # the same keywords appearing in conversation / logs / code / file content
@@ -925,12 +1632,60 @@ def detect_state(screen_text):
     # Returns (state, source). `source` lets evaluate() debounce a footer-only
     # "waiting" (generic picker) longer than a specific permission prompt, so a
     # config dialog you open and dismiss can't buzz.
+    #
+    # `wf_fg` ({line: (bullet fg, name fg)}, from wf_bullet_colours),
+    # `wf_watch` (a WorkflowWatch), `err_cells` ({line: {phrase: coloured}},
+    # from colour_phrases) and `err_colour` (does the screen carry colour at
+    # all) are what evaluate() knows beyond the text; without them the screen
+    # is read from its text alone.
     nonblank = [ln for ln in screen_text.splitlines() if ln.strip()]
+    transcript, chrome = split_screen(nonblank)
+
+    # Dynamic-workflow rows (see parse_wf_row) are read here and then taken OUT
+    # of every window below. They are names the user or the model chose, sitting
+    # in exactly the bottom lines those windows scan -- a run named after "the
+    # api error" would read ERROR -- and a stack of them pushes "? for
+    # shortcuts" out of the footer window, and the idle gate with it.
+    # All of it is fenced off: a row nobody anticipated must cost the workflow
+    # reading, never the session's whole state report.
+    wf_live = False
+    try:
+        wf = []
+        if chrome is not None:
+            base = len(nonblank) - len(chrome)
+            drop = set()
+            for j, ln in enumerate(chrome):
+                row = parse_wf_row(ln)
+                if row is None:
+                    continue
+                role = _wf_bullet_role(wf_fg.get(ln)) if wf_fg else ""
+                if row["bare"] and (role != "warning"
+                                    or re.search(r"\bmode on\b|shift\+tab", row["name"])):
+                    continue                   # the mode indicator, not a run
+                wf.append((row, role))
+                drop.add(base + j)
+            if drop:
+                nonblank = [ln for i, ln in enumerate(nonblank) if i not in drop]
+                chrome = [ln for j, ln in enumerate(chrome) if base + j not in drop]
+        if wf_watch is not None:
+            # A row on screen is proof enough that the footer is up -- Claude
+            # draws the rows under its normal prompt footer and nowhere else
+            # -- whatever prompt_footer_up makes of the rest of the frame. Held
+            # instead of read, a row that turned green went on being reported
+            # as a run still going.
+            wf_live = wf_watch.observe(wf, bool(wf) or prompt_footer_up(nonblank),
+                                       time.monotonic() if now is None else now)
+        else:
+            wf_live = any(wf_status(r, role) in _WF_LIVE for r, role in wf)
+    except Exception:
+        if wf_watch is not None:
+            wf_watch.lost = True       # ...and the report says "unknown" ('')
+                                       # rather than repeat an older frame's rows
+
     tail = "\n".join(nonblank[-STATUS_TAIL_LINES:]).lower()
     busy_tail = "\n".join(nonblank[-BUSY_TAIL_LINES:]).lower()
     footer = "\n".join(nonblank[-FOOTER_LINES:]).lower()
     full = "\n".join(nonblank)               # whole visible screen (for live lines)
-    transcript, chrome = split_screen(nonblank)
 
     # Where the live activity METER may be read. It is Claude's own foreground
     # status line and always renders directly ABOVE the prompt box, so the region
@@ -979,17 +1734,23 @@ def detect_state(screen_text):
     #   4. the in-flight chip in the hint row -- live chrome below the box, the
     #      one tell that is also true for work that is merely QUEUED, and the one
     #      that survives the transcript lines scrolling away.
+    # ...and a fifth, for the one kind of work the chip leaves out:
+    #   5. a dynamic workflow's own row in the panel under the hint row, live
+    #      while its bullet says it is (wf_live, above). Once the turn that
+    #      launched it has ended it is often the ONLY tell left on screen.
     if transcript is None:
         # No prompt box on screen (a full-screen picker/dialog). We cannot tell
         # Claude's chrome from its output, so trust no transcript tell and read
-        # the chip from the plain footer window.
-        bg_work = bool(_BG_CHIP_RE.search(footer))
+        # the chip from the plain footer window. A workflow seen running before
+        # the dialog came up is still running behind it (WorkflowWatch).
+        bg_work = bool(_BG_CHIP_RE.search(footer)) or wf_live
     else:
         transcript_text = "\n".join(transcript)
         bg_work = (bool(_BG_CHIP_RE.search("\n".join(chrome)))
-                   or _fresh(_BG_WORK_RE, transcript_text)
+                   or _banner_live(transcript_text, wf_watch)
                    or _fresh(_BG_TURN_END_RE, transcript_text)
-                   or _fresh(_BG_COUNT_RE, transcript_text))
+                   or _fresh(_BG_COUNT_RE, transcript_text)
+                   or wf_live)
     busy_now = live_work or bg_work
 
     # Strong, specific error strings win even mid-stream (a genuine API error
@@ -997,9 +1758,39 @@ def detect_state(screen_text):
     # bottom region AND never while the meter shows work in progress -- otherwise
     # the meter's own digits (e.g. "↓ 500 tokens") or a number on screen would
     # read as a false HTTP error that then nags every 5s.
-    if any(p in tail for p in _patterns["error"]):
+    #
+    # With the cells to go on (colour_phrases), a phrase counts only where it
+    # opens a row: in Claude's chrome below the prompt box that is enough;
+    # above its lower rule (the conversation, and the line you are typing) it
+    # must also be in an error colour -- unless the screen has no colour at
+    # all (err_colour False) -- and the row must still be current: no
+    # submitted prompt echoed after it. With no cells (text only), a plain
+    # substring match as before.
+    chrome_at = (len(nonblank) - len(chrome)) if chrome is not None else 0
+    box_at = len(transcript) if transcript is not None else 0
+
+    def current(i):
+        return not any(_PROMPT_ECHO_RE.match(ln) for ln in nonblank[i + 1:box_at])
+
+    def error_in(window, phrases):
+        first = len(nonblank) - window
+        for i, ln in enumerate(nonblank[-window:], start=max(0, first)):
+            low = ln.lower()
+            for p in phrases:
+                if p not in low:
+                    continue
+                if err_cells is None:
+                    return True
+                hit = err_cells.get(ln, {})
+                if p not in hit:
+                    continue                   # mid-row: code, a diff, prose
+                if i >= chrome_at or ((hit[p] or not err_colour) and current(i)):
+                    return True
+        return False
+
+    if error_in(STATUS_TAIL_LINES, _patterns["error"]):
         return ("error", "error")
-    if not busy_now and any(p in busy_tail for p in _patterns.get("error_footer", [])):
+    if not busy_now and error_in(BUSY_TAIL_LINES, _patterns.get("error_footer", [])):
         return ("error", "error")
     if any(p in tail for p in _patterns["waiting"]):
         return ("waiting", "specific")
@@ -1866,19 +2657,41 @@ def main():
     stream = pyte.ByteStream(screen)
     screen_lock = threading.Lock()
 
+    # meta_reported: model, effort, account, limit and the workflow field's
+    # SHAPE (wf_shape) as last reported -- '-', as the launch report says.
     state = {"cur": "idle", "reported": None, "pending": None,
              "pending_src": "idle", "since": 0.0, "last_sent": 0.0,
-             "meta_reported": ("", "", "", "")}
+             "meta_reported": ("", "", "", "", "-"),
+             "colour": True, "colour_at": -1e9}
     dbg = open(DEBUG, "a") if DEBUG else None
+    wf_watch = WorkflowWatch()                 # touched by evaluate() only
 
     def evaluate():
         global g_screen_text
-        with screen_lock:
-            text = "\n".join(screen.display)
+        now = time.monotonic()
+        with screen_lock:                      # all of it needs the live cells
+            display = screen.display
+            try:
+                wf_fg = wf_bullet_colours(screen, display)
+                err_cells = colour_phrases(
+                    screen, display,
+                    _patterns["error"] + _patterns.get("error_footer", []))
+                if now - state["colour_at"] >= 10.0:   # a session's colour depth
+                    state["colour"] = screen_has_colour(screen)   # does not change
+                    state["colour_at"] = now
+            except Exception:                  # colours are a refinement: fall
+                wf_fg = err_cells = None       # back to reading the text alone
+        text = "\n".join(display)
         g_screen_text = text                   # publish for the mirror view
         parse_meta(text)                       # refresh cached model/effort
-        new, src = detect_state(text)
-        now = time.monotonic()
+        new, src = detect_state(text, wf_fg, wf_watch, now, err_cells,
+                                state["colour"])
+        # The workflows, as of this frame, for whichever report goes out next.
+        # Fenced (wf_report): a failure here costs the field -- '' = keep --
+        # and is no reason to report; the state report goes out regardless.
+        g_meta["wf"], shape = wf_report(wf_watch, now)
+        if shape is None:
+            shape = state["meta_reported"][4]
         if new != state["pending"]:
             state["pending"] = new
             state["since"] = now
@@ -1892,9 +2705,12 @@ def main():
         if state["pending"] != state["cur"] and (now - state["since"]) >= hold:
             state["cur"] = state["pending"]
         # Report on a state change, when model/effort/account/limit first
-        # become known (or change), or as a periodic keepalive.
+        # become known (or change), when the workflows change SHAPE -- one
+        # starts, ends, pauses, gains a done agent -- or as a periodic
+        # keepalive. A workflow's clock and token count change every second
+        # and are not a reason to report: they ride the keepalive.
         meta = (g_meta["model"], g_meta["effort"],
-                g_meta["account"], g_meta["limit"])
+                g_meta["account"], g_meta["limit"], shape)
         if (state["cur"] != state["reported"] or meta != state["meta_reported"]
                 or (now - state["last_sent"]) >= KEEPALIVE_S):
             state["reported"] = state["cur"]
@@ -1903,7 +2719,8 @@ def main():
             send_daemon(state["cur"])
             if dbg:
                 dbg.write(f"\n===== {time.strftime('%H:%M:%S')} state={state['cur']} "
-                          f"model={meta[0]!r} effort={meta[1]!r} =====\n")
+                          f"model={meta[0]!r} effort={meta[1]!r} "
+                          f"wf={g_meta['wf']!r} =====\n")
                 dbg.write(text + "\n")
                 dbg.flush()
 

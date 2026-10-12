@@ -13,11 +13,17 @@ apart, and **both can be connected at once**.
 | Power | USB | USB or a 14500 Li-ion cell, with a battery gauge |
 | On-device UI | — | a menu: settings, about, the game, sleep |
 | Screen sleep | — | off after 1–30 min when nothing needs you |
+| Workflow band | r2 becomes a bar (or a status word) + progress | a band: bullet, name, status word, a segment per agent, progress |
 | Flash with | `arduino-cli upload` | **`./flash_s3.sh`** (see below) |
 
 The Nano build is **unchanged** by the S3 work and remains fully supported. The
 S3 is an addition, not a replacement — the extra pixels buy typography, colour
-and the terminal mirror, never a different information model.
+and the terminal mirror, never a different information model. **The one
+exception is the [workflow band](#the-workflow-band-both-devices):** a progress
+bar cannot cross an ASCII wire as text, so the daemon sends the numbers and each
+device draws them in its own geometry — the Nano gives up r2's model, effort and
+limit for a bar (or a status word) while the band is up, and the S3 adds the
+workflow's name and a status word beside its bar.
 
 ---
 
@@ -38,6 +44,10 @@ that one — the SSD1306 is driven by the bundled `softssd1306.h`, a software-I2
 leaves SDA on A4. Adafruit SSD1306 is *not* needed; CI compiles this sketch with
 Adafruit GFX alone.
 
+`workflow.h` is the [workflow band](#the-workflow-band-both-devices)'s parser and
+arithmetic, a byte-for-byte copy of the S3's (arduino-cli cannot include a
+header from outside the sketch folder, so it lives in both).
+
 `selftest/` is a standalone sketch that exercises the OLED, buttons and LED with
 no daemon attached — flash it first when bringing up new hardware.
 
@@ -50,6 +60,9 @@ so it can sit anywhere on a battery.
 
 - `claude_mate_s3.ino` — protocol, the CONDUCTOR view, the menu, hibernate
 - `board_s3.h` — pin map, layout geometry, palette, battery/charging constants
+- `workflow.h` — the workflow band's parser and arithmetic; **byte-identical**
+  to the Nano's copy
+- `wfband.h` — the band itself, drawn under the fleet strip
 - `netcfg.h` — Wi-Fi transport, mDNS discovery, HMAC handshake, NVS config,
   setup portal
 - `blelink.h` — the same line protocol over BLE: duty-cycled advertising, a GATT
@@ -705,3 +718,111 @@ those buttons — see [The menu](#the-menu).
 Terminal contents cross the network on the same token-authenticated but
 **plaintext** TCP link as everything else. That is a bigger exposure than a
 status string; keep it to networks you trust.
+
+---
+
+## The workflow band (both devices)
+
+While the session on the glass runs a Claude Code **workflow** — the row under
+the prompt that reads
+`◯ deployment-risk-sweep-3802 ▱▱▱▱▱ 0/5 · 2m39s · ↓ 542.8k tokens` —
+both devices show it:
+
+```
+  Nano: r2 becomes the band          S3: the strip under the fleet strip
+  ┌─────────────────────┐            ┌──────────────────────────────────────────┐
+  │aladdin              │            │  1/2  W  I                               │
+  │WORK  03:09  claudeal│            │  ● deployment-risk-sweep-3802    running │
+  │[    ] 0/5 2m39s 543k│            │  ▯▯▯▯▯                    0/5 2m39s 543k │
+  │1/2 W I              │            └══════════════════════════════════════════┘
+  └─────────────────────┘
+```
+
+| The run is | `st` | Nano r2 | S3 band |
+|---|---|---|---|
+| running | `R` | the bar, then the info | bullet in the working colour, the name, `running`, a segment per agent |
+| running, an agent failed | `E` | a shorter bar, `!`, the info | a **red** bullet over a still-running bar; failed agents' segments red |
+| paused on a usage limit | `P` | `paused` and when it resumes (`til 3:30pm`) | a **hollow** amber bullet, `paused` |
+| completed | `D` | `done` and the info | green bullet, `done` |
+| ended without completing | `F` | `ended` and the info | red bullet, `ended` |
+
+The info is the daemon's text, at most 14 characters: the count, the run's own
+clock in Claude's units and its tokens, giving up parts until it fits, with
+`+N` when the session has N more workflows (`+2` at most: the wrapper reports
+three runs per session). The S3 draws one segment per agent while each gets at
+least 4 px and one continuous bar beyond that; with no counts known at all
+neither device draws a bar, rather than an empty one that would read as 0%.
+
+**It needs the PTY wrapper.** The daemon learns about workflows only from
+`claude-mate-wrap`'s reading of the screen, so hook-only sessions and `.pkg`
+installs get no band. Firmware from before the band ignores it completely —
+`J|` is an unknown verb there and flags bit2 an unknown bit — and keeps showing
+r2 as it always has.
+
+**What it costs on the glass.** The Nano has no free row, so r2's model, effort
+and remaining-limit chip are hidden for as long as the band is up. The S3 hides
+only the link-detail line, whose strip the band uses — and whenever the link is
+**not** up, the link's status takes the place of the workflow's name, so
+"why is this not connecting" never leaves the screen. In flash and RAM: Nano
++932 B / +49 B, S3 +1,176 B / +136 B.
+
+**Why numbers, when everything else is text.** This is the one exception to
+"never a different information model". A bar cannot be sent as text: the wire is
+ASCII, so the bar glyphs Claude Code draws never reach a device, and the two
+panels are 128 and 320 px wide. So `J|<st>|<done>|<failed>|<total>|<info>|<name>`
+carries the counts and each device draws them in its own geometry. The words
+are still the daemon's — `info` arrives pre-rendered — except the four status
+words, which are fixed. The wire format is in
+[`docs/PROTOCOL.md`](../docs/PROTOCOL.md).
+
+**`J|` stages, `F|` commits.** A `J|` is never drawn on its own: the `F|` frame
+that follows it commits it, and the band shows only while that frame sets flags
+bit2. Drawing on the `J|` would put the next session's workflow under the
+current session's name for a frame on every PREV/NEXT — both firmwares redraw
+after 8 ms of quiet, and over BLE the two lines can land in different connection
+events. It is the mirror's `M|END` rule again: lines arrive, one line commits
+them. The daemon sends a `J|` before every such `F|` — and the pair again
+every second or so while the band is up, with a `J|-` ahead of a different
+session's `J|` — so a lost one costs a second or two of band at most, and
+never shows one session's run under another's name.
+
+**Malformed lines are refused whole.** The firmware accepts exactly
+`J|-` or `J|[A-Z]|<1-5 digits>|<1-5 digits>|<1-5 digits>|<0-14 chars>|<0-40 chars>`
+with no `|` inside the last two fields — a `J|` with the next `F|` glued on by a
+lost newline would otherwise show up as a workflow called `deployF|4|4|api…`. A
+refused line leaves the last good status exactly as it was. Counts saturate at
+65535 instead of wrapping, the same on every target (no `atoi`: it is 16-bit on
+the Nano), and an unknown status letter is drawn neutrally — no word, the idle
+colour — so a status added later degrades instead of freezing the band.
+
+**Nothing in it blinks.** A blink on this device means *an alert you have not
+acknowledged*, and nothing about a workflow can be acknowledged; a usage-limit
+pause can last hours. Paused is a hollow bullet, held steady, and the blink
+timers are untouched. For the same reason a running workflow does **not** keep
+the S3's screen awake. A finished run is not an alert of its own: it reaches you
+through the session's own DONE once the session leaves working — the usual `V|`
+and name flash — and those do.
+
+**`workflow.h` exists twice.** arduino-cli copies a sketch into its build
+directory before compiling it, so a header outside the sketch folder cannot be
+included; `firmware/claude_mate/workflow.h` and `firmware/claude_mate_s3/workflow.h`
+are byte-identical copies. Edit one and copy it over the other —
+`tools/test_workflow_fw.py` fails the moment they differ. The same test checks
+the caps against the daemon's (`WF_INFO_CHARS`, `WF_NAME_CHARS`), then builds
+`tools/wf_harness.cpp` twice — once as the Nano includes the header, once as
+the S3 does — and runs the grammar, the arithmetic, the Nano's r2 for every info
+length and the S3 band's extents for every status on the host.
+
+To see it on hardware without a workflow, type the pair into the serial monitor
+(115200 baud), then clear it:
+
+```
+J|E|2|1|5|2/5 4m10s 880k|deployment-risk-sweep-3802
+F|4|4|api-server|WORK  04:10|Opus 4.8 xhigh|1/1 W
+J|-
+F|0|4|api-server|WORK  04:11|Opus 4.8 xhigh|1/1 W
+```
+
+`J` is not one of the S3's config-console letters, so this works over its USB
+cable too. It could not have been `W`, `S` or `T`: on USB those would have
+written the workflow into the Wi-Fi password, the daemon host or the token.

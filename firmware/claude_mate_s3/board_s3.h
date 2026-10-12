@@ -271,7 +271,11 @@ struct Btn {
 // ---- LAYOUT (320 x 172 landscape) ------------------------------------------
 // The daemon owns all text: it pre-renders FOUR rows of at most 21 characters
 // and this firmware draws them, exactly like the 128x32 Nano build. The extra
-// pixels buy typography and colour, never a different information model.
+// pixels buy typography and colour, never a different information model --
+// with ONE exception, the workflow band. There the daemon sends numbers (J|)
+// that each device draws in its own geometry, and this one adds what the
+// Nano has no room for: the workflow's name, and a status word beside the
+// bar rather than instead of it. See wfband.h.
 //
 //   +--------------------------------------------+
 //   | (wifi)  CLAUDE MATE              [ 87% ]   |  status bar: link + battery
@@ -284,6 +288,14 @@ struct Btn {
 //   |  wifi 192.168.1.42                         |  link detail (firmware-local)
 //   |============================================|  state accent bar
 //   +--------------------------------------------+
+//
+// ...and while a workflow band is up (F| flags bit2), it takes the strip the
+// link detail sits in:
+//
+//   |  2/6  E  B  W  D  I                        |
+//   |  o deployment-risk-sweep-3802     running  |  bullet, name, status word
+//   |  [##][##][  ][  ][  ]     2/5 2m39s 543k   |  per-agent bar, info (big)
+//   |============================================|
 //
 // The built-in 5x7 font is used deliberately: it is MONOSPACE, and the protocol
 // addresses the active tab by CHARACTER COLUMN within r3 (the `sel` field), so
@@ -327,6 +339,30 @@ struct Btn {
 #define LINK_Y        142     // firmware-local link detail (size 1, dim)
 #define ACCENT_Y      164     // full-width state colour bar
 #define ACCENT_H      8
+
+// ---- WORKFLOW BAND (J| + F| flags bit2, drawn by wfband.h) -----------------
+// The strip between the fleet strip's selection box (which ends at y129) and
+// the accent bar: 34 px, which is two lines -- a small one that says WHAT is
+// running and a big one that says HOW FAR along it is. The progress is the
+// part read from across a desk, so it gets the size every other conductor
+// row has; at size 1 in a dim colour it would read worse than the Nano's.
+//
+// LINK_Y is inside this strip, so the link-detail line is not drawn while the
+// band is up. While linked that line only says which address the link is on;
+// when the link is NOT up, its text takes the place of the workflow's name, so
+// the diagnostics never disappear.
+#define WF_BAND_Y     130     // the band draws in y130..163 and nowhere else
+#define WF_BAND_H     34
+#define WF_LINE1_Y    132     // bullet + name + status word, size 1 (..139)
+#define WF_BULLET_R   3       // bullet centred on (PAD_X + 3, WF_LINE1_Y + 3)
+#define WF_NAME_X     (PAD_X + 10)
+#define WF_LINE2_Y    146     // bar + info, size 2 (..161)
+#define WF_INFO_SIZE  2
+#define WF_BAR_Y      150     // the bar, centred on line 2 (..157)
+#define WF_BAR_H      8
+#define WF_BAR_GAP    6       // between the bar's end and the info
+#define WF_SEG_GAP    2       // between per-agent segments...
+#define WF_SEG_MIN    4       // ...each at least this wide, or one plain bar
 
 // ---- MENU: the item strip ---------------------------------------------------
 // A horizontal strip with the selected tile enlarged, PS5-style, rather than a
@@ -387,7 +423,7 @@ struct Btn {
 // Shown on the About page and by the serial `?`. The only place a flashed
 // device can tell you which build it is running -- which matters because the
 // flash script writes in verified pieces and a partial run is otherwise silent.
-#define FW_VERSION "s3-2.2"
+#define FW_VERSION "s3-2.3"
 
 // ---- Timing (identical semantics to the Nano build) ------------------------
 #define SERIAL_BAUD     115200

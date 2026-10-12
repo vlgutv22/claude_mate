@@ -78,6 +78,89 @@ python3 tools/test_detect.py          # the wrapper's screen scrape: which rende
                                       # must STOP reading working once it finishes
                                       # (real captured frames) (needs pyte)
 
+python3 tools/test_workflow_rows.py   # a dynamic workflow's footer row: every
+                                      # layout Claude draws (widths, Ghostty, paused,
+                                      # selected) and the lines that only look like
+                                      # one; its bullet colour in all six themes as
+                                      # pyte reports it; ANSI frames through a real
+                                      # pyte screen (running reads working, a
+                                      # finished row lingering reads idle); the
+                                      # frozen-clock and hidden-row memory, and the
+                                      # prompt box told from a dialog however tall
+                                      # the prompt in it; and the field-8 record
+                                      # each row becomes on the wire — at most
+                                      # three and 300 bytes: a run seen to end in
+                                      # the last ten seconds first, then the running
+                                      # ones, then the most recently ended, and four
+                                      # rows whose runs end one after another, each
+                                      # end reaching the wire once; a finished run
+                                      # still listed behind a dialog and through a
+                                      # half-drawn frame, '-' once Claude drops it;
+                                      # the compact 'til 3:30pm' note, the clock
+                                      # estimate, and a shape change sending at
+                                      # once while the clock and tokens wait for
+                                      # the keepalive (needs pyte)
+
+python3 tools/test_workflow_daemon.py # the daemon's half of the workflow band, in
+                                      # process with an injected clock, then the real
+                                      # daemon over a PTY, then --mock: field 8 kept
+                                      # on '', cleared on '-', kept when no record
+                                      # parses; workflow data never touching a
+                                      # state, an ack or the LED; a wrapper's record
+                                      # stale after 90 s, a hook-shaped one never;
+                                      # the 60 s linger and its tombstone (a
+                                      # keepalive cannot bring a finished run back);
+                                      # a clock that never steps back; the primary
+                                      # record — the ten-second spotlight only for
+                                      # an end the daemon saw, never for a run that
+                                      # arrives finished — +N, and the 14-char info,
+                                      # empty where the device draws the word
+                                      # itself. Then the wire: a J| right before
+                                      # every F| with bit2, that F| written as the
+                                      # commit even when unchanged, and the pair
+                                      # again once a second old; J|- once, and
+                                      # ahead of another session's J|; a lost J|
+                                      # costing a second of band and never
+                                      # showing another session's;
+                                      # no bit2 in the no-sessions frame or under a
+                                      # notice, H re-sending both, every J| in the
+                                      # firmware's grammar and every line ASCII and
+                                      # short enough for the Nano; the queue JSON's
+                                      # 'workflows'; and --mock walking the band
+                                      # through every status (needs pyserial)
+
+python3 tools/test_workflow_fw.py     # the firmware's half. First, with no compiler
+                                      # needed: the two copies of workflow.h are
+                                      # byte-identical and their caps match the
+                                      # daemon's (info 14; the S3's name 40); in
+                                      # both sketches a J| only stages and the F|
+                                      # commits it; the S3 draws the band in
+                                      # drawFrame() alone; neither blink trigger
+                                      # knows a workflow exists; and every example
+                                      # F| in the docs boxes its r1's fleet letter.
+                                      # Then tools/wf_harness.cpp, built twice — the
+                                      # Nano's WF_NAME_MAX=1 and the S3's default —
+                                      # runs the real header: the J| grammar (a line
+                                      # with the next F| spliced onto its name is
+                                      # rejected, an unknown letter accepted), J|-,
+                                      # 99999 -> 65535, clamping, bar fill and
+                                      # segments, the Nano's r2 for every info
+                                      # length 0-14, the S3 band inside y130-163 for
+                                      # every status, and staging (a J| with no F|
+                                      # after it changes nothing on screen), and
+                                      # every J| the docs tell you to type,
+                                      # accepted by both builds. That half SKIPs
+                                      # without a C++ compiler, like
+                                      # tools/test_battery.py
+
+python3 tools/test_error_colour.py    # an error phrase counts only in Claude's error
+                                      # colours above the prompt box: a reply that
+                                      # MENTIONS "api error" reads idle, a real
+                                      # warning-coloured API-error row (four themes /
+                                      # colour depths) and the red retry line read
+                                      # error, a limit notice in the chrome still does
+                                      # (needs pyte)
+
 python3 tools/test_hook_state.py      # the hook's wire line per Stop payload —
                                       # incl. "the turn ended but work is still in
                                       # flight" reporting working instead of done
@@ -208,7 +291,46 @@ Flash the **real firmware**. Open the Arduino IDE **Serial Monitor** at
    the LINK LOST screen** (the daemon-silence watchdog); any typed line brings
    the frame back.
 
-3. Send a ping:
+3. Draw a **workflow band**: a `J|` line, then a frame with bit2 (`flags` `4`):
+
+   ```
+   J|R|2|0|5|2/5 2m39s 543k|deployment-risk-sweep
+   F|4|4|api-server|WORK  02:39      work|Opus 4.8 xhigh  5h82%|1/3 W B D
+   ```
+
+   → the `J|` alone changes nothing on screen: it is only staged, and the `F|`
+   commits it. Then, on the Nano, r2 becomes a bar two-fifths full with
+   `2/5 2m39s 543k` right-aligned; on the S3, under the fleet strip, the name
+   and `running` in the WORK colour over five segments, two of them filled, and
+   the same info. Send each of these on its own, exactly as it is, followed by
+   the same `F|`:
+
+   ```
+   J|E|2|0|5|2/5 2m39s 543k|deployment-risk-sweep
+   J|P|0|0|0|til 3:30pm|nightly-triage
+   J|D|5|0|5|5/5 4m02s 1.2M|deployment-risk-sweep
+   J|F|3|0|5|3/5 3m10s 801k|deployment-risk-sweep
+   J|Q|1|0|5|1/5|future-status
+   ```
+
+   - `E`: a shorter bar and a `!` (Nano); a red bullet over the running bar (S3)
+   - `P`: `paused` and no bar; a hollow amber bullet (S3)
+   - `D`: `done`
+   - `F`: `ended`
+   - `Q`, a letter the firmware does not know: the info alone (Nano); no word,
+     the IDLE colour (S3)
+
+   Everything after the last `|` is the name, so a note typed after it becomes
+   part of the name — and past 40 characters the firmware refuses the whole
+   line, which leaves the previous status on screen as if the new one were
+   drawn wrong.
+
+   Nothing in the band blinks, whatever the status. Send the frame with `flags`
+   `0` and the band goes — r2 is model + effort + chip again although no `J|-`
+   was sent, because bit2 is the gate; `J|-` then a frame clears it for good. A
+   firmware that predates the band ignores all of it and keeps drawing r2.
+
+4. Send a ping:
 
    ```
    P
@@ -216,7 +338,7 @@ Flash the **real firmware**. Open the Arduino IDE **Serial Monitor** at
 
    → the board replies `K` (the keepalive ack; `H` is sent only on boot/reset).
 
-4. Press the physical buttons and confirm the Serial Monitor prints:
+5. Press the physical buttons and confirm the Serial Monitor prints:
 
    ```
    B|G     ← GO (D2), short press
@@ -229,8 +351,9 @@ Flash the **real firmware**. Open the Arduino IDE **Serial Monitor** at
 
 Pass criterion: `H` on boot, `F|` frames render (flash flag flashes the name
 row), the LED patterns (`V|`, incl. the looping kinds stopped by `V|OFF`)
-play from typed lines, LINK LOST appears after ~30 s of silence, buttons emit
-`B|G`/`B|K`/`B|N`/`B|P` with auto-repeat on held PREV/NEXT.
+play from typed lines, LINK LOST appears after ~30 s of silence, a `J|` draws
+nothing until an `F|` with bit2 commits it and then draws each status as above,
+buttons emit `B|G`/`B|K`/`B|N`/`B|P` with auto-repeat on held PREV/NEXT.
 
 > When done, **close the Serial Monitor** so the daemon can use the port.
 
@@ -267,13 +390,23 @@ python3 $REPO/daemon/claude_mate_daemon.py --mock
   doesn't move.)
 - **Double-click GO** → toggles FOLLOW mode (a ► marker appears); PREV/NEXT
   then also raise the selected terminal after it settles.
+- **The workflow band** → the `api` session — the first tab, which the screen
+  starts on — runs a workflow called `release-risk-sweep` that moves on at
+  every mock step, every few seconds: running, its bar filling `0/5` → `5/5`
+  and its tokens growing; then running with a failed agent (the Nano's `!`, the
+  S3's red bullet); `paused` with `til 3:30pm`; `done`; `ended`; then gone, and
+  round again. The band belongs to the session on the glass, so every other tab
+  shows none; step back to `api` if you have moved off it. Nothing in it
+  blinks, and none of it moves the LED. Mock re-sends the record at every step,
+  so it never goes stale.
 
 Also confirm robustness: **unplug** the Nano mid-run — the daemon should not
 crash — then **replug**; it should reconnect and (via the `H` handshake) restore
-the frame AND re-arm any active LED loop.
+the frame, with its workflow band, AND re-arm any active LED loop.
 
 Pass criterion: queue-ordered display + correct LED class + buttons handled +
-survives an unplug/replug.
+the workflow band cycling through every status on its tab + survives an
+unplug/replug.
 
 ---
 
@@ -299,8 +432,39 @@ and watch the frame and the LED update accordingly:
 - `done` → `DONE` frame, flashing + a looping `V|DONE` cascade.
 - `working` (nothing else pending) → `WORK` frame, steady + one-shot `V|START`.
 
+Then a **workflow**, in the wrapper's nine-field form — field 3 a control-socket
+path (any non-empty one will do), fields 4–7 empty (empty means *keep*), field 8
+one running record (`st;done;total;failed;pct;elapsed_s;tokens;note;name`):
+
+```sh
+$REPO/tools/feed.sh 'working|wf-demo|demo|/tmp/feed-demo.sock|||||R;2;5;;40;159;542800;;deployment-risk-sweep'
+```
+
+→ select `demo` and the band appears: `2/5 2m39s 543k`, its clock counting on
+from 2m39s. Then try:
+
+```sh
+$REPO/tools/feed.sh 'working|wf-demo|demo|/tmp/feed-demo.sock|||||P;;;;;;;til 3:30pm;deployment-risk-sweep'
+$REPO/tools/feed.sh 'working|wf-demo|demo|/tmp/feed-demo.sock|||||D;5;5;;100;312;1200000;;deployment-risk-sweep'
+$REPO/tools/feed.sh 'working|wf-demo|demo|/tmp/feed-demo.sock|||||-'
+```
+
+— `paused` with `til 3:30pm`, then `done` (`5/5 5m12s 1.2M`), then no band.
+Each change of status adds one `workflow:` line to the daemon log; sending the
+same line again adds none.
+
+**A record goes stale after 90 s without a refresh.** A field 3 that is not
+empty makes the line a wrapper's, and a wrapper's running or paused record is
+hidden 90 s after the last line that listed it — the real wrapper re-sends every
+20 s, and feed.sh does not. So a band left alone vanishes after a minute and a
+half; send the line again to bring it back. (A line with field 3 empty, the way
+the hook sends it, has no such timeout: its record stays until replaced,
+cleared with `-`, or the session is pruned.) A finished `D` record goes on its
+own after at most 60 s either way.
+
 Pass criterion: feeding socket lines drives the frame + LED per
-[PROTOCOL.md](PROTOCOL.md).
+[PROTOCOL.md](PROTOCOL.md), and a field-8 line puts up, changes and clears the
+workflow band.
 
 ---
 
@@ -335,6 +499,18 @@ and the hooks merged (see [INSTALL.md](INSTALL.md)):
 Pass criterion: real hook events drive the frames and LED correctly, GO raises
 the right session, and navigation never touches a window.
 
+**The workflow band needs the wrapper, not the hooks.** Run Claude through
+`claude-mate-wrap`, have it start a dynamic workflow, and keep that session on
+the glass: the band appears with the row under the prompt box, follows its
+progress and clock, and is gone within a minute of the run's end. Worth seeing
+once at full width and once in a terminal under ~85 columns (counts become a
+percentage), and through a completion, an agent failure and a stop (`done`, the
+`!`, `ended`). Open a menu or the run's own detail view while it runs: the band
+holds, and the session stays `WORK`. Do the same in the half-minute a finished
+run lingers: its band stays up, rather than blinking off and on. And stop a
+run on purpose once: it reads `running` for about 10 s more, then `ended`, its
+clock stepping back to where it stopped.
+
 ---
 
 ## Quick troubleshooting
@@ -350,3 +526,4 @@ the right session, and navigation never touches a window.
 | LED blinks forever | It loops until acknowledged: GO (raise) or hold GO (ack only) sends `V|OFF`. A loop also self-stops ~30 s after the daemon goes silent (and LINK LOST appears). |
 | Buttons do nothing in the daemon | Confirm Level 2 first (`B|G`/`B|N`/`B|P` over serial, `B|K` on a held GO), then check the daemon's button thread/logs. |
 | Screen shows LINK LOST | The daemon has been silent ~30 s: check `launchctl list \| grep claudemate` and `~/Library/Logs/claude-mate.err.log`. Any daemon line clears the overlay. |
+| No workflow band while a workflow runs | The band needs the PTY wrapper — a hook-only session never has one — and firmware that knows `J\|` (type one by hand, Level 2). It follows the session on the glass and steps aside for the ~4 s a notice is up; the S3 draws it on the main screen only, not under the menu or the mirror. If `claude-mate status` lists the workflow first under the `>` row, the daemon is sending it and the firmware is the gap. If it is under another row, the glass is on a different session: select that one. If it is not listed at all, the wrapper is not reading the row. |

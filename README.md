@@ -57,6 +57,7 @@ session you have open — in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
         [ PREV ]  [ GO ]  [ NEXT ]  [ MENU ]       ← a fourth button, with three gestures
    MENU: tap = the selected session's real terminal · double-tap = the on-device menu
          hold 2 s = long sleep (a tap wakes the board)
+   a workflow running? the link line gives way to its band: name · status word · a segment per agent · 2/5 2m39s 543k
 ```
 
 **Iteration 1 — Arduino Nano, 128×32 mono OLED, USB:**
@@ -78,6 +79,8 @@ session you have open — in VS Code, the terminal CLI, iTerm2, tmux, anywhere.
    the box:   the active tab's letter is a wide centred filled rectangle (letter knocked out) — shows which tab is on screen
    the right edges: which ACCOUNT the session runs as (its wrapper profile) · how much of that account's plan
               limit is LEFT (5h82% = 82% of the 5-hour window · wk31% = 31% of the week — the tighter one shows)
+   the band:  while the session runs a dynamic workflow, r2 shows the run instead — a bar + 2/5 2m39s 543k,
+              or paused · done · ended; model, effort and the limit come back when it goes
    FOLLOW:    double-click GO → a ► marker appears; PREV/NEXT then also raise the selected terminal (raise only)
    the LED:   START 1 s blink · INPUT even blink · DONE 4-blink cascade · ERROR fast strobe  (loops until you GO/ack)
 ```
@@ -122,7 +125,7 @@ puts the three commands below on your `PATH`. Idempotent — re-run it after a
 question.
 
 **Then point `claude` at the wrapper** — this is what puts model, effort, account
-and remaining limit on the screen:
+and remaining limit on the screen, and a running workflow's progress:
 
 ```sh
 echo 'alias claude="'"$PWD"'/bin/claude-mate-wrap"' >> ~/.zshrc && exec zsh
@@ -214,6 +217,7 @@ daemon on your Mac. Build it either way — or both, at the same time:
 | Buttons | 3 — PREV / GO / NEXT | 4 — + **MENU** (Kailh Choc low-profile) |
 | Alert light | one LED, rhythm only | WS2812, rhythm **+ colour** |
 | Power | USB | USB **or** a 14500 cell, with a gauge |
+| Workflow band | a bar + `2/5 2m39s 543k` in place of r2 | the name, a status word, a segment per agent, the same info |
 | Extra | — | a **live mirror** of a session's terminal |
 
 The daemon keeps ONE **stable, alphabetically-ordered** **triage queue** of every
@@ -234,8 +238,13 @@ Retrying or resubmitting a turn is intentionally **out of scope** (see
 [Limitations](#limitations)).
 
 The extra pixels on the S3 buy **typography, colour and the terminal mirror** —
-never a different information model. The daemon pre-renders the same four rows
-of at most 21 characters for both devices; each just draws what it was sent.
+never a different information model, with one exception: the **workflow band**.
+For a running dynamic workflow the daemon sends both devices the same numbers
+(`J|`), and each draws them in its own geometry — the Nano a bar and an info
+string in place of r2's model/effort/limit, the S3 the workflow's name and a
+status word as well. Everything else is the same four rows of at most 21
+characters, pre-rendered by the daemon for both devices; each just draws what
+it was sent.
 
 ---
 
@@ -268,11 +277,13 @@ You can drive the daemon from **either or both** of these — mix freely:
 
 | Path | What it is | What it can see |
 |------|-----------|-----------------|
-| **(a) Claude Code hooks** | `hooks/claude-status.sh`, wired to `UserPromptSubmit` / `Notification` / `Stop` / `StopFailure`. Fire-and-forget; never blocks or fails a turn. | Turn boundaries: started, needs-input, finished OK, finished on error — plus the **background work Claude reports on `Stop`** (`background_tasks` entries whose own `status` is still in flight, plus one-shot `session_crons`), so a turn that ends with work still running reports `working`, not a premature DONE — while a task listed as already finished is not counted, because the next `Stop` that would correct it may never come. Works in the VS Code extension and the CLI. |
-| **(b) PTY wrapper** `bin/claude-mate-wrap` | Run `claude` *through* a wrapper (`alias claude=claude-mate-wrap`). It forks a pseudo-terminal, relays stdin/stdout transparently, and mirrors the TUI into a headless terminal emulator to read the **live screen**. | Everything on screen the hooks can't report: the spinner, **API errors/retries**, **permission prompts**, interactive option-pickers, and every **background-work** tell — the *"Waiting for N dynamic workflow to finish"* banner, the turn recap's *"· 1 shell still running"* suffix and the **live in-flight chip** in the hint row — i.e. it knows a session is **still busy after the turn "ends"**, including work that is only queued, and knows when it has stopped being busy. |
+| **(a) Claude Code hooks** | `hooks/claude-status.sh`, wired to `UserPromptSubmit` / `Notification` / `Stop` / `StopFailure`. Fire-and-forget; never blocks or fails a turn. | Turn boundaries: started, needs-input, finished OK, finished on error — plus the **background work Claude reports on `Stop`** (`background_tasks` entries whose own `status` is still in flight, plus one-shot `session_crons`), so a turn that ends with work still running reports `working`, not a premature DONE — while a task listed as already finished is not counted, because the next `Stop` that would correct it may never come. Works in the VS Code extension and the CLI. No **workflow band**: the hook says *that* work is running, never which workflow or how far along. |
+| **(b) PTY wrapper** `bin/claude-mate-wrap` | Run `claude` *through* a wrapper (`alias claude=claude-mate-wrap`). It forks a pseudo-terminal, relays stdin/stdout transparently, and mirrors the TUI into a headless terminal emulator to read the **live screen**. | Everything on screen the hooks can't report: the spinner, **API errors/retries**, **permission prompts**, interactive option-pickers, and every **background-work** tell — the *"Waiting for N dynamic workflow to finish"* banner, the turn recap's *"· 1 shell still running"* suffix, the **live in-flight chip** in the hint row and a **dynamic workflow's own row** under it — i.e. it knows a session is **still busy after the turn "ends"**, including work that is only queued, and knows when it has stopped being busy. That workflow row is also what the device's **workflow band** is drawn from: its status, progress, clock and tokens. |
 
 The wrapper is the more capable feed (true live state, plus terminal focus); the
-hooks are the zero-dependency feed. Use whichever fits each session.
+hooks are the zero-dependency feed. Use whichever fits each session. The
+workflow band needs the wrapper: a hook-only session shows none, and neither
+does a `.pkg` install on its own, which ships no wrapper.
 
 ---
 
@@ -330,6 +341,27 @@ hooks are the zero-dependency feed. Use whichever fits each session.
 - **Live time-in-state** — the state row counts up how long the session has
   been in its current state: for a `working` tab that IS the live turn
   runtime; for an alert it is how long it has been waiting on *you*.
+- **A running workflow, not just WORK** — when the shown session runs a dynamic
+  workflow (Claude Code's Workflow tool), the device shows the run itself: the
+  row Claude draws for it under the prompt box,
+  `◯ deployment-risk-sweep  ▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱  2/5 · 2m39s · ↓ 542.8k tokens`,
+  becomes a **workflow band** on each device.
+  - **Nano:** r2 becomes the band — a bar, with `2/5 2m39s 543k` right-aligned.
+    A paused, finished or ended run shows a word where the bar was — `paused`
+    (with `til 3:30pm` when Claude says when the limit resets), `done`,
+    `ended` — and one still going after an agent failed gets a `!` after its
+    bar. Model, effort and the limit chip step aside while it is up.
+  - **S3:** a band under the fleet strip, in the link line's place: the
+    workflow's name and a status word (`running`, `paused`, `done`, `ended`) in
+    the state colours the screen already uses, a bar with one segment per agent,
+    and the same info at row size.
+
+  Its clock is the run's own, in Claude's units — `2m39s`, `1h02m` — while r1
+  keeps counting the session's time in state. Several runs in one session? The
+  band shows one and counts the rest (`+1`) — it follows up to three — and a
+  run that has just finished gets ten seconds of it to be seen. It is display
+  only: it never changes a state, an alert or the LED, never blinks, and is gone
+  within a minute of a run's end. Needs the PTY wrapper.
 - **One-button FOCUS** — GO raises the session's window: first the **PTY
   wrapper's own terminal** (iTerm2 / Terminal.app / VS Code / Ghostty / Warp /
   tmux, matched by TTY), else a **VS Code deep link**, else the VS Code window
@@ -393,10 +425,11 @@ hooks are the zero-dependency feed. Use whichever fits each session.
   LED — which the daemon drives from exactly "worst unacknowledged alert", so it
   is the authoritative signal. An alert turns the screen back on by itself. A
   `working` fleet does **not** hold it on — an hour of grinding with nothing to
-  say is the case this exists for — and neither does `NO LINK`, because a dead
-  daemon must not be able to burn the cell flat. A press on a dark screen only
-  wakes, and is swallowed: GO raises a window, and obeying a press aimed at a
-  screen you cannot read would sometimes yank you to the wrong session.
+  say is the case this exists for, workflow band or not — and neither does
+  `NO LINK`, because a dead daemon must not be able to burn the cell flat. A
+  press on a dark screen only wakes, and is swallowed: GO raises a window, and
+  obeying a press aimed at a screen you cannot read would sometimes yank you to
+  the wrong session.
 - **Long sleep** — hold the **4th button** for 2 s for deep sleep, tap to wake.
   Roughly a month of standby on a 14500; the WS2812 has no shutdown pin, so a
   switch in the battery lead is the only true zero.
@@ -411,7 +444,8 @@ hooks are the zero-dependency feed. Use whichever fits each session.
    │                 "<state>|<sid>|<name>\n"
    │
    └─ (b) PTY wrapper ─ bin/claude-mate-wrap  (alias claude=claude-mate-wrap)
-                     "<state>|<sid>|<name>|<ctrl_sock>|<model>|<effort>\n"   + screen-scrapes the live TUI
+                     "<state>|<sid>|<name>|<ctrl_sock>|<model>|<effort>|<account>|<limit>|<wf>\n"
+                     + screen-scrapes the live TUI (wf = its dynamic workflows)
                             │
                             ▼
               Unix domain socket  /tmp/claude-mate.sock
@@ -423,6 +457,8 @@ hooks are the zero-dependency feed. Use whichever fits each session.
    │   • ONE pre-rendered screen                  │    tabs never shuffle; urgency separate)
    │       F|<flags>|<sel>|<r0>|<r1>|<r2>|<r3>          │
    │   • LED policy  V|<START/INPUT/DONE/ERR/OFF> │   worst unacked class, loops until ack
+   │   • WORKFLOW band  J|… written just before   │
+   │     its F| (flags bit2 = the band is up)     │
    │   • GO: raise the session's window — RAISE   │
    │     ONLY (wrapper ctrl-sock → VS Code link)  │
    │   • MIRROR: pull the session's live screen   │
@@ -439,6 +475,8 @@ hooks are the zero-dependency feed. Use whichever fits each session.
    │  • SSD1306 128x32 OLED —   │  │  • ST7789 172x320 colour IPS —   │
    │    draws the one frame it  │  │    same four rows, + status bar  │
    │    was last sent (dumb)    │  │    and the M| terminal mirror    │
+   │  • J| band: r2 becomes a   │  │  • J| band: name, status word,   │
+   │    workflow's bar + info   │  │    a segment per agent, info     │
    │  • LED (D8) plays V|<KIND> │  │  • WS2812 plays V|<KIND> in the  │
    │  • PREV/GO/NEXT buttons    │  │    alert class's colour          │
    │    → B|P B|N B|G B|K       │  │  • + MENU button → B|M           │
@@ -464,9 +502,9 @@ Two control flows worth calling out:
   VS Code deep link / window raise.
 - **Reset recovery.** Opening the USB serial port resets the Nano (~1.5 s). On
   boot the Arduino emits `H`; the daemon responds by re-sending the full current
-  state (the current frame + re-arming the LED loop), so the display recovers
-  cleanly after any reconnect. A wireless device gets the same treatment when it
-  (re)connects.
+  state (the workflow band's `J|`, the current frame, and the LED loop
+  re-armed), so the display recovers cleanly after any reconnect. A wireless
+  device gets the same treatment when it (re)connects.
 - **The wireless handshake.** The device dials the daemon, not the other way
   round — so it works from any address the Mac never has to know. It finds the
   listener via the `_claudemate._tcp` mDNS advertisement, then proves it knows
@@ -631,7 +669,7 @@ asks before touching `settings.json` — that is the only question it has. Re-ru
 any time; it is idempotent.
 
 Then point `claude` at the PTY wrapper, which is what puts model, effort, account
-and remaining limit on the screen:
+and remaining limit on the screen, and a running workflow's progress:
 
 ```sh
 echo 'alias claude="'"$PWD"'/bin/claude-mate-wrap"' >> ~/.zshrc && exec zsh
@@ -908,11 +946,28 @@ must **persist a couple of seconds** before it reports — so a config dialog yo
 open and dismiss (the `/effort` or `/model` slider, whose footer is
 `… · Esc to cancel`) no longer alerts the instant you open it.
 
+**An error phrase counts only where Claude's own error UI would put it.** The
+bottom 20 lines are mostly conversation, and a reply that merely *mentions*
+"api error" used to put the device on ERR. Claude Code's error rows **open**
+with the phrase, right after their glyph (`⏺ API Error: 529 …`,
+`⎿  You've hit your 5-hour limit · resets 3pm`, `✻ API error · Retrying in 5s ·
+attempt 1/10`), and are drawn in its warning or error colour; a reply, a quoted
+log, the line you type, a code block's red string literals, a diff's yellow
+ones, the spinner's task text and a failed command's red output all have the
+phrase somewhere else on the row. So a phrase counts only where it opens a row;
+above the prompt box it must also start on an error- or warning-coloured cell —
+read off the emulator, in every theme — and still be **current**: once you
+submit another prompt, an old error row is behind you. Below the prompt box, in
+Claude's own chrome, opening a row is enough. A grey *notice* ("Usage limit
+reached · continuing automatically at 3pm") is a notice, not an error: the limit
+row above it is what reads ERR. With Claude's colour off (`NO_COLOR`,
+`TERM=dumb`) there is no colour to ask for, and the rest of the rule stands.
+
 **Background work is not tunable there — and deliberately so.** A turn can end
 while a dynamic workflow, background agents, a backgrounded shell, a monitor or
 an MCP task keep going, and the session must stay `working` until they finish
 (otherwise the device buzzes DONE mid-flight and then shows IDLE for work that
-is still running). Claude renders four tells for it, and the wrapper matches
+is still running). Claude renders five tells for it, and the wrapper matches
 them with **structural regexes** in code, because a substring loose enough to
 catch them would fire on ordinary prose:
 
@@ -921,7 +976,8 @@ catch them would fire on ordinary prose:
 | Banner | `✻ Waiting for 2 background agents and 1 dynamic workflow to finish` | Turn end; also matched when it **wraps** in a narrow terminal |
 | Turn recap suffix | `✻ Crunched for 1m 56s · 1 shell still running` | Turn end, for work the banner doesn't name |
 | Task-panel counter | a dim, right-aligned *`N` in background* | The same fact on Claude's task panel |
-| **In-flight chip** (hint row) | `⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage` | **Everything, including queued work and scheduled loops.** Read only *below the prompt box*, where neither the conversation nor the line you are typing can reach |
+| **In-flight chip** (hint row) | `⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage` | **Everything except a dynamic workflow, including queued work and scheduled loops.** Read only *below the prompt box*, where neither the conversation nor the line you are typing can reach |
+| **Workflow row** (under the hint row) | `◯ deployment-risk-sweep  ▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  2/5 · 2m39s · ↓ 542.8k tokens` | **A dynamic workflow** — the one kind of work the chip leaves out, and once its turn has ended often the only tell on screen. Read below the prompt box, with its bullet's **colour** |
 
 **The first three are transcript text, so they expire.** Claude prints them
 once and never rewrites them — a recap still reads *"1 shell still running"*
@@ -934,6 +990,28 @@ chip needs no such gate — it lives in Claude's live chrome and disappears on i
 own. Verified against two 200-second recordings of real sessions, one per tell;
 the frames are the fixtures in `tools/test_detect.py`.
 
+**A workflow row says what state it is in only with colour.** Its text is the
+same whether the run is going or finished — Claude keeps a finished row up for
+about 30 seconds, clock frozen — and the status is the bullet: no colour while
+it runs, green once it completed, red once it failed or was stopped (or, while
+its clock still ticks, when one agent failed and the run goes on), amber with ⏸
+while it waits out a usage limit. So the wrapper reads the bullet's colour off
+the emulator's cells and counts the row only while it is live. A running row's
+bullet is not uncoloured: Claude draws it, and the name beside it, in the
+theme's dimmed colour — grey in the built-in themes, anything in a custom one —
+so a bullet the colour of its own name is running, and only a bullet coloured
+apart from it carries a status. With no colour to read at all, a clock that has
+stopped settles it. A row that **vanishes** while still live was hidden, not
+finished — a run always shows its outcome first: the reading holds for as long
+as a dialog (the workflow's own detail view among them), help, shell mode or a
+suggestion list has Claude's normal prompt footer out of view, and lets go 20 s
+after that footer is back without the row. Once a row has been *seen* to end, a
+*"Waiting for 1 dynamic workflow"* banner that names nothing else stops counting
+too: a run you stop yourself prints no completion line, and that banner used to
+hold the session on WORK for good. The hint row's mode indicator draws the same
+⏸ glyph as a paused run (`⏸ plan mode on`); only a paused run's bullet is amber
+apart from its name, and that is what tells them apart.
+
 Three guards come with it. A to-do left `in progress` in the task panel is
 **not** counted — it is a plan item, not a running task, and keying off it would
 mean the device could never report DONE again. A **finished** subagent's row in
@@ -943,6 +1021,16 @@ box, never from that panel. And background work never masks
 **needs-your-input**: only the foreground spinner vetoes a question picker, so a
 session that keeps a shell or a workflow running still alerts when it asks you
 something.
+
+**The same workflow row is what the device shows.** What the wrapper reads off
+it — the status, done/total or the bar's percentage, the run's clock, its
+tokens, a compact usage-limit note and the name — goes to the daemon as field 8
+of the socket line, up to three workflows per session: one that has just ended
+first, then the running ones. While a menu or a dialog hides the rows, the held
+reading is what goes — finished rows included, so a run that has just ended
+does not blink off the device and come back with its minute started over when
+the dialog closes. The daemon turns it into the [workflow band](#features). The
+format is in [PROTOCOL.md](docs/PROTOCOL.md#wf-field).
 
 ---
 
@@ -976,6 +1064,22 @@ pattern is always the class of the worst *unacknowledged* alert (`ERROR` >
 `INPUT` > `DONE`), dropping to `V|OFF` when nothing needs you. GO/ACK act on the
 session **currently shown** (WYSIWYG) and never move the tab order. With zero
 sessions the device shows `MATE / no sessions`.
+
+**A dynamic workflow is not a state of its own.** While one is live the session
+stays `working` — the wrapper's reading of its row, above — and the device shows
+the run in its **workflow band**:
+
+| Claude's row | Letter | The band says | S3 colour | Keeps the session `working`? |
+|---|---|---|---|---|
+| no colour, clock ticking | `R` | running | WORK | yes |
+| red, clock still ticking — an agent failed, the run goes on | `E` | running, with a `!` after the Nano's bar | WORK, with a red bullet | yes |
+| amber `⏸ … paused · usage limit resets at 3:30pm` | `P` | paused · `til 3:30pm` | WAIT | yes |
+| green | `D` | done | DONE | no |
+| red, clock stopped — it failed, or was stopped | `F` | ended | ERR | no |
+
+The band never changes the state, the acknowledgement or the LED, and a run
+ending is not an alert of its own: the session's DONE still comes when the
+session leaves `working`, and is acknowledged the same way.
 
 ---
 
@@ -1051,6 +1155,27 @@ claude_mate/
   OAuth usage endpoint (an undocumented interface that may change), polled with
   the session's own token. Offline / expired-token / console-account sessions
   simply show no chip (or keep the last known value until a poll succeeds).
+- **The workflow band is a best-effort scrape of an undocumented footer.** It is
+  read off the row Claude Code draws under the prompt box for each dynamic
+  workflow — not a documented interface, so a Claude Code release that redraws
+  that row can take the band away until the wrapper catches up. It needs the PTY
+  wrapper: a hook-only session shows none, and neither does a `.pkg` install,
+  which ships no wrapper. Below **~85 columns** Claude drops done/total from the
+  row first, so the band shows the bar's percentage (`40%`) instead of counts.
+  The row never says how many agents failed, so neither can the band; and a run
+  that failed and one you stopped look the same on screen, so both read
+  `ended`. The workflow's **name** goes over the link to the device — see the
+  wireless bullet below.
+- **The band follows at most three runs per session.** That is all the wrapper
+  reports, so a fourth run in one session is never on the band, and its `+N`
+  stops at `+2`.
+- **A run you stop reads `running` for about 10 s more**, its clock still
+  counting, before the band says `ended` and the clock steps back to where the
+  run stopped. A red row whose clock still moves is a run with a failed agent
+  that goes on, so only a clock that has stopped says the run is over — and
+  seeing that takes ten seconds of watching, or a minute on a run past an
+  hour, whose clock moves once a minute (Claude has usually dropped that row,
+  and the band with it, by then). A run that fails does the same.
 - **FOCUS targets the wrapper's terminal first, then VS Code.** A wrapped session
   raises its own terminal window (matched by TTY) using the terminal app's own
   scripting — it selects the session's tab and brings that window to the front.
@@ -1062,17 +1187,26 @@ claude_mate/
 - **Detection is screen-scrape-based (wrapper).** State is inferred from the
   rendered TUI using `patterns.json`. It is scoped to the live status region to
   avoid false positives, but unusual terminal themes/locales may need a pattern
-  tweak — which you can do live, no restart.
+  tweak — which you can do live, no restart. Two readings also depend on
+  **colour** — an error phrase above the prompt box, and a dynamic workflow's
+  status — classified by hue, which holds in the six themes Claude Code ships. A
+  **custom theme** whose error or warning colour is not a red-to-yellow hue
+  (blue, purple, a near-grey pastel) loses the error reading above the prompt
+  box. With Claude's **colour off** altogether the error rule falls back to the
+  row's shape alone, and a workflow's finished row holds WORK through its ~30 s
+  linger. And from the **third retry attempt** on, Claude's retry line names the
+  raw error ("529 Overloaded") rather than a phrase, so a long outage reads WORK,
+  not ERR, until the turn gives up.
 - **The wireless link is authenticated, not encrypted.** The handshake is
   nonce/HMAC and the token never crosses the wire, but the session itself is
-  **plaintext** — so session names, states and, with the mirror open, raw
-  terminal contents are readable by anyone on the same network. `--tcp` is
-  opt-in and refuses to start without a token; treat it as a trusted-LAN
-  feature. **`--ble` is exactly the same trade**, over a different pipe and with
-  a shorter radius: the link is deliberately unpaired and unencrypted, because
-  "Just Works" pairing is what a device with no keypad gets and is
-  unauthenticated by definition — the token handshake, not Bluetooth, is what
-  decides who may drive the device.
+  **plaintext** — so session names, states, the names of your dynamic workflows
+  and, with the mirror open, raw terminal contents are readable by anyone on the
+  same network. `--tcp` is opt-in and refuses to start without a token; treat it
+  as a trusted-LAN feature. **`--ble` is exactly the same trade**, over a
+  different pipe and with a shorter radius: the link is deliberately unpaired
+  and unencrypted, because "Just Works" pairing is what a device with no keypad
+  gets and is unauthenticated by definition — the token handshake, not
+  Bluetooth, is what decides who may drive the device.
 - **`arduino-cli upload` cannot flash the ESP32-S3 board.** Its download mode
   ignores the DTR/RTS straps, the USB link stalls partway through any large
   transfer, and `--after hard-reset` lands back in the bootloader looking

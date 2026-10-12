@@ -32,13 +32,15 @@ Leave off `--yes` and it asks before touching `settings.json` — that is the on
 question it has. It is idempotent: re-run it after a `git pull`.
 
 **Then feed it.** Either alias `claude` to the PTY wrapper, which is what gets
-you model, effort, account and limit on the screen:
+you model, effort, account and limit on the screen, and a running workflow's
+progress:
 
 ```sh
 echo 'alias claude="'"$PWD"'/bin/claude-mate-wrap"' >> ~/.zshrc && exec zsh
 ```
 
-…or rely on the hooks alone, which give you states but not the extras.
+…or rely on the hooks alone, which give you states but not the extras — no
+model, effort, account or limit, and no [workflow band](#the-workflow-band).
 
 **Check it:**
 
@@ -149,6 +151,14 @@ claude-mate watch               # ...and keep printing it
 `<-- needs you` is an unacknowledged alert. The right-hand columns are model,
 effort, account and how much of that account's plan limit is left.
 
+A session running a dynamic workflow gets an indented line under it for each
+workflow the daemon has: the name, the status word and whatever progress is
+known, the clock and tokens written the way the band writes them (`2m39s`,
+`543k`). The first line under the `>` row is the run the band is showing; the
+others are its `+N`, or belong to sessions that are not on the glass. That
+first line is the quickest way to tell *the daemon has it but the device does
+not show it* from *the daemon never got it*.
+
 ### Every command
 
 | Command | Button | What it does |
@@ -243,12 +253,80 @@ Four buttons. **PREV · GO · NEXT**, and a 4th with three gestures.
 effort, account and remaining limit, and a letter per session across the fleet —
 `E` error, `B` waiting, `W` working, `D` done, `I` idle. A letter **blinks**
 while that session's alert is unacknowledged. The active tab's letter sits in a
-filled box.
+filled box. While the session runs a dynamic workflow, the
+[workflow band](#the-workflow-band) shows that too.
 
 **The LED** plays a distinct rhythm per alert class and keeps playing until you
 acknowledge. Colour is a second channel, not the only one — the rhythms differ
 too, and the brightness levels differ, so it reads in sunlight and to a
 red/green-colourblind eye.
+
+### The workflow band
+
+When the session on the glass runs a **dynamic workflow** — Claude Code's
+Workflow tool, the row under the prompt box that reads
+`◯ deployment-risk-sweep  ▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱  2/5 · 2m39s · ↓ 542.8k tokens`
+— the device shows that run, not just `WORK`.
+
+| | Nano | S3 |
+|---|---|---|
+| where | r2, the model row: model, effort and the limit chip step aside while the band is up | under the fleet strip, where the link line (`wifi 192.168.1.42`) is otherwise drawn |
+| running | a bar, filled done/total | a bar with one segment per agent when they fit — done ones in the status colour, pending ones as an outline — else a continuous bar |
+| an agent failed, the run goes on | the bar, a little shorter, then `!` | the bar and the word `running`, with a red bullet |
+| paused on a usage limit | the word `paused` | a hollow amber bullet and the word `paused` |
+| finished | `done`, or `ended` if it failed or was stopped | the same words, in the DONE and ERR colours |
+| info, right-aligned | `2/5 2m39s 543k` | the same, at row size |
+| name | not shown | the workflow's name, cut to fit |
+
+**The info** is the best of these that fits 14 characters: done/total, the run's
+clock and its tokens, plus `+1` when another workflow in that session is visible
+too — `2/5 2m39s 543k`, or `2/5 2m39s +1`. A terminal under ~85 columns makes
+Claude drop the counts, and the band shows the bar's percentage instead
+(`40% 2m39s 543k`). A paused run shows when its usage limit resets —
+`til 3:30pm`, `til Oct 11 3pm`. A running one with nothing else to show says
+`running`; a paused, finished or ended one with nothing to add shows its word
+alone, which the device draws anyway.
+
+**Two clocks.** The time on r1 is how long the *session* has been in its state.
+It starts again at every change — approving a workflow agent's permission
+prompt is WAIT → WORK, so r1 can read `00:05` above a run that is twelve
+minutes in — and after a daemon restart. The band's clock is the *run's own*,
+in Claude's units exactly as the terminal prints them: `45s`, `2m39s`, `1h02m`,
+`1d03h`. It never looks like r1's `mm:ss`, and it keeps counting through both.
+
+**A run you stop reads `running` for about 10 s more.** Claude turns a stopped
+run's row red, and red is also a run that lost an agent and goes on — the only
+difference is that the stopped one's clock has stopped. So the band waits to see
+the clock stand still for 10 s (counted from when the row is back in view, if
+you stopped it from the `/workflows` dialog), still saying `running` with its
+clock counting, then says `ended` — and its clock steps back to where the run
+stopped. A run that fails does the same. Past an hour, whose clock moves once a
+minute, the wait is a minute; Claude has usually dropped the row by then, and
+the band goes without ever saying `ended`.
+
+**Several at once.** A session can have more than one workflow running. The
+band shows one — the first one still going — and counts the others (`+1`); a
+run that has just finished takes the band for ten seconds so its end is seen,
+then hands it back. It follows at most three runs per session — all the wrapper
+reports — so with a fourth the count stops at `+2`.
+
+**How long it stays.** As long as the run is live. A finished run stays as long
+as Claude keeps its row (about 30 seconds), and never more than a minute; a
+dialog or a menu covering the rows meanwhile does not take it down. If the
+wrapper itself dies, a running band goes 90 seconds later rather than claiming
+progress nobody is reporting. For the ~4 seconds a notice holds the middle rows
+— a declined press, an account switch — the band steps aside.
+
+**It never asks for anything.** Nothing in the band blinks, because on this
+device a blink means *needs you, and GO clears it*, and nothing about a workflow
+can be acknowledged — a usage-limit pause can last until a weekly reset. It does
+not change the session's state or the LED, and it does not keep the S3's screen
+awake. When a run ends, the DONE you acknowledge is still the session's, when
+it leaves `WORK`.
+
+**Old firmware ignores it.** A device that has not been reflashed since the band
+arrived shows r2 exactly as before and no band: the S3 needs `s3-2.3` or later
+(SETTINGS → About), the Nano a reflash.
 
 ### The menu (4th button, double-tap)
 
@@ -395,8 +473,9 @@ still plaintext:
 
 > **The payload is not encrypted.** Anyone who can sniff a network you have
 > trusted can read session names, project paths, the account each session runs
-> as, and — if you open it — the terminal mirror's actual screen contents. An
-> on-path attacker could inject button events into an established connection.
+> as, the names of the dynamic workflows they run, and — if you open it — the
+> terminal mirror's actual screen contents. An on-path attacker could inject
+> button events into an established connection.
 > The token is never sent and cannot be sniffed, so nobody can *impersonate*
 > your device; that is authentication, not confidentiality.
 
@@ -461,6 +540,9 @@ claude-mate-connect
 | `ble: start the daemon with --ble` | the device is fine and waiting; the daemon has BLE off |
 | the daemon says `no device found yet` while the device says it is advertising | macOS Bluetooth permission for the daemon's Python, in **Privacy & Security → Bluetooth** |
 | no model/effort/account on the screen | those come from the PTY wrapper — alias `claude` to `claude-mate-wrap` |
+| a workflow is running but the device shows no band | in order: the glass is on another session — the band follows the selected one, so step to it; a notice is up — the band steps aside for its ~4 s — or, on the S3, the menu or the mirror is, since the band is drawn on the main screen only; the session is not wrapped — a hook-only session has no band, and a `.pkg` install on its own ships no wrapper; the firmware predates it — the S3 needs `s3-2.3` or later (SETTINGS → About), the Nano a reflash; or Claude Code has redrawn its workflow row and the wrapper no longer reads it — if `claude-mate status` lists no workflow under the session either, that is the one. Listed first under the `>` row, with the main screen up and still no band, is the firmware |
+| the band shows `40%`, not `2/5` | the terminal is narrower than ~85 columns: Claude drops the counts first, and the band falls back to the bar's percentage |
+| the band says `ended` for a run you did not stop | Claude draws a failed run and a stopped one alike — red, clock frozen. The terminal's transcript says which |
 | the board is not on `/dev/cu.usbmodem*` | it is on battery, or asleep. A button wakes it |
 
 **Rotating the token** — if it has been in a screenshot or a log:

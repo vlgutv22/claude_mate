@@ -15,7 +15,8 @@
  * pre-renders ONE frame as four rows of at most 21 characters. This firmware is
  * a dumb renderer: it holds exactly one frame and draws it. All ordering,
  * selection, truncation and text layout live in the daemon -- the extra pixels
- * here buy TYPOGRAPHY and COLOUR, never a different information model.
+ * here buy TYPOGRAPHY and COLOUR, never a different information model, with
+ * ONE exception: the workflow band, below.
  *
  *   +--------------------------------------------+
  *   | (wifi)  CLAUDE MATE               [ 87% ]  |  firmware-local status bar
@@ -28,6 +29,28 @@
  *   |  wifi 192.168.1.42                         |  tab sits in a filled box,
  *   |============================================|  unacked alerts BLINK
  *   +--------------------------------------------+  accent = worst state colour
+ *
+ * THE WORKFLOW BAND. A progress bar cannot be sent as text -- the wire is
+ * ASCII and the two devices are 128 and 320 px wide -- so for the shown
+ * session's workflow the daemon sends NUMBERS, and each device draws them in
+ * its own geometry:
+ *
+ *     J|<st>|<done>|<failed>|<total>|<info>|<name>    (J|- = none)
+ *
+ * st is R running / E an agent failed / P paused on a usage limit / D done /
+ * F ended; the counts drive only the bar; info is the daemon's own text. A J|
+ * is only STAGED: the F| that follows it commits it, and the band is drawn
+ * only while that F| sets flags bit2. The Nano gives up r2 for a bar (or a
+ * status word) and the info; this panel keeps r2 and puts the band where the
+ * link-detail line was, with the workflow's name and a status word as well:
+ *
+ *   |  2/6  E  B  W  D  I                        |
+ *   |  o deployment-risk-sweep-3802     running  |  bullet, name, status word
+ *   |  [##][##][  ][  ][  ]     2/5 2m39s 543k   |  per-agent bar, info
+ *   |============================================|
+ *
+ * Nothing in it blinks: here a blink means an alert to acknowledge, and a
+ * workflow has none. See workflow.h (shared with the Nano) and wfband.h.
  *
  * There are NO modes: the buttons mean the same thing at all times --
  *
@@ -121,6 +144,8 @@
 #include <driver/rtc_io.h>
 #include "board_s3.h"
 #include "battery.h"       // the gauge's arithmetic, so a host can test it
+#include "workflow.h"      // J| parsing + bar arithmetic, identical to the Nano's
+#include "wfband.h"        // ...and the band that draws it on this panel
 #include "netcfg.h"
 #include "settings.h"
 #include "blelink.h"
@@ -379,6 +404,9 @@ static int8_t frameSel    = -1;      // active tab's fleet-letter column in r3
 static bool   haveFrame   = false;   // false until the first F| arrives
 static bool   linkLost    = false;   // nothing heard for LINK_WATCHDOG_MS
 static bool   blinkOn     = true;    // shared blink phase (flash + fleet)
+static bool   frameWf     = false;   // F| flags bit2: the workflow band is up
+static WfPair wf;                    // the J| waiting for its F|, and the one
+                                     // the band draws (workflow.h)
 
 // ---- Render coalescing -------------------------------------------------------
 // Handlers only MARK the display dirty; the redraw happens in loop() once the
@@ -1045,11 +1073,18 @@ static void drawStatusBar() {
 
 // The bottom band: what the link is doing (firmware-local, never from the
 // daemon) plus the state accent bar.
-static void drawFooter(uint16_t accent) {
-  gfx->setTextSize(1);
-  gfx->setTextColor(C_DIM);
-  gfx->setCursor(PAD_X, LINK_Y);
-  gfx->print(linkStatusText());
+//
+// `linkLine` false leaves the link text out, for the one caller that has the
+// workflow band in that strip. Nothing is lost by it: the band carries the
+// same text in place of the workflow's name whenever the link is not up, and
+// while it IS up this line only says which address it is on.
+static void drawFooter(uint16_t accent, bool linkLine = true) {
+  if (linkLine) {
+    gfx->setTextSize(1);
+    gfx->setTextColor(C_DIM);
+    gfx->setCursor(PAD_X, LINK_Y);
+    gfx->print(linkStatusText());
+  }
   bool blip = (long)(millis() - blipUntil) < 0;
   gfx->fillRect(0, ACCENT_Y, SCREEN_W, ACCENT_H, blip ? C_TEXT : accent);
 }
@@ -1131,7 +1166,20 @@ static void drawFrame() {
                       x + 10, R1_Y + ROW_H / 2, C_TEXT);
   }
 
-  drawFooter(accent);
+  // The workflow band, in the strip under the fleet strip. Only here, so it is
+  // never drawn over the menu, the mirror, the pad, the game or a pairing
+  // prompt -- and only from the J| this frame's own F| committed. It takes the
+  // link-detail line's place; while the link is down, the link's text takes
+  // the workflow name's place instead, so the reason stays readable.
+  //
+  // NOT gated on linkConnected(): a radio that is down while the cable
+  // carries the frames is still a live frame, and hiding the band then would
+  // hide it for exactly the people debugging their radio.
+  bool band = frameWf && wf.live.st;
+  if (band)
+    wfDrawBand(gfx, wf.live, linkConnected() ? nullptr : linkStatusText());
+
+  drawFooter(accent, !band);
 }
 
 // Firmware-local: nothing heard for LINK_WATCHDOG_MS. An honest state instead
@@ -2152,6 +2200,8 @@ static void handleLine(char *line) {
       uint8_t flags = (uint8_t)atoi(fields[1]);
       frameFlash  = flags & 1;
       frameFollow = flags & 2;
+      frameWf     = flags & 4;             // the workflow band is up...
+      wfCommit(wf);                        // ...as of the J| just before this
       frameSel    = (int8_t)atoi(fields[2]);
       for (uint8_t r = 0; r < 4; r++)
         copyField(frameRow[r], sizeof(frameRow[r]), fields[3 + r]);
@@ -2159,6 +2209,16 @@ static void handleLine(char *line) {
       requestRender();
       break;
     }
+
+    case 'J':                              // J|<st>|<done>|<failed>|<total>|...
+      // Staged, and deliberately NOT a reason to redraw: drawn on its own it
+      // would put the next session's workflow under this session's name until
+      // the F| arrived -- over BLE the two can land in different connection
+      // events. The F| that follows commits it, like M|END does the mirror.
+      // NOT a console letter either: on USB, W|, S| and T| would have written
+      // a workflow into the Wi-Fi password, the daemon host or the token.
+      wfStage(wf, line);
+      break;
 
     case 'G': {                            // G|1 / G|0 -- gamepad (controller)
                                            // mode. NOT 'X': that is X|WIPE in
@@ -2393,12 +2453,13 @@ static bool handleConfigLine(char *line) {
 
     case 'I': {                            // I|WIFI or I|BLE -- which radio
                                            // carries the daemon.
-      // 'I' for interface. It is not one of the protocol's verbs (F G L M P V)
-      // and it is not one of this console's (? R S T W X Y Z), which is a
-      // property worth checking rather than assuming: handleConfigLine() runs
-      // FIRST on USB lines, so a verb claimed by both is silently unreachable
-      // over the cable. tools/test_controller_mode.py asserts the two sets stay
-      // disjoint, which is how X| was caught.
+      // 'I' for interface. It is not one of the protocol's verbs
+      // (F G J L M P V) and it is not one of this console's
+      // (? R S T W X Y Z), which is a property worth checking rather than
+      // assuming: handleConfigLine() runs FIRST on USB lines, so a verb
+      // claimed by both is silently unreachable over the cable.
+      // tools/test_controller_mode.py asserts the two sets stay disjoint,
+      // which is how X| was caught.
       char *a = strchr(line, '|');
       if (!a) return false;
       a++;
@@ -2782,9 +2843,12 @@ static void powerOff() {
 //
 // Note what is deliberately NOT here. A `working` session does not count: a
 // fleet grinding away for an hour with nothing to say is precisely the case this
-// setting exists for. Neither does NO LINK -- a dead daemon must not be able to
-// hold the backlight on until the cell is flat, which is what would happen the
-// moment you carried the device out of WiFi range.
+// setting exists for. A workflow band is that same case with a progress bar, so
+// it does not count either; a finished run reaches you through the session's
+// own DONE once it leaves working (V| and the name flash), and those do.
+// Neither does NO LINK -- a dead daemon must not be
+// able to hold the backlight on until the cell is flat, which is what would
+// happen the moment you carried the device out of WiFi range.
 static bool needsAttention() {
   if (haveFrame && !linkLost) {
     if (frameFlash) return true;

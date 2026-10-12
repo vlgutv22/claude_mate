@@ -13,6 +13,11 @@ Covers the security posture too: a wrong token is rejected, a token is never
 sent in the clear, the nonce is fresh per connection, and --tcp without a token
 refuses to listen at all.
 
+And the workflow band, which is the first thing on this link written as a PAIR
+-- a J| the firmware stages, then the F| that commits it: the device must see
+the J first (again after H), and the socket must not hold the F back behind it
+(TCP_NODELAY).
+
 Run:   python3 tools/test_net_link.py      (needs pyserial)
 """
 import hmac
@@ -453,6 +458,48 @@ check("both got byte-identical frames",
       bool(got_wifi) and bool(got_usb) and got_wifi[0] == got_usb[0])
 
 # --------------------------------------------------------------------------- #
+# Phase 3b: the workflow band crosses the radio the way it crosses the cable
+# --------------------------------------------------------------------------- #
+# The band is a J| line that the F| after it commits; the firmware draws
+# nothing from a J alone. So over TCP, as over USB, the device must see the J
+# BEFORE the frame that carries bit2 -- and again after it says H, because a
+# device that just rebooted has lost the J it had staged.
+print("\n-- phase 3b: a workflow's J| arrives before the F| that commits it --")
+
+
+def band_pairs(since):
+    """(J, F) for every F with bit2 the wireless device saw after `since`,
+    J being the J|/F| line just before it (None if it was not a J)."""
+    seq = dev.seen(lambda l: l.startswith("J|") or l.startswith("F|"), since)
+    out = []
+    for i, l in enumerate(seq):
+        p = l.split("|")
+        if l.startswith("F|") and len(p) >= 7 and p[1].isdigit() \
+                and int(p[1]) & 4:
+            prev = seq[i - 1] if i else ""
+            out.append((prev if prev.startswith("J|") else None, l))
+    return out
+
+
+before = dev.count()
+feed("working|sid-net|alpha|" + os.path.join(tmp, "ctrl-alpha.sock")
+     + "|||||R;1;4;;25;30;1000;;sweep")
+pairs = wait_for(lambda: band_pairs(before))
+check("the wireless device gets the run's J, then the F with bit2",
+      bool(pairs) and pairs[0][0] is not None
+      and pairs[0][0].startswith("J|R|1|0|4|")
+      and pairs[0][0].endswith("|sweep")
+      and frame_subject(pairs[0][1]) == "alpha")
+check("...and never an F with bit2 that no J came right before",
+      bool(pairs) and all(j is not None and j != "J|-" for j, _ in pairs))
+before = dev.count()
+dev.send("H")
+pairs = wait_for(lambda: band_pairs(before))
+check("after H the J goes out again ahead of the frame",
+      bool(pairs) and pairs[0][0] is not None
+      and pairs[0][0].startswith("J|R|1|0|4|"))
+
+# --------------------------------------------------------------------------- #
 # Phase 4: buttons from either transport drive the same queue
 # --------------------------------------------------------------------------- #
 print("\n-- phase 4: buttons from either device drive the queue --")
@@ -608,6 +655,28 @@ _t.join(timeout=5.0)
 check("a throwing dispatch does not kill the button reader -- the next press "
       "still lands", _dispatched == ["B|G", "B|N"])
 check("...and the reader stops cleanly when asked", not _t.is_alive())
+
+# --------------------------------------------------------------------------- #
+print("\n-- phase 9: a device socket does not wait on Nagle --")
+# The workflow band writes J| and then, immediately, the F| that commits it.
+# With Nagle on, that small F sits in the kernel until the device ACKs the J,
+# and the ESP32's lwIP delays that ACK by up to ~250 ms: every frame would
+# reach a Wi-Fi device a quarter-second late. Read off the accepted socket
+# itself -- the option is per socket, so the peer cannot see it.
+_nd_port = free_port()
+_ndnet = _cmd.NetLink("127.0.0.1", _nd_port, TOKEN, queue.Queue())
+assert _ndnet.start()
+_nd_dev = FakeDevice(_nd_port, TOKEN)
+check("an in-process listener accepts the device", _nd_dev.connect())
+check("...and holds it as a client", bool(wait_for(_ndnet.has_clients)))
+with _ndnet._lock:
+    _nd_socks = list(_ndnet._clients)
+check("the accepted device socket has TCP_NODELAY set",
+      bool(_nd_socks) and all(
+          s.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) != 0
+          for s in _nd_socks))
+_nd_dev.close()
+_ndnet.stop()
 
 
 # --------------------------------------------------------------------------- #

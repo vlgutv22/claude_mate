@@ -17,7 +17,10 @@ There are three interfaces:
 The daemon keeps ONE **stable-ordered** list of sessions (alphabetical, so tabs
 never shuffle) and renders ONE screen: the *selected* session. The firmware is
 a dumb renderer: it holds exactly one pre-composed frame (four size-1 rows) and
-draws it. All ordering, selection, truncation and layout live in the daemon.
+draws it. All ordering, selection, truncation and layout live in the daemon —
+with one exception, the **workflow band** ([`J|`](#workflow-band)): for a
+dynamic workflow the daemon sends numbers and a pre-rendered info string, and
+each device draws the band in its own geometry.
 
 ```
 +---------------------+
@@ -35,6 +38,14 @@ how much of that account's plan limit is left, for whichever window is more
 depleted: `5h82%` = 82% of the 5-hour window remaining, `wk31%` = 31% of the
 week left. Both come from the PTY wrapper and are empty (row right edges stay
 blank) for hook-driven sessions.
+
+While the shown session runs a **dynamic workflow** (Claude Code's Workflow
+tool), the device shows the run itself in a **workflow band**: on the Nano it
+takes r2's place — a bar and `2/5 2m39s 543k` — and model, effort and the chip
+come back when it goes; on the S3 it sits under the fleet strip with the
+workflow's name and a status word. It is display only: it never changes a
+state, an acknowledgement or the LED. See [§1a](#workflow-band) and
+[§3](#per-session-workflows).
 
 The **active tab** (the session shown above) has its fleet letter drawn in a
 **wide filled rectangle** in r3 — a lit block with the letter centred and
@@ -110,6 +121,7 @@ input buffer at 96 bytes and drops malformed/oversized lines).
 | Line | Meaning |
 |------|---------|
 | `F\|<flags>\|<sel>\|<r0>\|<r1>\|<r2>\|<r3>` | **The whole screen**, pre-rendered as four size-1 rows. See field table below. At least 7 fields; `r3` is the **last** field and may itself contain `\|`. A **transient notice** (why a press was declined, or which account a switch is heading for) rides in `r1`+`r2` for ~4 s: the daemon owns row rendering, so saying something new on the glass costs no firmware change and works on a device already flashed. `r0` and `r3` are left alone, so the message never loses the session it is about. |
+| `J\|<st>\|<done>\|<failed>\|<total>\|<info>\|<name>` · `J\|-` | **The workflow band** for the session on the glass: a dynamic workflow's status, the counts that drive its bar, and an info string the daemon has already laid out. Drawn only while the `F\|` that follows carries flags **bit2**, and only from the `J\|` that `F\|` committed. `J\|-` clears it. Seven fields, frozen; grammar, caps and the write order in [The workflow band](#workflow-band) below. Older firmware ignores the line and the bit, and looks exactly as it did. |
 | `V\|<kind>` | LED alert control (indication LED only; never touches the OLED). `<kind>` is `START`, `INPUT`, `DONE`, `ERROR`, or `OFF`. See **LED** below. |
 | `L\|<i>\|<n>\|<name>\|<chip>` | **One saved account**, pushed on every handshake so the device's picker can show the logins you already have. Row 0 is always `default` (the `~/.claude` login, which is not a directory under the profiles root — omitting it let the device switch away from your main account with no way back). `i==0` resets the list, so a profile you deleted cannot leave a stale row behind. `<chip>` is that account's remaining-limit chip and may be empty: the names are free, the limits cost an HTTPS round trip each, so the daemon sends names immediately and re-sends enriched a moment later rather than blocking the handshake. Which account has headroom is the whole basis of the choice. Two consequences of that re-send, both load-bearing: the device must keep its **selection by name** across a rebuild (row numbers do not survive one, and the enriched push lands while a thumb is over GO), and the daemon must decode `B\|A<i>` against the list it actually **pushed** — it re-pushes within ~5 s of the profile set changing, but until then the glass is showing older rows and a fresh `listdir` would decode them to the wrong name. |
 | `G\|2` | **BLE gamepad mode.** The device comes up as an ordinary Bluetooth HID gamepad (four buttons, no axes, physical order) and needs no daemon, no Wi-Fi and no loopback from then on — which is the only way a page served over **https** can be driven by this hardware, since it cannot reach `http://127.0.0.1`. Entering parks whichever radio was carrying the link, because the S3 has one 2.4 GHz radio and sharing it costs the link that matters. Reachable from the device itself at **SETTINGS → BLE gamepad** — the verb exists so the mode can also be entered, and tested, from the far end of a cable. Verified on hardware: advertises as `Claude Mate` with service `0x1812`, and `deinit` + Wi-Fi restart round-trips cleanly. **That last part holds only because Wi-Fi is a different stack** — BLE itself does *not* come back after a `deinit` in the same boot (`BLEDevice::init()` fails from then on), so on a device whose *link* is BLE, turning the gamepad off reboots rather than restarting the stack. See `firmware/README.md`. **`G\|2` now also sets the device's stored gamepad switch**, so it survives a reboot exactly as the menu toggle does — and consequently `G\|0` will *not* undo it (see below). |
@@ -127,23 +139,155 @@ input buffer at 96 bytes and drops malformed/oversized lines).
 > config` — one lax compare away from wiping the Wi-Fi credentials and the
 > token every time somebody opened the game. `tools/test_controller_mode.py`
 > asserts the two sets stay disjoint.
+>
+> **The workflow band is `J|` for exactly this reason.** `W` was the obvious
+> letter and is the worst one available: the console reads `W|<ssid>|<password>`
+> and saves it, so a cabled S3 would have had its Wi-Fi credentials overwritten
+> by a workflow's name. `T` (the token) and `S` (the daemon host) are the
+> console's too. `J` is free on every path, in both directions.
 
 **`F` line fields** — each row is ≤ 21 chars (size-1), drawn top to bottom:
 
 | Field   | Description |
 |---------|-------------|
-| `flags` | Bitfield. **bit0**: invert **row 0** (the name) at ~2.5 Hz (an unacknowledged alert is on screen). **bit1**: FOLLOW mode is on (draw a ► marker by the state row). |
+| `flags` | Bitfield. **bit0**: invert **row 0** (the name) at ~2.5 Hz (an unacknowledged alert is on screen). **bit1**: FOLLOW mode is on (draw a ► marker by the state row). **bit2** (value 4): the **workflow band** is live for the shown session — draw it from the `J\|` this frame commits ([below](#workflow-band)). Set only when the shown session has a visible workflow and no notice holds `r1`/`r2`; never in the no-sessions frame. Older firmware reads only bit0 and bit1, and `flags` stays a single digit, so the frame is no longer than it was. |
 | `sel`   | The character column **within `r3`** of the active tab's fleet letter (`-1` = none). The firmware fills a **wide** rectangle (~11 px) **centred** on that letter — a lit block with the letter knocked out. |
 | `r0` (name) | Session name. The daemon truncates to the row width and, when two long sibling names collide, disambiguates with a middle squeeze (first 9 + `~` + last 10, e.g. `webapp-ba~ervice-one`). |
 | `r1` (state) | `TAG  time` — the 4-char state tag (`ERR`/`WAIT`/`DONE`/`WORK`/`IDLE`) and the time in that state (mm:ss, or h:mm past an hour) — plus the session's **account** right-aligned (≥ 2-space gap, truncated to fit; omitted when unknown). |
-| `r2` (meta) | Best-fit `model effort`, plus the **remaining-limit chip** (e.g. `5h82%`) right-aligned (≥ 2-space gap); the model+effort best-fit degrades into the room the chip leaves. Empty for hook-driven sessions with no scraped metadata. |
+| `r2` (meta) | Best-fit `model effort`, plus the **remaining-limit chip** (e.g. `5h82%`) right-aligned (≥ 2-space gap); the model+effort best-fit degrades into the room the chip leaves. Empty for hook-driven sessions with no scraped metadata. Sent the same with or without a workflow band: the Nano hides it while bit2 is set and draws the band there, the S3 keeps it, and older firmware just draws it. |
 | `r3` (fleet) | `pos/total ` + one status **letter** per session in the stable (alphabetical) order, **space-separated**: `E` error, `B` waiting (blocked), `W` working, `D` done, `I` idle. An **unacknowledged alert's letter is sent LOWERCASE** — the firmware draws it uppercase but **blinks** it, so you can see which tabs still need acknowledging (they stop blinking as you ack them). When the strip does not fit, it is cut with a trailing `+`. `r3` is the last field (the firmware stops tokenizing at the 6th `\|` and takes the rest verbatim). |
 
 The daemon sends an `F` line whenever the rendered bytes change: immediately on
 any state change or button, and ~1/s while a displayed time ticks. Identical
-frames are not re-sent (except on handshake).
+frames are not re-sent — except on handshake, and while a workflow band is up:
+then the `J|` and the `F|` that commits it go out together again whenever the
+last pair is a second old, changed or not (below).
 
-With no sessions the daemon sends `F|0|-1|MATE|no sessions||`.
+With no sessions the daemon sends `F|0|-1|MATE|no sessions||` (never with
+bit2).
+
+#### The workflow band — `J|` {#workflow-band}
+
+While the shown session runs a dynamic workflow, the daemon sends it as numbers
+plus one pre-rendered string, and each device draws the band in its own
+geometry. It is the one place the firmware lays anything out — and even here the
+daemon composes the text (`info`, the name); the device adds only a fixed
+status word and decides where the bar ends.
+
+```
+J|<st>|<done>|<failed>|<total>|<info>|<name>     the band, for the session on the glass
+J|-                                              no band: clear
+```
+
+Seven fields, **frozen**: nothing will ever be appended, which is what lets the
+name be last. Mind the order — `done|failed|total` — which is not the socket
+record's `done;total;failed` (§2). The firmware accepts exactly this, at most
+77 bytes, and ignores anything else:
+
+```
+^J\|-$
+^J\|[A-Z]\|\d{1,5}\|\d{1,5}\|\d{1,5}\|[^|]{0,14}\|[^|]{0,40}$
+```
+
+| Field | Description |
+|-------|-------------|
+| `st` | The workflow's status: `R` running · `E` running, an agent has failed · `P` paused on a usage limit · `D` completed · `F` ended without completing (failed or stopped — the screen cannot tell which). These are the workflow's letters, not the fleet strip's: an `E` here is a run that is still going, not a session error. The firmware accepts any `A`–`Z` and draws a letter it does not know neutrally — no word, the idle colour — so a status added later degrades instead of freezing the previous band. |
+| `done` `failed` `total` | Up to 5 digits each, and they drive **only the bar**. The firmware saturates at 65535 and clamps `done ≤ total`, `failed ≤ total − done`. Counts unknown but the bar's percentage known → `done`=pct, `failed`=0, `total`=100. Nothing numeric known → `0\|0\|0`, and the firmware draws **no bar** at all, because an empty outline would read as 0 %. `failed` is 0 today: Claude's row does not show it. |
+| `info` | ≤ 14 printable ASCII chars, no `\|`, composed by the daemon (below) and drawn right-aligned, verbatim. |
+| `name` | ≤ 40 chars of ASCII: `\|` → `/`, `…` → `~`, any other non-ASCII → `?`, control characters removed. With `N` more workflows visible in that session it ends in ` +N`, inside the 40; a name cut to make room ends in `~`. The Nano never draws it. A `\|` cannot come from the daemon, so a name holding one is a line whose newline was lost with the next line spliced on — `J\|R\|1\|0\|5\|1/5\|deployF\|4\|4\|api…` — and the firmware rejects it rather than drawing half a frame as a name. |
+
+**`info`** is built from up to four parts:
+
+| Part | |
+|---|---|
+| COUNT | `done/total` — `3/5`; or `40%` when only the bar's percentage is known |
+| CLK | the workflow's own clock, in Claude's units: `45s` under a minute, `2m39s` under an hour, `1h02m` under a day, then `1d03h` |
+| TOK | tokens, compact: `999`, `1.2k`, `543k`, `1.4M`, `12M`, `1.2B` — rounded, and never `1000k` (that is `1.0M`) |
+| PLUS | `+N` when `N` more workflows are visible |
+
+It is the first of these that fits 14 characters, parts joined by single spaces
+and missing ones skipped: COUNT CLK TOK PLUS · COUNT CLK PLUS · COUNT PLUS ·
+COUNT CLK TOK · COUNT CLK · COUNT TOK · COUNT · CLK TOK · CLK · TOK. A paused
+workflow with a usage-limit note shows the note instead (`til 3:30pm`). With
+nothing at all to show — or nothing that fits 14 characters — a running one
+(`R`/`E`) says `running`, followed by ` +N` when `N` more are visible
+(`running +2`): the Nano draws no word for a running run, and without it r2
+would be blank. A paused, finished or ended one gets just `+N`, or an empty
+info, because both devices already draw `paused`, `done` or `ended` themselves
+— the word again would read `paused … paused`. So a session whose footer reads
+`◯ deployment-risk-sweep-3802  ▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  0/5 · 2m39s · ↓ 542.8k tokens`
+gets, on every device:
+
+```
+J|R|0|0|5|0/5 2m39s 543k|deployment-risk-sweep-3802
+F|4|4|aladdin|WORK  03:09  claudeal|Opus 5.5 xhigh  5h82%|1/2 W I
+```
+
+and a second visible workflow in that session would make the info
+`0/5 2m39s +1`.
+
+**bit2 is the gate, `F|` is the commit.** The firmware parses a `J|` into a
+staging copy and draws nothing; the next `F|` adopts it and renders, the way
+`M|END` commits a mirror page. The staging copy outlives its commit, and a
+refused `J|` leaves it as it was — so an `F|` whose own `J|` never arrived
+commits the one before it. The write rules exist for that case. The daemon,
+under the lock that composes the frame:
+
+* while the band is up, writes the subject's `J|` and then the `F|` whenever it
+  writes anything at all — a changed frame, a changed band, a forced resend —
+  and, when nothing has changed, again once the last pair is **a second old**:
+  the next call of the daemon's 1 Hz ticker, so every second or two. It writes
+  that `F|` **even when its bytes are unchanged**, because it is the commit.
+  Without the repeat, a band and a frame that both stand still — a paused or
+  finished run under an `r1` past the hour, which moves once a minute — would
+  leave a lost `J|` wrong for up to a minute;
+* when the band moves to a different session — PREV/NEXT from one session's
+  band to another's — writes `J|-` ahead of the new session's `J|`; likewise
+  for the first band after the daemon starts, since a device that outlived the
+  last daemon may still hold a `J|` it staged;
+* when the band goes, writes `J|-` once, then frames as usual;
+* on a forced resend (`H`, the serial port reopening, the mirror closing),
+  writes `J|` — or `J|-` — and then `F|`.
+
+So every frame with bit2 arrives right behind its `J|`, and a frame is always
+drawn from a `J|` and the `F|` that committed it. A lost `J|` costs a second or
+two of band at most — the next pair repairs it, the same *every frame is the
+whole screen* rule the rest of the protocol lives by — and it never puts one
+session's band under another session's name: after a press of NEXT, what a
+lost `J|` leaves staged is the `J|-` written ahead of it, so that `F|` commits
+no band rather than the last session's. Device sockets on TCP have Nagle off
+(`TCP_NODELAY`), so an `F|` written right behind its `J|` is not held back
+waiting for an ACK.
+
+**Nothing in the band blinks**, on either device. A blink here means an
+unacknowledged alert that GO clears, and a usage-limit pause can last until a
+weekly reset with nothing to acknowledge. Workflow data never touches a
+session's state, its acknowledgement or the LED ([§3](#per-session-workflows)),
+and a running workflow does not keep the S3's screen awake.
+
+**What each device draws** — the pixels and the four status words are the
+firmware's, every other character is the daemon's:
+
+* **Nano** — r2 is replaced while bit2 is set: `info` right-aligned, and to its
+  left a bar outlined and filled `done/total` (`R`); the same bar 7 px shorter
+  with a `!` after it (`E`); or the word `paused`, `done` or `ended` (`P`, `D`,
+  `F`). No bar when `total` is 0; nothing for a letter it does not know. It never
+  draws the name, and no word for a running (`R`/`E`) workflow. When bit2
+  clears, r2 is model + effort + chip again.
+* **S3** — two lines under the fleet strip, where the link-detail line is
+  otherwise drawn, and only on the triage view (never over the menu, the
+  mirror, the game, the gamepad face, pairing or the P2P screen): a bullet, the
+  name and the status word (`running`, `paused`, `done`, `ended`); then a bar —
+  one segment per agent when they fit (done in the status colour, failed in the
+  error colour, pending as an outline), else a continuous bar — and `info` in
+  the rows' size-2 type. Running is drawn in the WORK colour (with an
+  error-coloured bullet for `E`), paused in WAIT's, done in DONE's, ended in
+  ERR's, an unknown letter in IDLE's; a paused bullet is hollow. While the link
+  is down its status replaces the name, dimmed, so the diagnosis stays on
+  screen.
+
+An already-flashed device ignores `J|` (an unknown verb) and bit2 (it reads
+only bit0 and bit1), and keeps drawing r2: it looks exactly as it did.
 
 #### LED — `V|<kind>`
 
@@ -192,7 +336,7 @@ distinguish a short press (emit on release) from a long press (emit once at
 
 | Line  | Meaning |
 |-------|---------|
-| `H`   | Hello / handshake, sent **once** right after boot/reset. On receiving `H` the daemon **re-sends the full current state** (frame + re-arms the LED loop). |
+| `H`   | Hello / handshake, sent **once** right after boot/reset. On receiving `H` the daemon **re-sends the full current state**: the shown session's workflow band (`J\|`, or `J\|-` when it has none) and then the frame, and it re-arms the LED loop. |
 | `K`   | Keepalive ack — the reply to `P`. The daemon ignores it. |
 | `B\|P` | **PREV** pressed (D4) — selection one step up the queue. Repeats while held. |
 | `B\|N` | **NEXT** pressed (D3) — selection one step down the queue. Repeats while held. |
@@ -329,28 +473,133 @@ every replug.
 **Framing:** one **newline-terminated** line per message.
 
 ```
-<state>|<session_id>|<name>[|<ctrl_sock>|<model>|<effort>|<account>|<limit>]
+<state>|<session_id>|<name>[|<ctrl_sock>|<model>|<effort>|<account>|<limit>|<wf>]
 ```
 
 | Field        | Description |
 |--------------|-------------|
 | `state`      | One of: `working`, `waiting`, `done`, `error` (or `idle`/`end` from the PTY wrapper). |
 | `session_id` | The Claude Code session id. **MAY be empty** if not provided. |
-| `name`       | Basename of `cwd`. |
+| `name`       | Basename of `cwd`. The wrapper sanitises it like the meta fields — `\|` → `/`, CR/LF removed — because a `\|` in a directory name used to shift every field after it. |
 | `ctrl_sock`  | (PTY wrapper) per-session control socket GO's `focus` connects to. Empty for hooks. |
 | `model`      | (PTY wrapper) model in use, e.g. `Opus 4.8`. Empty until scraped / for hooks. |
 | `effort`     | (PTY wrapper) effort level, e.g. `xhigh`. Empty until scraped / for hooks. |
 | `account`    | (PTY wrapper) account/profile the session runs as, e.g. `work` or `default`. Empty for hooks. |
 | `limit`      | (PTY wrapper) remaining-limit chip for that account, e.g. `5h82%` (82% of the 5-hour window left) or `wk31%` (31% of the week left) — whichever window is more depleted. Refreshed every `CLAUDE_MATE_USAGE_POLL_S` (default 120 s) from Anthropic's OAuth usage endpoint; empty until the first successful poll / for hooks. |
+| `wf`         | (PTY wrapper) the session's **dynamic workflows**, read off Claude's footer: up to three records, or `-` for none. Empty = keep what the daemon has. See [Field 8](#wf-field) below. |
 
-The hook path sends only the first three fields; the PTY wrapper appends the
-control socket, (once scraped) the model + effort, and (once known) the
-account + remaining limit. All trailing fields are optional — the daemon
-defaults missing ones to empty.
+The hook path sends only the first three fields, and still does now that there
+is a workflow band — so a hook-only session never shows one. The PTY wrapper
+always sends all nine: the control socket, (once scraped) the model + effort,
+(once known) the account + remaining limit, and `wf`. All trailing fields are
+optional — the daemon defaults missing ones to empty, and an empty model,
+effort, account or limit means *unchanged*, never *cleared*. Fields after the
+ninth are ignored, so a later producer can append one without confusing this
+daemon.
 
 The hook is **fire-and-forget**: it connects with a short timeout, writes one
 line, and exits **0** regardless of outcome. If the daemon/socket is down it
 **silently no-ops**. The hook must never block or fail a Claude turn.
+
+### Field 8 — `wf`, the session's workflows {#wf-field}
+
+The PTY wrapper reads the row Claude Code draws under the prompt box for each
+dynamic workflow (README, *Background work*) and sends what it sees:
+
+```
+wf  := '-'                              no workflows: clear
+     | rec ('~' rec){0,2}               at most 3 records
+rec := st ';' done ';' total ';' failed ';' pct ';' elapsed_s ';' tokens ';' note ';' name
+```
+
+An empty or missing field 8 means *keep what you have* — every older wrapper
+sends that, and so does this one when its workflow code could not build the
+field. `-` is the explicit *none*: the other fields are sticky when empty, so
+without it a finished workflow could never be cleared. Anything else replaces
+the session's whole set, unless no record in it is valid — then the set is
+kept.
+
+| Sub-field | Description |
+|---|---|
+| `st` | `R` running · `E` running, an agent has failed · `P` paused on a usage limit · `D` completed · `F` ended without completing (failed or stopped; the screen cannot tell which). The row's text says little of this: only a paused row says it in words — `⏸ … paused · usage limit resets …` — and the rest is the bullet's colour, plus whether the run's clock still moves. |
+| `done` `total` `failed` | Decimal integers, or empty when unknown. Claude drops `done/total` first as the terminal narrows (below ~85 columns with a long name). `failed` is always empty today: the screen does not show it. |
+| `pct` | 0–100, the progress fraction: from `done/total` when the row shows them, else read off the bar. Sent whenever the row has a bar. |
+| `elapsed_s` | The run's own clock **now**, in seconds (below). Empty when no clock is on screen. |
+| `tokens` | A plain integer: `542.8k` → `542800`. |
+| `note` | Empty, or a compact usage-limit note: ASCII, ≤ 14 chars, no `;` `~` `\|`. |
+| `name` | The **last** sub-field — a record is split with `split(';', 8)`, so a name may contain `;`. `\|` → `/`, `~` → `-`, control characters removed; ≤ 40 characters. |
+
+The whole field is capped at **300 UTF-8 bytes** by leaving out whole records,
+lowest priority first (the order in *Which records*, below), never part of one;
+if not even one fits, the field is empty (keep).
+
+**The usage-limit note** is the reset time, cut down to fit the band:
+
+| A paused row reads | `note` |
+|---|---|
+| `paused · usage limit resets at 3:30pm` | `til 3:30pm` |
+| `paused · usage limit resets at 3:30pm (Europe/Madrid)` | `til 3:30pm` |
+| `paused · usage limit resets Oct 11, 3pm` | `til Oct 11 3pm` |
+| `paused · usage limit` | `usage limit` |
+| `paused` | *(empty)* |
+
+The rule: take the text after `resets`, drop a leading `at ` and a trailing
+`(…)` time zone, remove commas, collapse spaces and put `til ` in front; if
+that is over 14 characters, drop the `til `; then cut to 14.
+
+**Which records.** The wrapper's workflow watch decides: the rows on screen,
+or the rows it saw last while they are out of sight. It *holds* them — finished
+ones too — for as long as a menu or a dialog has the panel's place, and for
+about **1.5 s** with Claude's prompt footer up but no row drawn, which is what a
+frame Claude has only half redrawn looks like; a live run's rows for 20 s, since
+a run always shows its outcome before its row goes. Only then does it send `-`.
+A finished run sent as `-` and listed again a moment later would be a new
+record to the daemon, its minute to linger started over
+([§3](#per-session-workflows)), and the band would blink off and on every time
+something covered it. Every line before a workflow was first seen carries `-`
+too.
+
+At most three records, chosen in this order:
+
+1. a run the watch saw end in the last **10 s**, the most recent first — so an
+   end reaches the daemon while it is still news, however many runs are still
+   going beside it;
+2. the running ones (`R`/`E`/`P`), in on-screen order — so a stack of finished
+   rows cannot push one still running off the line;
+3. the other finished ones, the most recently ended first, and last those it
+   never saw end — rows that were already finished when it first read them.
+
+The chosen records go out in on-screen (start-time) order. Rows past the third
+are not on the line at all: the band follows at most three runs per session,
+and its `+N` never says more than `+2`.
+
+**`elapsed_s` is the clock now, not the clock last read.** Claude's clock text
+ticks at its own resolution — every second for `2m39s`, every minute for
+`1h02m`, every hour for `1d03h`. For a running row (`R`/`E`) the wrapper sends
+the parsed clock plus the time since that text last changed, capped at one
+tick; for a `P`/`D`/`F` row, or a clock that has stopped, the parsed value.
+While a running row is held out of sight, its clock keeps advancing from its
+last sighting.
+
+**Cadence.** The wrapper re-sends when its state or meta fields change, and
+that check now includes the workflows' *shape*: each record's `st`, `done`,
+`total`, `failed`, `pct`, `note` and `name`, and how many records there are. A
+shape change goes out at once. `elapsed_s` and `tokens` are not part of it: they
+ride the existing 20 s keepalive, and the daemon runs the clock in between
+([§3](#per-session-workflows)). There is no extra refresh timer, so the line
+rate is what it was. With `CLAUDE_MATE_DEBUG` set, the snapshot header shows
+`wf` as well.
+
+**Fenced.** If the wrapper's workflow code fails, `wf` falls back to empty
+(keep) and the state report still goes out: a workflow can cost the band, never
+the session.
+
+The uncoloured — running — row from [§1a](#workflow-band) reaches the socket
+as:
+
+```
+working|3f9c1a2b|aladdin|/tmp/claude-mate-ctrl-3f9c1a2b.sock|Opus 5.5|xhigh|claudealaddin2|5h82%|R;0;5;;0;159;542800;;deployment-risk-sweep-3802
+```
 
 ### The control socket (CLI → daemon) {#the-control-socket}
 
@@ -360,7 +609,7 @@ above and dropped, so a typo is silent rather than an error.
 
 | Line | Reply | Meaning |
 |---|---|---|
-| `queue` | JSON | the whole queue, as the device shows it. Also the only liveness check there is |
+| `queue` | JSON | the whole queue, as the device shows it — each entry with its visible `workflows` ([§3](#per-session-workflows)). Also the only liveness check there is |
 | `accounts` | JSON | the saved logins and where they live |
 | `accounts-refresh` | `ok` | re-read the accounts directory (after something changed it) |
 | `press\|<code>` | `ok` | press a device button: `P N G K F M C T`, or `A<n>` to continue on saved account *n* |
@@ -418,6 +667,11 @@ daemon **never sends it**.
 > forever would hide it from the device. Both fields are optional, so a Claude
 > Code build that omits them behaves exactly as before.
 
+> **The hook does not forward the workflow itself.** It still sends three
+> fields, so a `Stop` with a workflow in flight reports `working` and nothing
+> more: the workflow band — the name, the progress, the status — needs the PTY
+> wrapper ([field 8](#wf-field)).
+
 > **No `SessionEnd` hook is installed.** The daemon's `idle` state is **not**
 > driven by any socket message — it is reached purely via the
 > done-until-acknowledged model and TTL pruning (see §3).
@@ -443,6 +697,7 @@ The daemon keeps a dictionary of sessions, **keyed by `session_id`** (or by
 | `account`/`limit`| The account the session runs as + its remaining-limit chip (PTY wrapper; sticky once seen). |
 | `focus_ctrl`     | The wrapper control socket path, if any. |
 | `acked`          | Has the human seen this alert? |
+| `workflows`      | The session's dynamic workflows from field 8 — up to three records, replaced whole. Display only; see [Per-session workflows](#per-session-workflows). |
 
 ### States
 
@@ -500,3 +755,88 @@ silenced).
 * PREV/NEXT wrap around the ends.
 * **FOLLOW** (double-click GO) makes PREV/NEXT also raise the selected terminal
   after the selection settles (~250 ms); double-click again to turn it off.
+
+### Per-session workflows {#per-session-workflows}
+
+Each session keeps the records its latest field 8 listed, as one immutable tuple
+replaced whole under the registry lock and read without it, the way the frame
+reads every other field. An empty field 8 keeps the tuple, `-` empties it, and
+a field with at least one valid record replaces it.
+
+**Never a state.** Workflow data never changes a session's `state`,
+`state_since` or acknowledgement, the one-shot LED kind an update returns, or
+the LED. A workflow finishing is not an alert of its own: what keeps a session
+`working` while its run is live is the wrapper's detection (*States* above), and
+the DONE you acknowledge is still the session's, when it leaves `working` —
+exactly as before.
+
+**Merging.** A new list is matched to the old one by name, the k-th record of a
+name to the previous k-th record of that name, and each record carries two
+times of its own:
+
+* an **anchor** for its clock — for `R`/`E` with a known `elapsed_s`, arrival
+  time minus `elapsed_s`. While the record stays `R`/`E` the daemon keeps the
+  earlier of the old and the new anchor, so the clock never steps back when a
+  scrape lags; it starts afresh when the record enters `R`/`E` from `P`/`D`/`F`,
+  or is new;
+* **ended** — set when the record turns `D`/`F`, carried while it stays there,
+  cleared if it goes back to `R`/`E`/`P`; and whether that end was **seen** —
+  whether the line before listed the same record `R`/`E`/`P`. A record that
+  first arrives already finished gets an ended time on arrival, for its linger,
+  but no seen end.
+
+It also remembers when a line last listed it, and whether that line came from a
+wrapper — one with a non-empty `ctrl_sock`, which the hook never sends.
+
+**Visibility** at a given moment — one rule, used by the frame, `J|`, the queue
+JSON and the prune:
+
+| Record | Visible while |
+|---|---|
+| `R` `E` `P`, listed by a wrapper | the last line that listed it is at most **90 s** old (`WF_STALE_S`). The wrapper's 20 s keepalive keeps a live one fresh; a wrapper that crashed does not |
+| `R` `E` `P`, listed by a line with an empty `ctrl_sock` | always — until it is replaced or cleared, or the session itself is pruned |
+| `D` `F` | at most **60 s** after it ended (`WF_LINGER_S`). Claude drops the row about 30 s after the end, so this is a backstop |
+
+An expired `D`/`F` that its producer still lists stays as a **hidden
+tombstone**. Without it, the next keepalive would bring the record back with a
+fresh 60 s, and a finished run would flap on the device for as long as its row
+stayed up. It goes when a line no longer lists it, on `-`, or with the session.
+The prune that runs every 5 s drops stale `R`/`E`/`P` records.
+
+**The primary record** — the one the device shows — is the most recently ended
+visible `D`/`F` whose end the daemon saw, if that was within the last **10 s**
+(`WF_SPOTLIGHT_S`), so a run finishing beside one still going is seen to finish;
+else the first visible `R`/`E`/`P`; else the first visible `D`/`F`. A record that
+arrives already finished — after a daemon restart, or a name Claude has cut
+afresh on a resize — ended at a moment the daemon never saw, possibly long ago:
+it lingers like any other, but never takes the band from a running one, which
+would announce a stale run as just finished. Every other visible record counts
+toward the band's `+N`.
+
+**Two clocks.** `state_since`, and so r1, is time in *state*: it restarts at
+every state change — approving a workflow agent's permission prompt is WAIT →
+WORK — and for every session when the daemon restarts. The band's clock is the
+*run's*: `now − anchor` for `R`/`E`, `elapsed_s` as sent for `P`/`D`/`F`, none
+when unknown. It carries on through both, which is why the device writes it in
+Claude's units (`12m30s`, `1h02m`) and never in r1's `mm:ss`.
+
+**A run that is stopped, or fails, counts on for a while.** Its row turns red at
+once, and red with a clock still moving is a run with a failed agent that goes
+on (`E`), so the wrapper reports `F` only once the clock has stood still for
+10 s — 70 s for a clock past the hour, which moves once a minute. Until then the
+record is `E`, the anchor keeps the band's clock counting, and at `F` it shows
+`elapsed_s` as sent: the time Claude froze, a step back by however long it
+counted on. A run past the hour usually leaves the band first, when Claude
+drops its row.
+
+**Logging.** One daemon log line per start or finish — a name appears or goes,
+or a record's status changes — such as
+`workflow: aladdin "deployment-risk-sweep-3802" R -> D`. Never one per
+keepalive.
+
+**The queue JSON** (`queue`, and so `claude-mate status`) gives every entry a
+`workflows` list — always present, `[]` when there are none — of its *visible*
+records, each with `name`, `st` (the letter), `status` (the word: `running`,
+`paused`, `done`, `ended`), `done`, `total`, `failed`, `pct`, `secs` (the
+displayed clock in whole seconds, rounded down, or null), `tokens` and `note`.
+The record the device shows comes first, then the rest in on-screen order.

@@ -25,10 +25,24 @@
  *                                   rectangle (letter knocked out). A ">"
  *                                   triangle by the state row = FOLLOW mode on.
  *
- * The firmware is a dumb renderer: it holds exactly one frame (3 text rows +
- * a flash flag) and draws it. All ordering, selection, truncation, and text
- * layout live in the daemon. There are NO modes: the buttons mean the same
- * thing at all times --
+ * While the shown session runs a workflow, r2 is its band instead:
+ *
+ *     |[=====    ] 3/5 2m39s|   R running: the bar fills as agents finish
+ *     |[===    ] ! 2/5 4m10s|   E an agent failed: a shorter bar and a '!'
+ *     |paused     til 3:30pm|   P / D / F: "paused" / "done" / "ended"
+ *
+ * The firmware is a dumb renderer: it holds exactly one frame (4 text rows +
+ * a few flags) and draws it. All ordering, selection, truncation, and text
+ * layout live in the daemon.
+ *
+ * The ONE exception is the WORKFLOW BAND. A progress bar cannot be sent as
+ * text -- the wire is ASCII and the two devices are 128 and 320 px wide -- so
+ * J| carries the numbers and each device draws them in its own geometry.
+ * Here, r2 becomes a pixel bar (or a status word) plus the daemon's info text,
+ * and gives up model/effort/limit for as long as the band is up. The S3 keeps
+ * r2 and adds the workflow's name and a status word. See workflow.h.
+ *
+ * There are NO modes: the buttons mean the same thing at all times --
  *
  *     PREV (left)   step the selection up the queue      (auto-repeats held)
  *     GO   (middle) short: raise that session's terminal window (+ack)
@@ -66,7 +80,10 @@
  *                                        four size-1 rows (each up to 21 chars).
  *         flags = bitfield: bit0 = flash row 0 (the name) at ~2.5 Hz (unacked
  *                 alert); bit1 = FOLLOW mode (draw the play triangle by r1;
- *                 the daemon keeps r1's last two columns blank while set)
+ *                 the daemon keeps r1's last two columns blank while set);
+ *                 bit2 = the workflow band is live: draw the J| that came
+ *                 just before this frame in place of r2 (never set while a
+ *                 notice is using r1/r2)
  *         sel   = column in r3 of the active tab's fleet letter (-1 = none);
  *                 that letter's cell is filled (lit square, letter knocked out)
  *         r0    = session name
@@ -76,6 +93,17 @@
  *                 unacked alert's letter is LOWERCASE -> drawn uppercase but
  *                 blinking). r3 is the LAST field (the tokenizer stops at the
  *                 6th bar and takes the rest verbatim).
+ *     J|<st>|<done>|<failed>|<total>|<info>|<name>
+ *                                        the shown session's workflow. STAGED
+ *                                        only: the F| after it is what draws
+ *                                        it (and only with bit2). st R running
+ *                                        / E an agent failed / P paused / D
+ *                                        done / F ended; done/failed/total
+ *                                        drive only the bar (total 0 = no
+ *                                        bar); info <= 14 chars, drawn
+ *                                        right-aligned; name <= 40, not drawn
+ *                                        here. J|- clears. Anything else that
+ *                                        starts J| is ignored (workflow.h).
  *     V|<kind>                           LED alert control (light only):
  *                                        START one-shot start blink; INPUT /
  *                                        ERROR / DONE looping "until
@@ -108,6 +136,11 @@
 // code below is unchanged. To go back to hardware I2C (A4/A5), restore the
 // Adafruit_SSD1306 + <Wire.h> include and the matching constructor.
 #include "softssd1306.h"      // defines OLED_SW_SCL=A3, OLED_SW_SDA=A4
+// The workflow band's parser and arithmetic -- the same file, byte for byte, as
+// the S3's. This panel never draws a workflow's name, so it keeps one
+// character of it: the 78 bytes the full 40 would cost are better left free.
+#define WF_NAME_MAX 1
+#include "workflow.h"
 
 // ---- OLED configuration ------------------------------------------------------
 #define SCREEN_WIDTH   128
@@ -164,6 +197,13 @@ static int8_t frameSel  = -1;        // active tab's fleet-letter column in row 
 static bool  haveFrame  = false;     // false until the first F| arrives
 static bool  linkLost   = false;     // daemon silent > LINK_WATCHDOG_MS
 static bool  gBlinkOn   = true;      // shared blink phase for the flash band
+static bool  frameWf    = false;     // F| flags bit2: r2 is the workflow band
+static WfPair wf;                    // the J| waiting for its F|, and the one
+                                     // the frame draws (2 x 24 B)
+
+// workflow.h lays the band out for this panel's r2; say so where it would break.
+static_assert(WF_ROW_W == SCREEN_WIDTH && WF_ROW_Y == 2 * ROW_H &&
+              WF_ROW_H == ROW_H, "the workflow row is r2 of this panel");
 
 // ---- Render coalescing ---------------------------------------------------
 // Serial handlers only MARK the display dirty (requestRender); the actual
@@ -348,15 +388,44 @@ static void ledForKind(const char *k) {
 // Rendering -- one frame type plus two firmware-local states
 // -----------------------------------------------------------------------------
 
+// r2 while the workflow band is up: the bar -- or the status word -- on the
+// left, the daemon's info right-aligned. Every coordinate comes from
+// wfRowLayout(), which tools/test_workflow_fw.py checks for every info length.
+// Steady in every state: a blink here means an alert to acknowledge, and a
+// workflow has none.
+static void drawWfRow() {
+  const WfStatus &s = wf.live;
+  const WfRowLayout L = wfRowLayout(s.st, s.done, s.total,
+                                    (uint8_t)strlen(s.info));
+  display.setCursor(L.infoX, WF_ROW_Y);
+  display.print(s.info);
+  if (L.barW) {
+    display.drawRect(0, WF_ROW_BAR_Y, L.barW, WF_ROW_BAR_H, SSD1306_WHITE);
+    if (L.fillW)
+      display.fillRect(1, WF_ROW_BAR_Y + 1, L.fillW, WF_ROW_BAR_H - 2,
+                       SSD1306_WHITE);
+  }
+  if (L.bangX >= 0) {
+    display.setCursor(L.bangX, WF_ROW_Y);
+    display.write('!');
+  }
+  if (L.word) {                          // a PROGMEM string here: see wfWord()
+    display.setCursor(0, WF_ROW_Y);
+    display.print(reinterpret_cast<const __FlashStringHelper *>(wfWord(s.st)));
+  }
+}
+
 static void drawFrame() {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
 
-  // Rows 0-2 print straight. Row 3 (fleet strip) prints char by char so an
-  // UNACKNOWLEDGED alert's letter -- sent LOWERCASE -- draws uppercase but can
-  // BLINK, showing at a glance which tabs still need acknowledging.
+  // Rows 0-2 print straight -- r2 unless the workflow band has it. Row 3
+  // (fleet strip) prints char by char so an UNACKNOWLEDGED alert's letter --
+  // sent LOWERCASE -- draws uppercase but can BLINK, showing at a glance which
+  // tabs still need acknowledging.
   for (uint8_t r = 0; r < 3; r++) {
+    if (r == 2 && frameWf && wf.live.st) { drawWfRow(); continue; }
     display.setCursor(0, r * ROW_H);
     display.print(frameRow[r]);
   }
@@ -470,6 +539,8 @@ static void handleLine(char *line) {
       uint8_t flags = (uint8_t)atoi(fields[1]);
       frameFlash  = flags & 1;
       frameFollow = flags & 2;
+      frameWf     = flags & 4;           // r2 is the workflow band...
+      wfCommit(wf);                      // ...as of the J| just before this
       frameSel    = (int8_t)atoi(fields[2]);   // -1 = no active-tab box
       for (uint8_t r = 0; r < 4; r++)
         copyField(frameRow[r], sizeof(frameRow[r]), fields[3 + r]);
@@ -477,6 +548,13 @@ static void handleLine(char *line) {
       requestRender();
       break;
     }
+
+    case 'J':                            // J|<st>|<done>|<failed>|<total>|...
+      // Staged, and deliberately NOT a reason to redraw: drawn on its own it
+      // would put the next session's workflow under this session's name until
+      // the F| arrived. The F| that follows commits it (workflow.h).
+      wfStage(wf, line);
+      break;
 
     case 'V': {                          // V|<KIND> -- play an LED pattern NOW
       char *bar = strchr(line, '|');
