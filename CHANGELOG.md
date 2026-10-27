@@ -355,6 +355,13 @@ a note is erased to its end. And a CLI whose own directory had been deleted
 under it refused every resume with `cannot load the wrapper … No such file or
 directory`, so the wrapper loads from `~`.
 
+Found by CI: the wrapper narrows the process-wide umask to `0o177` while it
+binds its control socket, and a context directory another thread made in that
+moment came out `0600` — no x bit, so nothing could open a file in it, the
+context file, the caps cache and the CLI's liveness check included. Older than
+this change, which moved when the directory is made; it is put back to `0700`
+on every write now.
+
 Each code fix is a case in `tools/test_history.py`, `tools/test_wrapper.py`,
 `tools/test_account_switch.py`, `tools/test_workflow_daemon.py` or
 `tools/test_app.py`, and each failed against the code before it.
