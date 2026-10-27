@@ -84,9 +84,9 @@ open(fake, "w").write(textwrap.dedent('''\
     def screen(s):
         sys.stdout.write("\\x1b[2J\\x1b[H" + s + "\\n"); sys.stdout.flush()
     screen("welcome to claude")                          # idle
-    time.sleep(0.7)
+    time.sleep(1.0)       # past the launch burst: probe, FOCUS, first reports
     screen("Generating... esc to interrupt")             # working
-    time.sleep(0.8)
+    time.sleep(1.2)       # a slow CI runner missed a 0.8 s window once
     screen("Do you want to proceed?\\n 1. Yes\\n 2. No")   # waiting
     time.sleep(0.8)
     screen("API Error: Overloaded (529). retrying")      # error

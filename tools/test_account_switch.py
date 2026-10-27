@@ -429,6 +429,19 @@ check("...and lives under the temp dir, so a reboot clears it",
 check("the file is private (0600)", oct(os.stat(p).st_mode)[-3:] == "600")
 check("its directory is private (0700)",
       oct(os.stat(os.path.dirname(p)).st_mode)[-3:] == "700")
+# THE UMASK RACE. ctrl_listener narrows the process umask to 0o177 while it
+# binds; a directory made by another thread in that moment is 0600 -- no x bit,
+# nothing inside it can be opened. CI hit it. The next write must mend it.
+os.chmod(os.path.dirname(p), 0o600)
+real_getcwd, os.getcwd = os.getcwd, lambda: cwd
+try:
+    W.ctx_write("working", started)
+finally:
+    os.getcwd = real_getcwd
+check("a context dir left 0600 by the umask race is put back to 0700, and "
+      "the file is written again",
+      oct(os.stat(os.path.dirname(p)).st_mode)[-3:] == "700"
+      and json.load(open(p)).get("state") == "working")
 check("no .tmp scratch file is left behind",
       not [f for f in os.listdir(os.path.dirname(p)) if f.endswith(".tmp")])
 

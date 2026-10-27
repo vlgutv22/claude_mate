@@ -2393,6 +2393,18 @@ CTX_STALE_S = 900.0          # a context not refreshed for this long is dead
 # means "no id this time" (the verified scan below still works) and the answer
 # is fetched in the background for the next session. It changes only when the
 # binary does.
+def ensure_ctx_dir():
+    """CTX_DIR, 0700 -- and put back to 0700 when it is not.
+
+    THE UMASK IS PROCESS-WIDE. ctrl_listener narrows it to 0o177 for the
+    moment it binds its socket, and a directory another thread makes inside
+    that moment comes out 0600: no x bit, so nothing can open a file in it --
+    not the context file, not the caps cache, not the CLI that reads them
+    (CI caught it as a PermissionError). chmod does not go through the umask,
+    so it mends whatever that race left, on the next write."""
+    os.makedirs(CTX_DIR, mode=0o700, exist_ok=True)
+    os.chmod(CTX_DIR, 0o700)
+
 def caps_path():
     return os.path.join(CTX_DIR, "claude-caps.json")
 
@@ -2442,7 +2454,7 @@ def probe_session_id_support(binary):
     blob = dict(list(blob.items())[-3:])        # the last few binaries, no more
     blob[key] = ok
     try:
-        os.makedirs(CTX_DIR, mode=0o700, exist_ok=True)
+        ensure_ctx_dir()
         tmp = caps_path() + f".{os.getpid()}.tmp"
         with open(tmp, "w") as fh:
             json.dump(blob, fh)
@@ -2747,7 +2759,7 @@ def ctx_write(state="", started=0.0):
         cfg = os.environ.get("CLAUDE_CONFIG_DIR", "")
         transcript = find_transcript(cfg, os.getcwd(), started, g_claude_sid)
         learn_conversation(cfg, os.getcwd(), transcript)
-        os.makedirs(CTX_DIR, mode=0o700, exist_ok=True)
+        ensure_ctx_dir()
         blob = json.dumps({
             "tty": MY_TTY,
             "pid": os.getpid(),
