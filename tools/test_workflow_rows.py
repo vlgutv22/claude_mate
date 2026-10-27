@@ -33,7 +33,10 @@ tools/test_detect.py pins the text-only reading. This file pins the rest:
      frame -- and '-' once it does not; reports that go out for a change of
      shape but not for a ticking clock; a failure anywhere in it costing the
      field ('') rather than the state report; and the caps it shares with
-     the daemon, read from the daemon's own source;
+     the daemon, read from the daemon's own source. Beside it, field 9 -- the
+     conversation, its directory, login and flags as one percent-encoded JSON
+     object, each key worked out on its own, within its byte budget -- and
+     nothing at all sent after `end`;
   6. the footer around the rows, as 2.1.295 draws it: bare ⏸ lines, a running
      row's colour in any theme, rows hidden by a dialog, help, shell mode or a
      suggestion list (live ones holding the session, finished ones still
@@ -42,7 +45,7 @@ tools/test_detect.py pins the text-only reading. This file pins the rest:
 
 Run:  python3 tools/test_workflow_rows.py     (needs pyte: pip install pyte)
 """
-import os, re, sys, socket, shutil, tempfile, importlib.util
+import os, re, sys, socket, shutil, tempfile, importlib.util, json, urllib.parse
 from importlib.machinery import SourceFileLoader
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -757,7 +760,7 @@ srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 srv.bind(os.path.join(tmpd, "d.sock"))
 srv.listen(8)
 srv.settimeout(3.0)
-saved = (cmw.DAEMON_SOCK, cmw.NAME, dict(cmw.g_meta))
+saved = (cmw.DAEMON_SOCK, cmw.NAME, dict(cmw.g_meta), os.environ.get("CLAUDE_CONFIG_DIR"))
 cmw.DAEMON_SOCK = os.path.join(tmpd, "d.sock")     # never the real daemon's socket
 
 
@@ -787,24 +790,101 @@ try:
     parts = raw.decode().rstrip("\n").split("|")
     check("one line, ended by its only LF, no CR", raw.endswith(b"\n")
           and raw.count(b"\n") == 1 and b"\r" not in raw, repr(raw[:60]))
-    check("always nine fields", len(parts) == 9, str(len(parts)))
+    check("always ten fields", len(parts) == 10, str(len(parts)))
     check("NAME is sanitised like the rest ('|' -> '/', CR/LF gone)",
-          len(parts) == 9 and parts[2] == "my/projx", parts[2:3])
-    check("...as is the model", len(parts) == 9 and parts[4] == "Opus/5.5", parts[4:5])
-    check("field 8 is the workflow field, as built", len(parts) == 9 and parts[8] == field)
+          len(parts) == 10 and parts[2] == "my/projx", parts[2:3])
+    check("...as is the model", len(parts) == 10 and parts[4] == "Opus/5.5", parts[4:5])
+    check("field 8 is the workflow field, as built", len(parts) == 10 and parts[8] == field)
     parts = report(wf="-").decode().rstrip("\n").split("|")
-    check("'-' goes out as '-'", len(parts) == 9 and parts[8] == "-", parts[8:])
+    check("'-' goes out as '-'", len(parts) == 10 and parts[8] == "-", parts[8:9])
     parts = report(wf=None).decode().rstrip("\n").split("|")
     check("a field that is not text: '' -- and the state report still goes out",
-          len(parts) == 9 and parts[0] == "working" and parts[8] == "", parts)
+          len(parts) == 10 and parts[0] == "working" and parts[8] == "", parts)
     cmw.NAME = "Д" * 20
     raw = report(account="claudealaddin2", wf=field)
-    check(f"a full line with non-ASCII names fits one recv(512) ({len(raw)} bytes)",
-          0 < len(raw) < 512)
+    head = "|".join(raw.decode().rstrip("\n").split("|")[:9]).encode()
+    # Fields 0-8 only: field 9 holds a path and flags as long as the machine
+    # makes them, and the daemon reads a line to its newline.
+    check(f"fields 0-8 of a full line with non-ASCII names fit one recv(512) "
+          f"({len(head)} bytes)", 0 < len(head) < 512)
+
+    def f9(**meta):
+        """Field 9 of a report, decoded."""
+        line = report(**meta).decode().rstrip("\n").split("|")
+        return json.loads(urllib.parse.unquote(line[9])) if len(line) == 10 and line[9] else {}
+
+    print("\nfield 9: the conversation, its directory, login and flags")
+    os.environ.pop("CLAUDE_CONFIG_DIR", None)
+    got = f9()
+    check("one percent-encoded JSON object: where it runs, '' for the default login",
+          got == {"cwd": os.getcwd(), "config": ""}, str(got))
+    check("...no id until the wrapper has seen the conversation's transcript, no flags "
+          "while they are unknown", "id" not in got and "flags" not in got, str(got))
+    cmw.g_conv = "3f2a9c1e-7b4d-4c1a-9e8f-0123456789ab"
+    cmw.g_resume_flags = ["--model", "opus", "--name", "a|b;c"]
+    got = f9()
+    check("...then both, as they are -- never _field()ed: a '|' stays a '|'",
+          got.get("id") == cmw.g_conv and got.get("flags") == cmw.g_resume_flags, str(got))
+    real_getcwd = os.getcwd
+    os.getcwd = lambda: "/tmp/we|ird\nname \udce9"       # '|', a newline, a byte not UTF-8
+    try:
+        raw = report()
+        got = f9()
+    finally:
+        os.getcwd = real_getcwd
+    check("a directory with '|', a newline and a non-UTF-8 byte arrives whole, "
+          "on one line of ten fields",
+          got.get("cwd") == "/tmp/we|ird\nname \udce9" and raw.count(b"\n") == 1
+          and len(raw.decode().split("|")) == 10, str(got))
+    os.environ["CLAUDE_CONFIG_DIR"] = "/Users/me/.claude-accounts/work 2/"
+    check("an absolute CLAUDE_CONFIG_DIR goes as the exact string (claude hashes the "
+          "raw value into its Keychain entry)",
+          f9().get("config") == "/Users/me/.claude-accounts/work 2/")
+    os.environ["CLAUDE_CONFIG_DIR"] = "rel/prof"
+    check("...a relative one, made absolute",
+          f9().get("config") == os.path.abspath("rel/prof"))
+    os.environ.pop("CLAUDE_CONFIG_DIR", None)
+    cmw.g_resume_flags = ["--name", "x" * 5000]
+    got = f9()
+    check(f"over {cmw.HIST_FIELD_MAX} bytes the flags go as NONE, the rest goes "
+          "(a missing key would let a record keep an older session's bypass)",
+          got.get("flags") == [] and got.get("id") == cmw.g_conv, str(got)[:80])
+    os.getcwd = lambda: "/" + "d" * 5000
+    try:
+        parts = report().decode().rstrip("\n").split("|")
+    finally:
+        os.getcwd = real_getcwd
+    check("...and still over without them, field 9 goes out empty -- the state "
+          "report regardless", len(parts) == 10 and parts[9] == "" and parts[0] == "working")
+    cmw.g_resume_flags = 42                              # not a list: that key fails
+    os.getcwd = lambda: 1 / 0                            # ...and so does this one
+    try:
+        parts = report().decode().rstrip("\n").split("|")
+    except Exception as exc:                             # send_daemon raised: say so
+        parts = [repr(exc)]
+    finally:
+        os.getcwd = real_getcwd
+    got = json.loads(urllib.parse.unquote(parts[9])) if len(parts) == 10 and parts[9] else None
+    check("an input that fails costs its own key, never the field or the report",
+          got == {"config": "", "id": cmw.g_conv} and parts[0] == "working", str(parts))
+
+    print("\nnothing after 'end'")
+    cmw.g_resume_flags = []
+    end = report("end").decode().rstrip("\n").split("|")
+    check("'end' goes out, field 9 and all", end[0] == "end" and len(end) == 10
+          and bool(end[9]))
+    srv.settimeout(0.5)
+    check("a report after it does not: a late keepalive would bring the session "
+          "back as a ghost", report("working") == b"" and report("idle") == b"")
 finally:
     cmw.DAEMON_SOCK, cmw.NAME = saved[0], saved[1]
     cmw.g_meta.clear()
     cmw.g_meta.update(saved[2])
+    cmw.g_conv, cmw.g_resume_flags, cmw.g_ended = "", None, False
+    if saved[3] is None:
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+    else:
+        os.environ["CLAUDE_CONFIG_DIR"] = saved[3]
     srv.close()
     shutil.rmtree(tmpd, ignore_errors=True)
 

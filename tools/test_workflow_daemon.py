@@ -36,6 +36,11 @@ In-process first (an injected `now`, so nothing here waits out 90 s), then the
 real daemon over a PTY, then `--mock` -- which runs alongside the rest, since
 its demo needs ~25 s to get from "running" to anything else.
 
+Last, a section of its own that only borrows the in-process daemon: three
+fixes from reviewing the chat history -- what a press acts on once the device
+has gone, when a deleted record counts as deleted, and that a record goes
+down before the link to its transcript.
+
 Hermetic: temp sockets and HOME, a PTY for the device, and stubs on PATH for
 everything the daemon might shell out to (the Keychain lookup behind the
 account chips, curl, open, osascript), so a handshake reads no real login and
@@ -44,6 +49,7 @@ makes no network call.
 Run:   python3 tools/test_workflow_daemon.py      (needs pyserial)
 """
 import atexit
+import errno
 import importlib.util
 import json
 import os
@@ -58,6 +64,7 @@ import tempfile
 import threading
 import time
 import tty
+import urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -1162,6 +1169,329 @@ try:
           all(j_ok(l) for l in seen if l.startswith("J|")))
 finally:
     stop_daemon(mock_proc)
+
+# =========================================================================== #
+# REVIEW FIXES FROM THE CHAT HISTORY, in process. Not about workflows: they sit
+# here because this file already loads the daemon with its log and its clock
+# in the test's hands. Each check below that is marked (regression) failed
+# against the code before its fix.
+# =========================================================================== #
+D.log = lambda msg: logged.append(msg)
+D.time = clock                          # frames that do not tick under a test
+clock.t = T0 + 100_000
+
+print("\n== no glass: with no device linked, a press acts on the selection ==")
+# GO and ACK act on the session whose frame is on the glass, and CONTINUE and
+# FOLLOW on the one shown there. That key only moved when a frame reached a
+# device, so once the device had gone -- a cable pulled, a battery device
+# asleep -- it went on naming the last session drawn, and History's "Raise its
+# terminal" (select|<key>, then press|G) raised and acknowledged THAT one.
+
+
+class GlassLink:
+    """A device link that can be unplugged (`up`), refuse a write while it is
+    plugged in (`ok`), or find the cable gone on its next write (`dies`), as a
+    serial write does when the device has been pulled."""
+
+    def __init__(self):
+        self.up, self.ok, self.dies, self.lines = True, True, False, []
+
+    def is_open(self):
+        return self.up
+
+    def write_line(self, line):
+        if self.dies:
+            self.up = self.dies = False
+        if not (self.up and self.ok):
+            return False
+        self.lines.append(line)
+        return True
+
+
+def frames(lines):
+    return [l for l in lines if l.startswith("F|")]
+
+
+KA, KB = "aaaa1111", "bbbb2222"
+glink, greg = GlassLink(), D.Registry()
+greg.update("waiting", KA, "alpha", focus_ctrl="/ctl-a")   # nobody has seen it
+greg.update("idle", KB, "bravo", focus_ctrl="/ctl-b")
+gscr = D.Screen(glink, greg)
+gsrv = D.SocketServer(os.path.join(tmp, "unused3.sock"), greg,
+                      on_update=lambda: None)
+gsrv.screen, gsrv.on_select = gscr, gscr.select_by
+
+
+def acts_on():
+    """(the key GO and ACK act on, the key CONTINUE and FOLLOW act on)."""
+    t, s = gscr.resolve_press_target(), gscr.current_shown()
+    return (t.key if t else None, s.key if s else None)
+
+
+def select(key):
+    return gsrv._process_line(("select|" + key).encode())
+
+
+gscr.refresh(force=True)
+check("linked: alpha is on the glass, and every press means alpha",
+      acts_on() == (KA, KA) and subject(frames(glink.lines)[-1]) == "alpha")
+glink.ok = False
+check("linked, one write refused: select|<bravo's key> answers 'ok bravo'...",
+      select(KB) == "ok bravo\n")
+check("...yet a press still means alpha, which the glass still shows: a "
+      "refused write is not a device gone", acts_on() == (KA, KA),
+      repr(acts_on()))
+glink.ok = True
+gscr.refresh()
+check("...until bravo's frame lands", acts_on() == (KB, KB))
+
+gscr.select_by(KA)
+glink.up = False                        # the cable out, or the device asleep
+check("unplugged: select|<bravo's key> still answers 'ok bravo'...",
+      select(KB) == "ok bravo\n")
+check("(regression) ...and GO, ACK and CONTINUE mean bravo, the selection -- "
+      "not alpha, the last name drawn on glass nobody can see",
+      acts_on() == (KB, KB), repr(acts_on()))
+gsnap = gsrv.queue_snapshot()
+check("(regression) ...which the queue marks as both shown and selected",
+      (gsnap["shown"], gsnap["selected"]) == (KB, KB),
+      repr((gsnap["shown"], gsnap["selected"])))
+
+raised, ctrl_calls = [], []
+
+
+def fake_ctrl_call(ctrl, cmd):
+    ctrl_calls.append((ctrl, cmd))
+    return True, ""
+
+
+greader = D.ButtonReader(glink, gscr)
+greader.on_ack = lambda s: (greg.acknowledge(s), gscr.notify_change())
+greader._raise = lambda s: raised.append(s.key if s else None)
+_real_ctrl_call = D.wrapper_ctrl_call
+D.wrapper_ctrl_call = fake_ctrl_call
+try:
+    greader._go()
+    alpha = next(s for s in greg.queue() if s.key == KA)
+    check("(regression) GO raises bravo's terminal and stays on bravo, and "
+          "alpha's alert is still unseen", raised == [KB]
+          and gscr._sel_key == KB and alpha.unacked_alert(), repr(raised))
+    greader._continue_pressed()
+    check("(regression) CONTINUE types into bravo",
+          ctrl_calls == [("/ctl-b", "submit continue")], repr(ctrl_calls))
+    del raised[:]
+    greader._follow_pressed()           # FOLLOW on raises the shown one...
+    greader._follow_pressed()           # ...and off again raises nothing
+    check("(regression) turning FOLLOW on raises bravo", raised == [KB],
+          repr(raised))
+    greader._mirror_pressed()
+    check("(regression) MIRROR opens no view: a view needs glass, and one "
+          "opened into nothing would poll the wrapper every second for nobody",
+          not greader.mirror_open())
+finally:
+    greader.mirror_close()
+    D.wrapper_ctrl_call = _real_ctrl_call
+
+glink.up, glink.lines = True, []        # plugged back in
+gscr.refresh()
+check("plugged back in: the next frame goes out unforced and is what a press "
+      "means", [subject(f) for f in frames(glink.lines)] == ["bravo"]
+      and acts_on() == (KB, KB), repr(glink.lines))
+glink.up = False
+gscr.refresh()                          # a tick while it is out
+glink.up, glink.lines = True, []
+gscr.refresh()
+check("(regression) ...even when it is the very frame last sent: a device "
+      "that came back is told what is on it, and the press follows",
+      [subject(f) for f in frames(glink.lines)] == ["bravo"]
+      and gscr._shown_key == KB, repr(glink.lines))
+
+gscr.select_by(KA)                      # alpha on the glass again, linked
+glink.dies = True
+check("the write that finds the cable gone: select|<bravo's key> answers "
+      "'ok bravo'", select(KB) == "ok bravo\n" and not glink.up)
+check("(regression) ...and a press means bravo at once, before any tick "
+      "has noticed the device is gone", acts_on() == (KB, KB),
+      repr(acts_on()))
+glink.up = True
+
+# --------------------------------------------------------------------------- #
+# The chat history's writer, against a temp root and a fake transcript tree
+# under a temp HOME -- `~/.claude` is where the default login's transcripts
+# are looked for, and this must never be the real one.
+htmp = tempfile.mkdtemp(prefix="cm-wf-hist-")
+_real_home = os.environ.get("HOME")
+os.environ["HOME"] = os.path.join(htmp, "home")
+try:
+    PROJ = os.path.join(htmp, "proj")
+    TREE = os.path.join(htmp, "home", ".claude", "projects", "-proj")
+    os.makedirs(PROJ)
+    os.makedirs(TREE)
+
+    def transcript(conv):
+        path = os.path.join(TREE, conv + ".jsonl")
+        with open(path, "w") as fh:
+            fh.write(json.dumps({"type": "user", "cwd": PROJ}) + "\n")
+        return path
+
+    def hsnap(conv, key="w1", turn_ts=1000.0):
+        """A wrapped session that ran a turn, as Registry.snapshot() has it."""
+        return {"key": key, "name": "proj", "cwd": PROJ, "conversation": conv,
+                "config_dir": "", "flags": (), "account": "default",
+                "turned": True, "turn_ts": turn_ts}
+
+    def hput(writer, s, ended=None):
+        writer.note(s, ended=ended)
+        writer.flush()
+
+    def record(root, conv):
+        try:
+            with open(os.path.join(root, conv + ".json")) as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return None
+
+    def kept(root, conv, src):
+        dst = os.path.join(root, conv + ".jsonl")
+        return os.path.exists(dst) and os.path.samefile(src, dst)
+
+    def forget(root, conv):
+        """What the CLI's `history rm` does: the link first, then the record."""
+        for ext in (".jsonl", ".json"):
+            try:
+                os.unlink(os.path.join(root, conv + ext))
+            except FileNotFoundError:
+                pass
+
+    print("\n== a deleted record is dated by when it was last seen ==")
+    hroot = os.path.join(htmp, "history")
+    hnow = [1000.5]
+    hw = D.HistoryWriter(hroot, clock=lambda: hnow[0])
+    CX = "3f2a9c1e-7b4d-4c1a-9e8f-0123456789ab"
+    CY = "5b6c7d8e-1f2a-4b3c-8d4e-5f6a7b8c9d0e"
+    tx, ty = transcript(CX), transcript(CY)
+    hput(hw, hsnap(CX))                  # its turn at 1000, written at 1000.5
+    hnow[0] = 1010.0
+    hput(hw, hsnap(CX), ended=1010.0)    # closed: last seen there at 1010
+    forget(hroot, CX)                    # deleted at, say, 1020
+    hnow[0] = 1030.75                    # noticed at 1030.75, by the report of
+    hput(hw, hsnap(CX, key="w2", turn_ts=1030.0))    # a turn begun at 1030
+    rx = record(hroot, CX) or {}
+    check("(regression) a turn begun after the deletion, but named only once "
+          "it was under way (claude -c), keeps the chat again -- though the "
+          "writer noticed the deletion after that turn had begun",
+          rx.get("last_active") == 1030.0 and rx.get("ended") is None
+          and kept(hroot, CX, tx), repr(rx))
+
+    hnow[0] = 1000.5
+    hput(hw, hsnap(CY))
+    hnow[0] = 1015.5                     # a turn begun at 1015 is a change,
+    hput(hw, hsnap(CY, turn_ts=1015.0))  # written within the debounce
+    forget(hroot, CY)                    # deleted at, say, 1020
+    hnow[0] = 1030.75                    # ...noticed at 1030.75, by that
+    hput(hw, hsnap(CY, turn_ts=1015.0))  # turn's next report, then its end
+    hput(hw, hsnap(CY, turn_ts=1015.0), ended=1031.0)
+    check("a turn begun before the deletion cannot bring it back -- a write "
+          "that saw the record noted its start -- nor can its end",
+          record(hroot, CY) is None
+          and not os.path.exists(os.path.join(hroot, CY + ".jsonl")))
+    hnow[0] = 1041.0
+    hput(hw, hsnap(CY, key="w3", turn_ts=1040.0))
+    check("...only a turn begun after it does",
+          (record(hroot, CY) or {}).get("last_active") == 1040.0
+          and kept(hroot, CY, ty))
+
+    print("\n== ...and through the socket, the way claude -c reports it ==")
+
+    def wline(state, sid, **hist):
+        """A wrapper's ten-field line; field 9 names the chat once `id` is
+        in it -- for claude -c, only after its first turn has begun."""
+        hist.update(cwd=PROJ, config="", flags=[])
+        field9 = urllib.parse.quote(json.dumps(
+            hist, ensure_ascii=True, separators=(",", ":"), sort_keys=True),
+            safe="")
+        return "|".join([state, sid, "proj", "/tmp/cm-wf-ctl-" + sid, "", "",
+                         "default", "", "", field9]).encode()
+
+    zroot = os.path.join(htmp, "history-z")
+    zsrv = D.SocketServer(os.path.join(htmp, "z.sock"), D.Registry(),
+                          on_update=lambda: None)
+    zw = D.HistoryWriter(zroot, clock=lambda: clock.t)
+    zsrv.history = zw
+    CZ = "9d8c7b6a-5f4e-4d3c-8b2a-1f0e9d8c7b6a"
+    tz = transcript(CZ)
+    for t, ln in ((5000.0, wline("idle", "aaaa0001")),
+                  (5001.0, wline("working", "aaaa0001")),
+                  (5001.25, wline("working", "aaaa0001", id=CZ))):
+        clock.t = t
+        zsrv._process_line(ln)
+    clock.t = 5001.75
+    zw.flush()
+    check("a first session's turn keeps the chat",
+          (record(zroot, CZ) or {}).get("last_active") == 5001.0)
+    clock.t = 5011.0
+    zsrv._process_line(wline("end", "aaaa0001", id=CZ))
+    clock.t = 5011.5
+    zw.flush()
+    forget(zroot, CZ)                    # closed, then deleted at 5020
+    for t, ln in ((5030.0, wline("idle", "bbbb0002")),      # claude -c: no id
+                  (5040.0, wline("working", "bbbb0002")),   # its first turn
+                  (5040.25, wline("working", "bbbb0002", id=CZ))):
+        clock.t = t
+        zsrv._process_line(ln)
+    clock.t = 5040.75
+    zw.flush()
+    rz = record(zroot, CZ) or {}
+    check("(regression) closed, deleted, then picked up again with claude -c: "
+          "its first turn keeps the chat again, transcript linked beside it",
+          rz.get("last_active") == 5040.0 and rz.get("ended") is None
+          and kept(zroot, CZ, tz), repr(rz))
+    clock.t = 5051.0
+    zsrv._process_line(wline("end", "bbbb0002", id=CZ))
+    clock.t = 5051.5
+    zw.flush()
+    check("...and its end closes it",
+          (record(zroot, CZ) or {}).get("ended") == 5051.0)
+
+    print("\n== the record goes down before the link to its transcript ==")
+    kroot = os.path.join(htmp, "history-k")
+    kw = D.HistoryWriter(kroot, clock=lambda: 2000.0)
+    CN = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
+    tn = transcript(CN)
+
+    def no_space(path, merged, conv):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    kw._replace = no_space        # the record's write fails, or dies half way
+    mark = len(logged)
+    hput(kw, hsnap(CN))
+    check("(regression) a NEW record whose write fails leaves no link to its "
+          "transcript: nothing would list it, delete it or let go of its disk",
+          os.listdir(kroot) == [], repr(os.listdir(kroot)))
+    check("...and the failure is logged, by the record's name",
+          any(CN in m and "failed" in m for m in logged[mark:]))
+    del kw._replace
+    hput(kw, hsnap(CN))
+    rn = record(kroot, CN) or {}
+    check("the next write puts the record down and then the link, the record "
+          "naming the project it found the transcript in",
+          rn.get("project") == "-proj" and kept(kroot, CN, tn), repr(rn))
+    ino = os.stat(os.path.join(kroot, CN + ".json")).st_ino
+    with open(tn + ".new", "w") as fh:   # Claude rewrites its copy: a new
+        fh.write(json.dumps({"type": "user", "cwd": PROJ}) + "\n{}\n")
+    os.replace(tn + ".new", tn)          # file, a new inode
+    hput(kw, hsnap(CN))
+    check("an unchanged record is not rewritten, and its link still follows "
+          "Claude's new copy", kept(kroot, CN, tn)
+          and os.stat(os.path.join(kroot, CN + ".json")).st_ino == ino)
+finally:
+    if _real_home is None:
+        os.environ.pop("HOME", None)
+    else:
+        os.environ["HOME"] = _real_home
+    shutil.rmtree(htmp, ignore_errors=True)
+    D.time = time
+    D.log = _real_log
 
 shutil.rmtree(tmp, ignore_errors=True)
 print(f"\n{checks - len(failures)}/{checks} checks passed")
