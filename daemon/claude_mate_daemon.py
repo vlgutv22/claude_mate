@@ -9,12 +9,16 @@ The "brain" of the Claude Mate USB hardware companion. It:
      by Claude Code hooks / the PTY wrapper:
 
          <state>|<session_id>|<name>[|<ctrl_sock>|<model>|<effort>|<account>
-          |<limit>|<wf>]
+          |<limit>|<wf>|<hist>]
 
-     Hooks send the first three fields, the wrapper all nine. <wf> is the
+     Hooks send the first three fields, the wrapper all ten. <wf> is the
      session's dynamic workflows: up to three records joined by '~', each
      st;done;total;failed;pct;elapsed_s;tokens;note;name with st one of
      R E P D F -- or '-' for none, or empty for "no change" (parse_wf).
+     <hist> is one percent-encoded JSON object: the Claude Code conversation
+     the session is running, its directory, its login and the launch flags a
+     resume replays -- each key absent until known (parse_history_field).
+     It is what the chat history keeps (HistoryWriter).
   2. Manages the device link(s). By default that is a single, continuously-open
      USB serial connection to the Arduino Nano: it auto-detects the port
      (/dev/cu.usbserial* then /dev/cu.usbmodem*), opens it once, keeps it open,
@@ -88,25 +92,29 @@ Config via environment variables:
 from __future__ import annotations
 
 import argparse
+import errno
 import glob
 import hmac
 import json
 import os
 import queue
+import re
 import secrets
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
 import urllib.parse
 import wave
 from dataclasses import dataclass, field
-from typing import (Any, Callable, Dict, List, NamedTuple, Optional, Tuple,
-                    Union)
+from typing import (Any, Callable, Dict, List, NamedTuple, Optional, Set,
+                    Tuple, Union)
 
 # --------------------------------------------------------------------------- #
 # Crash-loop damage control -- BEFORE the first import that can fail
@@ -290,6 +298,28 @@ WF_RESEND_S = 1.0           # while the band is up, its J+F pair goes out at
                             # costs a second or two (the 1 Hz Ticker's next
                             # call past this age), not the minute a frame at
                             # h:mm and a finished run's J can sit unchanged
+
+# ---- Chat history (field 9 in, HistoryWriter out) ------------------------- #
+# One record per Claude Code conversation a wrapped session ran, kept until the
+# user deletes it -- in the CLI's own process, never over the socket. Next to
+# the token and the trusted networks, NOT under ~/Library/Caches: macOS may
+# purge a cache, and this is the one thing here whose whole job is to outlive
+# the session, the daemon and the reboot. Resolved in main(), at startup.
+HISTORY_DIR = "~/.config/claude-mate/history"
+HISTORY_DEBOUNCE_S = 0.5    # a burst of reports -- a turn starting is a state
+                            # change and a meta change in quick succession --
+                            # costs one write, not one per line
+HISTORY_JOIN_S = 5.0        # main() waits this long for the writer's final
+                            # flush (the last `end`s) before exiting anyway
+HISTORY_TMP_STALE_S = 600.0  # a temp file this old was left by a killed
+                             # writer: a live one exists for milliseconds
+HISTORY_READ_MAX = 65536    # a record is about 1 KB; past this it is not one
+HISTORY_FIELD_MAX = 65536   # field 9 as received: 16x what the wrapper ever
+                            # sends (it caps the field at 4096 bytes), a bound
+                            # on work for the socket thread, not a format rule
+HISTORY_PATH_MAX = 4096     # cwd / config dir in field 9: PATH_MAX
+HISTORY_FLAGS_MAX = 64      # launch flags in field 9: at most this many...
+HISTORY_FLAGS_CHARS = 4096  # ...and this many characters between them
 
 # 4-char state tag shown on the state row.
 STATE_TAG = {"working": "WORK", "waiting": "WAIT", "error": "ERR",
@@ -726,6 +756,129 @@ def _wf_fault(where: str, exc: BaseException) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Faults that are contained -- and still heard about
+# --------------------------------------------------------------------------- #
+# NOT "FIVE, THEN SILENCE". _wf_fault's rule suits a parser that would print
+# the same odd field forever. It is wrong where silence IS the failure: a
+# socket line that faults once can fault on every line after it, and a history
+# record that cannot be written stays unwritten -- the sixth failure is as much
+# news as the first. So these are logged at most once a minute PER KEY (a
+# record, the socket), each repeat with a count of what it skipped, and the
+# traceback only the first time a key is heard from.
+FAULT_LOG_GAP_S = 60.0
+
+_fault_lock = threading.Lock()
+_fault_seen: Dict[str, Tuple[float, int]] = {}  # key -> (last logged, skipped)
+
+
+def _fault(key: str, what: str, exc: BaseException) -> None:
+    """Log a contained fault, rate-limited per `key`. Call it from the
+    `except` that caught `exc`: the traceback it prints is the one being
+    handled. Takes no lock but its own and never raises into its caller."""
+    try:
+        now = time.time()
+        with _fault_lock:
+            prev = _fault_seen.get(key)
+            if prev is not None and now - prev[0] < FAULT_LOG_GAP_S:
+                _fault_seen[key] = (prev[0], prev[1] + 1)
+                return
+            if prev is None and len(_fault_seen) >= 256:
+                _fault_seen.clear()                 # a bound, not a policy
+            _fault_seen[key] = (now, 0)
+        if prev is None:
+            tail = "\n" + traceback.format_exc()
+        else:
+            tail = f" (again; {prev[1]} more since it was last logged)"
+        log(f"{what} failed ({type(exc).__name__}: {exc}); carrying on{tail}")
+    except Exception:
+        pass
+
+
+def _sock_fault(exc: BaseException) -> None:
+    """One socket line failed: the line is lost, the socket thread is not
+    (SocketServer._serve says why that matters)."""
+    _fault("socket", "socket line", exc)
+
+
+def _history_fault(where: str, exc: BaseException, key: str = "") -> None:
+    """A history step failed. It costs the history -- that record, that
+    event -- and never the state report, the frame or the thread."""
+    _fault("history:" + (key or where), f"history {where}", exc)
+
+
+# --------------------------------------------------------------------------- #
+# Field 9: which conversation a wrapped session is running
+# --------------------------------------------------------------------------- #
+# The wrapper's key is its own 8-hex SID, new on every launch, every account
+# switch and every resume; field 9 names the thing those all continue -- Claude
+# Code's conversation id, the one `claude --resume` takes -- and where, and as
+# whom, and how it was started. The chat history is built from nothing else.
+_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def _hist_text_ok(value: Any, limit: int) -> bool:
+    """A str of at most `limit` characters with no C0 control and no DEL --
+    a NUL in a path would make every os call on it raise ValueError, and a
+    newline would forge a line in anything that prints it."""
+    return (isinstance(value, str) and len(value) <= limit
+            and not any(ch < " " or ch == "\x7f" for ch in value))
+
+
+def _hist_path_ok(value: Any) -> bool:
+    """An absolute path as the wrapper sends it. A lone surrogate passes on
+    purpose: that is how json carries a directory name that is not UTF-8, and
+    it has to come back as the same bytes for anything to find the directory."""
+    return _hist_text_ok(value, HISTORY_PATH_MAX) and value.startswith("/")
+
+
+def parse_history_field(text: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Field 9 of a wrapper line -> {"id", "cwd", "config", "flags"}, or None.
+
+        hist := quote(json.dumps({"id": uuid, "cwd": path,
+                                  "config": "" | path, "flags": [str, ...]}),
+                      safe="")
+
+    A key that is absent means "unknown / unchanged", and so does a key that
+    fails its check: EACH KEY STANDS ALONE, so flags over their budget cost the
+    flags and never the conversation id beside them. The dict always has all
+    four keys, None for each that is absent or invalid; None for the whole
+    field when it is empty or not a JSON object (a field from a newer producer
+    included). The id is lowercased -- claude names the transcript in lowercase
+    and the record is named after it; config "" is the default login.
+
+    Pure, and it NEVER raises: it runs on the socket thread, inside the line
+    whose state report must go through whatever this field holds."""
+    try:
+        text = (text or "").strip()
+        if not text or len(text) > HISTORY_FIELD_MAX:
+            return None
+        obj = json.loads(urllib.parse.unquote(text))
+        if not isinstance(obj, dict):
+            return None
+        out: Dict[str, Any] = {"id": None, "cwd": None, "config": None,
+                               "flags": None}
+        value = obj.get("id")
+        if (isinstance(value, str) and value.isascii()
+                and _UUID_RE.fullmatch(value.lower())):
+            out["id"] = value.lower()
+        value = obj.get("cwd")
+        if _hist_path_ok(value):
+            out["cwd"] = value
+        value = obj.get("config")
+        if value == "" or _hist_path_ok(value):
+            out["config"] = value
+        value = obj.get("flags")
+        if (isinstance(value, list) and len(value) <= HISTORY_FLAGS_MAX
+                and all(_hist_text_ok(f, HISTORY_FLAGS_CHARS) for f in value)
+                and sum(len(f) for f in value) <= HISTORY_FLAGS_CHARS):
+            out["flags"] = tuple(value)
+        return out
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------------------------- #
 # Session model + thread-safe registry
 # --------------------------------------------------------------------------- #
 
@@ -752,6 +905,29 @@ class Session:
     # Registry._lock and read without it: one reference read of an immutable
     # tuple, which is how _compose reads every other field here.
     workflows: Tuple[WfRec, ...] = ()
+    # What the chat history needs (field 9, wrapper lines only), sticky like
+    # account and limit: a line that does not carry one changes nothing.
+    conversation: str = ""         # Claude Code's id, the one --resume takes
+    config_dir: Optional[str] = None   # the login: None unknown, "" the
+                                       # default (~/.claude), else the path
+    flags: Optional[Tuple[str, ...]] = None  # launch flags a resume replays
+    # A TURN RAN, and when the latest one started: set on a transition INTO
+    # working, never by a keepalive. The history creates a record only for a
+    # conversation that ran a turn here, and takes its directory, login and
+    # flags only from one -- a `--resume <id>` started in the wrong directory
+    # or under the wrong login is refused by claude before it runs anything,
+    # and must not repoint the record at where it could not be found.
+    turned: bool = False
+    turn_ts: float = 0.0
+
+    def history_snapshot(self) -> Dict[str, Any]:
+        """What the history writer needs of this session, as a plain dict it
+        can keep after the session is gone (Registry.snapshot, and `end`)."""
+        return {"key": self.key, "name": self.name, "cwd": self.cwd,
+                "conversation": self.conversation,
+                "config_dir": self.config_dir, "flags": self.flags,
+                "account": self.account, "turned": self.turned,
+                "turn_ts": self.turn_ts}
 
     def display_seconds(self) -> float:
         """The time shown on the info row: time in the current state.
@@ -773,11 +949,18 @@ class Registry:
         self._lock = threading.Lock()
         self._sessions: Dict[str, Session] = {}
 
+    @staticmethod
+    def key_for(sid: str, name: str) -> str:
+        """The key a session line is filed under: its id, else its name."""
+        return sid if sid else (name if name else "unknown")
+
     def update(self, state: str, sid: str, name: str, cwd: str = "",
                focus_ctrl: str = "", model: str = "",
                effort: str = "", account: str = "",
                limit: str = "", wf: Optional[str] = None,
-               now: Optional[float] = None) -> Optional[str]:
+               now: Optional[float] = None, conversation: str = "",
+               config_dir: Optional[str] = None,
+               flags: Optional[Tuple[str, ...]] = None) -> Optional[str]:
         """Apply a status update from a hook, the PTY wrapper, or the mock injector.
 
         Returns the one-shot LED KIND for this session's own transition
@@ -791,11 +974,17 @@ class Registry:
         session's workflows, '-' clears them, records replace them. It never
         touches anything else here -- not the state, not the ack, not the
         return value. `now` exists for tests; everything else passes nothing.
+
+        `cwd`, `conversation`, `config_dir` and `flags` come from field 9 (see
+        parse_history_field): "" or None keeps what the session has, a value
+        replaces it -- config_dir "" is a value (the default login), and so
+        is an empty flags tuple (started with none). Nothing else here reads
+        them; the history takes them from Registry.snapshot().
         """
         if state not in VALID_STATES:
             log(f"ignoring update with invalid state: {state!r}")
             return None
-        key = sid if sid else (name if name else "unknown")
+        key = self.key_for(sid, name)
         now = time.time() if now is None else now
         # Parsed before the lock (it is pure) and fenced: a workflow field
         # nobody anticipated costs the workflows, never the state report.
@@ -827,6 +1016,12 @@ class Registry:
                 sess.account = account
             if limit:
                 sess.limit = limit
+            if conversation:
+                sess.conversation = conversation
+            if config_dir is not None:
+                sess.config_dir = config_dir
+            if flags is not None:
+                sess.flags = flags
             if recs is not None:
                 try:
                     new = (wf_merge(sess.workflows, recs, now,
@@ -868,6 +1063,8 @@ class Registry:
                     sess.acked = True
                     sess.last_ack_state = ""     # real forward progress: a
                     sess.last_ack_ts = 0.0       # future alert is NEW, not a flap
+                    sess.turned = True           # a turn started: the history
+                    sess.turn_ts = now           # may keep this conversation
                     haptic = "START"             # job (re)started: calm tick
                 else:                            # idle
                     sess.acked = True
@@ -878,9 +1075,18 @@ class Registry:
             log(f'workflow: {sess.name} "{wname}" {was} -> {now_st}')
         return haptic
 
-    def remove(self, key: str) -> None:
+    def remove(self, key: str) -> Optional[Session]:
+        """Drop a session and hand it back (None if it was not there): an
+        `end` is recorded in the history from what the session WAS."""
         with self._lock:
-            self._sessions.pop(key, None)
+            return self._sessions.pop(key, None)
+
+    def snapshot(self, key: str) -> Optional[Dict[str, Any]]:
+        """One session as the history needs it (Session.history_snapshot),
+        copied under the lock so it is one moment, never half of an update."""
+        with self._lock:
+            sess = self._sessions.get(key)
+            return sess.history_snapshot() if sess is not None else None
 
     def acknowledge(self, sess: Optional["Session"]) -> None:
         """GO/ACK pressed: mark this session's alert as seen. A finished (done)
@@ -2208,6 +2414,7 @@ class Screen:
         # Last frame actually sent (dedup) + the key of the subject CURRENTLY
         # ON THE GLASS. A GO/ACK press acts on exactly this key (WYSIWYG), so
         # the raised terminal always matches the name the user is looking at.
+        # Both are forgotten while no device is reachable (see refresh).
         self._last_frame = ""
         self._shown_key: Optional[str] = None
         # Last J| line actually sent ("" = none yet), the session whose band
@@ -2307,12 +2514,19 @@ class Screen:
         self.refresh()
 
     def select_by(self, want: str) -> Optional[str]:
-        """Select a session by queue index or by name. Returns the name, or None.
+        """Select a session by key, queue index or name. Returns the name, or
+        None.
 
         The device has no equivalent -- it walks there with PREV/NEXT -- but a
         terminal that can print the whole queue at once should be able to point
         at a row instead of stepping to it. The index is into the SAME queue the
         snapshot prints, so what you read is what you get.
+
+        AN EXACT SESSION KEY FIRST. The queue JSON carries every row's key, and
+        a client that already knows which row it means -- the app raising the
+        terminal of a chat from its History -- says so by key: an index can
+        shift under it between its read and this one, and a name is refused
+        as ambiguous whenever two rows share one.
 
         Name matching is exact-first, then unique prefix, then unique substring.
         AMBIGUITY IS A REFUSAL rather than a guess: this moves what GO acts on,
@@ -2325,8 +2539,8 @@ class Screen:
         queue = self._reg.queue()
         if not queue:
             return None
-        pick = None
-        if want.isdigit():
+        pick = next((s for s in queue if s.key == want), None)
+        if pick is None and want.isdigit():
             i = int(want)
             if 0 <= i < len(queue):
                 pick = queue[i]
@@ -2370,14 +2584,33 @@ class Screen:
         with self._lock:
             return self._follow
 
+    def _unlinked(self) -> bool:
+        """No device is reachable, so there is no glass at all. Caller holds
+        the lock.
+
+        Fenced, like _wf_view: it is asked under the Screen lock on the
+        ticker, the socket thread and the button reader, and an exception
+        would end whichever one it was on. A link that cannot answer is taken
+        as up -- all the screen ever assumed before it asked."""
+        try:
+            return not self._link.is_open()
+        except Exception:
+            return False
+
     def current_shown(self) -> Optional[Session]:
-        """The session whose frame is on the glass right now (for FOLLOW's
-        auto-raise), or None."""
+        """The session whose frame is on the glass right now, or None: what
+        FOLLOW raises, CONTINUE types into and the queue marks as shown.
+
+        With no device reachable it is the selection instead -- what the glass
+        would show, and what a press from a terminal means (see refresh)."""
         with self._lock:
+            queue = self._reg.queue()
+            if self._unlinked():
+                return self._subject(queue)
             key = self._shown_key
             if key is None:
                 return None
-            for s in self._reg.queue():
+            for s in queue:
                 if s.key == key:
                     return s
             return None
@@ -2386,10 +2619,11 @@ class Screen:
         """The session a GO/ACK press applies to: EXACTLY the one whose frame is
         on the glass (WYSIWYG). Never a freshly recomputed head -- so a press
         can only ever act on the name the user is actually looking at. Falls
-        back to the queue head only if the shown session has vanished."""
+        back to the selection (the head, if that has gone too) only if the
+        shown session has vanished, or no device is reachable to show one."""
         with self._lock:
             queue = self._reg.queue()
-            if self._shown_key is not None:
+            if self._shown_key is not None and not self._unlinked():
                 for s in queue:
                     if s.key == self._shown_key:
                         return s
@@ -2556,6 +2790,21 @@ class Screen:
         J yet counts as different: a device that outlived the last daemon may
         still hold a J it staged."""
         with self._lock:
+            if self._unlinked():
+                # NO GLASS, NO STALE SUBJECT. _shown_key moves only when a
+                # frame reaches a device, so once the device had gone -- a
+                # cable pulled, a battery device asleep -- it went on naming
+                # the last session drawn, and GO raised and acknowledged THAT
+                # one: the app's History selected a chat's row by its key, was
+                # told "ok", and its press raised another terminal. With
+                # nothing linked the selection is the subject (current_shown,
+                # resolve_press_target), and forgetting the last frame means
+                # the first one after a reconnect goes out and is committed.
+                # A write refused while the link is up clears nothing: the
+                # old frame may still be on the glass, and a press must act
+                # on what is there.
+                self._shown_key = None
+                self._last_frame = ""
             now = time.time()
             queue = self._reg.queue()
             subject = self._subject(queue)
@@ -3051,8 +3300,9 @@ def _which(prog: str) -> bool:
 
 class SocketServer(threading.Thread):
     """Unix-domain socket server: parses '<state>|<session_id>|<name>[|...]'
-    lines (the wrapper's nine fields end with its workflows; see
-    _process_line) and answers the CLI's few commands."""
+    lines (the wrapper's ten fields end with its workflows and the
+    conversation it is running; see _process_line) and answers the CLI's few
+    commands."""
 
     def __init__(self, sock_path: str, registry: Registry, on_update,
                  on_haptic=None) -> None:
@@ -3070,6 +3320,7 @@ class SocketServer(threading.Thread):
         self.on_accounts_refresh = None   # re-read ~/.claude-accounts
         self.on_device_link = None        # switch the cabled device's transport
         self.screen = None                # for queue_snapshot()
+        self.history = None               # HistoryWriter; unset under --mock
         self._stop_evt = threading.Event()  # NOT `_stop`: Thread.join() calls its own _stop()
         self._srv: Optional[socket.socket] = None
 
@@ -3135,12 +3386,26 @@ class SocketServer(threading.Thread):
                 buf += chunk
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
-                    self._reply(conn, self._process_line(line))
-            # Process any trailing line without a newline.
+                    self._serve(conn, line, complete=True)
+            # A trailing piece with no newline is processed too -- but it may
+            # be a line its sender gave up on half way (a sendall that timed out
+            # stops at the socket buffer, 8 KB on macOS), so it is marked as
+            # such: its state counts, its field 9 does not.
             if buf:
-                self._reply(conn, self._process_line(buf))
+                self._serve(conn, buf, complete=False)
         except OSError:
             pass
+
+    def _serve(self, conn: socket.socket, raw: bytes, complete: bool) -> None:
+        """One line in, its answer (if any) out -- and A FAULT COSTS THE LINE,
+        NEVER THE THREAD. Anything but an OSError used to end this thread for
+        good while the process lived on: launchd restarts a daemon that dies,
+        not one that has stopped listening, so every report after it went
+        nowhere without a word. Each line is fenced, and the next one is read."""
+        try:
+            self._reply(conn, self._process_line(raw, complete))
+        except Exception as exc:
+            _sock_fault(exc)
 
     @staticmethod
     def _reply(conn: socket.socket, body: Optional[str]) -> None:
@@ -3157,7 +3422,7 @@ class SocketServer(threading.Thread):
         except OSError:
             pass
 
-    def _process_line(self, raw: bytes) -> None:
+    def _process_line(self, raw: bytes, complete: bool = True) -> None:
         try:
             line = raw.decode("utf-8", errors="replace").strip()
         except Exception:
@@ -3246,10 +3511,11 @@ class SocketServer(threading.Thread):
             return f"ok {got}\n" if got else f"error: no session matching {want!r}\n"
 
         # Expected: "<state>|<session_id>|<name>|<ctrl_sock?>|<model?>|<effort?>
-        # |<account?>|<limit?>|<wf?>". The hook path sends only the first three
-        # fields; the PTY wrapper sends all nine: the control socket, the
-        # scraped model + effort, the account it runs as, the remaining-limit
-        # chip, and the session's dynamic workflows (parse_wf).
+        # |<account?>|<limit?>|<wf?>|<hist?>". The hook path sends only the
+        # first three fields; the PTY wrapper sends all ten: the control
+        # socket, the scraped model + effort, the account it runs as, the
+        # remaining-limit chip, the session's dynamic workflows (parse_wf) and
+        # the conversation it is running (parse_history_field).
         # state may be "end" (from the PTY wrapper) to remove the session.
         parts = line.split("|")
         state = parts[0].strip() if len(parts) > 0 else ""
@@ -3262,27 +3528,92 @@ class SocketServer(threading.Thread):
         limit = parts[7].strip() if len(parts) > 7 else ""
         # A PLAIN split, not split('|', 8). The workflow grammar already keeps
         # '|' out of field 8, so a maxsplit would buy nothing -- and it would
-        # glue any field a later producer adds after it onto the last
-        # workflow's name. Fields past 8 are ignored, as past 7 always were.
+        # glue field 9 onto the last workflow's name. Fields past 9 are
+        # ignored, as past 8 always were.
         wf = parts[8].strip() if len(parts) > 8 else ""
         if not state:
             log(f"ignoring malformed socket line: {line!r}")
             return
+        # FIELD 9 ONLY FROM A WHOLE WRAPPER LINE. A hook never sends one, and
+        # a line cut short (see _handle_conn) can end inside a path that still
+        # reads as a path -- one directory up, say -- which the history would
+        # then keep as where the chat lives.
+        hist = None
+        if complete and ctrl and len(parts) > 9:
+            hist = parse_history_field(parts[9])
         if state == "end":
             key = sid if sid else name
             if key:
-                self._reg.remove(key)
+                sess = self._reg.remove(key)
                 log(f"session ended: {name or sid}")
                 self._on_update()
+                self._history_end(sess, key, name, account, hist)
             return
         log(f"socket update: state={state} sid={sid or '-'} name={name or '-'}")
+        h = hist or {}
         haptic = self._reg.update(state, sid, name, focus_ctrl=ctrl,
                                   model=model, effort=effort,
-                                  account=account, limit=limit, wf=wf)
+                                  account=account, limit=limit, wf=wf,
+                                  cwd=h.get("cwd") or "",
+                                  conversation=h.get("id") or "",
+                                  config_dir=h.get("config"),
+                                  flags=h.get("flags"))
         self._on_update()
         if haptic and self._on_haptic:
             log(f"LED: {haptic} transition for {name or sid} ({state})")
             self._on_haptic(haptic)
+        self._history_seen(Registry.key_for(sid, name))
+
+    # ---- the chat history's two doors -------------------------------------- #
+    # BOTH FENCED, BOTH LAST. By the time either runs, the line has done
+    # everything it is for -- the registry, the screen, the LED -- so a history
+    # fault costs the history and nothing else. And neither touches a file:
+    # note() only queues, and the HistoryWriter thread does the I/O.
+
+    def _history_seen(self, key: str) -> None:
+        """A session line: hand the writer the session as it now stands, if
+        it is running a conversation the history can name."""
+        try:
+            if self.history is None:
+                return
+            snap = self._reg.snapshot(key)
+            if snap is not None and snap["conversation"]:
+                self.history.note(snap)
+        except Exception as exc:
+            _history_fault("note", exc)
+
+    def _history_end(self, sess: Optional[Session], key: str, name: str,
+                     account: str, hist: Optional[Dict[str, Any]]) -> None:
+        """An `end`: the session is gone from the registry; tell the writer
+        its conversation closed, from what the session was."""
+        try:
+            if self.history is None:
+                return
+            if sess is not None:
+                snap = sess.history_snapshot()
+            else:
+                # UNKNOWN: the daemon restarted since this session last
+                # reported, so all it knows is the end line. That may close a
+                # record but never create or repoint one -- turned=False.
+                snap = {"key": key, "name": name, "cwd": "",
+                        "conversation": "", "config_dir": None,
+                        "flags": None, "account": account, "turned": False,
+                        "turn_ts": 0.0}
+            # The end line's own field 9 on top: the id can arrive first on
+            # it, when the transcript appeared after the last report.
+            if hist is not None:
+                if hist["id"]:
+                    snap["conversation"] = hist["id"]
+                if hist["cwd"]:
+                    snap["cwd"] = hist["cwd"]
+                if hist["config"] is not None:
+                    snap["config_dir"] = hist["config"]
+                if hist["flags"] is not None:
+                    snap["flags"] = hist["flags"]
+            if snap["conversation"]:
+                self.history.note(snap, ended=time.time())
+        except Exception as exc:
+            _history_fault("end", exc)
 
     # ---- what the CLI reads ------------------------------------------------ #
 
@@ -3329,6 +3660,13 @@ class SocketServer(threading.Thread):
                 "account": sess.account,
                 "limit": sess.limit,
                 "cwd": sess.cwd,
+                "conversation": sess.conversation,
+                # Seconds since its last line. A wrapper reports at least every
+                # KEEPALIVE_S (20 s), so a row this quiet for a minute is a
+                # terminal that died without an `end` (kill -9) -- the CLI does
+                # not call a chat open on its word, though the row stays here
+                # until prune() takes it.
+                "seen": round(max(0.0, now - sess.last_update_ts)),
                 "acked": sess.acked,
                 "shown": sess.key == shown,
                 "workflows": wfs,
@@ -3622,7 +3960,11 @@ class ButtonReader(threading.Thread):
                 self._mirror_close_locked()
                 log("MIRROR off")
                 return
-            if sess is None:
+            # A VIEW NEEDS GLASS. With no device reachable current_shown() is
+            # the selection, which is what a press that acts on a session
+            # wants -- but a view opened into nothing would poll the wrapper
+            # every second, for nobody, until something closed it.
+            if sess is None or not self._link.is_open():
                 return
             self._mirror_key = sess.key
             self._mirror_scroll = 0
@@ -4018,6 +4360,454 @@ class Ticker(threading.Thread):
 
     def stop(self) -> None:
         self._stop_evt.set()
+
+
+# --------------------------------------------------------------------------- #
+# Chat history: one durable record per conversation
+# --------------------------------------------------------------------------- #
+
+# Every key a v1 record has, and what it holds until something is known.
+# "project" is the one optional key: the directory under <login>/projects
+# the transcript was last found in.
+_HISTORY_DEFAULTS = (("name", ""), ("cwd", ""), ("config_dir", None),
+                     ("account", ""), ("flags", None), ("last_active", 0.0),
+                     ("ended", None))
+
+
+def _history_time(value: Any) -> bool:
+    """A JSON number usable as a time: not a bool (True is an int to Python),
+    not NaN or an infinity (json.loads accepts both)."""
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and float("-inf") < value < float("inf"))
+
+
+def _history_clean(obj: Any) -> Dict[str, Any]:
+    """A parsed record with every known field of the wrong type dropped --
+    WRONG TYPE = ABSENT -- so the merge never meets a list where it needs a
+    number. A record is a file the user can edit by hand. Unknown keys stay
+    as they are: a newer version wrote them, and a merge hands them back."""
+    if not isinstance(obj, dict):
+        return {}
+    out = {}
+    for key, value in obj.items():
+        if key in ("conversation", "name", "cwd", "account", "project"):
+            ok = isinstance(value, str)
+        elif key == "config_dir":
+            ok = value is None or isinstance(value, str)
+        elif key == "flags":
+            ok = value is None or (isinstance(value, list) and all(
+                isinstance(f, str) for f in value))
+        elif key == "last_active":
+            ok = _history_time(value)
+        elif key == "ended":
+            ok = value is None or _history_time(value)
+        elif key == "v":
+            ok = isinstance(value, int) and not isinstance(value, bool)
+        else:
+            ok = True
+        if ok:
+            out[key] = value
+    return out
+
+
+def _locate_transcript(base: str, fname: str,
+                       hint: Any = None) -> Optional[Tuple[str, str]]:
+    """(project directory, path) of `fname` under <base>/projects/*/, or None.
+
+    os.listdir, NEVER glob: profile names are whatever the user typed, and a
+    '[' or a '*' in one turns the base into a pattern that matches nothing --
+    a transcript reported missing while it sits right there. The record's own
+    project is looked at first, so a write normally costs one stat."""
+    projects = os.path.join(base, "projects")
+    if (isinstance(hint, str) and hint and "/" not in hint
+            and hint not in (".", "..")):
+        path = os.path.join(projects, hint, fname)
+        if os.path.isfile(path):
+            return hint, path
+    try:
+        names = sorted(os.listdir(projects))
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    for name in names:
+        path = os.path.join(projects, name, fname)
+        if os.path.isfile(path):
+            return name, path
+    return None
+
+
+def _same_file(a: str, b: str) -> bool:
+    try:
+        return os.path.samefile(a, b)
+    except (OSError, ValueError):
+        return False
+
+
+def _unlink_quietly(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+class HistoryWriter(threading.Thread):
+    """Keeps a record of every conversation a wrapped session ran, in
+    <root>/<id>.json, with a hard link to its transcript beside it,
+    <root>/<id>.jsonl -- until the user deletes them.
+
+    WHY A RECORD OUTLIVES ITS SESSION. Closing a chat used to destroy it as
+    far as anything here knew: the session left the queue, and which
+    conversation it was, where and as whom went with it. A crash or a reboot
+    did the same. A record is written while the chat runs and survives close,
+    prune, a daemon restart or crash, and a reboot, so it can be resumed where
+    and as it was. Deleting one is the user's, in the CLI's own process --
+    never over the socket, where a hook's malformed line could reach it.
+
+    WHY THE HARD LINK. Claude Code deletes transcripts on its own --
+    cleanupPeriodDays (30 days by default), `claude purge`, a profile removed
+    with `claude-mate accounts rm` -- and a record whose transcript is gone
+    keeps only the address of a chat, not the chat. A second name for the
+    same inode keeps the conversation for as long as the record exists, and
+    costs no disk while Claude still has its copy.
+
+    THREADING. note() runs on the socket thread and does NO I/O: it queues the
+    event under a lock that guards nothing else and wakes this thread, which
+    gathers a burst for HISTORY_DEBOUNCE_S and writes holding no daemon lock.
+    Nothing is read or written at startup -- a fault there would be a launchd
+    restart every five seconds -- so the first event is the first I/O. stop()
+    only asks: the thread does the final flush itself, and main() stops it
+    after the socket server is joined, so every last `end` is in that flush.
+
+    THE RULES, per event, are in _write, numbered as the design numbers them.
+    Each event is fenced on its own: a record that cannot be written costs that
+    record, and is logged once a minute for as long as it keeps failing."""
+
+    def __init__(self, root: str,
+                 clock: Callable[[], float] = time.time) -> None:
+        super().__init__(name="history", daemon=True)
+        self._root = root
+        self._clock = clock           # injectable for tests; real time here
+        self._lock = threading.Lock()         # _pending and _wake, nothing else
+        self._flush_lock = threading.Lock()   # one flush at a time
+        self._pending: Dict[str, List[Tuple[Dict[str, Any],
+                                            Optional[float]]]] = {}
+        self._wake = threading.Event()
+        self._stop_evt = threading.Event()  # NOT `_stop`: Thread.join() calls its own _stop()
+        # Everything below belongs to the flush, under _flush_lock.
+        self._written: Set[str] = set()       # records this process wrote
+        self._last: Dict[str, Dict[str, Any]] = {}   # ...as it last wrote them
+        self._present: Dict[str, float] = {}  # when each was last seen there
+        self._deleted: Dict[str, float] = {}  # deleted ones, dated (rule 2)
+        self._swept = False
+        self._newer: Set[str] = set()         # v > 1 records already logged
+        self._link_logged = False
+
+    # ---- the socket thread's side ------------------------------------------ #
+
+    def note(self, snap: Optional[Dict[str, Any]],
+             ended: Optional[float] = None) -> None:
+        """Queue one event: a session as it stands (`ended` None) or as it
+        ended (`ended` = when). NO I/O -- the socket thread is the only way in
+        for every hook -- and None or a snapshot with no conversation is a
+        no-op, so a caller never has to check first.
+
+        A snapshot REPLACES a trailing snapshot of the same session -- a
+        burst of keepalives is one write -- but never an end, and never across
+        one: an `end` followed by a session that resumed the same chat (an
+        account switch) must land as the close and then the reopening."""
+        conv = (snap or {}).get("conversation")
+        if not conv:
+            return
+        with self._lock:
+            events = self._pending.setdefault(conv, [])
+            if (ended is None and events and events[-1][1] is None
+                    and events[-1][0].get("key") == snap.get("key")):
+                events[-1] = (snap, None)
+            else:
+                events.append((snap, ended))
+            self._wake.set()
+
+    def stop(self) -> None:
+        """Ask the thread to finish. It flushes once more on its way out."""
+        self._stop_evt.set()
+        self._wake.set()
+
+    # ---- the writer's side ------------------------------------------------- #
+
+    def run(self) -> None:
+        while not self._stop_evt.is_set():
+            self._wake.wait()
+            self._stop_evt.wait(HISTORY_DEBOUNCE_S)   # cut short by stop()
+            self._flush_fenced()
+        self._flush_fenced()        # stopped: whatever arrived since lands now
+
+    def _flush_fenced(self) -> None:
+        try:
+            self.flush()
+        except Exception as exc:                # the thread must outlive it
+            _history_fault("flush", exc)
+
+    def flush(self) -> None:
+        """Write everything queued so far. The writer thread's, and the tests'.
+
+        The wake Event is cleared IN THE SAME LOCK as the swap: cleared after
+        it, a note() landing in between would be in neither this batch nor a
+        wake-up, and could sit unwritten until some later chat said anything."""
+        with self._flush_lock:
+            with self._lock:
+                batch, self._pending = self._pending, {}
+                self._wake.clear()
+            for conv, events in batch.items():
+                for snap, ended in events:
+                    try:
+                        self._write(conv, snap, ended)
+                    except Exception as exc:
+                        _history_fault(f"record {conv}", exc, key=conv)
+
+    def _write(self, conv: str, snap: Dict[str, Any],
+               ended: Optional[float]) -> None:
+        """One event for conversation `conv`, through rules 1-8."""
+        root = self._root
+        # 1. THE DIRECTORY, ON EVERY WRITE. A user who `rm -rf`s it gets it back
+        # on the next write, instead of a history that stopped without a word
+        # until the daemon restarted. 0700 whatever made it: a record names
+        # directories, a login and launch flags.
+        os.makedirs(root, mode=0o700, exist_ok=True)
+        os.chmod(root, 0o700)
+        if not self._swept:
+            self._swept = True
+            self._sweep()
+        path = os.path.join(root, conv + ".json")
+        # 2. DELETED UNDER US. A record this process wrote that is not there
+        # now was deleted by the user, and the session still reporting must
+        # not put it straight back. DATED BY WHEN IT WAS LAST SEEN, not by
+        # when this noticed it gone. A turn begun before the deletion still
+        # cannot bring it back: its start was a change, written within the
+        # debounce by a write that saw the record -- and the CLI will not
+        # delete an open chat at all. But `claude -c` names its chat only
+        # once its first turn is under way, so dated by the noticing, that
+        # turn -- begun after the deletion -- read as older, and the chat it
+        # picked up again was not kept.
+        rec = self._read(path) if os.path.isfile(path) else None
+        exists = rec is not None
+        if exists:
+            self._present[conv] = self._clock()
+        elif conv in self._written:
+            self._deleted[conv] = self._present.pop(conv, self._clock())
+            self._written.discard(conv)
+            self._last.pop(conv, None)
+        turned = bool(snap.get("turned"))
+        turn_ts = float(snap.get("turn_ts") or 0.0)
+        if not exists:
+            # 3. CREATED ONLY BY A TURN -- after a deletion, by a NEW one,
+            # begun since the record was last seen. A session that never ran
+            # a turn has nothing to resume, and an `end` from a session this
+            # daemon never saw knows too little to start a record with.
+            if not (turned and turn_ts > self._deleted.get(conv, 0.0)):
+                return
+            rec = {}
+        elif isinstance(rec.get("v"), int) and rec["v"] > 1:
+            # 4. (read in _read) NEVER DOWNGRADE a record a newer version
+            # wrote: rewriting it as v1 would drop what it knows and this
+            # does not.
+            if conv not in self._newer:
+                self._newer.add(conv)
+                log(f"history: {conv} is a v{rec['v']} record, newer than "
+                    f"this daemon; leaving it as it is")
+            return
+        # 5. MERGE into what is there; keys this version does not know stay.
+        merged = dict(rec)
+        merged["v"] = 1
+        merged["conversation"] = conv
+        if turned:
+            cwd = snap.get("cwd") or ""
+            if cwd:
+                merged["cwd"] = cwd
+            name = os.path.basename(cwd) or snap.get("name") or ""
+            if name:
+                merged["name"] = name
+            if snap.get("config_dir") is not None:
+                merged["config_dir"] = snap["config_dir"]
+            if snap.get("account"):
+                merged["account"] = snap["account"]
+            if snap.get("flags") is not None:
+                merged["flags"] = list(snap["flags"])
+            merged["last_active"] = max(rec.get("last_active", 0.0), turn_ts)
+            merged["ended"] = ended         # None reopens a closed record
+        elif ended is None:
+            return      # NO TURN, NO SAY: only an end may touch the record
+        else:
+            merged["ended"] = ended
+        for key, default in _HISTORY_DEFAULTS:
+            merged.setdefault(key, default)
+        # 6. KEEP THE TRANSCRIPT beside the record: found here, so the record
+        # names the project it is in, and linked below, once the record is.
+        src = self._find_transcript(conv, merged)
+        # 7. NOTHING NEW, NO WRITE: a keepalive is not a disk write.
+        if not (exists and merged == self._last.get(conv)):
+            # 8. IN WHOLE OR NOT AT ALL.
+            self._replace(path, merged, conv)
+            self._written.add(conv)
+            self._last[conv] = merged
+            self._present[conv] = self._clock()
+            # One line per record created and per record closed -- never per
+            # write, like the workflow start/finish lines.
+            label = f"{merged['name'] or '?'} {conv[:8]}"
+            if not exists:
+                log(f"history: kept {label}"
+                    + (" (closed)" if ended is not None else ""))
+            elif ended is not None:
+                log(f"history: {label} closed")
+        # 6, the link. THE RECORD BEFORE ITS LINK. A writer killed between the
+        # two, or a record that could not be written (the raise skips this),
+        # leaves a record without its link, which the next write heals --
+        # never a link without a record: a transcript nothing lists or
+        # deletes, holding its disk long after Claude dropped its own copy.
+        # An unchanged record gets it too: Claude may have replaced its copy
+        # with a new file, and the link follows it.
+        if src is not None:
+            self._keep(conv, src)
+
+    @staticmethod
+    def _read(path: str) -> Optional[Dict[str, Any]]:
+        """Rule 4: the record at `path`, read SAFELY -- None if it is not
+        there (deleted between the check and the open, too).
+
+        O_NOFOLLOW, O_NONBLOCK, a regular-file check on the open descriptor
+        and a size cap: it sits in a directory the user can write to, and a
+        FIFO there would block this thread for good, a symlink to /dev/zero or
+        a huge file would be read whole. Anything that is not a JSON object --
+        a symlink included, which is replaced and never written through --
+        reads as {}, an empty record the merge then fills in properly."""
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                return {}
+            raise
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return {}
+            data = b""
+            while len(data) <= HISTORY_READ_MAX:
+                chunk = os.read(fd, HISTORY_READ_MAX + 1 - len(data))
+                if not chunk:
+                    break
+                data += chunk
+        finally:
+            os.close(fd)
+        if len(data) > HISTORY_READ_MAX:
+            return {}
+        try:
+            return _history_clean(json.loads(data.decode("utf-8")))
+        except Exception:
+            return {}
+
+    def _find_transcript(self, conv: str,
+                         merged: Dict[str, Any]) -> Optional[str]:
+        """Rule 6, the lookup: where the transcript is now, or None -- with
+        the project directory it is in noted in `merged`, so the record about
+        to be written names it. Not found: the record keeps what it had."""
+        cfg = merged.get("config_dir")
+        if cfg is None or (cfg and not cfg.startswith("/")):
+            return None         # which login is unknown: nowhere to look
+        base = os.path.expanduser("~/.claude") if cfg == "" else cfg
+        try:
+            hit = _locate_transcript(base, conv + ".jsonl",
+                                     merged.get("project"))
+        except (OSError, ValueError) as exc:
+            self._cannot_keep(exc)
+            return None
+        if hit is None:
+            return None
+        project, src = hit
+        merged["project"] = project
+        return src
+
+    def _keep(self, conv: str, src: str) -> None:
+        """Rule 6, the link: hard-link the transcript at `src` beside the
+        record, once the record is written (see _write). A transcript that
+        was not found is never linked, so an existing kept link is left alone
+        -- that is the point of keeping it."""
+        dst = os.path.join(self._root, conv + ".jsonl")
+        try:
+            if _same_file(src, dst):
+                return
+            tmp = os.path.join(self._root,
+                               f".{conv}.{secrets.token_hex(4)}.lnk")
+            os.link(src, tmp)
+            try:
+                os.replace(tmp, dst)
+            except OSError:
+                _unlink_quietly(tmp)
+                raise
+        except (OSError, ValueError) as exc:
+            self._cannot_keep(exc)
+
+    def _cannot_keep(self, exc: Exception) -> None:
+        # EXDEV (the history and the transcripts on different volumes),
+        # EPERM, ... The record is still worth writing without it.
+        if not self._link_logged:
+            self._link_logged = True
+            log(f"history: cannot keep a transcript beside its record "
+                f"({type(exc).__name__}: {exc}); records are still kept, "
+                f"transcripts only by Claude Code. Said once.")
+
+    def _replace(self, path: str, merged: Dict[str, Any], conv: str) -> None:
+        """Rule 8: a temp file in the same directory, synced, renamed over the
+        record, then the directory synced so the rename survives a power cut
+        too. Any failure removes the temp file and is raised."""
+        text = json.dumps(merged, indent=1, sort_keys=True,
+                          ensure_ascii=True) + "\n"
+        fd, tmp = tempfile.mkstemp(dir=self._root, prefix="." + conv + ".",
+                                   suffix=".tmp")
+        done = False
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                os.fchmod(fh.fileno(), 0o600)
+                fh.write(text)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+            done = True
+        finally:
+            if not done:
+                _unlink_quietly(tmp)
+        try:
+            dfd = os.open(self._root, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass                # best effort: not every filesystem allows it
+
+    def _sweep(self) -> None:
+        """Rule 1, once per process: what a writer killed mid-write left.
+
+        A temp record older than HISTORY_TMP_STALE_S goes. A temp LINK goes
+        whatever its age: it is one more name for a transcript -- a chat the
+        user may since have deleted, kept alive by a file nothing lists -- and
+        its mtime is the transcript's, not its own, so age says nothing about
+        it. Only this thread makes one, and only between two calls in _keep,
+        so none of this process's is in flight while this runs."""
+        now = self._clock()
+        try:
+            names = os.listdir(self._root)
+        except OSError:
+            return
+        for name in names:
+            if not name.startswith("."):
+                continue
+            path = os.path.join(self._root, name)
+            try:
+                if name.endswith(".lnk") or (
+                        name.endswith(".tmp") and
+                        now - os.lstat(path).st_mtime > HISTORY_TMP_STALE_S):
+                    os.unlink(path)
+            except OSError:
+                pass
 
 
 # --------------------------------------------------------------------------- #
@@ -4491,6 +5281,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     # both. The device being reconfigured is by definition the one on the cable.
     socket_server.on_device_link = \
         lambda mode: serial_link.write_line(f"I|{mode.upper()}")
+    # THE CHAT HISTORY -- but never the demo's. --mock's sessions are fake,
+    # and its MockInjector writes the registry directly, past the socket and
+    # field 9: nothing it does is a chat anyone had, and the history is a
+    # promise about chats you had. Nothing is read or written here; the
+    # writer's first I/O is the first conversation a wrapper names.
+    history: Optional[HistoryWriter] = None
+    if args.mock:
+        log("  history: off (--mock)")
+    else:
+        history = HistoryWriter(os.path.expanduser(HISTORY_DIR))
+        socket_server.history = history
+        log(f"  history: {HISTORY_DIR}")
     button_reader = ButtonReader(link, screen)
     button_reader.on_ack = on_ack
     button_reader.bridge = web
@@ -4515,6 +5317,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     for t in threads:
         t.start()
+    # Not in `threads`: it is stopped on its own, last -- see the finally.
+    if history is not None:
+        history.start()
 
     # launchd stops us with SIGTERM: turn it into a clean SystemExit so the
     # finally below runs and the device is left in an honest state.
@@ -4548,6 +5353,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         if mdns is not None:
             mdns.stop()
         link.close()      # LinkHub.close() also stops every wireless transport
+        # THE HISTORY LAST. Every thread that can hand it an event -- the
+        # socket server above all, whose final `end`s are the ones that say a
+        # chat closed rather than broke -- has been stopped and joined above,
+        # so the writer's own last flush has everything there will be.
+        # Stopped with the others, a note landing after that flush would be
+        # lost, and a chat that closed cleanly would read as interrupted.
+        if history is not None:
+            history.stop()
+            history.join(timeout=HISTORY_JOIN_S)
     return 0
 
 

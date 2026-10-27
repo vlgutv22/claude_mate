@@ -79,6 +79,17 @@ the target profile and re-execs `claude --resume`. Temp and per-terminal on
 purpose -- it describes a running process, is worthless once that process is
 gone, and two terminals in one directory are two different conversations.
 
+Keeping a chat after its terminal closes: every report also says which Claude
+Code conversation this is -- the id `claude --resume` takes, once its
+transcript exists -- in which directory, under which login, and with which of
+its launch flags a resume should replay (field 9, see history_field). That is
+what lets the daemon keep a record of the chat after the window is gone and
+`claude-mate history` start it again as it was. The id is learned once and
+then never changes (learn_conversation); the flags go through resume_flags,
+which is stricter than the account switch: the history starts a chat again
+days later from a record it kept, where a switch replays this session's own
+argv at once and keeps nothing.
+
 Config (env):
   CLAUDE_MATE_SOCK          daemon socket (default /tmp/claude-mate.sock)
   CLAUDE_MATE_DEBUG         if set to a path, append screen+state snapshots there
@@ -91,7 +102,7 @@ Requires: pyte  (pip install pyte)
 """
 import os, sys, pty, tty, termios, fcntl, struct, signal, select, socket, \
        threading, time, re, json, uuid, subprocess, shutil, atexit, hashlib, \
-       tempfile, colorsys, unicodedata
+       tempfile, colorsys, unicodedata, urllib.parse
 
 try:
     import pyte
@@ -288,20 +299,95 @@ def _field(value):
         return ""
     return value.replace("|", "/").replace("\r", "").replace("\n", "")
 
-def send_daemon(state):
-    """Best-effort one-line report to the daemon. Never raises.
+# Field 9's ceiling, in bytes. The daemon reads a line up to its newline, but a
+# line that a timed-out sender could not finish arrives cut at the socket
+# buffer -- 8 KB on macOS -- and a path cut short still looks like a path. So
+# past this the field sends its flags as none (the one part that grows with what
+# was typed), and past it again it goes out empty: a missing key is "unknown",
+# which the daemon can live with, where a wrong one is recorded.
+HIST_FIELD_MAX = 4096
 
-    Wire format, always all nine fields:
-        state|SID|NAME|CTRL_SOCK|MODEL|EFFORT|ACCOUNT|LIMIT|WF
+def history_field():
+    """Field 9: which conversation this session is running, where, as whom,
+    and with which flags it would start again. ONE JSON object,
+    percent-encoded, so a directory or a flag can hold '|', ';', a newline or
+    bytes that are not UTF-8 (json escapes the lone surrogates those decode
+    to) without a field or an escaping rule of its own. A MISSING KEY MEANS
+    UNKNOWN, and each key is worked out on its own: a failure costs that key,
+    never the field and never the state report. Never raises; '' at worst.
+
+        id      the conversation's id, only once its transcript exists (g_conv)
+        cwd     the directory claude runs in
+        config  '' for the default login, else the CLAUDE_CONFIG_DIR it runs
+                under -- the EXACT string when it is absolute: claude hashes
+                the raw value into the Keychain service name (_access_token),
+                so a tidier spelling of the same directory is another login
+        flags   the launch flags a resume replays (resume_flags)"""
+    obj = {}
+    if g_conv:
+        obj["id"] = g_conv
+    try:
+        obj["cwd"] = os.getcwd()
+    except Exception:
+        pass
+    try:
+        raw = os.environ.get("CLAUDE_CONFIG_DIR", "")
+        obj["config"] = raw if not raw or os.path.isabs(raw) else os.path.abspath(raw)
+    except Exception:
+        pass
+    try:
+        if g_resume_flags is not None:
+            obj["flags"] = list(g_resume_flags)
+    except Exception:
+        pass
+
+    def encode(o):
+        return urllib.parse.quote(json.dumps(o, ensure_ascii=True, separators=(",", ":"),
+                                             sort_keys=True), safe="")
+    try:
+        text = encode(obj)
+        if len(text) > HIST_FIELD_MAX and "flags" in obj:
+            # NONE, NOT "UNKNOWN". A missing key would let a record keep the
+            # flags an earlier session left in it -- a bypass this one may not
+            # have had, without restrictions this one did. An empty list is
+            # the safe way to be wrong: a resume asks its permission prompts.
+            obj["flags"] = []
+            text = encode(obj)
+        return text if len(text) <= HIST_FIELD_MAX else ""
+    except Exception:
+        return ""
+
+# NO REPORT AFTER `end`. cleanup() sends `end` without waiting for the monitor
+# thread, which can be halfway through evaluate() at that moment -- and a late
+# report landing after the `end` registered the session all over again: a
+# ghost row for 600 s, and a chat that had just closed reading as open all
+# that time. So `end` sets g_ended under this lock and every report after it
+# is dropped, while one already on its way is let finish first. Re-entrant
+# because cleanup() also runs from a signal handler, on the main thread: a
+# plain Lock taken again by the thread holding it is the SIGWINCH freeze all
+# over again (see the resize handler in main).
+_send_lock = threading.RLock()
+g_ended = False
+
+def send_daemon(state):
+    """Best-effort one-line report to the daemon. Never raises, and never
+    sends anything after `end` (see _send_lock).
+
+    Wire format, always all ten fields:
+        state|SID|NAME|CTRL_SOCK|MODEL|EFFORT|ACCOUNT|LIMIT|WF|HIST
     (model/effort are empty until captured from the screen; account/limit are
     empty until known. WF is this session's dynamic workflows: '-' for none,
     or up to three '~'-joined records
         st;done;total;failed;pct;elapsed_s;tokens;note;name
     -- see wf_field -- or '' when they could not be read this time, which the
-    daemon takes as "keep what you have". The daemon treats ALL trailing fields
-    as optional, so older peers stay compatible.) NAME is the directory's own
-    name, so it is sanitised like the rest: a '|' in it used to shift every
-    field after it."""
+    daemon takes as "keep what you have". HIST is the conversation, its
+    directory, its login and the flags a resume replays, as one percent-encoded
+    JSON object -- see history_field -- and it never goes through _field: it
+    has no '|' to lose, and '|' -> '/' would change a path. The daemon treats
+    ALL trailing fields as optional, so older peers stay compatible: an older
+    daemon ignores HIST.) NAME is the directory's own name, so it is sanitised
+    like the rest: a '|' in it used to shift every field after it."""
+    global g_ended
     head = "|".join([state, SID, _field(NAME), CTRL_SOCK]
                     + [_field(g_meta[k]) for k in ("model", "effort",
                                                    "account", "limit")])
@@ -309,17 +395,23 @@ def send_daemon(state):
         wf = _field(g_meta.get("wf", ""))
     except Exception:                  # never at the cost of the state report
         wf = ""
-    try:
-        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        c.settimeout(0.5)
-        c.connect(DAEMON_SOCK)
-        # errors="replace": a directory name that is not valid UTF-8 reaches
-        # Python as lone surrogates, which a strict encode refuses -- and a
-        # refused report is a session the device never hears from again.
-        c.sendall(f"{head}|{wf}\n".encode("utf-8", errors="replace"))
-        c.close()
-    except OSError:
-        pass
+    hist = history_field()             # never raises: '' when it cannot be built
+    with _send_lock:
+        if g_ended:
+            return
+        if state == "end":
+            g_ended = True
+        try:
+            c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            c.settimeout(0.5)
+            c.connect(DAEMON_SOCK)
+            # errors="replace": a directory name that is not valid UTF-8 reaches
+            # Python as lone surrogates, which a strict encode refuses -- and a
+            # refused report is a session the device never hears from again.
+            c.sendall(f"{head}|{wf}|{hist}\n".encode("utf-8", errors="replace"))
+            c.close()
+        except OSError:
+            pass
 
 # --------------------------------------------------------------------------- #
 # Focus: raise THIS terminal window, method chosen from $TERM_PROGRAM
@@ -702,6 +794,19 @@ g_child_pid = -1
 g_claude_sid = ""
 g_user_argv = []
 g_started_at = 0.0
+
+# The same, as the daemon is told it (field 9). g_conv is Claude Code's id for
+# the conversation -- the one `claude --resume <id>` takes -- once its
+# transcript exists, and '' until then; learned once and then LOCKED (see
+# learn_conversation). g_conv_mode says how it can be learned, '' meaning
+# never or no longer; g_launch_transcripts is this cwd's transcripts as they
+# stood before claude started. g_resume_flags is what a resume replays
+# (resume_flags), worked out once in main(); None = unknown.
+g_conv = ""
+g_conv_mode = ""
+g_launch_transcripts = {}
+g_resume_flags = None
+g_turn_seen = False         # reported 'working' at least once (ctx_write)
 
 def queue_input(data: bytes):
     """Hand keystrokes to the relay from another thread."""
@@ -2288,6 +2393,18 @@ CTX_STALE_S = 900.0          # a context not refreshed for this long is dead
 # means "no id this time" (the verified scan below still works) and the answer
 # is fetched in the background for the next session. It changes only when the
 # binary does.
+def ensure_ctx_dir():
+    """CTX_DIR, 0700 -- and put back to 0700 when it is not.
+
+    THE UMASK IS PROCESS-WIDE. ctrl_listener narrows it to 0o177 for the
+    moment it binds its socket, and a directory another thread makes inside
+    that moment comes out 0600: no x bit, so nothing can open a file in it --
+    not the context file, not the caps cache, not the CLI that reads them
+    (CI caught it as a PermissionError). chmod does not go through the umask,
+    so it mends whatever that race left, on the next write."""
+    os.makedirs(CTX_DIR, mode=0o700, exist_ok=True)
+    os.chmod(CTX_DIR, 0o700)
+
 def caps_path():
     return os.path.join(CTX_DIR, "claude-caps.json")
 
@@ -2337,7 +2454,7 @@ def probe_session_id_support(binary):
     blob = dict(list(blob.items())[-3:])        # the last few binaries, no more
     blob[key] = ok
     try:
-        os.makedirs(CTX_DIR, mode=0o700, exist_ok=True)
+        ensure_ctx_dir()
         tmp = caps_path() + f".{os.getpid()}.tmp"
         with open(tmp, "w") as fh:
             json.dump(blob, fh)
@@ -2492,14 +2609,157 @@ def find_transcript(cfg_dir, cwd, since=0.0, sid=""):
             best, best_mtime = p, m
     return best
 
+# --------------------------------------------------------------------------- #
+# Which conversation the history is told about -- on evidence, once
+# --------------------------------------------------------------------------- #
+# The daemon keys a chat's record by Claude Code's conversation id, and a wrong
+# id is worse than none: the chat is recorded under another terminal's
+# conversation, with this terminal's directory, login and flags, and its own
+# is never recorded at all. So g_conv is set only on evidence, only once, and
+# never changes afterwards -- not even when another conversation in this
+# directory turns out to be busier, which is how the scan above would flip
+# between two terminals four times a second. The evidence depends on how
+# claude was started (conv_mode):
+#   known     the id is in hand -- minted and handed over as --session-id, or
+#             the user's own --resume/--session-id <uuid> -- so it only waits
+#             for the transcript to exist. A chat that never ran a turn has
+#             nothing to resume, and the daemon hears of no chat at all;
+#   new       claude mints it -- a cold caps cache (the first session after
+#             every Claude Code update) or --fork-session -- so it is the ONE
+#             transcript in this cwd's project directories that was not there
+#             when we started and that records this cwd. Two such, and it
+#             gives up for the session: which is whose would be a guess;
+#   carry     claude carries on a conversation that was already there and
+#             does not tell us which: -c/--continue, a bare --resume (its own
+#             picker), -r <name>, --from-pr. So it is the ONE transcript that
+#             was there at launch, records this cwd and has grown since; two
+#             such -- another terminal at work in this directory -- and it
+#             gives up. NOT "the newest one", which is what --continue was
+#             taken to pick: it skips `claude -p` and SDK runs, /loop, --bg
+#             and teammate transcripts, so the newest file could be one it
+#             never touches -- recorded under this terminal's directory and
+#             flags while the chat it did carry on went unrecorded. Never a
+#             new file either: without --fork-session claude keeps the old
+#             one, so a new transcript here is someone else's;
+#   ''        never: a --session-id that is not a UUID, which claude refuses
+#             anyway -- or a scan that failed, or gave up.
+# NEW AND CARRY WAIT FOR THIS SESSION'S OWN FIRST TURN (g_turn_seen). Until it
+# has run one, its own transcript need not have appeared or grown at all -- so
+# the one new file in this directory, or the one that has grown, is somebody
+# else's: a second terminal in the same project at work on a conversation of
+# its own, the usual thing right after a Claude Code update. Looking only after
+# our turn, two of them is a refusal to guess instead of a lock on the wrong
+# one -- and so is a file that has grown without saying where it belongs.
+# ctx_write's transcript and session_id are deliberately left out of this:
+# they are what an account switch carries, and tools/test_account_switch.py
+# pins their rules.
+#
+# The ids are UUIDs (claude's --session-id insists on one). Always fullmatch():
+# '$' also matches just before a trailing newline, and an id carrying one ends
+# up in a file name.
+_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+
+def conv_mode(argv, sid):
+    """'known', 'new', 'carry' or '' (see above): how this session can learn
+    its conversation id. `argv` is the user's own, `sid` what session_argv
+    made of it -- for -r <name>, a name rather than an id."""
+    if _UUID_RE.fullmatch(sid or ""):
+        return "known"
+    if "--fork-session" in argv:
+        return "new"
+    if any(a in ("-c", "--continue", "-r", "--resume", "--from-pr")
+           or a.startswith(("--resume=", "--from-pr=")) for a in argv):
+        return "carry"
+    if sid:
+        return ""                     # a --session-id that is not a UUID
+    return "new"
+
+def _conv_id(path):
+    """The conversation id a transcript's file name carries, lowercased, or ''."""
+    name = os.path.basename(path)
+    if name.endswith(".jsonl") and _UUID_RE.fullmatch(name[:-6]):
+        return name[:-6].lower()
+    return ""
+
+def conv_transcripts(cfg_dir, cwd):
+    """The .jsonl files in every project directory that can hold this cwd's
+    transcripts: the names project_dir_names() knows, plus Claude Code's own
+    rule -- every character that is not a letter or a digit becomes '-'."""
+    root = os.path.join(cfg_dir or os.path.expanduser("~/.claude"), "projects")
+    out = []
+    for name in project_dir_names(cwd) | {re.sub(r"[^a-zA-Z0-9]", "-", cwd)}:
+        d = os.path.join(root, name)
+        try:
+            out += [os.path.join(d, fn) for fn in os.listdir(d) if fn.endswith(".jsonl")]
+        except OSError:
+            pass
+    return out
+
+def launch_transcripts(cfg_dir, cwd):
+    """{path: mtime} of those files, taken before claude starts."""
+    out = {}
+    for p in conv_transcripts(cfg_dir, cwd):
+        try:
+            out[p] = os.path.getmtime(p)
+        except OSError:
+            pass
+    return out
+
+def learn_conversation(cfg_dir, cwd, transcript):
+    """Set g_conv once there is evidence for it (see above), and never again.
+    `transcript` is what find_transcript just found for g_claude_sid. Never
+    raises: a scan that fails gives up, rather than fail four times a second."""
+    global g_conv, g_conv_mode
+    if g_conv or not g_conv_mode:
+        return
+    try:
+        if g_conv_mode == "known":
+            if transcript:
+                g_conv = g_claude_sid.lower()
+            return
+        if not g_turn_seen:
+            return                    # see above: anything found now is not ours
+        here = os.path.realpath(cwd)
+        if g_conv_mode == "carry":    # there at launch, and grown since
+            paths = []
+            for p, then in g_launch_transcripts.items():
+                try:
+                    if _conv_id(p) and os.path.getmtime(p) > then:
+                        paths.append(p)
+                except OSError:
+                    pass              # gone since: claude's own cleanup at startup
+        else:                         # new: not there at launch
+            paths = [p for p in conv_transcripts(cfg_dir, cwd)
+                     if p not in g_launch_transcripts and _conv_id(p)]
+        found, count = "", 0
+        for p in paths:
+            rec = transcript_cwd(p)
+            if rec and os.path.realpath(rec) != here:
+                continue              # another directory whose name mangles like ours
+            count += 1                # ours, or not saying where it belongs (yet)
+            if rec:
+                found = _conv_id(p)
+        if count > 1:
+            g_conv_mode = ""
+        elif found:
+            g_conv = found
+    except Exception:
+        g_conv_mode = ""
+
 def ctx_write(state="", started=0.0):
     """Publish this terminal's context. Best-effort and never fatal: the tracker
     is a convenience for a command the user may never run, and must not be able
-    to take down a working session."""
+    to take down a working session. The conversation id is learned here too, on
+    the same beat (learn_conversation), first, so the file carries it."""
+    global g_turn_seen
     try:
-        os.makedirs(CTX_DIR, mode=0o700, exist_ok=True)
+        if state == "working":
+            g_turn_seen = True        # this session has run a turn of its own
         cfg = os.environ.get("CLAUDE_CONFIG_DIR", "")
         transcript = find_transcript(cfg, os.getcwd(), started, g_claude_sid)
+        learn_conversation(cfg, os.getcwd(), transcript)
+        ensure_ctx_dir()
         blob = json.dumps({
             "tty": MY_TTY,
             "pid": os.getpid(),
@@ -2508,6 +2768,10 @@ def ctx_write(state="", started=0.0):
             "config_dir": cfg,
             "transcript": transcript,
             "session_id": (os.path.basename(transcript)[:-6] if transcript else ""),
+            # The conversation as the daemon is told it: unlike session_id, only
+            # ever an id this wrapper is sure of. The CLI reads it to tell an
+            # open chat from a closed one while the daemon is down.
+            "conversation": g_conv,
             # The flags this session was started with, so a switch can resume it
             # as the same kind of session rather than a default one.
             "argv": list(g_user_argv),
@@ -2592,6 +2856,245 @@ def switch_refusal(req):
     return ""
 
 # --------------------------------------------------------------------------- #
+# The flags a resumed session comes back with
+# --------------------------------------------------------------------------- #
+# Which of the flags this session started with make a resumed session the same
+# kind of session -- for the HISTORY, which starts a closed chat again days
+# later from the record the daemon kept: the flags go into that record (field
+# 9) and stay there until someone deletes it. Hence a stricter rule than the
+# account switch, which keeps its own (claude-mate-switch replays everything
+# that does not name another conversation): a switch happens now, from this
+# terminal's own argv, and stores nothing new. A record is kept, so no inline
+# JSON (where tokens and API keys go), no system prompt and nothing past the
+# daemon's size budget -- and it is replayed when nobody remembers the opening
+# prompt, which a resume SENDS AGAIN, or the -w that makes a NEW worktree.
+#
+# AN ALLOWLIST, from Claude Code 2.1.311's --help. A flag that is not on it is
+# dropped, with its value: nobody has decided what it means on a resume.
+# Every flag that --help lists is in exactly one of the sets below, the
+# dropped ones included -- tools/test_account_switch.py holds a copy of that
+# --help option list: refresh the copy when Claude Code is upgraded, and it
+# fails for every flag nobody has classified.
+RESUME_FLAGS_BOOL = frozenset({                   # no value
+    "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
+    "--verbose", "--chrome", "--no-chrome", "--ide", "--strict-mcp-config",
+    "--disable-slash-commands", "--ax-screen-reader", "--brief", "--bare",
+    "--safe-mode", "--restricted", "--exclude-dynamic-system-prompt-sections"})
+RESUME_FLAGS_VALUE = frozenset({                  # exactly one value
+    "--model", "--effort", "--permission-mode", "--fallback-model", "--agent",
+    "--setting-sources", "--autocompact", "--plugin-dir", "--plugin-url",
+    "--name", "-n"})
+# One value, kept only when it names a file that exists. Both also take inline
+# JSON, which is where tokens and API keys go -- and a chat's record keeps its
+# flags until someone deletes it. An interactive claude takes --agents ONLY
+# inline, so a wrapped session's never survives -- and an --agent naming one of
+# its agents would come back with claude's default tools and no prompts asked
+# under --dangerously-skip-permissions: freer than the agent it ran as. So a
+# session that dropped an inline --agents and picked an --agent keeps no flags
+# at all, the way a lost restriction does (RESUME_FLAGS_RESTRICT, below).
+RESUME_FLAGS_FILE = frozenset({"--settings", "--agents"})
+# Every value up to the next flag. --mcp-config's values are files or inline
+# JSON just like --settings', so only the files survive, and the flag goes when
+# none does.
+RESUME_FLAGS_MANY = frozenset({
+    "--add-dir", "--allowedTools", "--allowed-tools", "--disallowedTools",
+    "--disallowed-tools", "--tools", "--betas", "--mcp-config"})
+# Never replayed. They name another conversation (--resume, --continue, ...),
+# start something other than this terminal's session (--print, --bg, --cloud,
+# a new worktree, ...), only mean anything to a non-interactive run, or were a
+# one-off. --system-prompt and --append-system-prompt too: claude records the
+# system prompt on the conversation's first request and sends that record on
+# every resume (--system-prompt-snapshot, on by default), and they are the
+# values long enough to blow any budget.
+RESUME_FLAGS_DROP = frozenset({
+    "-r", "--resume", "-c", "--continue", "--from-pr", "--session-id",
+    "--fork-session", "--teleport", "--cloud", "--remote-control",
+    "--remote-control-session-name-prefix", "-p", "--print", "--output-format",
+    "--input-format", "--json-schema", "--max-budget-usd", "--include-hook-events",
+    "--include-partial-messages", "--replay-user-messages", "--permission-prompts",
+    "--forward-subagent-text", "--no-session-persistence", "-w", "--worktree",
+    "--tmux", "--bg", "--background", "--desktop", "--file", "-d", "--debug",
+    "--debug-file", "--environment", "--prompt-suggestions", "--system-prompt",
+    "--append-system-prompt", "--system-prompt-snapshot", "-h", "--help", "-v",
+    "--version"})
+# A VALUE IS WHATEVER CLAUDE'S OWN PARSER SAYS IT IS. A flag whose value is
+# required (`<x>` in --help) takes the next word even when it starts with '-',
+# so `--name --dangerously-skip-permissions` names a session and skips nothing.
+# Read as a flag, that word would come back as one: a resumed session skipping
+# the permission prompts its original never skipped. So the word after a
+# required-value flag is its value, whatever it looks like, and is kept or
+# dropped with it (every kept flag that takes a value requires one; these are
+# the dropped flags that do). A flag whose value is optional (`[x]`) takes the
+# next word only when it is not a flag, and `--` ends the flags: everything
+# after it is a prompt.
+_DROP_TAKES_VALUE = frozenset({
+    "--session-id", "--remote-control-session-name-prefix", "--output-format",
+    "--input-format", "--json-schema", "--max-budget-usd", "--permission-prompts",
+    "--file", "--debug-file", "--environment", "--system-prompt",
+    "--append-system-prompt", "--system-prompt-snapshot"})
+# A SHORT-OPTION CLUSTER IS SEVERAL FLAGS. Commander reads -cn as -c then -n,
+# and -n takes the next word whatever it looks like: `-cn
+# --dangerously-skip-permissions` continues a session NAMED that, and skips no
+# prompt -- read as a flag, that word came back as the bypass. But -nc is -n
+# with the value "c", and the word after it IS a flag: which one claude saw
+# depends on the cluster's letters. So a plain word after a cluster goes with
+# it (a value or a prompt, never a flag, either way), and a word that looks
+# like a flag -- `--` too, which -cn takes as its name -- leaves nothing kept
+# at all: dropping just that word moved the guess one word on, to its value
+# (`-nc --model --dangerously-skip-permissions` came back as a bypass).
+_SHORT_CLUSTER_RE = re.compile(r"-[A-Za-z]{2,}")
+# RESTRICTIONS ARE NEVER LOST. These take something away from a session -- a
+# deny list, a narrower tool set, plan mode, the refusal to bypass permissions
+# -- while --dangerously-skip-permissions, a boolean, is always kept: a resume
+# that lost one of these would be freer than the chat it carries on. So they
+# are kept past the size budget, and one that still cannot be kept (a value
+# too long or with a control character in it, the word cap) empties the whole
+# list -- no flags at all is no --dangerously-skip-permissions either, the
+# safe way to be wrong. Losing --permission-mode bypassPermissions is that
+# safe way already, so that one alone may go.
+RESUME_FLAGS_RESTRICT = frozenset({
+    "--disallowedTools", "--disallowed-tools", "--tools", "--permission-mode",
+    "--restricted"})
+RESUME_VALUE_MAX = 256      # chars of one value; a longer one goes, with its flag
+RESUME_TOTAL_MAX = 1024     # chars of everything kept; past it only booleans and
+                            # restrictions (RESUME_FLAGS_RESTRICT) join
+RESUME_WORDS_MAX = 64       # words kept, booleans too: the daemon takes no more
+                            # (HISTORY_FLAGS_MAX), and it refuses the WHOLE list
+                            # past that -- the permission flags with the rest
+
+def _flag_file(value, cwd):
+    """Does a flag's value name an existing regular file (relative ones looked
+    up under `cwd`, default this directory)?"""
+    try:
+        if not value:
+            return False
+        return os.path.isfile(value if os.path.isabs(value)
+                              else os.path.join(cwd or os.getcwd(), value))
+    except (OSError, ValueError):
+        return False
+
+def _plain_word(word):
+    """No C0 control and no DEL: the daemon refuses a flags list with one in
+    it (parse_history_field) -- the whole list, not just that word."""
+    return not any(ch < " " or ch == "\x7f" for ch in word)
+
+def _restricts(flag, values):
+    """Would a resumed session that lost this flag, with these values, be
+    freer than its original (RESUME_FLAGS_RESTRICT)?"""
+    return flag in RESUME_FLAGS_RESTRICT and not (
+        flag == "--permission-mode" and list(values) == ["bypassPermissions"])
+
+def resume_flags(argv, cwd=None):
+    """The launch flags, out of `argv`, that make a resumed session the same
+    kind of session -- in their order, filtered through the sets above. Pure,
+    and NEVER raises: [] for anything that is not an argv. The words of
+    resume_flag_items(), one list."""
+    return [w for item in resume_flag_items(argv, cwd) for w in item]
+
+def resume_flag_items(argv, cwd=None):
+    """resume_flags(), a flag at a time: a list of items, each one flag WITH
+    its values -- ['--verbose'], ['--model', 'opus'], ['--add-dir', 'a', 'b'],
+    ['--effort=high']. Pure, and NEVER raises: [] for anything not an argv.
+
+    ITEMS, BECAUSE A WORD ALONE CANNOT SAY WHAT IT IS. In
+    `--name --dangerously-skip-permissions` the second word is a session's
+    name, and a caller that scans words for the permission flag -- to label a
+    resume, or to take the flag out -- reads a bypass the session never had,
+    or strips the name's value and leaves `--name` to swallow `--resume`.
+    So whatever has to reason about flags gets them already paired.
+
+    A required value comes with its flag, never without it: replayed alone,
+    the flag would take the `--resume <id>` after it as its value and start a
+    fresh session. A `--flag=value` word is kept whole. Budget: a flag whose
+    value is over RESUME_VALUE_MAX, or holds a control character, goes; once
+    what is kept would pass RESUME_TOTAL_MAX nothing more is added -- except
+    booleans and restrictions, which are always kept -- and nothing at all
+    past RESUME_WORDS_MAX words. A restriction that cannot be kept for all
+    that leaves [] (RESUME_FLAGS_RESTRICT). `cwd` is where relative
+    --settings/--agents/--mcp-config paths are looked up: the directory the
+    session ran in, which is where it resumes."""
+    try:
+        argv = list(argv)
+        if not all(isinstance(a, str) for a in argv):
+            return []
+        # capped: the word cap is reached. Nothing more is added, but the scan
+        # goes on -- a restriction further on must not be lost unnoticed.
+        out, total, words, full, capped, i = [], 0, 0, False, False, 0
+        lost_agents = False             # an inline --agents went (see above)
+        while i < len(argv):
+            a = argv[i]
+            i += 1
+            if a == "--":
+                break                             # the rest is a prompt
+            if a in RESUME_FLAGS_BOOL:
+                if capped or words + 1 > RESUME_WORDS_MAX:
+                    if _restricts(a, []):
+                        return []
+                    capped = True
+                    continue
+                out.append([a])
+                total += len(a)
+                words += 1
+                continue
+            flag, eq, inline = a.partition("=")
+            if eq and a.startswith("--"):
+                if (flag not in RESUME_FLAGS_VALUE and flag not in RESUME_FLAGS_FILE
+                        and flag not in RESUME_FLAGS_MANY):
+                    continue                      # dropped or unknown: one word
+                values = [inline]
+            elif a in RESUME_FLAGS_VALUE or a in RESUME_FLAGS_FILE:
+                if i >= len(argv):
+                    continue                      # no value: dropped
+                values = [argv[i]]
+                i += 1
+            elif a in RESUME_FLAGS_MANY:
+                values = argv[i:i + 1]            # the first, whatever it looks like
+                i += len(values)
+                while i < len(argv) and not argv[i].startswith("-"):
+                    values.append(argv[i])
+                    i += 1
+            else:
+                # Dropped, unknown, or a prompt -- and so is a value after it.
+                if (_SHORT_CLUSTER_RE.fullmatch(a) and i < len(argv)
+                        and argv[i].startswith("-")):
+                    return []                     # see _SHORT_CLUSTER_RE
+                if a in _DROP_TAKES_VALUE or (
+                        a.startswith("-") and i < len(argv)
+                        and not argv[i].startswith("-")):
+                    i += 1
+                continue
+            restricts = _restricts(flag, values)
+            if flag in RESUME_FLAGS_FILE or flag == "--mcp-config":
+                values = [v for v in values if _flag_file(v, cwd)]
+            if not values:
+                lost_agents = lost_agents or flag == "--agents"
+                continue
+            if any(len(v) > RESUME_VALUE_MAX or not _plain_word(v) for v in values):
+                if restricts:
+                    return []
+                continue
+            item = [a] if eq else [flag] + values
+            n = sum(len(t) for t in item)
+            if flag not in RESUME_FLAGS_RESTRICT and (
+                    full or total + n > RESUME_TOTAL_MAX):
+                full = True
+                continue
+            if capped or words + len(item) > RESUME_WORDS_MAX:
+                if restricts:
+                    return []
+                capped = True
+                continue
+            out.append(item)
+            total += n
+            words += len(item)
+        if lost_agents and any(it[0].partition("=")[0] == "--agent"
+                               for it in out):
+            return []                     # its agent's limits went: see above
+        return out
+    except Exception:
+        return []
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def main():
@@ -2621,9 +3124,29 @@ def main():
     # two unwrapped exec paths above: an unwrapped claude feeds no tracker and
     # must run exactly as the user typed it. g_user_argv keeps the user's own
     # flags so a switch can resume as the same kind of session.
-    global g_user_argv, g_claude_sid
+    global g_user_argv, g_claude_sid, g_resume_flags, g_conv_mode, \
+        g_launch_transcripts
     g_user_argv = list(sys.argv[1:])
+    # What a resume of this session would replay, worked out once. Fenced
+    # although resume_flags never raises: this runs before claude starts, and
+    # nothing in the history may be able to stop it starting.
+    try:
+        g_resume_flags = resume_flags(g_user_argv)
+    except Exception:
+        g_resume_flags = None
     sys.argv[1:], g_claude_sid = session_argv(sys.argv[1:])
+    # How this session will learn its conversation id, and -- for an id claude
+    # mints, or a conversation it carries on -- the transcripts this cwd had,
+    # and their mtimes, BEFORE claude could add or touch one: taken here, ahead
+    # of the fork, so not even a claude quick off the mark can write before we
+    # have looked (see learn_conversation).
+    try:
+        g_conv_mode = conv_mode(g_user_argv, g_claude_sid)
+        if g_conv_mode in ("new", "carry"):
+            g_launch_transcripts = launch_transcripts(
+                os.environ.get("CLAUDE_CONFIG_DIR", ""), os.getcwd())
+    except Exception:
+        g_conv_mode = ""
 
     rows, cols = get_winsize(sys.stdin.fileno())
 
@@ -2658,10 +3181,12 @@ def main():
     screen_lock = threading.Lock()
 
     # meta_reported: model, effort, account, limit and the workflow field's
-    # SHAPE (wf_shape) as last reported -- '-', as the launch report says.
+    # SHAPE (wf_shape) as last reported -- '-', as the launch report says --
+    # then the conversation id (g_conv), '' until it is learned. APPENDED, not
+    # inserted: index 4 is read back as the shape below.
     state = {"cur": "idle", "reported": None, "pending": None,
              "pending_src": "idle", "since": 0.0, "last_sent": 0.0,
-             "meta_reported": ("", "", "", "", "-"),
+             "meta_reported": ("", "", "", "", "-", ""),
              "colour": True, "colour_at": -1e9}
     dbg = open(DEBUG, "a") if DEBUG else None
     wf_watch = WorkflowWatch()                 # touched by evaluate() only
@@ -2706,11 +3231,12 @@ def main():
             state["cur"] = state["pending"]
         # Report on a state change, when model/effort/account/limit first
         # become known (or change), when the workflows change SHAPE -- one
-        # starts, ends, pauses, gains a done agent -- or as a periodic
-        # keepalive. A workflow's clock and token count change every second
-        # and are not a reason to report: they ride the keepalive.
+        # starts, ends, pauses, gains a done agent -- when the conversation id
+        # is learned (the daemon can keep the chat from that report on), or
+        # as a periodic keepalive. A workflow's clock and token count change
+        # every second and are not a reason to report: they ride the keepalive.
         meta = (g_meta["model"], g_meta["effort"],
-                g_meta["account"], g_meta["limit"], shape)
+                g_meta["account"], g_meta["limit"], shape, g_conv)
         if (state["cur"] != state["reported"] or meta != state["meta_reported"]
                 or (now - state["last_sent"]) >= KEEPALIVE_S):
             state["reported"] = state["cur"]
@@ -2773,7 +3299,9 @@ def main():
     # Periodic evaluator (catches quiescence after output stops). `_running` lets
     # cleanup() stop it BEFORE it sends the final 'end', so the monitor can't fire
     # a keepalive/state report afterwards and re-register the just-ended session
-    # (a ghost the daemon would then keep alive via last_update_ts).
+    # (a ghost the daemon would then keep alive via last_update_ts). A pass
+    # already under way when the flag drops is send_daemon's to stop: nothing
+    # goes out after `end` (see _send_lock).
     _running = [True]
     # The transcript does not exist yet at launch -- claude creates it on the
     # first turn -- so the tracker is refreshed from the monitor rather than

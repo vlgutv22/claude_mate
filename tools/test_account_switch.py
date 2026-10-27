@@ -15,8 +15,10 @@ import contextlib
 import importlib.machinery
 import importlib.util
 import io
+import itertools
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -238,6 +240,105 @@ check("a binary that cannot be probed remembers nothing",
 
 
 # --------------------------------------------------------------------------- #
+print("\n-- ...and a conversation claude carries on without naming it --")
+
+# -c, a bare --resume (claude's own picker), -r <name> and --from-pr carry on a
+# conversation that is already there, and do not say which. The wrapper used
+# to bet on the NEWEST transcript for -c, and to give up on the rest. But
+# claude's --continue skips `claude -p` and SDK runs, /loop, --bg and teammate
+# transcripts: the history kept a -p job under this terminal's directory and
+# flags while the chat it really carried on went unrecorded -- and a chat open
+# in a terminal, never named, read as closed, so History offered to resume it
+# a second time. Now it is the ONE transcript that was there at launch, records
+# this directory and has grown since, looked for after this session's own
+# first turn; two such is no answer at all.
+U1 = "11111111-1111-4111-8111-111111111111"
+_carry = {a: W.conv_mode(list(a), W.session_argv(list(a))[1])
+          for a in (("-c",), ("--continue",), ("--resume",), ("-r",),
+                    ("-r", "my chat"), ("--resume=my-chat",), ("--from-pr",),
+                    ("--from-pr", "123"), ("--from-pr=123",))}
+check("-c, a bare --resume, -r <name> and --from-pr all carry on a conversation "
+      "that is already there" + "".join(f"; {a} -> {m!r}" for a, m in _carry.items()
+                                        if m != "carry"),
+      set(_carry.values()) == {"carry"})
+check("...while --fork-session makes a new one, whatever it forks",
+      W.conv_mode(["-c", "--fork-session"], "") == "new"
+      and W.conv_mode(["--resume", U1, "--fork-session"], "") == "new")
+check("an id in hand is known; a plain start is new; a --session-id that is no "
+      "UUID (claude refuses it) is nothing",
+      W.conv_mode(["--resume", U1], U1) == "known" and W.conv_mode([], "") == "new"
+      and W.conv_mode(["--session-id", "x"], "x") == "")
+
+c_cfg = os.path.join(tmp, "carry-cfg")
+c_cwd = os.path.realpath(tempfile.mkdtemp(prefix="carry-cwd-", dir=tmp))
+c_dir = os.path.join(c_cfg, "projects", re.sub(r"[^a-zA-Z0-9]", "-", c_cwd))
+
+
+def cid(n):
+    return f"{n:08x}-0000-4000-8000-{n:012x}"
+
+
+def carry(argv, there, grow=(), gone=(), turn=True):
+    """learn_conversation for a session started with `argv`, in a project
+    directory holding `there` at launch -- {id: (cwd recorded or None, entrypoint,
+    seconds old)} -- after the transcripts in `grow` grew and those in `gone`
+    went. Returns (id learned, mode left)."""
+    shutil.rmtree(c_dir, ignore_errors=True)
+    os.makedirs(c_dir)
+    now = time.time()
+    for n, (rec_cwd, entry, age) in there.items():
+        path = os.path.join(c_dir, n + ".jsonl")
+        head = ([{"type": "user", "cwd": rec_cwd, "sessionId": n, "entrypoint": entry}]
+                if rec_cwd else [{"type": "summary", "summary": "s"}] * 12)
+        with open(path, "w") as fh:
+            fh.writelines(json.dumps(r) + "\n" for r in head)
+        os.utime(path, (now - age, now - age))
+    W.g_conv, W.g_claude_sid, W.g_turn_seen = "", "", turn
+    W.g_conv_mode = W.conv_mode(list(argv), W.session_argv(list(argv))[1])
+    W.g_launch_transcripts = W.launch_transcripts(c_cfg, c_cwd)
+    for n in grow:
+        with open(os.path.join(c_dir, n + ".jsonl"), "a") as fh:
+            fh.write(json.dumps({"type": "assistant", "cwd": there[n][0] or c_cwd,
+                                 "sessionId": n}) + "\n")
+    for n in gone:
+        os.unlink(os.path.join(c_dir, n + ".jsonl"))
+    W.learn_conversation(c_cfg, c_cwd, "")
+    return W.g_conv, W.g_conv_mode
+
+
+A, B, Y = cid(0xA), cid(0xB), cid(0xC)
+_chat_and_job = {A: (c_cwd, "cli", 600), B: (c_cwd, "sdk-cli", 60)}
+check("-c carries on the chat it continued, not the newer `claude -p` job beside it",
+      carry(["-c"], _chat_and_job, grow=[A]) == (A, "carry"))
+check("...and while that job is still writing, two have grown: nothing is named, "
+      "never the job",
+      carry(["-c"], _chat_and_job, grow=[A, B]) == ("", ""))
+check("...nor anything before the session's own first turn: a file that grows "
+      "then may be anybody's",
+      carry(["-c"], _chat_and_job, grow=[A], turn=False) == ("", "carry"))
+check("...and with nothing grown yet it waits, rather than give up",
+      carry(["-c"], _chat_and_job) == ("", "carry"))
+check("the picker's choice is learned the same way: the older chat it picked",
+      carry(["--resume"], {A: (c_cwd, "cli", 900), Y: (c_cwd, "cli", 30)},
+            grow=[A]) == (A, "carry"))
+check("...and -r <name> too",
+      carry(["-r", "my chat"], {A: (c_cwd, "cli", 900), Y: (c_cwd, "cli", 30)},
+            grow=[A]) == (A, "carry"))
+check("a transcript of ANOTHER directory whose name mangles like ours is not ours",
+      carry(["-c"], {A: (c_cwd, "cli", 900),
+                     Y: (c_cwd.replace("carry-cwd-", "carry_cwd_"), "cli", 30)},
+            grow=[A, Y]) == (A, "carry"))
+check("one that grew without saying where it belongs is not ruled out: with ours, "
+      "two -- no answer",
+      carry(["-c"], {A: (c_cwd, "cli", 900), Y: (None, "cli", 30)},
+            grow=[A, Y]) == ("", ""))
+check("a transcript deleted since launch (claude's own cleanup) costs nothing",
+      carry(["-c"], {A: (c_cwd, "cli", 900), Y: (c_cwd, "cli", 86400 * 40)},
+            grow=[A], gone=[Y]) == (A, "carry"))
+W.g_conv, W.g_conv_mode, W.g_launch_transcripts, W.g_turn_seen = "", "", {}, False
+
+
+# --------------------------------------------------------------------------- #
 print("\n-- the request from the device: an account name is ONE argument --")
 
 # "work 2" is an ordinary name for a profile directory, and it used to be split
@@ -328,6 +429,19 @@ check("...and lives under the temp dir, so a reboot clears it",
 check("the file is private (0600)", oct(os.stat(p).st_mode)[-3:] == "600")
 check("its directory is private (0700)",
       oct(os.stat(os.path.dirname(p)).st_mode)[-3:] == "700")
+# THE UMASK RACE. ctrl_listener narrows the process umask to 0o177 while it
+# binds; a directory made by another thread in that moment is 0600 -- no x bit,
+# nothing inside it can be opened. CI hit it. The next write must mend it.
+os.chmod(os.path.dirname(p), 0o600)
+real_getcwd, os.getcwd = os.getcwd, lambda: cwd
+try:
+    W.ctx_write("working", started)
+finally:
+    os.getcwd = real_getcwd
+check("a context dir left 0600 by the umask race is put back to 0700, and "
+      "the file is written again",
+      oct(os.stat(os.path.dirname(p)).st_mode)[-3:] == "700"
+      and json.load(open(p)).get("state") == "working")
 check("no .tmp scratch file is left behind",
       not [f for f in os.listdir(os.path.dirname(p)) if f.endswith(".tmp")])
 
@@ -410,6 +524,413 @@ check("...and the --flag=value spelling",
       ["--verbose", "--resume", "mine"])
 check("a context from an older wrapper (no argv) still resumes",
       S.resume_argv({}, "mine") == ["--resume", "mine"])
+# THE SWITCH KEEPS ITS OWN RULE, NOT THE HISTORY'S. It happens now, from a
+# context file that already holds the whole argv, and stores nothing new -- so
+# nothing the history leaves out of a record it keeps for days (inline JSON, a
+# system prompt, whatever is past the daemon's size budget) may go missing on
+# the way to another account. Through the history's rules a read-only agent
+# came back as claude's default one (--agents dropped, --agent kept), Remote
+# Control was gone, and a long --add-dir took the deny list after it along.
+_agents = '{"reviewer":{"description":"d","prompt":"p","tools":["Read","Grep"]}}'
+check("the switch keeps inline --agents beside the --agent it defines",
+      S.resume_argv({"argv": ["--agents", _agents, "--agent", "reviewer"]}, "mine")
+      == ["--agents", _agents, "--agent", "reviewer", "--resume", "mine"])
+_inline = ["--append-system-prompt", "be terse", "--remote-control",
+           "--settings", '{"permissions":{"deny":["Bash"]}}',
+           "--mcp-config", '{"mcpServers":{}}', "--strict-mcp-config"]
+check("...and the system prompt, Remote Control and inline --settings/--mcp-config",
+      S.resume_argv({"argv": _inline}, "mine") == _inline + ["--resume", "mine"])
+_long = (["--add-dir"] + ["/x/" + "d" * 250] * 5
+         + ["--disallowedTools", "Bash", "--model", "opus"])
+check("...and every flag, however long the argv: a switch has no size budget",
+      S.resume_argv({"argv": _long}, "mine") == _long + ["--resume", "mine"])
+
+
+# --------------------------------------------------------------------------- #
+print("\n-- resume_flags: what a resumed session comes back with --")
+
+# The policy itself, in the wrapper, which the history replays a closed chat's
+# flags through as well. It runs before claude starts and on every report, so
+# it may never raise: [] for anything that is not an argv.
+check("nothing in, nothing out", W.resume_flags([]) == [])
+check("not an argv at all: [] rather than an exception",
+      W.resume_flags(None) == [] and W.resume_flags([1, "--verbose"]) == []
+      and W.resume_flags(object()) == [])
+check("a value flag as the last word is dropped -- alone, it would swallow "
+      "the --resume after it",
+      W.resume_flags(["--verbose", "--model"]) == ["--verbose"])
+check("--flag= with nothing after the '=' is still one whole word",
+      W.resume_flags(["--model="]) == ["--model="])
+check("booleans, values and --flag=value words are kept, in order",
+      W.resume_flags(["--model", "opus", "--verbose", "--effort=max", "-n", "my chat"])
+      == ["--model", "opus", "--verbose", "--effort=max", "-n", "my chat"])
+check("an unknown flag goes, and takes its value with it",
+      W.resume_flags(["--frobnicate", "x", "--verbose"]) == ["--verbose"])
+check("everything after -- is a prompt, flag-shaped or not",
+      W.resume_flags(["--verbose", "--", "--dangerously-skip-permissions"])
+      == ["--verbose"])
+# A required value is whatever claude's own parser takes it to be -- the next
+# word, even one that starts with '-'. Reading it as a flag instead would hand
+# a resumed session a permission bypass its original never had.
+check("`--name --dangerously-skip-permissions` is a name, and stays one",
+      W.resume_flags(["--name", "--dangerously-skip-permissions"])
+      == ["--name", "--dangerously-skip-permissions"])
+check("...and a dropped flag's flag-shaped value goes with it, never kept as a flag",
+      W.resume_flags(["--system-prompt", "--dangerously-skip-permissions"]) == []
+      and W.resume_flags(["--add-dir", "--dangerously-skip-permissions"])
+      == ["--add-dir", "--dangerously-skip-permissions"])
+check("every flag the policy drops goes with its value",
+      all(W.resume_flags([f, "v", "--verbose"]) == ["--verbose"]
+          for f in sorted(W.RESUME_FLAGS_DROP)))
+
+rf_dir = os.path.join(tmp, "rf-cwd")
+os.makedirs(rf_dir, exist_ok=True)
+for _f in ("s.json", "m.json"):
+    with open(os.path.join(rf_dir, _f), "w") as fh:
+        fh.write("{}")
+# Inline JSON is where tokens and API keys go, and a chat's record keeps its
+# flags until someone deletes it. A FILE is a path, and survives.
+check("--settings naming a file is kept, looked up in the session's directory",
+      W.resume_flags(["--settings", "s.json"], cwd=rf_dir) == ["--settings", "s.json"]
+      and W.resume_flags(["--settings=s.json"], cwd=rf_dir) == ["--settings=s.json"])
+check("...and dropped where that file does not exist",
+      W.resume_flags(["--settings", "s.json"], cwd=tmp) == [])
+check("inline JSON in --settings or --agents is never kept",
+      W.resume_flags(["--settings", '{"env":{"API_KEY":"sk-x"}}', "--verbose"],
+                     cwd=rf_dir) == ["--verbose"]
+      and W.resume_flags(["--agents", '{"r":{"prompt":"x"}}'], cwd=rf_dir) == [])
+# AN AGENT WHOSE DEFINITION WENT. An interactive claude takes --agents only
+# inline, so it never survives; an --agent naming one of its agents would come
+# back with claude's default tools -- and no prompts under the bypass beside it.
+check("an --agent whose inline --agents went keeps NO flags, the bypass included",
+      W.resume_flags(["--agents", '{"ro":{"tools":["Read"]}}', "--agent", "ro",
+                      "--dangerously-skip-permissions", "--model", "opus"],
+                     cwd=rf_dir) == []
+      and W.resume_flags(["--agents=" + '{"ro":{}}', "--agent=ro", "--verbose"],
+                         cwd=rf_dir) == [])
+check("...while inline --agents with no --agent, or an --agent alone, keep the rest",
+      W.resume_flags(["--agents", '{"r":{}}', "--model", "opus"], cwd=rf_dir)
+      == ["--model", "opus"]
+      and W.resume_flags(["--agent", "reviewer", "--verbose"], cwd=rf_dir)
+      == ["--agent", "reviewer", "--verbose"])
+check("--mcp-config keeps only the values that are files",
+      W.resume_flags(["--mcp-config", "m.json", '{"mcpServers":{}}', "--verbose"],
+                     cwd=rf_dir) == ["--mcp-config", "m.json", "--verbose"])
+check("...and goes entirely when none of them is",
+      W.resume_flags(["--mcp-config", '{"mcpServers":{}}'], cwd=rf_dir) == [])
+check("a variadic flag keeps every value up to the next flag",
+      W.resume_flags(["--add-dir", "a", "b", "--allowedTools", "Bash(git *)", "Edit",
+                      "--verbose"])
+      == ["--add-dir", "a", "b", "--allowedTools", "Bash(git *)", "Edit", "--verbose"])
+check("...but its --flag=value form is one value; a word after it is a prompt",
+      W.resume_flags(["--allowedTools=Edit", "fix it"]) == ["--allowedTools=Edit"])
+
+check(f"a value over {W.RESUME_VALUE_MAX} characters goes, with its flag",
+      W.resume_flags(["--name", "x" * (W.RESUME_VALUE_MAX + 1), "--verbose"])
+      == ["--verbose"]
+      and W.resume_flags(["--name", "x" * W.RESUME_VALUE_MAX])
+      == ["--name", "x" * W.RESUME_VALUE_MAX])
+_big = ["--name", "a" * 250, "--model", "b" * 250, "--agent", "c" * 250,
+        "--fallback-model", "d" * 250, "--effort", "max", "--verbose"]
+_kept = W.resume_flags(_big)
+check(f"past {W.RESUME_TOTAL_MAX} characters nothing more is added "
+      f"({sum(map(len, _kept))} kept)",
+      _kept == _big[:6] + ["--verbose"])
+check("...except a boolean, which is always kept",
+      _kept[-1] == "--verbose")
+# WHAT THE DAEMON WILL TAKE. It refuses a flags list of more than
+# HISTORY_FLAGS_MAX words, or with a control character in any of them -- the
+# whole list, permission flags included -- so the wrapper never sends one.
+_many = ["--add-dir", "d"] * 40 + ["--verbose"]
+_cut = W.resume_flags(_many)
+check(f"at most {W.RESUME_WORDS_MAX} words are kept, whole flags only "
+      f"({len(_cut)} kept)",
+      len(_cut) <= W.RESUME_WORDS_MAX and _cut == _many[:len(_cut)]
+      and len(_cut) % 2 == 0)
+check("a value with a control character goes, with its flag",
+      W.resume_flags(["--name", "a\tb", "--model", "opus", "--verbose"])
+      == ["--model", "opus", "--verbose"]
+      and W.resume_flags(["--name=a\x1bb", "--verbose"]) == ["--verbose"])
+# RESTRICTIONS ARE NEVER LOST. The booleans that skip every permission prompt
+# are always kept, so a budget that dropped the deny list, plan mode or
+# --restricted behind a long --add-dir resumed a chat freer than it ever ran:
+# every prompt skipped, nothing denied. A restriction is kept past the size
+# budget; one that still cannot be kept leaves no flags at all -- which drops
+# the bypass too, the safe way to be wrong.
+_restrict = getattr(W, "RESUME_FLAGS_RESTRICT", frozenset())
+check("the restrictions are flags the policy keeps -- booleans, values or lists",
+      bool(_restrict) and _restrict <= (W.RESUME_FLAGS_BOOL | W.RESUME_FLAGS_VALUE
+                                        | W.RESUME_FLAGS_MANY))
+_dirs = ["/Users/me/Projects/acme/monorepo/packages/service-%02d/src" % n
+         for n in range(17)]
+_deny = ["--disallowedTools", "Bash(rm:*)", "Bash(git push:*)", "WebFetch",
+         "--permission-mode", "plan"]
+_r = W.resume_flags(["--dangerously-skip-permissions", "--add-dir"] + _dirs + _deny)
+check(f"a deny list and plan mode survive past {W.RESUME_TOTAL_MAX} characters, "
+      f"behind a long --add-dir ({sum(map(len, _r))} kept)",
+      _r == ["--dangerously-skip-permissions", "--add-dir"] + _dirs + _deny
+      and sum(map(len, _r)) > W.RESUME_TOTAL_MAX)
+check("...in the --flag=value spelling too, while the budget still drops the rest",
+      W.resume_flags(["--add-dir"] + _dirs + ["--model", "m" * 60, "--tools=Read,Grep",
+                                              "--permission-mode=plan"])
+      == ["--add-dir"] + _dirs + ["--tools=Read,Grep", "--permission-mode=plan"])
+_allow = ["Bash(npm run task-%02d:*)" % n for n in range(45)]
+check("...and once the budget has run out, a deny list after it is still kept",
+      W.resume_flags(["--dangerously-skip-permissions", "--allowedTools"] + _allow
+                     + ["--disallowedTools", "Bash(rm:*)"])
+      == ["--dangerously-skip-permissions", "--disallowedTools", "Bash(rm:*)"])
+_short = ["T%d" % n for n in range(70)]
+check(f"a restriction past the {W.RESUME_WORDS_MAX}-word cap leaves no flags at all: "
+      f"no bypass either",
+      W.resume_flags(["--dangerously-skip-permissions", "--allowedTools"] + _short
+                     + ["--tools", "Read", "--disallowedTools", "Bash"]) == []
+      and W.resume_flags(["--dangerously-skip-permissions", "--allowedTools"] + _short
+                         + ["--restricted"]) == []
+      and W.resume_flags(["--dangerously-skip-permissions", "--disallowedTools"]
+                         + _short) == [])
+check(f"...nor does one with a value over {W.RESUME_VALUE_MAX} characters, or a "
+      f"control character in it",
+      W.resume_flags(["--dangerously-skip-permissions", "--disallowedTools",
+                      "Bash(" + "x" * W.RESUME_VALUE_MAX + ")"]) == []
+      and W.resume_flags(["--dangerously-skip-permissions",
+                          "--permission-mode=pl\tan"]) == [])
+check("--permission-mode bypassPermissions passes the budget like the boolean "
+      "bypass -- but losing it to the word cap only loses a bypass",
+      W.resume_flags(["--add-dir"] + _dirs + ["--model", "m" * 60, "--permission-mode",
+                                              "bypassPermissions"])
+      == ["--add-dir"] + _dirs + ["--permission-mode", "bypassPermissions"]
+      and W.resume_flags(["--verbose", "--allowedTools"] + _short
+                         + ["--permission-mode", "bypassPermissions"]) == ["--verbose"])
+# A SHORT-OPTION CLUSTER IS SEVERAL FLAGS, the way claude's parser reads it:
+# -cn is -c then -n, and -n takes the next word whatever it looks like -- so
+# `claude -cn --dangerously-skip-permissions` continues a session NAMED that,
+# and skips nothing. Read as a flag, that name came back as the bypass.
+check("`-cn --dangerously-skip-permissions` is a name: no bypass comes back",
+      W.resume_flags(["-cn", "--dangerously-skip-permissions"]) == []
+      and W.resume_flags(["-cpn", "--dangerously-skip-permissions"]) == []
+      and W.resume_flags(["-pn", "--dangerously-skip-permissions", "hi"]) == [])
+check("...a plain word after a cluster goes with it, and what follows is read as "
+      "before", W.resume_flags(["-cn", "my chat", "--verbose"]) == ["--verbose"])
+# Whether the word after a cluster is the cluster's value or a flag of its own
+# depends on the letters: -nc is -n with the value "c", so after it come real
+# flags. Dropping just that word moved the guess on to the next one.
+check("...but a word after it that looks like a flag, `--` too, leaves no flags at "
+      "all: claude may have read it either way",
+      W.resume_flags(["-nc", "--model", "--dangerously-skip-permissions"]) == []
+      and W.resume_flags(["--dangerously-skip-permissions", "-cn", "--",
+                          "--restricted"]) == []
+      and W.resume_flags(["-cn", "--permission-mode", "plan", "--verbose"]) == [])
+# ITEMS, FOR WHATEVER HAS TO REASON ABOUT A FLAG: the app labels a resume by
+# its permission mode and swaps the mode, and a word alone cannot say whether
+# it is a flag or the value of the one before it.
+check("resume_flag_items pairs every flag with its values",
+      W.resume_flag_items(["--name", "--dangerously-skip-permissions",
+                           "--add-dir", "a", "b", "--effort=max", "--verbose"])
+      == [["--name", "--dangerously-skip-permissions"], ["--add-dir", "a", "b"],
+          ["--effort=max"], ["--verbose"]])
+check("...and resume_flags is exactly its words, in order",
+      all(W.resume_flags(a) == [w for it in W.resume_flag_items(a) for w in it]
+          for a in (_big, _many, ["--model", "x", "fix it", "--chrome"], [])))
+
+# THIS LIST IS A LOCK, NOT AN OBSERVATION. Every option `claude --help` prints
+# (Claude Code 2.1.311), with its argument as the help writes it: <x> takes one
+# value, <x...> several, [x] may take one. Each one must be in EXACTLY ONE of
+# the wrapper's sets -- kept as a boolean, a value, a file or a list, or
+# dropped -- and with the argument shape the help gives it. When a Claude Code
+# upgrade adds an option, paste the new --help lines here, and decide in the
+# wrapper whether a resumed session should come back with it; until then this
+# fails. An unclassified flag is not harmless: it is dropped on every resume,
+# and nobody has said whether that is right.
+HELP_2_1_311 = """
+--add-dir <directories...>
+--agent <agent>
+--agents <json-or-file>
+--allow-dangerously-skip-permissions
+--allowedTools, --allowed-tools <tools...>
+--append-system-prompt <prompt>
+--autocompact <auto|tokens>
+--ax-screen-reader
+--bg, --background
+--bare
+--betas <betas...>
+--brief
+--chrome
+--cloud [description|session_id|url]
+-c, --continue
+--dangerously-skip-permissions
+-d, --debug [filter]
+--debug-file <path>
+--desktop
+--disable-slash-commands
+--disallowedTools, --disallowed-tools <tools...>
+--effort <level>
+--environment <environment_id>
+--exclude-dynamic-system-prompt-sections
+--fallback-model <model>
+--file <specs...>
+--fork-session
+--forward-subagent-text
+--from-pr [value]
+-h, --help
+--ide
+--include-hook-events
+--include-partial-messages
+--input-format <format>
+--json-schema <schema>
+--max-budget-usd <amount>
+--mcp-config <configs...>
+--model <model>
+-n, --name <name>
+--no-chrome
+--no-session-persistence
+--output-format <format>
+--permission-mode <mode>
+--permission-prompts <target>
+--plugin-dir <path>
+--plugin-url <url>
+-p, --print
+--prompt-suggestions [value]
+--remote-control [name]
+--remote-control-session-name-prefix <prefix>
+--replay-user-messages
+--restricted
+-r, --resume [value]
+--safe-mode
+--session-id <uuid>
+--setting-sources <sources>
+--settings <file-or-json>
+--strict-mcp-config
+--system-prompt <prompt>
+--system-prompt-snapshot <on|off>
+--teleport [session]
+--tmux
+--tools <tools...>
+--verbose
+-v, --version
+-w, --worktree [name]
+"""
+HELP_ARGS = {}                      # flag -> '' none, 'one', 'many' or 'maybe'
+for _line in HELP_2_1_311.strip().splitlines():
+    _m = re.fullmatch(r"(-[\w-]+(?:, -[\w-]+)*)(?: (.+))?", _line)
+    _arg = _m.group(2) or ""
+    for _n in _m.group(1).split(", "):
+        HELP_ARGS[_n] = ("" if not _arg else "maybe" if _arg.startswith("[")
+                         else "many" if _arg.endswith("...>") else "one")
+SETS = {"boolean": W.RESUME_FLAGS_BOOL, "value": W.RESUME_FLAGS_VALUE,
+        "file": W.RESUME_FLAGS_FILE, "list": W.RESUME_FLAGS_MANY,
+        "dropped": W.RESUME_FLAGS_DROP}
+WANT = {"boolean": "", "value": "one", "file": "one", "list": "many"}
+unclassified, misshapen = [], []
+for _n, _arg in sorted(HELP_ARGS.items()):
+    _in = [k for k, s in SETS.items() if _n in s]
+    if len(_in) != 1:
+        unclassified.append(f"{_n} ({' and '.join(_in) or 'nowhere'})")
+    elif _in[0] == "dropped":
+        # The word after a dropped flag that REQUIRES a value is that value,
+        # whatever it looks like -- or it would come back as a flag.
+        if (_n in W._DROP_TAKES_VALUE) != (_arg in ("one", "many")):
+            misshapen.append(_n)
+    elif _arg != WANT[_in[0]]:
+        misshapen.append(_n)
+check(f"every one of the {len(HELP_ARGS)} options in claude's --help is classified "
+      f"exactly once" + (f": {unclassified}" if unclassified else ""),
+      len(HELP_ARGS) == 77 and not unclassified)
+check("...each with the argument the help gives it (a value read as a flag is a "
+      "flag the original never had)" + (f": {misshapen}" if misshapen else ""),
+      not misshapen and W._DROP_TAKES_VALUE <= W.RESUME_FLAGS_DROP)
+
+# THE PROPERTY THAT MATTERS, over every short argv a pool of awkward words can
+# make: claude, reading what is replayed plus `--resume SID`, must resume SID,
+# see no prompt, and see no option or value the original launch did not have.
+# parse() reads words the way claude's own parser (commander) does, by the
+# argument shapes in the help above -- not by resume_flags' sets.
+
+
+def parse(words):
+    """claude's reading of `words`: (set of (flag, value), [prompt words])."""
+    opts, prompt, i, many = set(), [], 0, None
+    while i < len(words):
+        w = words[i]
+        i += 1
+        flagish = len(w) > 1 and w.startswith("-")
+        if many and not flagish:
+            opts.add((many, w))
+            continue
+        many = None
+        if w == "--":
+            prompt += words[i:]
+            break
+        if not flagish:
+            prompt.append(w)
+            continue
+        flag, eq, val = w.partition("=")
+        if eq and w.startswith("--") and HELP_ARGS.get(flag):
+            opts.add((flag, val))           # --flag=value: one value, no more
+            continue
+        kind = HELP_ARGS.get(w)
+        short = "-" + w[1:2]
+        if kind is None and len(w) > 2 and short != "--" and short in HELP_ARGS:
+            # A cluster: -cn is -c, then -n. A letter that takes a value takes
+            # the rest of the word as that value (-nc names the session "c").
+            if HELP_ARGS[short]:
+                opts.add((short, w[2:]))
+            else:
+                opts.add((short, None))
+                words = words[:i] + ["-" + w[2:]] + words[i:]
+            continue
+        if kind in ("one", "many") and i < len(words):
+            opts.add((w, words[i]))         # required: the next word, whatever it is
+            i += 1
+            many = w if kind == "many" else None
+        elif kind == "maybe" and i < len(words) and not (
+                len(words[i]) > 1 and words[i].startswith("-")):
+            opts.add((w, words[i]))
+            i += 1
+        else:
+            opts.add((w, None))
+    return opts, prompt
+
+
+POOL = ["--model", "opus", "--name", "--dangerously-skip-permissions", "--add-dir",
+        "--mcp-config", "s.json", "--", "-w", "--system-prompt", "--model=x",
+        "--resume", "fix it", "-cn", "-nc"]
+bad = []
+for _len in range(1, 5):
+    for _argv in itertools.product(POOL, repeat=_len):
+        _out = W.resume_flags(list(_argv), cwd=rf_dir)
+        _was, _ = parse(list(_argv))
+        _now, _prompt = parse(_out + ["--resume", "SID"])
+        if (_prompt or ("--resume", "SID") not in _now
+                or not (_now - {("--resume", "SID")}) <= _was):
+            bad.append((list(_argv), _out))
+check(f"replayed + `--resume SID` always resumes SID, with no prompt and nothing "
+      f"the original lacked ({sum(len(POOL) ** k for k in range(1, 5))} argvs)"
+      + (f": first of {len(bad)} {bad[0]}" if bad else ""),
+      not bad)
+
+# ...AND NEVER FREER THAN THE ORIGINAL. Every restriction claude read in the
+# launch -- a tool list, a deny list, a permission mode short of bypass,
+# --restricted -- it reads in the replay too, or nothing is replayed at all.
+RPOOL = ["--tools", "Read", "--disallowedTools", "--permission-mode", "plan",
+         "--restricted", "--dangerously-skip-permissions", "-cn", "-nc", "--name", "--"]
+bad, _ran = [], 0
+for _len in range(1, 5):
+    for _argv in itertools.product(RPOOL, repeat=_len):
+        _out = W.resume_flags(list(_argv))
+        _was, _ = parse(list(_argv))
+        if any(v is None and HELP_ARGS.get(f) in ("one", "many") for f, v in _was):
+            continue                        # a value missing: claude never started
+        _ran += 1
+        _now, _prompt = parse(_out + ["--resume", "SID"])
+        _lost = {(f, v) for f, v in _was if f in _restrict
+                 and (f, v) != ("--permission-mode", "bypassPermissions")} - _now
+        if (_prompt or ("--resume", "SID") not in _now
+                or not (_now - {("--resume", "SID")}) <= _was or (_lost and _out)):
+            bad.append((list(_argv), _out))
+check(f"...and every restriction the original had is replayed, or no flag is "
+      f"({_ran} argvs claude would start)"
+      + (f": first of {len(bad)} {bad[0]}" if bad else ""),
+      bool(_restrict) and not bad)
 
 # The move itself, with the exec stubbed: it must land in the conversation's own
 # directory. `claude --resume <id>` looks for the transcript under the project

@@ -127,7 +127,14 @@ python3 tools/test_workflow_daemon.py # the daemon's half of the workflow band, 
                                       # firmware's grammar and every line ASCII and
                                       # short enough for the Nano; the queue JSON's
                                       # 'workflows'; and --mock walking the band
-                                      # through every status (needs pyserial)
+                                      # through every status. Then, with the device
+                                      # unplugged, GO, ACK, CONTINUE and FOLLOW on the
+                                      # selection and MIRROR opening nothing; and the
+                                      # history writer dating a deletion by when it
+                                      # last saw the record (claude -c picking a
+                                      # deleted chat up again keeps it from its first
+                                      # turn) and writing the record before its
+                                      # transcript link (needs pyserial)
 
 python3 tools/test_workflow_fw.py     # the firmware's half. First, with no compiler
                                       # needed: the two copies of workflow.h are
@@ -193,6 +200,37 @@ python3 tools/test_ble_link.py        # the BLE transport, both halves. Starts w
                                       # static checks that the firmware has ONE
                                       # gamepad row, that it is persisted, and that
                                       # I| landed on the config side of the verb split
+
+python3 tools/test_history.py         # the chat history, against a temp HOME and
+                                      # with no Claude: field 9 from the wrapper's
+                                      # own line through the daemon's parser (a '|'
+                                      # and a non-UTF-8 directory name come through
+                                      # whole; a bad key costs only that key, a
+                                      # control character its path; a line cut short
+                                      # keeps its state and loses its field 9); the
+                                      # socket thread outliving a history fault;
+                                      # select|<key>; the writer's rules — a record
+                                      # only after a turn, a deleted one back only
+                                      # after a new turn, a session that never ran a
+                                      # turn unable to repoint one, `end` closing it
+                                      # and a turn reopening it, the kept hard link,
+                                      # no write for a keepalive; resume with the
+                                      # exec stubbed — where, as whom, with which
+                                      # flags, and what it refuses: open in a
+                                      # terminal (looked at again before the exec,
+                                      # a picker's chat by the transcript its
+                                      # terminal found, context files believed only
+                                      # in a directory of yours), a deleted profile,
+                                      # and a transcript written moments ago, which
+                                      # is a question; by index, which chat it is
+                                      # and Enter first; Raise skipping a killed
+                                      # terminal's row; then a real daemon fed by
+                                      # the wrapper's send_daemon(), SIGKILLed and
+                                      # started again, old line shapes and --mock
+                                      # keeping nothing, and the CLI listing (every
+                                      # name whole on a pipe) and deleting with no
+                                      # daemon at all, liveness from the terminals'
+                                      # context files (needs pyserial)
 ```
 
 Each prints a `PASS`/`FAIL` checklist and exits non-zero on failure, so they
@@ -432,9 +470,12 @@ and watch the frame and the LED update accordingly:
 - `done` → `DONE` frame, flashing + a looping `V|DONE` cascade.
 - `working` (nothing else pending) → `WORK` frame, steady + one-shot `V|START`.
 
-Then a **workflow**, in the wrapper's nine-field form — field 3 a control-socket
+Then a **workflow**, the way the wrapper sends one — field 3 a control-socket
 path (any non-empty one will do), fields 4–7 empty (empty means *keep*), field 8
-one running record (`st;done;total;failed;pct;elapsed_s;tokens;note;name`):
+one running record (`st;done;total;failed;pct;elapsed_s;tokens;note;name`). The
+wrapper sends ten fields; these lines stop at the ninth and leave off field 9,
+the conversation, which the daemon then takes as *unknown* — exactly what an
+older wrapper sends:
 
 ```sh
 $REPO/tools/feed.sh 'working|wf-demo|demo|/tmp/feed-demo.sock|||||R;2;5;;40;159;542800;;deployment-risk-sweep'
@@ -461,6 +502,11 @@ half; send the line again to bring it back. (A line with field 3 empty, the way
 the hook sends it, has no such timeout: its record stays until replaced,
 cleared with `-`, or the session is pruned.) A finished `D` record goes on its
 own after at most 60 s either way.
+
+**Leave field 9 off by hand.** A wrapper line carrying a conversation id, with
+a `working` after it, puts that chat in your real history, at
+`~/.config/claude-mate/history` — `claude-mate history rm` takes it out again.
+`tools/test_history.py` drives that path against a temporary `HOME` instead.
 
 Pass criterion: feeding socket lines drives the frame + LED per
 [PROTOCOL.md](PROTOCOL.md), and a field-8 line puts up, changes and clears the
@@ -510,6 +556,22 @@ holds, and the session stays `WORK`. Do the same in the half-minute a finished
 run lingers: its band stays up, rather than blinking off and on. And stop a
 run on purpose once: it reads `running` for about 10 s more, then `ended`, its
 clock stepping back to where it stopped.
+
+**So does the chat history.** In a wrapped session, run one turn and then quit
+— `/exit`, or close the terminal window, which sends the wrapper a SIGHUP it
+answers with `end`: `claude-mate history` lists the chat `closed` (the daemon's
+log says `history: kept …` once and `… closed` once). `history resume` brings it
+back in the same directory, as the same account, with the same permission mode
+and model — asking first, while its transcript was written under two minutes
+ago. Then `kill -9` a wrapped session's wrapper, the one way it cannot say
+goodbye: within a minute the chat reads `interrupted` and resumes — its context
+file's process is gone at once, and the daemon's row stops counting once it has
+missed three keepalives — though the device lists the session until the TTL
+prune. While a chat is open, stop the daemon:
+`claude-mate history` still lists it `open`, from that terminal's context file,
+and `history resume` refuses it. Last, `claude -c` in a directory that has an
+older chat: once its first turn has run, `claude-mate history` lists the chat
+it continued, `open`.
 
 ---
 

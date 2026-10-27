@@ -21,6 +21,7 @@ import json
 import os
 import pty
 import re
+import site
 import socket
 import subprocess
 import sys
@@ -28,6 +29,7 @@ import tempfile
 import threading
 import time
 import tty
+import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -78,15 +80,27 @@ def pty_drain():
 
 threading.Thread(target=pty_drain, daemon=True).start()
 
+HOME = os.path.join(tmp, "home")
+os.makedirs(HOME)
+
 env = dict(os.environ)
 env.update({
     "CLAUDE_MATE_SOCK": SOCK,
     "CLAUDE_MATE_PORT": os.ttyname(slave_fd),
     "CLAUDE_MATE_ACCOUNTS_DIR": ACCTS,
     "PYTHONUNBUFFERED": "1",
+    # A HOME AND A TMPDIR OF ITS OWN, for the daemon and the CLI alike. The
+    # daemon keeps a history of chats under ~/.config/claude-mate and the CLI
+    # reads it -- and the terminals' context files under TMPDIR -- so a run
+    # against the real ones would write the developer's history, or read it.
+    # The user site stays importable, in case that is where pyserial lives.
+    "HOME": HOME,
+    "PYTHONUSERBASE": site.getuserbase(),
+    "TMPDIR": tmp,
 })
 env.pop("CLAUDE_MATE_TCP", None)
 env.pop("CLAUDE_MATE_BLE", None)
+env.pop("CLAUDE_CONFIG_DIR", None)
 
 print("== starting a daemon (PTY device, no radios) ==")
 proc = subprocess.Popen([sys.executable, DAEMON], env=env, cwd=ROOT,
@@ -299,6 +313,9 @@ try:
     check("...and rejects one that does not exist", rc != 0)
     rc, out = cli("--help")
     check("`--help` explains itself", rc == 0 and "press" in out.lower())
+    check("...and lists the history commands",
+          all(f"claude-mate history{x}" in out
+              for x in ("", " resume", " rm", " clear")))
 
     # --- a failed start says WHY --------------------------------------------- #
     # THE REGRESSION THIS EXISTS FOR. On a real machine the daemon crash-looped
@@ -411,6 +428,92 @@ try:
                        capture_output=True, text=True, timeout=30)
     check("...and deletes it when the name is typed back",
           not os.path.exists(os.path.join(ACCTS, "spare")))
+
+    # --- history ------------------------------------------------------------ #
+    # THE CHATS THE DAEMON KEPT, read and deleted by the CLI in its own process
+    # and never over the socket, for the reason accounts rm gives. The records
+    # are planted by hand under this test's own HOME: the daemon writes them
+    # for wrapped sessions, and none run here.
+    print("\n== history ==")
+    hist = os.path.join(HOME, ".config", "claude-mate", "history")
+    rc, out = cli("history")
+    check("`claude-mate history` with nothing kept says so, and how a chat "
+          "comes to be kept", rc == 0 and "no chats kept yet" in out
+          and "first turn" in out)
+    proj = os.path.join(tmp, "proj_dir")
+    tdir = os.path.join(HOME, ".claude", "projects",
+                        re.sub(r"[^a-zA-Z0-9]", "-", proj))
+    for d in (proj, hist, tdir):
+        os.makedirs(d)
+    ids = {}
+    for key, ago, ended, title in (("new", 30, None, "add a history log"),
+                                   ("old", 7200, 1.0, "fix the tests")):
+        conv = ids[key] = str(uuid.uuid4())
+        with open(os.path.join(hist, conv + ".json"), "w") as fh:
+            json.dump({"v": 1, "conversation": conv, "name": "proj_dir",
+                       "cwd": proj, "config_dir": "", "account": "default",
+                       "flags": None, "last_active": time.time() - ago,
+                       "ended": ended}, fh)
+        with open(os.path.join(tdir, conv + ".jsonl"), "w") as fh:
+            fh.write(json.dumps({"type": "user", "cwd": proj}) + "\n")
+            fh.write(json.dumps({"type": "ai-title", "aiTitle": title}) + "\n")
+
+    def hist_rows():
+        rc, out = cli("history")
+        return rc, out, [ln.split() for ln in out.splitlines()
+                         if ln[:3].strip().isdigit()]
+
+    rc, out, rows = hist_rows()
+    check("...lists them newest first: index, short id, status, age, name, "
+          "account, title", rc == 0 and len(rows) == 2
+          and rows[0][:3] == ["0", ids["new"][:8], "interrupted"]
+          and rows[1][:3] == ["1", ids["old"][:8], "closed"]
+          and rows[0][4:6] == ["proj_dir", "default"]
+          and "add a history log" in out and "fix the tests" in out)
+    check("...under where it keeps them and how many, with no colour on a pipe",
+          f"{hist} · 2 chats" in out and "\x1b[" not in out)
+    # OPEN, BY THE TERMINAL'S OWN WORD. The daemon here knows nothing of the
+    # chat; the wrapper's context file -- its process alive, freshly written --
+    # is what keeps Resume and rm off a chat that is still running.
+    ctx = os.path.join(tmp, f"claude-mate-ctx-{os.getuid()}", "ttys999.json")
+    # 0700, as the wrapper makes it: the CLI believes these files only in a
+    # directory no one else can write, whatever the umask of the run.
+    os.makedirs(os.path.dirname(ctx), mode=0o700)
+    os.chmod(os.path.dirname(ctx), 0o700)
+    with open(ctx, "w") as fh:
+        json.dump({"pid": os.getpid(), "conversation": ids["new"],
+                   "updated_at": time.time()}, fh)
+    rc, out, rows = hist_rows()
+    check("a chat whose wrapper is still running reads 'open', from that "
+          "terminal's context file", rows and rows[0][2] == "open")
+    r = subprocess.run([sys.executable, CLI, "history", "rm", ids["new"][:8]],
+                       env=env, cwd=ROOT, input=ids["new"][:8] + "\n",
+                       capture_output=True, text=True, timeout=30)
+    check("...and is not deleted, even with its id typed back: it would come "
+          "back on its next turn", r.returncode != 0
+          and "still open" in r.stdout + r.stderr
+          and os.path.exists(os.path.join(hist, ids["new"] + ".json")))
+    os.unlink(ctx)
+    r = subprocess.run([sys.executable, CLI, "history", "rm", ids["old"][:6]],
+                       env=env, cwd=ROOT, input="fix the tests\n",
+                       capture_output=True, text=True, timeout=30)
+    check("`history rm` without its id typed back deletes nothing -- not even "
+          "for its title", r.returncode == 1 and "not deleted" in r.stdout
+          and os.path.exists(os.path.join(hist, ids["old"] + ".json")))
+    r = subprocess.run([sys.executable, CLI, "history", "rm", "1"],
+                       env=env, cwd=ROOT, input=ids["old"][:8] + "\n",
+                       capture_output=True, text=True, timeout=30)
+    check("...and forgets it, by its index, when the id is typed back",
+          r.returncode == 0
+          and not os.path.exists(os.path.join(hist, ids["old"] + ".json"))
+          and os.path.exists(os.path.join(tdir, ids["old"] + ".jsonl")))
+    rc, out = cli("history", "rm", "zz")
+    check("...and an argument that is neither an index nor an id is refused",
+          rc != 0 and "4+ characters of its id" in out)
+    rc, out = cli("history", "resume", "0")
+    check("`history resume` refuses without a terminal on both ends, rather "
+          "than run claude untracked", rc != 0 and "terminal on both ends" in out)
+
     # --- the manual, pinned to the code ------------------------------------ #
     # Docs rot silently, and this set in particular: a command added to the CLI
     # and not to the manual is a command nobody finds, and one removed from the
@@ -452,7 +555,7 @@ try:
         if re.search(r"(is|are)\s+`?chmod 0666", text):
             stale.append(name)
     check("...and nothing still describes it as world-writable", not stale)
-    for extra in ("select", "accounts", "watch"):
+    for extra in ("select", "accounts", "watch", "history"):
         check(f"...and `{extra}`", extra in using)
     check("...as is the one-command install, verbatim",
           "./install/install.sh --yes" in using)

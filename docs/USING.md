@@ -32,15 +32,16 @@ Leave off `--yes` and it asks before touching `settings.json` — that is the on
 question it has. It is idempotent: re-run it after a `git pull`.
 
 **Then feed it.** Either alias `claude` to the PTY wrapper, which is what gets
-you model, effort, account and limit on the screen, and a running workflow's
-progress:
+you model, effort, account and limit on the screen, a running workflow's
+progress, and every chat kept in [History](#history) until you delete it:
 
 ```sh
 echo 'alias claude="'"$PWD"'/bin/claude-mate-wrap"' >> ~/.zshrc && exec zsh
 ```
 
 …or rely on the hooks alone, which give you states but not the extras — no
-model, effort, account or limit, and no [workflow band](#the-workflow-band).
+model, effort, account or limit, no [workflow band](#the-workflow-band), and
+nothing kept in History.
 
 **Check it:**
 
@@ -51,7 +52,8 @@ claude-mate-connect      # every link, with a verdict
 
 Uninstall with `./install/uninstall.sh` — it removes the agent, the hook and its
 own symlinks, leaves your `settings.json` alone, and tells you which block to
-delete.
+delete. Your [chat history](#history) stays where it is, and it says so: it may
+hold the only copy of a conversation.
 
 ---
 
@@ -112,6 +114,7 @@ On a terminal, with no arguments, you get an app rather than a printout:
 
   ▸  Start new session
      Start new session · skip permissions
+     History · resume or delete a past chat
      Device · link status and pairing
      Accounts · switch or review
      Quit
@@ -128,6 +131,10 @@ and `a` / `f` / `m` / `c` are acknowledge, follow, mirror and continue.
 so the daemon sees it. The second entry adds `--dangerously-skip-permissions`;
 it is a separate entry rather than a setting because that is a decision worth
 naming out loud. Put anything else you want in `CLAUDE_MATE_NEW_ARGS`.
+
+**History** is every chat the daemon has kept, open or closed — pick one to
+raise its terminal, resume it where and as it was, or delete it. See
+[History](#history) below.
 
 If the daemon is not running, the app says so and `r` starts it.
 
@@ -148,8 +155,10 @@ claude-mate watch               # ...and keep printing it
 ```
 
 `>` marks the row that is **on the device's glass** — the one a press acts on.
-`<-- needs you` is an unacknowledged alert. The right-hand columns are model,
-effort, account and how much of that account's plan limit is left.
+With no device linked there is no glass, and `>` marks the selected row, which
+is what a press acts on then. `<-- needs you` is an unacknowledged alert. The
+right-hand columns are model, effort, account and how much of that account's
+plan limit is left.
 
 A session running a dynamic workflow gets an indented line under it for each
 workflow the daemon has: the name, the status word and whatever progress is
@@ -175,6 +184,10 @@ not show it* from *the daemon never got it*.
 | `select <n\|name>` | *(none)* | point at a row instead of stepping to it |
 | `accounts` | — | the saved logins |
 | `accounts rm <n\|name>` | — | delete one |
+| `history` | — | the chats it has kept, newest first |
+| `history resume <n\|id>` | — | pick one up again, where and as it was |
+| `history rm <n\|id>` | — | forget one, after typing its id back |
+| `history clear` | — | forget every chat that is not open |
 
 **`select` is the only command the device has no equivalent for** — it walks
 there with PREV/NEXT. It takes an index from the listing, or a name: exact first,
@@ -191,6 +204,13 @@ is open, GO closes the mirror before raising a real window, and a browser page
 holding the gamepad grab swallows presses from either source.
 
 There is no second implementation of GO to drift.
+
+**With no device linked, a press acts on the selection** — the row `select`,
+`next` or `prev` last pointed at. A press means *the session on the glass*, and
+with the cable pulled or a battery device asleep there is none: it used to mean
+the last session drawn before the device went, so `claude-mate select api` then
+`claude-mate go` raised and acknowledged some other terminal. `mirror`, a view
+of the glass, opens nothing until a device is back.
 
 ### Accounts
 
@@ -217,7 +237,11 @@ claude-mate accounts rm work     # or `rm 2` — an index, for names you cannot 
 It shows you the name, the email and the directory, then asks you to **type the
 name back**. A y/n on a destructive action is a reflex; typing the name is a
 decision, and it also proves you are deleting the one you think you are. There is
-no undo: the profile's login and every transcript under it go with it.
+no undo: the profile's login and every transcript under it go with it — except
+the chats [History](#history) kept from it, whose kept links outlive the
+profile. The summary says how many there are. Resuming one of those waits for
+the profile: make it again and log in, and the kept copy goes back where
+`--resume` looks — until then, resume refuses and says the chat is kept.
 
 `default` is your `~/.claude` login rather than a profile, and this command will
 not delete it.
@@ -232,6 +256,84 @@ numbers — use `claude-mate-switch`.
 > Even at `0600`, deletion stays out: a hook firing a malformed line should not
 > be able to remove a login. So `accounts rm` deletes in the CLI's own process
 > and only asks the daemon to re-read afterwards.
+
+### History
+
+```sh
+claude-mate history
+```
+
+```
+  0  3f2a9c1e  open          2m  claude_mate  work     add a history log to the daemon
+  1  8c41d07a  closed        3h  claude_mate  default  fix the flaky wrapper test
+  2  b7e05f93  interrupted  41d  api-server   work     why does the healthcheck 502 after deploy
+
+/Users/you/.config/claude-mate/history · 3 chats · 1.2 MB kept only here
+```
+
+Closing a terminal used to be the end of a chat as far as Claude Mate knew, and
+so was a crash or a reboot. Now every chat a **wrapped** session has run a turn
+in is kept — a record of where it ran, as whom and how it was started, and a
+hard link to its transcript — until *you* delete it. `open` is in a terminal
+right now; `closed` said goodbye; `interrupted` never did — a crash, a killed
+wrapper, a machine that went down with it — and those are the ones you will
+want back. The title is the name you gave the chat, else Claude's, else the
+last thing you asked.
+
+```sh
+claude-mate history resume 2     # its directory, its account, its flags
+```
+
+Resume runs it through the wrapper — so it is on the device again — in the
+directory it ran in, under the login it ran as, and with the flags it was
+started with: the permission mode, the model and the effort come back, the
+opening prompt never does, and a deny list or `--restricted` comes back or no
+flag does. `--skip-permissions` or `--ask-permissions` changes the permission
+mode and nothing else. It refuses rather than guess, and says what it checked:
+a chat that is still open somewhere (two claudes on one transcript fork it —
+raise that terminal instead), a profile or a directory that is gone, no
+transcript left anywhere, or no terminal to hand it. Given a number, it first shows you which chat that
+is now — the list reorders as chats run — and waits for Enter. And a chat whose
+transcript was written in the last two minutes, with no terminal claude-mate
+can see holding it, is a question rather than a go: something it cannot see —
+claude run without the wrapper, the VS Code panel — may still be writing it.
+Type `yes` to resume it anyway; in the app it is a yes/no that starts on *No*.
+
+```sh
+claude-mate history rm 1         # or 4+ characters of its id: rm 8c41
+claude-mate history clear        # every chat that is not open
+```
+
+`rm` shows you the chat and asks you to **type its id back** — the eight
+characters in the list. A chat's name is its directory's, shared by every chat
+in that project, and the numbers move as chats run; the id is the one thing
+that says which. `clear` asks you to type `clear`. Neither touches a chat that
+is open: it would be back on its next turn.
+
+**Deleting a record deletes its kept link.** While Claude Code still has its own
+copy of the transcript, nothing is lost. When the kept link is the **only** copy
+— Claude's was cleaned up after `cleanupPeriodDays` (30 days by default),
+purged, or went with a deleted profile — the conversation goes with it, and
+there is no undo. The confirmation says when that is so, and the footer says how
+much of it there is (*kept only here*).
+
+**What is not kept.** Only wrapped sessions are recorded, so **a `.pkg` install
+keeps nothing** — it ships no wrapper — and neither do a bare `claude` or the
+VS Code panel. Nor is a chat that never ran a turn, or one whose turns all ran
+while the daemon was down: only the daemon writes records, and only for a turn
+it saw start. A session that has to find its conversation for itself — the
+first after a Claude Code update, `--fork-session`, and `-c`, `-r <name>`, the
+picker or `--from-pr`, which carry on one already there — looks once its own
+first turn has run, and gives up rather than guess if another terminal in that
+directory started or carried on a chat meanwhile. `/clear` or `/resume` typed
+inside a running session switches conversations, and the record stays with the
+one it started as.
+
+In the app it is the **History** row: open a chat to raise its terminal, resume
+it — the permission mode is in the label, never hidden — or delete it, behind a
+chooser that starts on *No*. The deleting is done the way `accounts rm` does
+it, for the reason in the note above: in the CLI's own process. The daemon is
+asked only which chats are open, never to delete one.
 
 ---
 
@@ -540,6 +642,11 @@ claude-mate-connect
 | `ble: start the daemon with --ble` | the device is fine and waiting; the daemon has BLE off |
 | the daemon says `no device found yet` while the device says it is advertising | macOS Bluetooth permission for the daemon's Python, in **Privacy & Security → Bluetooth** |
 | no model/effort/account on the screen | those come from the PTY wrapper — alias `claude` to `claude-mate-wrap` |
+| a chat you had is not in `claude-mate history` | it was never kept. It ran unwrapped (a bare `claude`, the VS Code panel, any `.pkg` install), or never ran a turn; or the daemon never saw one of its turns start — only the daemon writes records, so a chat whose turns all ran while it was down, or while a daemon from before the history was still running, is not kept; or the wrapper could not tell which conversation it was — a session that has to find its id (the first after a Claude Code update, `--fork-session`, and `-c`, `-r <name>`, the picker or `--from-pr`) gives up rather than guess when another terminal in that directory started or carried on a chat during its first turn. One you switched with `/clear` inside the session is under the conversation it started as |
+| a closed chat still reads `open` | a terminal still has it — the daemon's queue or a running wrapper's context file says so; close that terminal, or raise it from History. A wrapper killed without a word (`kill -9`) holds it open for up to a minute — until it has missed three keepalives — and the device lists that session until the daemon prunes it |
+| `history resume` says there is no transcript | Claude Code's copy is gone and there is no kept link beside the record: the history sits on a different volume from the transcripts, where a hard link cannot go (the daemon's log says so, once), or the `.jsonl` beside the record was deleted by hand. The message says where it looked |
+| `history resume` says the account profile no longer exists | `accounts rm` deleted it, and its login with it. When it says the conversation is kept, make the profile again — the directory the message names: `mkdir -p` it, or type that name at the picker — log in there, and resume again: the kept copy goes back where `--resume` looks |
+| `history resume` asks before it resumes | its transcript was written in the last two minutes and no terminal claude-mate can see has the chat. Something it cannot see may — claude run without the wrapper, the VS Code panel, a session opened by `-r <name>` or the picker that has not run a turn yet — and two claudes on one transcript fork it. If nothing is writing it (you closed it a moment ago), type `yes` |
 | a workflow is running but the device shows no band | in order: the glass is on another session — the band follows the selected one, so step to it; a notice is up — the band steps aside for its ~4 s — or, on the S3, the menu or the mirror is, since the band is drawn on the main screen only; the session is not wrapped — a hook-only session has no band, and a `.pkg` install on its own ships no wrapper; the firmware predates it — the S3 needs `s3-2.3` or later (SETTINGS → About), the Nano a reflash; or Claude Code has redrawn its workflow row and the wrapper no longer reads it — if `claude-mate status` lists no workflow under the session either, that is the one. Listed first under the `>` row, with the main screen up and still no band, is the firmware |
 | the band shows `40%`, not `2/5` | the terminal is narrower than ~85 columns: Claude drops the counts first, and the band falls back to the bar's percentage |
 | the band says `ended` for a run you did not stop | Claude draws a failed run and a stopped one alike — red, clock frozen. The terminal's transcript says which |

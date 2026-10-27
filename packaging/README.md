@@ -74,6 +74,11 @@ pkgutil --expand packaging/dist/ClaudeMate-<ver>-unsigned.pkg /tmp/cm-expand
 ./packaging/uninstall-pkg.sh
 ```
 
+It leaves `~/.config/claude-mate/` alone — the token, and the chat history if a
+wrapper ever fed one (see below) — and says so when there is a history: it may
+hold the only copy of a conversation, so deleting it is yours to decide
+(`rm -r ~/.config/claude-mate/history`).
+
 ## Files
 
 | File | Purpose |
@@ -97,6 +102,14 @@ pkgutil --expand packaging/dist/ClaudeMate-<ver>-unsigned.pkg /tmp/cm-expand
   with absolute log paths instead.
 - Firmware is **not** flashed by the pkg — it's copied to the payload for
   reference only.
+- **A `.pkg` install records no chat history.** The daemon keeps a chat only
+  when a wrapped session names its conversation (field 9 of the socket line,
+  [PROTOCOL.md](../docs/PROTOCOL.md#chat-history)), and the package ships no
+  wrapper — nor the `claude-mate` CLI that lists, resumes and deletes kept
+  chats. The hook alone never names one, so nothing is written to
+  `~/.config/claude-mate/history`. A wrapper from a repo checkout reporting to
+  this daemon is a different matter: then the history is kept, under that path,
+  and that checkout's `claude-mate history` is how to see and delete it.
 - **AppleDouble (`._*`) in the payload:** macOS stamps a SIP-protected
   `com.apple.provenance` xattr that `pkgbuild` encodes as `._*` files. A normal
   Terminal build is clean; some managed/sandboxed environments stamp it on every
