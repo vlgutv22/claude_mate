@@ -1933,7 +1933,8 @@ try:
               bool(up) and not os.path.exists(HIST_R),
               ascii(" | ".join(dlog[-4:])))
         check("...and says where it keeps it",
-              any("history: ~/.config/claude-mate/history" in x for x in dlog))
+              wait_for(lambda: any("history: ~/.config/claude-mate/history"
+                                   in x for x in dlog), 5))
         w1 = Wrapper(SOCK_R, CHAT_D, flags=W.resume_flags(
             ["--model", "opus", "--dangerously-skip-permissions",
              "fix the tests"]))
@@ -1997,9 +1998,14 @@ try:
         closed = wait_for(lambda: (read_json(RP) or {}).get("ended"), 8)
         check("its `end` closes the record -- this daemon never saw it run a "
               "turn, and need not have", bool(closed))
-        check("...with one log line for it",
-              sum(1 for x in dlog if "history: proj|pipe" in x
-                  and UR[:8] in x and x.endswith("closed")) == 1,
+        # THE LOG LINE TRAILS THE FILE: the writer logs after its rename, and
+        # stderr reaches this test through a reader thread -- read at once,
+        # a slow runner (CI's Python 3.9) saw the record closed and no line.
+        def closed_lines():
+            return [x for x in dlog if "history: proj|pipe" in x
+                    and UR[:8] in x and x.endswith("closed")]
+        wait_for(closed_lines, 5)
+        check("...with one log line for it", len(closed_lines()) == 1,
               ascii([x for x in dlog if "history" in x]))
         rc, out, err = cli("history", home=HOME_R, sock=SOCK_R)
         check("...and the list says closed, though a hook's row for the same "
