@@ -21,11 +21,14 @@ Run:   python3 tools/test_app.py
 import fcntl
 import importlib.machinery
 import importlib.util
+import io
+import json
 import os
 import pty
 import re
 import select
 import shutil
+import site
 import struct
 import subprocess
 import sys
@@ -33,6 +36,7 @@ import tempfile
 import termios
 import time
 import unicodedata
+import uuid
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CLI = os.path.join(REPO, "bin", "claude-mate")
@@ -64,6 +68,26 @@ M = load(CLI, "cmate")
 # where it lives rather than through whichever script happens to re-export it.
 sys.path.insert(0, os.path.join(REPO, "bin"))
 import claude_mate_ui as UI  # noqa: E402
+
+# A HOME OF ITS OWN for every run of the CLI in this file. The app reads the
+# chats the daemon kept from ~/.config/claude-mate/history, and a test run
+# against the developer's real one would put his chats in its frames: one
+# result on his machine, another in CI. TMPDIR too, because the terminals'
+# context files there say which chats are open, and the accounts dir, because a
+# chat with no recorded login is looked for in every profile.
+SANDBOX = tempfile.mkdtemp(prefix="cm-app-")
+HOME = os.path.join(SANDBOX, "home")
+os.makedirs(HOME)
+
+
+def cli_env(home=HOME):
+    env = dict(os.environ)
+    env.update({"HOME": home, "PYTHONUSERBASE": site.getuserbase(),
+                "TMPDIR": SANDBOX,
+                "CLAUDE_MATE_ACCOUNTS_DIR": os.path.join(SANDBOX, "no-accounts")})
+    env.pop("CLAUDE_CONFIG_DIR", None)
+    env.pop("CLAUDE_MATE_ACCOUNT", None)
+    return env
 
 
 # --------------------------------------------------------------------------- #
@@ -127,7 +151,8 @@ def run_piped(args, stdin_devnull=True):
     with open(os.devnull) as null:
         return subprocess.run([sys.executable, CLI] + args,
                               stdin=null if stdin_devnull else None,
-                              capture_output=True, text=True, timeout=30)
+                              capture_output=True, text=True, timeout=30,
+                              env=cli_env())
 
 
 r = run_piped([])
@@ -171,7 +196,8 @@ check("...and the daemon command", "claude-mate daemon" in r.stdout)
 print("\n== the app, driven with arrow keys ==")
 
 
-def drive(keystrokes, settle=0.45, warmup=1.5):
+def drive(keystrokes, settle=0.45, warmup=1.5, home=HOME, size=(40, 100),
+          env_extra=None):
     m_in, s_in = pty.openpty()
     m_out, s_out = pty.openpty()
     # GIVE THE PTY A SIZE. openpty() leaves the window at 0x0, and a program
@@ -179,11 +205,13 @@ def drive(keystrokes, settle=0.45, warmup=1.5):
     # which is exactly how the app came to be silently dropping its last line.
     # A real terminal always has a size, so the test should provide one too;
     # the app now also floors it, and both halves are worth keeping.
-    fcntl.ioctl(s_out, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 100, 0, 0))
-    env = dict(os.environ)
+    fcntl.ioctl(s_out, termios.TIOCSWINSZ,
+                struct.pack("HHHH", size[0], size[1], 0, 0))
+    env = cli_env(home)
     # A socket that cannot exist, so the app runs in its no-daemon shape and
     # this test never depends on a daemon being up on the machine running it.
     env["CLAUDE_MATE_SOCK"] = "/tmp/claude-mate-test-nonexistent.sock"
+    env.update(env_extra or {})
     p = subprocess.Popen([sys.executable, CLI], stdin=s_in, stdout=s_out,
                          stderr=s_out, close_fds=True, env=env)
     os.close(s_in)
@@ -199,12 +227,18 @@ def drive(keystrokes, settle=0.45, warmup=1.5):
                     break
         return buf.decode("utf-8", errors="replace")
 
+    def press(k):
+        try:
+            os.write(m_in, k)
+        except OSError:             # it has gone: what it printed says why
+            pass
+
     frames = [drain(warmup)]
     for k in keystrokes:
-        os.write(m_in, k)
+        press(k)
         time.sleep(settle)
         frames.append(drain(settle))
-    os.write(m_in, b"q")
+    press(b"q")
     time.sleep(settle)
     frames.append(drain(1.0))
     try:
@@ -248,6 +282,9 @@ check("...and says which one skips permissions",
       "skip permissions" in menu)
 check("...and offers to start the daemon, saying start rather than restart "
       "when it is down", "start daemon" in menu)
+check("...and the History of past chats, as one row",
+      re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", frames[0].rsplit("\x1b[H", 1)[-1])
+      .count("History · resume or delete a past chat") == 1)
 
 # --------------------------------------------------------------------------- #
 # A session's workflow, drawn under it
@@ -406,6 +443,131 @@ check("narrower still (60): then the tokens and '+N more' go, and the word, "
           x in _sub60 for x in ("running", "an agent failed", "3/7")),
       repr(_sub60))
 
+# THE NOTE UNDER THE MENU, by the same rule. It is whatever a level below had
+# to say -- a resume refused because its directory is gone runs to 175
+# columns -- and painted raw it wrapped, pushed the frame past the bottom and
+# scrolled the header off the top: the failure above, by another door.
+print("\n== ...and neither does the note under the menu ==")
+_NOTE = ("\033[31mits directory /Users/me/Projects/claude_mate/.claude/"
+         "worktrees/feat-history no longer exists — claude finds the "
+         "conversation through it; recreate it, or delete the record\033[0m")
+_dn = M._draw(_TermOf(80), None, 0, M._rows(None), _NOTE, False)
+_nrows = [ln for ln in _dn if "\033[31m" in ln]
+check("a 175-column note is wrapped into at most three rows, and no line of "
+      "the frame is wider than 79 columns", 1 <= len(_nrows) <= 3
+      and all(_cols(ln) <= 79 for ln in _dn),
+      repr([(_cols(ln), ln) for ln in _dn if _cols(ln) > 79][:2]))
+check("...with every word of it, the end too",
+      "".join(_plain(_nrows)).replace(" ", "")
+      == _plain([_NOTE])[0].replace(" ", ""), repr(_plain(_nrows)))
+check("...each row in the note's colour, and reset at its end, so the colour "
+      "cannot run on", all(ln.startswith(" \033[31m") and ln.endswith("\033[0m")
+                           for ln in _nrows), repr(_nrows))
+_ML = ("\033[31mstarted it, but it exited immediately:\n"
+       "    ModuleNotFoundError: No module named 'serial'\n"
+       "  full log:  tail -f /Users/me/Library/Logs/claude-mate.err.log\033[0m")
+_mrows = [ln for ln in M._draw(_TermOf(40), None, 0, M._rows(None), _ML, False)
+          if "\033[31m" in ln]
+check("a note with line breaks of its own -- why the daemon died -- keeps "
+      "every line, each fitted to the width",
+      len(_mrows) >= 3 and all(_cols(ln) <= 39 and "\n" not in ln
+                               for ln in _mrows)
+      and "".join(_plain(_mrows)).replace(" ", "")
+      == _plain([_ML])[0].replace("\n", "").replace(" ", ""), repr(_mrows))
+
+# A REPAINT LEAVES NOTHING OF THE FRAME BEFORE. Term.paint erased only at the
+# end of each line, so the first row of a two-row note -- the chat menu's
+# cwd, the thing to read before Resume or Delete -- kept whatever the frame
+# before had drawn past it: another chat's title, run on after the path.
+print("\n== a repaint leaves nothing of the frame before ==")
+_CSI = re.compile(r"\x1b\[([0-9;?]*)([A-Za-z])")
+
+
+def _screen(data, rows=24, cols=80):
+    """The screen after `data`: as much of a terminal as Term.paint needs --
+    home, erase to the end of the line or of the screen, CR, LF and text,
+    colour codes taking no room."""
+    grid = [[" "] * cols for _ in range(rows)]
+    r = c = i = 0
+    while i < len(data):
+        m = _CSI.match(data, i)
+        if m:
+            if m.group(2) == "H":
+                r = c = 0
+            elif m.group(2) in ("K", "J"):
+                grid[r][c:] = [" "] * (cols - c)
+                if m.group(2) == "J":
+                    grid[r + 1:] = [[" "] * cols for _ in range(rows - r - 1)]
+            i = m.end()
+            continue
+        if data[i] == "\r":
+            c = 0
+        elif data[i] == "\n":
+            r = min(r + 1, rows - 1)
+        elif c < cols:
+            grid[r][c] = data[i]
+            c += 1
+        i += 1
+    return ["".join(row).rstrip() for row in grid]
+
+
+class _PaintTerm(UI.Term):
+    def __init__(self):             # nothing to set up: it paints into stdout
+        self.saved = None
+
+    def size(self):
+        return (80, 24)
+
+
+_buf, _stdout_was = io.StringIO(), sys.stdout
+sys.stdout = _buf
+try:
+    _pt = _PaintTerm()
+    _pt.paint([" HISTORY", ""] + [" " + "x" * 70] * 4)
+    _pt.paint([" CHAT · a chat", "", " /Users/me/p\n work · 3f2a9c1e",
+               " Back"])
+finally:
+    sys.stdout = _stdout_was
+_scr = _screen(_buf.getvalue())
+check("a two-row note painted over a wider frame: each of its rows is erased "
+      "past its end, so nothing of the old frame shows beside it",
+      _scr[2:6] == [" /Users/me/p", " work · 3f2a9c1e", " Back", ""],
+      repr(_scr[:6]))
+
+# --------------------------------------------------------------------------- #
+# The History row
+# --------------------------------------------------------------------------- #
+# ONE ROW ON THE TOP LEVEL, after the two that start a session -- the chats
+# themselves are a level down. The loops above already hold it to the rules
+# every row keeps (a label, one '▸', 79 columns); these pin where it sits and
+# that drawing it reads nothing: the top level repaints every second, and a
+# history is kept until someone deletes it, so it only ever grows.
+print("\n== the History row ==")
+_kinds = [r["kind"] for r in M._rows(None)]
+check("one History row, after the two Start rows and before Device",
+      _kinds == ["new", "new", "history", "device", "accounts", "quit"],
+      repr(_kinds))
+check("...labelled the way the other rows are: what it is · what it does",
+      M._rows(None)[2].get("label") == "History · resume or delete a past chat")
+check("...in the same place with sessions above it",
+      [r["kind"] for r in M._rows(_wf_snap)][2:5] == ["new", "new", "history"])
+_saved = (M.load_history, M.live_conversations, M.chat_title)
+
+
+def _no_disk(*_a, **_k):
+    raise AssertionError("the top level read the history")
+
+
+M.load_history = M.live_conversations = M.chat_title = _no_disk
+try:
+    M._draw(_Term(), _wf_snap, 2, M._rows(_wf_snap), None, True)
+    _pure = True
+except AssertionError:
+    _pure = False
+finally:
+    M.load_history, M.live_conversations, M.chat_title = _saved
+check("...and drawing the top level reads no history at all", _pure)
+
 # --------------------------------------------------------------------------- #
 # The shared chooser, and the picker every session goes through
 # --------------------------------------------------------------------------- #
@@ -417,11 +579,13 @@ check("narrower still (60): then the tokens and '+N more' go, and the word, "
 print("\n== the shared chooser ==")
 
 
-def drive_snippet(code, keystrokes, accounts_dir=None, warmup=1.5, settle=0.45):
+def drive_snippet(code, keystrokes, accounts_dir=None, warmup=1.5, settle=0.45,
+                  size=(40, 110)):
     """Run a python snippet under its own pty and feed it keys."""
     m_in, s_in = pty.openpty()
     m_out, s_out = pty.openpty()
-    fcntl.ioctl(s_out, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 110, 0, 0))
+    fcntl.ioctl(s_out, termios.TIOCSWINSZ,
+                struct.pack("HHHH", size[0], size[1], 0, 0))
     env = dict(os.environ)
     env["PYTHONPATH"] = os.path.join(REPO, "bin")
     if accounts_dir:
@@ -444,7 +608,10 @@ def drive_snippet(code, keystrokes, accounts_dir=None, warmup=1.5, settle=0.45):
 
     out = drain(warmup)
     for k in keystrokes:
-        os.write(m_in, k)
+        try:
+            os.write(m_in, k)
+        except OSError:             # it has gone: what it printed says why
+            break
         time.sleep(settle)
         out += drain(settle)
     try:
@@ -472,6 +639,17 @@ check("...and so does q", "CHOSE None" in out)
 out = drive_snippet(PICK, [b"2"])
 check("a digit still picks that row, for the old muscle memory",
       "CHOSE 'gamma'" in out)
+# A KEYBOARD LEFT IN ANOTHER LAYOUT. read_key hands a UTF-8 key over a byte at
+# a time, and the second byte of a Cyrillic 'в' is '²': a digit to
+# str.isdigit(), a ValueError to int() -- and a traceback where the chooser
+# was, the wrapper's account picker at the start of every session among them.
+out = drive_snippet(PICK, ["в".encode(), b"\r"])
+check("a Cyrillic 'в' (its second byte reads as '²') chooses nothing and "
+      "crashes nothing: Enter after it still takes the first row",
+      "CHOSE 'alpha'" in out and "Traceback" not in out, out[-200:])
+out = drive_snippet(PICK, ["й".encode(), "ó".encode(), "β".encode(), b"\r"])
+check("...nor й, ó or β (whose second bytes read as ¹, ³ and ²)",
+      "CHOSE 'alpha'" in out and "Traceback" not in out, out[-200:])
 
 # UNPRINTABLE NAMES ARE THE REASON printable() EXISTS. A profile really is
 # called "\033" on a real machine, so its label and its path both carry a raw
@@ -485,6 +663,170 @@ stray = re.sub(r"\x1b(\[[0-9;?]*[a-zA-Z]|\][^\x07]*\x07)", "", body).count("\x1b
 check("an item label containing a raw ESC cannot emit one", stray == 0,
       f"{stray} stray ESC bytes")
 check("...it is shown escaped instead", "\\x1b" in body)
+
+# --------------------------------------------------------------------------- #
+# The chooser, past the bottom of the screen
+# --------------------------------------------------------------------------- #
+# THE CHOOSER DREW EVERY ROW AND THE TERMINAL KEPT WHAT FITTED: Term.paint drops
+# whatever is past rows-1, the cursor's row with it once you had arrowed far
+# enough, and Enter then chose a row nobody could see. Nothing had that many
+# rows until the history, which only grows. Now a window of the list is drawn
+# around the cursor -- and every caller whose list fits must get exactly the
+# bytes it got before, the wrapper's account picker first among them: it runs
+# at the start of every session.
+print("\n== the chooser keeps its cursor on the screen ==")
+
+
+def _old_render(title, items, sel, hint, note):
+    """claude_mate_ui._render as it was before it could scroll, byte for byte:
+    the reference its no-size path is held to."""
+    U = UI
+    out = [f" {U.B}{title}{U.OFF}", ""]
+    labels = [U.printable(i.label) for i in items]
+    width = max((len(x) for x in labels), default=0)
+    for i, it in enumerate(items):
+        if it.gap:
+            out.append("")
+        cur = i == sel
+        label = labels[i]
+        mark = f"{U.C_SEL}{U.B}▸{U.OFF}" if cur else " "
+        col = U.C_WARN if it.danger else (U.C_SEL if cur else "")
+        body = f"{col}{U.B}{label}{U.OFF}" if cur else f"{col}{label}{U.OFF}"
+        pad = " " * max(0, width - len(label))
+        det = U.printable(it.detail)
+        detail = f"  {U.D}{det}{U.OFF}" if det else ""
+        out.append(f" {mark} {body}{pad}{detail}")
+    out.append("")
+    if note:
+        out.append(f" {note}")
+        out.append("")
+    out.append(f" {U.D}{hint or '↑↓ move   ⏎ choose   esc back'}{U.OFF}")
+    return out
+
+
+# The shapes the chooser is really called with. The account picker's rows, as
+# _pick_account builds them: the default login, a profile, an untypeable one
+# shown as a repr, a Cyrillic one, the gapped "New account…" and "Device…".
+_NEW, _DEV = object(), object()
+_SHAPES = [
+    ("claude-mate — which account?", [
+        UI.Item("default", value="", detail="me@example.com"),
+        UI.Item("work", value="work", detail="(not logged in)"),
+        UI.Item(repr("\x1b"), value="\x1b", detail="other@example.com"),
+        UI.Item("в", value="в", detail="(not logged in)"),
+        UI.Item("New account…", value=_NEW, gap=True,
+                detail="create a profile and log in there"),
+        UI.Item("Device…", value=_DEV,
+                detail="connect a Claude Mate, or see why it is not")],
+     "↑↓ move   ⏎ start   esc cancel", None),
+    ("DELETE work?", [UI.Item("No, leave it alone", value=False),
+                      UI.Item("Yes", value=True, danger=True)],
+     "me@example.com · /tmp/accounts/work · there is no undo", None),
+    ("ACCOUNT · work", [
+        UI.Item("Use for the next new session", value="use",
+                detail="sets CLAUDE_MATE_ACCOUNT for a session started here"),
+        UI.Item("Delete this profile", value="rm", danger=True, gap=True,
+                detail="its login and every transcript under it"),
+        UI.Item("Back", value="back", gap=True)],
+     None, "\033[2mme@example.com\n  /tmp/accounts/work\033[0m"),
+]
+# Real colour codes for the comparison even when this runs into a pipe (CI),
+# where the module blanks its own: where the codes land is part of the bytes.
+_colours = (UI.B, UI.D, UI.OFF, UI.C_SEL, UI.C_WARN)
+UI.B, UI.D, UI.OFF, UI.C_SEL, UI.C_WARN = (
+    "\033[1m", "\033[2m", "\033[0m", "\033[36m", "\033[31m")
+try:
+    _same = _fits_same = True
+    for _t, _its, _h, _n in _SHAPES:
+        for _s in range(len(_its)):
+            _want = _old_render(_t, _its, _s, _h, _n)
+            _same = _same and UI._render(_t, _its, _s, _h, _n) == _want
+            _fits_same = (_fits_same
+                          and UI._render(_t, _its, _s, _h, _n, 110, 40) == _want)
+finally:
+    UI.B, UI.D, UI.OFF, UI.C_SEL, UI.C_WARN = _colours
+check("with no size, _render is the same bytes it always was -- the account "
+      "picker's rows, a confirm, a two-line note", _same)
+check("...and with the terminal's size, when everything fits, still the same "
+      "bytes", _fits_same)
+
+_many = [UI.Item(f"i{n:02d} " + "名前" * (n % 4),
+                 detail=" ".join(["detail"] * (n % 6)),
+                 gap=(n % 10 == 9), danger=(n % 13 == 0)) for n in range(40)]
+_vbad = []
+for _rows_n, _cols_n in ((24, 80), (10, 40), (24, 40)):
+    for _note in (None, "a note", "a note\n on two lines"):
+        for _s in range(len(_many)):
+            _lines, _whole = UI._layout("PICK ONE", _many, _s, "the hint",
+                                        _note, _cols_n, _rows_n)
+            _phys = "\n".join(_plain(_lines)).split("\n")
+            _at = [i for i, ln in enumerate(_phys) if "▸" in ln]
+            _up = [ln for ln in _phys if "↑" in ln and "more" in ln]
+            _dn = [ln for ln in _phys if "↓" in ln and "more" in ln]
+            _seen = sum(1 for ln in _phys if re.match(r"^ [▸ ] i\d\d", ln))
+            _n_up = int(_up[0].split()[1]) if _up else 0
+            _n_dn = int(_dn[0].split()[1]) if _dn else 0
+            _ok = (len(_phys) <= _rows_n - 1
+                   and all(_cols(ln) <= _cols_n - 1 for ln in _phys)
+                   and len(_at) == 1 and f"i{_s:02d}" in _phys[_at[0]]
+                   and "PICK ONE" in _phys[0] and "the hint" in _phys[-1]
+                   and (_note is None or "a note" in "\n".join(_phys))
+                   and _n_up + _seen + _n_dn == len(_many) and not _whole)
+            if not _ok:
+                _vbad.append((_rows_n, _cols_n, _note, _s))
+check("40 rows in a 24- or 10-row terminal: on every row the cursor can be on, "
+      "the frame fits, the cursor's row is drawn, and title, note and hint stay",
+      not _vbad, repr(_vbad[:3]))
+check("...every line fits the width, wide characters counted as two "
+      "(checked above, for 80 and 40 columns)", not _vbad)
+check("...and '↑ N more' / '↓ N more' account for every row not drawn "
+      "(checked above)", not _vbad)
+def _cursor_row(lines):
+    phys = "\n".join(_plain(lines)).split("\n")
+    return next((i for i, ln in enumerate(phys) if "▸" in ln), -1)
+
+
+_floor = all(0 <= _cursor_row(UI._render("PICK ONE", _many, _s, "the hint",
+                                         _note, 40, 6)) < 5
+             for _s in range(len(_many)) for _note in (None, "a note"))
+check("...and at the smallest screen Term will report (6 rows) the cursor's row "
+      "is still drawn", _floor)
+check("a list that fits says so, so its digits still work",
+      UI._layout("T", _many[:5], 0, None, None, 80, 24)[1] is True)
+
+# DIGITS. A number chooses its row at once, which is the old typed picker's
+# muscle memory -- and in confirm() it was a YES to a destructive question
+# without the cursor ever leaving No, and in a scrolled list a row off the
+# screen. Driven under a pty, as a person would press them.
+print("\n== the number shortcuts ==")
+CONFIRM = ("import claude_mate_ui as U;"
+           "print('CHOSE',repr(U.confirm('SURE?','there is no undo')))")
+out = drive_snippet(CONFIRM, [b"1", b"\r"])
+check("in a confirm, '1' does not answer Yes: Enter after it is still No",
+      "CHOSE False" in out, out.split("CHOSE")[-1][:30] if "CHOSE" in out
+      else out[-120:])
+out = drive_snippet(CONFIRM, [b"\x1b[B", b"\r"])
+check("...Yes is still one arrow and Enter away", "CHOSE True" in out)
+NODIG = PICK.replace("U.pick('PICK ONE',items)",
+                     "U.pick('PICK ONE',items,digits=False)")
+out = drive_snippet(NODIG, [b"2", b"\r"])
+check("pick(digits=False) ignores a digit", "CHOSE 'alpha'" in out)
+LONG = ("import claude_mate_ui as U;"
+        "items=[U.Item('i%02d' % n) for n in range(30)];"
+        "print('CHOSE',repr(U.pick('LONG',items)))")
+out = drive_snippet(LONG, [b"2", b"\r"], size=(12, 80))
+check("a list longer than the screen: a digit does nothing (it could choose a "
+      "row nobody can see)", "CHOSE 'i00'" in out,
+      out.split("CHOSE")[-1][:30] if "CHOSE" in out else out[-120:])
+check("...and the screen says how much is below", re.search(
+    r"↓.*\b2\d more", re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", out)) is not None)
+out = drive_snippet(LONG, [b"\x1b[A", b"\r"], size=(12, 80))
+_last = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "",
+               out.split("CHOSE")[0].rsplit("\x1b[H", 1)[-1])
+check("...up from the top wraps to the last row, and that row is on the "
+      "screen with the cursor on it",
+      "CHOSE 'i29'" in out and re.search(r"▸ i29", _last) is not None,
+      repr(_last[-200:]))
 
 print("\n== the account picker the wrapper shows ==")
 tmp = tempfile.mkdtemp(prefix="cm-pick-")
@@ -522,6 +864,128 @@ check("mashing the arrow keys at the picker creates no profiles",
       set(os.listdir(tmp)) == before,
       f"{sorted(set(os.listdir(tmp)) - before)!r}")
 shutil.rmtree(tmp, ignore_errors=True)
+
+# --------------------------------------------------------------------------- #
+# History, in the app
+# --------------------------------------------------------------------------- #
+# The whole path a person takes, in the real app on an 80x24 terminal, against
+# a HOME made here: two kept chats -- one whose transcript Claude still has, one
+# that survives only as the copy History kept, and whose title is made of the
+# cursor's own glyph -- then into the first, onto Delete, a '1' that must not
+# answer the confirmation, and the Yes that does.
+print("\n== History, in the app ==")
+
+
+def last_paint(chunk):
+    """The lines of the last full paint in a chunk of output, colour gone."""
+    part = chunk.rsplit("\x1b[H", 1)[-1].replace("\r", "")
+    return _plain(part.split("\n"))
+
+
+_hhome = os.path.join(SANDBOX, "hist-home")
+_hist = os.path.join(_hhome, ".config", "claude-mate", "history")
+_proj = os.path.join(SANDBOX, "some_project")
+_tdir = os.path.join(_hhome, ".claude", "projects",
+                     re.sub(r"[^a-zA-Z0-9]", "-", _proj))
+for _d in (_hist, _proj, _tdir):
+    os.makedirs(_d)
+_A, _B = str(uuid.uuid4()), str(uuid.uuid4())
+for _conv, _ago, _title, _flags in (
+        (_A, 60, "add a history log to the daemon", ["--model", "opus"]),
+        (_B, 7200, "▸▸ a title made of cursors", None)):
+    with open(os.path.join(_hist, _conv + ".json"), "w") as fh:
+        json.dump({"v": 1, "conversation": _conv, "name": "some_project",
+                   "cwd": _proj, "config_dir": "", "account": "default",
+                   "flags": _flags, "last_active": time.time() - _ago,
+                   "ended": None}, fh)
+    with open(os.path.join(_tdir, _conv + ".jsonl"), "w") as fh:
+        fh.write(json.dumps({"type": "user", "cwd": _proj}) + "\n")
+        fh.write(json.dumps({"type": "ai-title", "aiTitle": _title}) + "\n")
+os.link(os.path.join(_tdir, _B + ".jsonl"), os.path.join(_hist, _B + ".jsonl"))
+os.unlink(os.path.join(_tdir, _B + ".jsonl"))       # Claude's copy is gone
+
+_D, _E = b"\x1b[B", b"\r"
+rc, fr = drive([_D, _D, _E, _E, _D, _D, _E, b"1", _D, _E], home=_hhome,
+               size=(24, 80))
+_list, _chat, _conf, _after1, _end = (last_paint(fr[i]) for i in (3, 4, 7, 8, 10))
+_txt = "\n".join
+_ia = _txt(_list).find("add a history log")
+_ib = _txt(_list).find("a title made of cursors")
+check("Enter on History lists the kept chats, newest first, by title",
+      "HISTORY" in _txt(_list) and 0 <= _ia < _ib, _txt(_list)[-600:])
+check("...a title made of '▸' shows as '>', so the cursor's is the only one",
+      ">> a title made of cursors" in _txt(_list)
+      and sum(ln.count("▸") for ln in _list) == 1)
+check("...the note says where they are and how much exists only here",
+      "chats" in _txt(_list) and "kept only here" in _txt(_list))
+check("...and no line is wider than 79 columns",
+      all(_cols(ln) <= 79 for ln in _list + _chat + _conf), repr(
+          [ln for ln in _list + _chat + _conf if _cols(ln) > 79][:2]))
+check("Enter on a chat offers Resume and Delete, and says where it ran",
+      "Resume" in _txt(_chat) and "Delete from history" in _txt(_chat)
+      and "some_project" in _txt(_chat), _txt(_chat)[-600:])
+check("Delete asks first, and says Claude Code still has its own copy",
+      "DELETE" in _txt(_conf) and "No, leave it alone" in _txt(_conf)
+      and "Claude Code keeps its own copy" in _txt(_conf), _txt(_conf)[-400:])
+check("...a '1' there does not answer Yes: the question is still on screen",
+      "No, leave it alone" in _txt(_after1) and "forgot" not in _txt(_after1))
+check("...and Yes forgets the chat: its record goes, and says so",
+      rc == 0 and "forgot" in _txt(_end)
+      and not os.path.exists(os.path.join(_hist, _A + ".json")),
+      _txt(_end)[-300:])
+check("...Claude's own transcript of it is left where it was",
+      os.path.exists(os.path.join(_tdir, _A + ".jsonl")))
+check("...and the other chat, and the only copy of its conversation, stay",
+      os.path.exists(os.path.join(_hist, _B + ".json"))
+      and os.path.exists(os.path.join(_hist, _B + ".jsonl")))
+
+# A CHAT WRITTEN MOMENTS AGO, with no terminal the app can see on it: what
+# has it may be something claude-mate cannot see (claude without the wrapper,
+# the VS Code panel, a picker session before its first turn), and a second
+# claude on it forks the transcript. So Resume asks, No where the cursor
+# starts, and No starts nothing. If it ever goes ahead regardless, it meets
+# stubs -- a claude that only leaves a mark, no usage poll, no Keychain, no
+# network -- so the check fails without anything real being run.
+_ahome = os.path.join(SANDBOX, "ask-home")
+_ahist = os.path.join(_ahome, ".config", "claude-mate", "history")
+_aproj = os.path.join(SANDBOX, "ask_project")
+_atdir = os.path.join(_ahome, ".claude", "projects",
+                      re.sub(r"[^a-zA-Z0-9]", "-", _aproj))
+_stubs = os.path.join(SANDBOX, "stubs")
+for _d in (_ahist, _aproj, _atdir, _stubs):
+    os.makedirs(_d)
+_C = str(uuid.uuid4())
+with open(os.path.join(_ahist, _C + ".json"), "w") as fh:
+    json.dump({"v": 1, "conversation": _C, "name": "ask_project",
+               "cwd": _aproj, "config_dir": "", "account": "default",
+               "flags": ["--model", "opus"], "last_active": time.time() - 30,
+               "ended": None}, fh)
+with open(os.path.join(_atdir, _C + ".jsonl"), "w") as fh:   # written now
+    fh.write(json.dumps({"type": "user", "cwd": _aproj}) + "\n")
+    fh.write(json.dumps({"type": "ai-title",
+                         "aiTitle": "a chat still being written"}) + "\n")
+_mark = os.path.join(SANDBOX, "claude-ran")
+for _prog, _body in (("claude", f"touch '{_mark}'\n"), ("security", "exit 1\n"),
+                     ("curl", "exit 1\n")):
+    with open(os.path.join(_stubs, _prog), "w") as fh:
+        fh.write("#!/bin/sh\n" + _body)
+    os.chmod(os.path.join(_stubs, _prog), 0o755)
+rc, fr = drive([_D, _D, _E, _E, _E, _E, b"q"], home=_ahome, size=(24, 80),
+               env_extra={"CLAUDE_REAL": os.path.join(_stubs, "claude"),
+                          "CLAUDE_MATE_USAGE_POLL_S": "0",
+                          "PATH": _stubs + os.pathsep + os.environ["PATH"]})
+_ask, _back = last_paint(fr[5]), last_paint(fr[6])
+check("Resume on a chat whose transcript was written moments ago asks first: "
+      "what it saw, with No where the cursor starts",
+      "RESUME" in _txt(_ask) and "its transcript was written" in _txt(_ask)
+      and "▸ No, leave it alone" in _txt(_ask), _txt(_ask)[-600:])
+check("...the question wrapped to the width: no line wider than 79 columns",
+      all(_cols(ln) <= 79 for ln in _ask),
+      repr([ln for ln in _ask if _cols(ln) > 79][:2]))
+check("...and No starts nothing: back on the list, claude never run",
+      rc == 0 and "HISTORY" in _txt(_back) and not os.path.exists(_mark),
+      _txt(_back)[-300:])
+shutil.rmtree(SANDBOX, ignore_errors=True)
 
 print(f"\n{'FAILED' if fails else 'all passed'}: "
       f"{fails} failure{'' if fails == 1 else 's'}")

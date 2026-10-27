@@ -26,6 +26,11 @@ the glass. There is no second implementation to drift.
   claude-mate select <n|name> point at a row instead of stepping to it
   claude-mate accounts        the saved logins
   claude-mate accounts rm <name|n> delete one, after saying its name back
+  claude-mate history         the chats it has kept, newest first
+  claude-mate history resume <n|id> [--skip-permissions|--ask-permissions]
+                              pick one up again, where and as it was
+  claude-mate history rm <n|id>    forget one, after typing its id back
+  claude-mate history clear   forget every chat that is not open
   claude-mate link <auto|cable|ble|wifi|p2p>  the device's connection mode
   claude-mate trust           allow the TCP listener on the network you are on
   claude-mate trust --list    which networks it will listen on
@@ -44,17 +49,23 @@ WHAT IT DELIBERATELY DOES NOT DO OVER THE SOCKET. The socket is chmod 0600 --
 owner-only, which is all a hook needs, since hooks run in your own shells. Even
 so, deletion is not a daemon command: a hook firing a malformed line should not
 be able to remove a login. `accounts rm` therefore does the deletion HERE, in
-this process, and only asks the daemon to re-read afterwards.
+this process, and only asks the daemon to re-read afterwards. `history rm` and
+`history clear` are the same: the chats the daemon keeps are forgotten here,
+and nothing on the socket can ask for that.
 """
+import importlib.machinery
+import importlib.util
 import json
+import math
 import os
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
+import tempfile
 import time
-import unicodedata
 
 SOCK = os.environ.get("CLAUDE_MATE_SOCK", "/tmp/claude-mate.sock")
 
@@ -252,51 +263,10 @@ def wf_summary(w, more=0):
 
 
 # ---- fitting a line to the app's width ------------------------------------ #
-# THE APP PAINTS ONE TERMINAL ROW PER LINE (Term.paint: home, then each line
-# and an erase), so a line wider than the terminal is not just cut off -- it
-# wraps, every row below it moves down one, and once they pass the bottom the
-# terminal scrolls: the header and the cursor row go off the top, and Enter
-# acts on a row nobody can see. So the lines that carry data are fitted here,
-# in COLUMNS: colour codes take none, an East Asian wide character two.
-_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
-
-
-def _cells(ch):
-    if unicodedata.category(ch) in ("Mn", "Me", "Cf"):
-        return 0                              # combining marks, joiners
-    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
-
-
-def vis_width(text):
-    """The columns `text` takes on a terminal."""
-    return sum(_cells(ch) for ch in _ANSI.sub("", text))
-
-
-def clip(text, room):
-    """`text` in at most `room` columns. A cut ends in '…' -- so '3/12' cut
-    short cannot pass for a whole '3/1' -- and in a colour reset, so the
-    colour of the half that went cannot run on into the next line. Colour
-    codes are kept, and cost nothing."""
-    if vis_width(text) <= room:
-        return text
-    out, used, i = [], 0, 0
-    while i < len(text):
-        m = _ANSI.match(text, i)
-        if m:
-            out.append(m.group())
-            i = m.end()
-            continue
-        w = _cells(text[i])
-        if used + w > room - 1:
-            break
-        out.append(text[i])
-        used += w
-        i += 1
-    kept = "".join(out)
-    mark = "" if (room <= 0 or _ANSI.sub("", kept).endswith("…")) else "…"
-    return kept + mark + OFF
-
-
+# A line wider than the terminal wraps and scrolls the whole frame, so the lines
+# that carry data are fitted in COLUMNS by vis_width() and clip(). They moved to
+# claude_mate_ui, beside the chooser that now fits its own lines with them, and
+# are imported below with the rest of its machinery -- see the note there.
 WF_NAME_MIN = 12          # columns a name is cut to before anything else goes
 
 
@@ -648,6 +618,9 @@ def cmd_accounts(argv):
     print(f"  dir    {a['dir']}")
     print(f"\n{D}That includes its login and every transcript under it. There is"
           f" no undo.{OFF}")
+    in_history = history_on_account(a["dir"])
+    if in_history:
+        print(f"{D}{history_account_note(in_history)}.{OFF}")
     # TYPE THE NAME. A y/n on a destructive action is a reflex; typing the name
     # is a decision, and it also proves you are deleting the one you think.
     token = name if show_name(name) == name else "delete"
@@ -710,6 +683,809 @@ def show_name(name):
 
 
 # ---------------------------------------------------------------------------
+# History: the chats the daemon has kept
+# ---------------------------------------------------------------------------
+# ONE FILE PER CHAT, WRITTEN BY THE DAEMON, READ AND DELETED HERE. For every
+# conversation a wrapped session has run a turn in, the daemon writes
+# ~/.config/claude-mate/history/<id>.json and keeps a hard link to the
+# transcript beside it (<id>.jsonl), so Claude Code's own cleanup -- or a
+# deleted profile -- cannot take the conversation away while the record is
+# there. None of it goes through the socket. Reading works with the daemon down,
+# which is the crash this exists for; deleting happens in this process, for the
+# reason `accounts rm` does above.
+HISTORY_READ_MAX = 65536      # bytes of a record, or of a transcript's tail
+CTX_STALE_S = 900.0           # the wrapper's: a context this stale is dead
+LIVE_REPORT_S = 60.0          # a queue row this quiet is a dead terminal's: a
+                              # wrapper reports at least every 20 s
+TITLE_MAX = 200               # characters of a title; the screen cuts shorter
+_UUID = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+# The transcript records a title is read from, newest first, and their keys.
+_TITLE_KEYS = (("custom-title", "customTitle"),     # -n/--name, or /rename
+               ("ai-title", "aiTitle"),
+               ("last-prompt", "lastPrompt"))
+
+
+def history_dir():
+    """Where the records are. Worked out when asked, never at import, so a
+    test that points HOME somewhere else gets somewhere else."""
+    return os.path.expanduser("~/.config/claude-mate/history")
+
+
+def _read_regular(path, limit=HISTORY_READ_MAX, tail=False, uid=None):
+    """At most `limit` bytes of a REGULAR file -- its end, with `tail` -- or
+    None. (bytes, offset read from.) Given `uid`, only a file that user owns.
+
+    O_NOFOLLOW AND O_NONBLOCK, AND A TYPE CHECK. The history directory and the
+    terminals' context directory are places other things can write into: a FIFO
+    named like a record would hang open() forever, and a symlink to /dev/zero
+    would be read until memory ran out."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except (OSError, ValueError):
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or (uid is not None
+                                             and st.st_uid != uid):
+            return None
+        start = max(0, st.st_size - limit) if tail else 0
+        if start:
+            os.lseek(fd, start, os.SEEK_SET)
+        chunks, left = [], limit
+        while left > 0:
+            b = os.read(fd, left)
+            if not b:
+                break
+            chunks.append(b)
+            left -= len(b)
+        return b"".join(chunks), start
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _path_ok(p):
+    """An absolute path with nothing in it a terminal or execve() would choke on
+    -- the daemon's own rule for the paths it is sent, checked again here
+    because a record is a file anyone with this login can edit."""
+    return (isinstance(p, str) and p.startswith("/") and len(p) <= 4096
+            and not any(ord(c) < 0x20 or ord(c) == 0x7F for c in p))
+
+
+def _when(v):
+    """A timestamp from a record, or None for anything that is not one."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    try:
+        return float(v) if math.isfinite(v) else None
+    except OverflowError:                 # an int past any float
+        return None
+
+
+def _record(path, conv):
+    """One record, every field checked for its type, or None.
+
+    A field of the wrong type counts as absent rather than sinking the record:
+    the file name already says which chat it is, and a chat you cannot see is a
+    chat you cannot delete. The id IS the file name -- the daemon writes
+    <id>.json and nothing else, and forget_chats() unlinks by it."""
+    got = _read_regular(path)
+    if got is None:
+        return None
+    try:
+        r = json.loads(got[0].decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(r, dict):
+        return None
+    cfg = r.get("config_dir")
+    if not (cfg is None or cfg == "" or _path_ok(cfg)):
+        cfg = None
+    flags = r.get("flags")
+    if not (isinstance(flags, list) and len(flags) <= 64 and all(
+            isinstance(f, str) and not any(ord(c) < 0x20 or ord(c) == 0x7F
+                                           for c in f) for f in flags)):
+        flags = None
+    project = r.get("project")
+    if not (isinstance(project, str) and project not in ("", ".", "..")
+            and "/" not in project and _path_ok("/" + project)):
+        project = ""                  # a directory NAME, never a path
+
+    def text(key):
+        return r[key] if isinstance(r.get(key), str) else ""
+
+    return {
+        "conversation": conv,
+        "name": text("name"),
+        "cwd": r["cwd"] if _path_ok(r.get("cwd")) else "",
+        "config_dir": cfg,
+        "account": text("account"),
+        "flags": flags,
+        "last_active": max(0.0, _when(r.get("last_active")) or 0.0),
+        "ended": _when(r.get("ended")),
+        "project": project,
+    }
+
+
+def load_history():
+    """Every readable record, newest first (last_active, then id). Never
+    raises: an unreadable or malformed file is skipped, and the directory not
+    existing yet is simply no history."""
+    root = history_dir()
+    try:
+        names = os.listdir(root)
+    except (OSError, ValueError):
+        return []
+    out = []
+    for fn in names:
+        # <id>.json only: the daemon's .tmp and .lnk files are on their way to
+        # becoming one, and <id>.jsonl is the kept transcript, not a record.
+        if not fn.endswith(".json") or not _UUID.fullmatch(fn[:-5]):
+            continue
+        try:
+            rec = _record(os.path.join(root, fn), fn[:-5])
+        except Exception:                         # noqa: BLE001
+            rec = None
+        if rec:
+            out.append(rec)
+    out.sort(key=lambda r: (-r["last_active"], r["conversation"]))
+    return out
+
+
+def _queue_snapshot(timeout=2.0):
+    """The daemon's queue as a dict, or None when nothing answers with one."""
+    reply = talk("queue", timeout=timeout)
+    if not reply:
+        return None
+    try:
+        snap = json.loads(reply)
+    except ValueError:
+        return None
+    return snap if isinstance(snap, dict) else None
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, OverflowError):     # no such pid, or none ever
+        return False
+    except OSError:
+        return True               # EPERM: it exists, it is just not ours
+    return True
+
+
+def _quiet(s):
+    """Seconds since the daemon last heard from a queue row's terminal; 0 from
+    a daemon too old to send `seen`, which is taken at its word."""
+    v = s.get("seen")
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+
+
+def _heard(s):
+    """Is a queue row's terminal still reporting (LIVE_REPORT_S)?"""
+    return not _quiet(s) > LIVE_REPORT_S
+
+
+def _ctx_conversations(ctx):
+    """Every conversation a terminal's context file names: the one its
+    wrapper is sure of, and the one its transcript scan found.
+
+    THE SCAN COUNTS HERE, THOUGH IT IS NOT GOOD ENOUGH TO RECORD A CHAT BY.
+    `conversation` is set only once the wrapper knows the id for certain, and
+    a chat opened through claude's own picker, `-r <name>` or `--from-pr`
+    never gets one -- it read as closed while it ran, and Resume started a
+    second claude on it. Its terminal's file still carries the transcript the
+    wrapper found (and so its session id), and for liveness a wrong guess only
+    ever refuses a resume."""
+    out = set()
+    for key in ("conversation", "session_id"):
+        v = ctx.get(key)
+        if isinstance(v, str) and _UUID.fullmatch(v.lower()):
+            out.add(v.lower())
+    tr = ctx.get("transcript")
+    if isinstance(tr, str) and tr.endswith(".jsonl"):
+        name = os.path.basename(tr)[:-len(".jsonl")].lower()
+        if _UUID.fullmatch(name):
+            out.add(name)
+    return out
+
+
+def live_conversations(snap):
+    """The conversations open in a terminal right now, as a set of ids.
+
+    TWO SOURCES, AND THE SECOND IS THE ONE THAT MATTERS. The daemon's queue
+    says which conversation each wrapped session is running -- when there is a
+    daemon to ask. When it is down, or has just restarted and the wrappers have
+    not re-registered yet (up to a keepalive, 20 s), the queue says nothing is
+    open while chats are, and Resume would start a SECOND claude on one of them:
+    two processes appending to one transcript fork it, and whichever branch a
+    later resume follows, the other one's turns are gone from the context. So
+    every wrapper's per-terminal context file counts too -- if its process is
+    alive and it has been refreshed recently (the switch's CTX_STALE_S).
+
+    AND A QUEUE ROW ONLY WHILE IT IS STILL BEING HEARD FROM. A terminal killed
+    outright (kill -9, a crashed terminal app) sends no `end`, and its row stays
+    in the queue until the daemon prunes it -- up to ten minutes in which the
+    chat you most want back would be refused as "open". Its context file says
+    otherwise at once (the pid is gone); its row says so once it has missed a
+    few keepalives (`seen`, LIVE_REPORT_S). A daemon too old to send `seen` is
+    taken at its word."""
+    live = set()
+    if isinstance(snap, dict) and isinstance(snap.get("queue"), list):
+        for s in snap["queue"]:
+            if not isinstance(s, dict) or not _heard(s):
+                continue
+            conv = s.get("conversation")
+            if isinstance(conv, str) and conv:
+                live.add(conv.lower())
+    uid = os.getuid()
+    d = os.path.join(tempfile.gettempdir(), f"claude-mate-ctx-{uid}")
+    # A DIRECTORY ONLY THIS USER CAN WRITE, OR NONE AT ALL. Nothing in these
+    # files is signed, so they are only as true as the directory is private:
+    # where the temp dir is a shared /tmp, another user who made this one
+    # first could plant files that hold any chat "open" -- refused by rm,
+    # clear and resume. So a real directory (not a symlink), this user's,
+    # writable by no one else -- and in it, only this user's files.
+    try:
+        st = os.lstat(d)
+        if (not stat.S_ISDIR(st.st_mode) or st.st_uid != uid
+                or st.st_mode & 0o022):
+            return live
+        names = os.listdir(d)
+    except (OSError, ValueError):
+        return live
+    now = time.time()
+    for fn in names:
+        if not fn.endswith(".json"):
+            continue
+        got = _read_regular(os.path.join(d, fn), uid=uid)
+        try:
+            ctx = json.loads(got[0].decode("utf-8")) if got else None
+            if not isinstance(ctx, dict):
+                continue
+            pid = ctx.get("pid")
+            fresh = now - float(ctx.get("updated_at") or 0) < CTX_STALE_S
+        except (UnicodeDecodeError, ValueError, TypeError, OverflowError):
+            continue
+        if fresh and isinstance(pid, int) and not isinstance(pid, bool) \
+                and pid > 0 and _pid_alive(pid):
+            live |= _ctx_conversations(ctx)
+    return live
+
+
+def chat_status(rec, live):
+    """open (in a terminal now), closed (its wrapper said so) or interrupted
+    (it never said: a crash, a killed terminal, a reboot)."""
+    if rec["conversation"] in live:
+        return "open"
+    return "closed" if rec["ended"] is not None else "interrupted"
+
+
+def _accounts_root():
+    return os.path.expanduser(
+        os.environ.get("CLAUDE_MATE_ACCOUNTS_DIR", "~/.claude-accounts"))
+
+
+def _search_bases(rec):
+    """The config dirs a chat's transcript can be under: the one it ran in when
+    that is known ('' is the default login, ~/.claude), else every login."""
+    cfg = rec["config_dir"]
+    if cfg == "":
+        return [os.path.expanduser("~/.claude")]
+    if cfg:
+        return [cfg]
+    bases = [os.path.expanduser("~/.claude")]
+    root = _accounts_root()
+    try:
+        bases += [os.path.join(root, d) for d in sorted(os.listdir(root))
+                  if os.path.isdir(os.path.join(root, d))]
+    except (OSError, ValueError):
+        pass
+    return bases
+
+
+def _locate(rec):
+    """(Claude's own copy of the transcript, the config dir it is under), or
+    ("", ""). By listdir and never by glob: profile names are whatever someone
+    typed, and `work [eu]` is a glob pattern that matches nothing."""
+    name = rec["conversation"] + ".jsonl"
+    try:
+        for base in _search_bases(rec):
+            root = os.path.join(base, "projects")
+            try:
+                dirs = os.listdir(root)
+            except (OSError, ValueError):
+                continue
+            if rec["project"] in dirs:                # where it was last seen
+                dirs.remove(rec["project"])
+                dirs.insert(0, rec["project"])
+            for d in dirs:
+                p = os.path.join(root, d, name)
+                if os.path.isfile(p):
+                    return p, base
+    except Exception:                                 # noqa: BLE001
+        pass
+    return "", ""
+
+
+def chat_transcript(rec):
+    """Claude Code's own copy of a chat's transcript, or ''. Never raises."""
+    return _locate(rec)[0]
+
+
+def chat_kept(rec):
+    """The copy the daemon kept for this chat, or ''. A regular file only: the
+    kept copy is a hard link, and anything else there was not put there by
+    us."""
+    p = os.path.join(history_dir(), rec["conversation"] + ".jsonl")
+    try:
+        return p if stat.S_ISREG(os.lstat(p).st_mode) else ""
+    except (OSError, ValueError):
+        return ""
+
+
+def _clean(text):
+    """Text from a record or a transcript, as one printable line -- and never
+    with the '▸' the app marks its cursor with, which is how its tests (and a
+    person) find the cursor. Same rule as _wf_text."""
+    return printable(" ".join(str(text or "").split())).replace("▸", ">")
+
+
+def chat_title(rec, path=None):
+    """What a chat is about, in one line, or ''. Never raises.
+
+    ONE READ, OF THE END. The records a title comes from are appended as the
+    chat goes, so the newest are in the last 64 KB, where all three of these
+    were for nearly every real transcript sampled: the name you gave it
+    (custom-title, from -n or /rename), else the one Claude gave it (ai-title),
+    else the last thing you asked (last-prompt, its first line). Claude's own
+    copy if there is one, else the one kept here."""
+    try:
+        path = path or chat_transcript(rec) or chat_kept(rec)
+        got = _read_regular(path, tail=True) if path else None
+        if not got:
+            return ""
+        lines = got[0].decode("utf-8", "replace").split("\n")
+        if got[1]:
+            lines = lines[1:]                 # began mid-line
+        found = {}
+        for line in reversed(lines):
+            if not any(f'"{kind}"' in line for kind, _k in _TITLE_KEYS):
+                continue
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            kind = r.get("type") if isinstance(r, dict) else None
+            key = dict(_TITLE_KEYS).get(kind)
+            v = r.get(key) if key else None
+            if kind in found or not (isinstance(v, str) and v.strip()):
+                continue
+            found[kind] = v
+            if kind == "custom-title":
+                break                             # nothing outranks it
+        title = found.get("custom-title") or found.get("ai-title") or ""
+        if not title and found.get("last-prompt"):
+            title = next(ln for ln in found["last-prompt"].split("\n")
+                         if ln.strip())
+        return _clean(title)[:TITLE_MAX]
+    except Exception:                             # noqa: BLE001
+        return ""
+
+
+def chat_age(secs):
+    """Compact, the way the list prints it: 45s, 12m, 3h, 5d."""
+    s = int(max(0, secs))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m"
+    if s < 86400:
+        return f"{s // 3600}h"
+    return f"{s // 86400}d"
+
+
+def _kept_only(rec, transcript):
+    """(the kept copy or '', whether it is the ONLY copy, its size if so).
+
+    THE ONLY COPY: Claude's is gone (`transcript` is where it was looked for)
+    and nothing else links to the kept one. Deleting the record then deletes
+    the conversation, and every confirmation has to say so."""
+    kept = chat_kept(rec)
+    if not kept or transcript:
+        return kept, False, 0
+    try:
+        st = os.lstat(kept)
+    except OSError:
+        return kept, False, 0
+    return kept, st.st_nlink == 1, st.st_size if st.st_nlink == 1 else 0
+
+
+def _chat_facts(rec, live, now=None):
+    """What the list and the menus say about one chat, looked up once."""
+    now = time.time() if now is None else now
+    tr = chat_transcript(rec)
+    kept, only, size = _kept_only(rec, tr)
+    return {"transcript": tr, "kept": kept, "only": only, "only_bytes": size,
+            "status": chat_status(rec, live),
+            "title": chat_title(rec, tr or kept),
+            "age": chat_age(now - rec["last_active"]) if rec["last_active"]
+            else "-"}
+
+
+def _copies(facts):
+    """The sentence every delete confirmation carries: is this the last copy?"""
+    if facts["only"]:
+        return "this is the only copy of the conversation — there is no undo"
+    if facts["transcript"] or facts["kept"]:
+        return "Claude Code keeps its own copy of the transcript"
+    return "its transcript is gone already — only the record goes"
+
+
+def _mb(n):
+    return f"{n / 1e6:.1f} MB" if n >= 50000 else "<0.1 MB"
+
+
+def _plural(n, word):
+    return f"{n} {word}" + ("" if n == 1 else "s")
+
+
+def _stays(n):
+    return "stays" if n == 1 else "stay"
+
+
+def _history_footer(recs, facts, short=False):
+    """`<dir> · N chats`, and how much of it exists nowhere else. `short`
+    writes the home directory as ~, for a screen whose width cuts the end of the
+    line -- which is where the count is."""
+    where = history_dir()
+    home = os.path.expanduser("~")
+    if short and home not in ("", "/") and where.startswith(home + os.sep):
+        where = "~" + where[len(home):]
+    out = f"{printable(where)} · {_plural(len(recs), 'chat')}"
+    only = sum(f["only_bytes"] for f in facts)
+    if only:
+        out += f" · {_mb(only)} kept only here"
+    return out
+
+
+def _cut(text, room):
+    """Plain text in at most `room` columns, a cut ending in '…': clip()
+    without its colour reset, for a string that is about to be escaped."""
+    return _ANSI.sub("", clip(text, room))
+
+
+def _pad(text, width):
+    t = _cut(text, width)
+    return t + " " * max(0, width - vis_width(t))
+
+
+def forget_chats(ids):
+    """Forget chats: unlink each record and its kept transcript, HERE.
+    Returns (ids now gone, error lines). A file already gone counts as gone.
+
+    THE KEPT TRANSCRIPT GOES FIRST. If anything fails half way, what is left
+    is a record you can see and delete again -- never a transcript nobody lists,
+    holding disk space out of sight."""
+    root = history_dir()
+    gone, errors = [], []
+    for conv in ids:
+        if not (isinstance(conv, str) and _UUID.fullmatch(conv)):
+            errors.append(f"{show_name(str(conv))}: not a chat id")
+            continue
+        for ext in (".jsonl", ".json"):
+            try:
+                os.unlink(os.path.join(root, conv + ext))
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                errors.append(f"{conv[:8]}: could not delete {conv}{ext}: "
+                              f"{exc.strerror or exc}")
+                break
+        else:
+            gone.append(conv)
+    return gone, errors
+
+
+def history_on_account(cfg_dir):
+    """How many kept chats ran under the account profile at `cfg_dir`."""
+    try:
+        want = os.path.realpath(cfg_dir)
+        return sum(1 for r in load_history() if r["config_dir"]
+                   and os.path.realpath(r["config_dir"]) == want)
+    except (OSError, ValueError):
+        return 0
+
+
+def history_account_note(n):
+    """What deleting a profile does to History: nothing, and it says so. The
+    kept transcripts are hard links of their own, so they outlive the profile
+    -- which is the point -- until you delete them from History too."""
+    if n == 1:
+        return ("1 chat in History was on this account — its kept transcript "
+                "stays until you delete it there")
+    return (f"{n} chats in History were on this account — their kept "
+            f"transcripts stay until you delete them there")
+
+
+def _history_state():
+    """(records, live conversation ids, whether a daemon answered)."""
+    snap = _queue_snapshot()
+    return load_history(), live_conversations(snap), snap is not None
+
+
+def _index_of(recs, want):
+    """The list index an argument is, or None for anything else: all ASCII
+    digits, and smaller than the list (nine digits at most, so int() is never
+    handed a number too long to convert)."""
+    w = want.strip()
+    return (int(w) if re.fullmatch(r"[0-9]{1,9}", w) and int(w) < len(recs)
+            else None)
+
+
+def _address(recs, want):
+    """The chat an argument names: (record, None), or (None, why not).
+
+    AN INDEX OR AN ID, never a name. Every chat in one project has that
+    project's name, so a name says nothing about WHICH one -- and the index is
+    only the list `claude-mate history` printed last time, which reorders as
+    chats run (so `rm` has its id typed back, and `resume` by index says which
+    chat it is and asks first). An all-digit argument smaller than the list is
+    that index; anything else is the start of an id, at least four hex digits,
+    and it must match exactly one chat."""
+    w = want.strip().lower()
+    i = _index_of(recs, w)
+    if i is not None:
+        return recs[i], None
+    if not re.fullmatch(r"[0-9a-f-]{4,36}", w):
+        return None, (f"no chat {show_name(want)}: give its number from "
+                      f"`claude-mate history`, or 4+ characters of its id")
+    hits = [r for r in recs if r["conversation"].startswith(w)]
+    if not hits:
+        return None, f"no chat with an id starting {w}"
+    if len(hits) > 1:
+        return None, (f"{w} matches {len(hits)} chats ("
+                      + ", ".join(r["conversation"][:8] for r in hits)
+                      + ") -- give more of the id")
+    return hits[0], None
+
+
+def _chat_item(rec, facts, room):
+    """A chat as a chooser row: what it is about, then where and how it is."""
+    name = _clean(rec["name"]) or "?"
+    acct = _clean(rec["account"]) or "-"
+    return Item(_cut(facts["title"] or name, room), value=("chat", rec),
+                detail=f"{name} · {facts['status']} {facts['age']} · {acct}")
+
+
+def _choose_chat(title, recs, live):
+    """A chooser over the kept chats, for a subcommand given no chat. The
+    record, or None for cancelled."""
+    if not recs:
+        die("claude-mate history: no chats kept yet")
+    room = max(20, (shutil.get_terminal_size((80, 24)).columns - 1) // 2)
+    now = time.time()
+    items = [_chat_item(r, _chat_facts(r, live, now), room) for r in recs]
+    items.append(Item("Cancel", value=("cancel", None), gap=True))
+    got = pick(title, items, hint="↑↓ move   ⏎ choose   esc cancel")
+    return got[1] if got and got[0] == "chat" else None
+
+
+HISTORY_USAGE = """\
+usage: claude-mate history                the chats it has kept, newest first
+       claude-mate history resume <n|id>  pick one up again, where and as it was
+                    [--skip-permissions|--ask-permissions]
+       claude-mate history rm <n|id>      forget one, after typing its id back
+       claude-mate history clear          forget every chat that is not open"""
+
+STATUS_COLOUR = {"open": "done", "interrupted": "waiting"}   # closed: dim
+
+
+def cmd_history(argv):
+    if not argv:
+        return _history_list()
+    sub, rest = argv[0], argv[1:]
+    if sub in ("rm", "remove", "delete"):
+        return _history_rm(rest)
+    if sub == "resume":
+        return _history_resume(rest)
+    if sub == "clear":
+        return _history_clear()
+    if sub in ("-h", "--help", "help"):
+        print(HISTORY_USAGE)
+        return 0
+    die(f"claude-mate history: unknown subcommand {show_name(sub)}\n"
+        + HISTORY_USAGE)
+
+
+def _history_list():
+    recs, live, alive = _history_state()
+    if not recs:
+        print(f"{D}no chats kept yet. a chat is kept after its first turn in a "
+              f"wrapped session.{OFF}")
+        return 0
+    now = time.time()
+    facts = [_chat_facts(r, live, now) for r in recs]
+    names = [_clean(r["name"]) or "?" for r in recs]
+    accts = [_clean(r["account"]) or "-" for r in recs]
+    nw = max(vis_width(n) for n in names)
+    aw = max(vis_width(a) for a in accts)
+    # Cut to the terminal on a terminal, so a long title cannot wrap a row into
+    # two -- and a name past 24 columns or an account past 16 cut first, so
+    # they cannot push the title off it. A pipe gets every character of both,
+    # since whatever reads it may want them: padded to line up, never cut.
+    room = (shutil.get_terminal_size((80, 24)).columns - 1
+            if sys.stdout.isatty() else None)
+    if room:
+        nw, aw = min(nw, 24), min(aw, 16)
+    for i, (r, f) in enumerate(zip(recs, facts)):
+        col = COLOUR.get(STATUS_COLOUR.get(f["status"], "idle"), "")
+        line = (f"{i:>3}  {r['conversation'][:8]}  {col}{f['status']:<11}{OFF}"
+                f"  {f['age']:>3}  {_pad(names[i], nw)}  "
+                f"{D}{_pad(accts[i], aw)}{OFF}  {f['title']}")
+        print(clip(line, room) if room else line)
+    print(f"\n{D}{_history_footer(recs, facts)}{OFF}")
+    if not alive:
+        print(f"{D}(daemon not running: liveness from the terminals' context "
+              f"files){OFF}")
+    return 0
+
+
+def _history_rm(rest):
+    recs, live, _alive = _history_state()
+    if not rest:
+        # ASK, RATHER THAN SCOLD -- accounts rm's rule, for the same reason.
+        if not supports_ui():
+            die("claude-mate history rm: which chat? "
+                "(see `claude-mate history`)")
+        rec = _choose_chat("FORGET WHICH CHAT?", recs, live)
+        if rec is None:
+            print("not deleted.")
+            return 1
+    else:
+        rec, why = _address(recs, rest[0])
+        if rec is None:
+            die(f"claude-mate history: {why}")
+    if rec["conversation"] in live:
+        die("claude-mate history rm: still open — it would come back on its "
+            "next turn; close it first")
+    f = _chat_facts(rec, live)
+    print(f"\n{B}This forgets a chat.{OFF}")
+    print(f"  id       {rec['conversation']}")
+    print(f"  title    {f['title'] or '(none)'}")
+    print(f"  name     {_clean(rec['name']) or '?'}")
+    print(f"  cwd      {printable(rec['cwd']) or '?'}")
+    print(f"  account  {_clean(rec['account']) or '-'}")
+    print(f"  status   {f['status']}")
+    print(f"\n{D}{_copies(f)}.{OFF}")
+    # TYPE ITS ID. accounts rm types the NAME back, and that works there because
+    # account names are unique. Chat names are not -- every chat in a project
+    # has the project's -- and an index shifts as chats run, so the only thing
+    # that proves which chat you mean is its id.
+    token = rec["conversation"][:8]
+    try:
+        typed = input(f"\ntype its id, {B}{token}{OFF}, to confirm: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return 130
+    if typed.lower() != token:
+        print("not deleted.")
+        return 1
+    _gone, errors = forget_chats([rec["conversation"]])
+    for e in errors:
+        print(f"claude-mate history: {e}", file=sys.stderr)
+    if errors:
+        return 1
+    print(f"forgot {token}.")
+    return 0
+
+
+def _history_clear():
+    recs, live, _alive = _history_state()
+    go = [r for r in recs if r["conversation"] not in live]
+    stay = len(recs) - len(go)
+    if not go:
+        print("nothing to clear" + (f": {_plural(stay, 'open chat')}, and an "
+                                    f"open chat is never forgotten"
+                                    if stay else "") + ".")
+        return 0
+    only = sum(1 for r in go if _kept_only(r, chat_transcript(r))[1])
+    print(f"\n{B}This forgets {_plural(len(go), 'chat')}.{OFF}")
+    if only:
+        are = "is" if only == 1 else "are"
+        print(f"  {only} of them {are} the only copy of the conversation — "
+              f"there is no undo.")
+    else:
+        print(f"  {D}none of them holds the only copy of a conversation.{OFF}")
+    if stay:
+        print(f"  {D}{_plural(stay, 'open chat')} {_stays(stay)}: an open chat would "
+              f"come back on its next turn.{OFF}")
+    try:
+        typed = input(f"\ntype {B}clear{OFF} to confirm: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return 130
+    if typed != "clear":
+        print("not deleted.")
+        return 1
+    gone, errors = forget_chats([r["conversation"] for r in go])
+    for e in errors:
+        print(f"claude-mate history: {e}", file=sys.stderr)
+    print(f"forgot {_plural(len(gone), 'chat')}.")
+    return 1 if errors else 0
+
+
+def _history_resume(rest):
+    mode, args = "as-started", []
+    for a in rest:
+        want = {"--skip-permissions": "skip", "--ask-permissions": "ask"}.get(a)
+        if want:
+            if mode not in ("as-started", want):
+                die("claude-mate history resume: --skip-permissions or "
+                    "--ask-permissions, not both")
+            mode = want
+        elif a.startswith("-"):
+            die(f"claude-mate history resume: unknown option {show_name(a)}\n"
+                + HISTORY_USAGE)
+        else:
+            args.append(a)
+    if len(args) > 1:
+        die("claude-mate history resume: one chat at a time")
+    recs, live, _alive = _history_state()
+    if not args:
+        if not supports_ui():
+            die("claude-mate history resume: which chat? "
+                "(see `claude-mate history`)")
+        rec = _choose_chat("RESUME WHICH CHAT?", recs, live)
+        if rec is None:
+            return 1
+    else:
+        rec, why = _address(recs, args[0])
+        if rec is None:
+            die(f"claude-mate history: {why}")
+        if _index_of(recs, args[0]) is not None:
+            # BY NUMBER, IT SAYS WHICH CHAT FIRST. The number is the list
+            # `claude-mate history` printed a while ago, and that reorders as
+            # chats run: one new chat's first turn and `resume 1` is another
+            # chat -- same project, same name, perhaps skipping permissions
+            # -- and the prompt you type next goes into it. An id cannot
+            # shift, and goes straight on.
+            if not (sys.stdin.isatty() and sys.stdout.isatty()):
+                die(f"claude-mate history resume: {NO_TTY}")
+            f = _chat_facts(rec, live)
+            print(f"\n{B}{rec['conversation'][:8]}{OFF}  "
+                  f"{f['title'] or _clean(rec['name']) or '(no title)'}")
+            print(f"  {D}in {printable(rec['cwd']) or '?'}{OFF}")
+            try:
+                typed = input("\npress enter to resume it, ctrl-c to stop: ")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return 130
+            if typed.strip():
+                print("not resumed.")
+                return 1
+    why = resume_chat(rec, mode, live=live, ask=_ask_typed)
+    if not why:
+        print("not resumed.")
+        return 1
+    die(f"claude-mate history resume: {why}")
+
+
+def _ask_typed(question):
+    """resume_chat's question at a shell prompt: True for a typed `yes` and
+    for nothing else; end of input or ctrl-c is 130, as at every prompt here."""
+    print(f"\n{question}.")
+    try:
+        typed = input(f"\ntype {B}yes{OFF} to resume it anyway: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        raise SystemExit(130)
+    return typed == "yes"
+
+
+# ---------------------------------------------------------------------------
 # The daemon, as something you can start rather than be told about
 # ---------------------------------------------------------------------------
 # THROUGH LAUNCHD, ALWAYS, and never by spawning the daemon directly. There is
@@ -723,7 +1499,7 @@ def show_name(name):
 def daemon_alive():
     """Is a daemon answering? `queue` is the only liveness proof there is.
 
-    The socket has no ping, status or version verb -- six verbs, and anything
+    The socket has no ping, status or version verb -- seven verbs, and anything
     unrecognised is parsed as a session update and dropped -- so the honest test
     is to ask it something real and see whether JSON comes back.
     """
@@ -881,6 +1657,7 @@ def why_the_daemon_died(log_path=None, max_lines=12):
 # test caught it. The module keeps its own copies for its own rendering.
 from claude_mate_ui import (                                    # noqa: E402
     Item, Term, confirm, pick, printable, read_key, supports_ui,
+    _ANSI, _cells, clip, vis_width,
 )
 
 # ---------------------------------------------------------------------------
@@ -902,18 +1679,281 @@ from claude_mate_ui import (                                    # noqa: E402
 # decision and this is somebody else's machine as often as it is ours, so the
 # menu says which one it is doing rather than quietly picking. Anything else
 # goes in CLAUDE_MATE_NEW_ARGS.
-def exec_new_session(extra_argv, term=None):
+#
+# A RESUMED CHAT COMES THROUGH HERE TOO, which is what `cwd`, `env` and `verb`
+# are for: `claude --resume <id>` finds the conversation through the directory
+# it is run in, and the login through CLAUDE_CONFIG_DIR. ValueError as well as
+# OSError, because that is what execve() raises for a NUL in an argument, and a
+# traceback after the terminal has been handed back is no way to say so.
+def exec_new_session(extra_argv, term=None, cwd=None, env=None,
+                     verb="starting"):
     if term is not None:
         term.restore()
     if not os.path.exists(WRAP):
         die(f"claude-mate: cannot find the wrapper at {WRAP}")
     argv = [sys.executable, WRAP] + list(extra_argv)
-    print(f"{D}starting: claude {' '.join(extra_argv)}{OFF}\n")
+    print(f"{D}{verb}: claude {printable(' '.join(extra_argv))}{OFF}\n")
     sys.stdout.flush()
     try:
-        os.execve(sys.executable, argv, dict(os.environ))
-    except OSError as exc:
+        if cwd:
+            os.chdir(cwd)
+        os.execve(sys.executable, argv,
+                  dict(os.environ) if env is None else env)
+    except (OSError, ValueError) as exc:
         die(f"claude-mate: could not start the wrapper: {exc}")
+
+
+# ---- resuming a kept chat ----------------------------------------------- #
+_WRAPPER = []           # the wrapper as a module, once loaded
+
+
+def _wrapper():
+    """The wrapper, loaded by path, for the policy a resume replays flags by.
+
+    ONE POLICY, AND IT IS THE WRAPPER'S. Which launch flags make a resumed
+    session the same kind of session -- permission mode, model, effort, yes; a
+    prompt, which would be SENT AGAIN, or -w, which makes a new worktree, no --
+    is decided once, in resume_flags(), for a chat resumed days later from its
+    record -- stricter than the account switch's own rule, which carries a
+    session on the spot and stores nothing. Loaded the way claude-mate-switch
+    loads it (an executable with no .py,
+    everything that starts a session behind its __main__ guard), and only when
+    a resume needs it."""
+    if not _WRAPPER:
+        # FROM A DIRECTORY THAT IS STILL THERE. The wrapper names its session
+        # after os.getcwd() as it loads, and in a directory deleted under this
+        # shell (a removed worktree, a cleaned-up temp dir) that raises: every
+        # resume was refused as "cannot load the wrapper ... No such file or
+        # directory" for a wrapper that was right there, and the chat menu
+        # lost the flags it labels Resume by. So it loads from ~ -- a resume
+        # runs in the chat's own directory anyway.
+        try:
+            os.getcwd()
+        except OSError:
+            os.chdir(os.path.expanduser("~"))
+        name = "cm_wrap"
+        spec = importlib.util.spec_from_loader(
+            name, importlib.machinery.SourceFileLoader(name, WRAP))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _WRAPPER.append(mod)
+    return _WRAPPER[0]
+
+
+def _flag_items(flags, cwd=None):
+    """A kept chat's flags as the wrapper parses them -- one item per flag,
+    WITH its values (resume_flag_items) -- or [] when the wrapper cannot load.
+
+    NEVER WORD BY WORD. In `--name --dangerously-skip-permissions` the second
+    word is the session's name: a scan for the permission flag reads a bypass
+    the chat never had, and taking that word out leaves `--name` to swallow the
+    `--resume` behind it -- a NEW session, with the id as its first prompt."""
+    try:
+        return [list(it) for it in
+                _wrapper().resume_flag_items(list(flags or []), cwd=cwd)]
+    except Exception:                                 # noqa: BLE001
+        return []
+
+
+def _permission_mode_of(item):
+    """The mode a `--permission-mode` item sets, either spelling; None for
+    any other flag."""
+    if item[0].split("=", 1)[0] != "--permission-mode":
+        return None
+    if "=" in item[0]:
+        return item[0].split("=", 1)[1]
+    return item[1] if len(item) > 1 else ""
+
+
+def _skip_items(items):
+    """Do these items start a session that asks no permission? Both ways of
+    saying so count -- a record that bypasses through --permission-mode must
+    not be offered a plain Resume that quietly bypasses too."""
+    return any(it[0] == "--dangerously-skip-permissions"
+               or _permission_mode_of(it) == "bypassPermissions"
+               for it in items)
+
+
+def skips_permissions(flags, cwd=None):
+    """_skip_items() for a list of flags, parsed the wrapper's way first."""
+    return _skip_items(_flag_items(flags, cwd))
+
+
+def _label_of(cfg):
+    """The wrapper's account_label() rule, for a config dir we hold rather
+    than one in the environment."""
+    return os.path.basename(os.path.normpath(cfg)).lstrip(".") or "default"
+
+
+NO_TTY = ("resume needs a terminal on both ends: the wrapper would run claude "
+          "unwrapped, untracked")
+OPEN_NOW = ("it is open in a terminal — raise it instead; resuming it twice "
+            "would write one transcript from two places")
+RECENT_WRITE_S = 120.0    # a transcript written this lately may have a writer
+                          # nothing here can see: ask before resuming it
+
+
+def _written_ago(path):
+    """Seconds since `path` was last written, or None when that is unknown."""
+    try:
+        return time.time() - os.stat(path).st_mtime
+    except (OSError, ValueError):
+        return None
+
+
+def resume_chat(rec, mode, term=None, live=None, ask=None):
+    """Pick a kept chat up again, where and as it was. Returns why not -- the
+    app shows it as a note, the CLI dies with it -- or '' when `ask` was
+    answered no, or never returns.
+
+    mode: "as-started" replays the flags it was started with; "skip" swaps any
+    permission mode for --dangerously-skip-permissions; "ask" drops every way
+    of skipping them.
+
+    `live` is chats the caller already knows are open: it is ADDED to a fresh
+    look, never taken instead of one. `ask(question)` goes on only on True --
+    it is how a transcript written moments ago is put to a person (see
+    RECENT_WRITE_S); with no `ask`, that question is a refusal.
+
+    EVERYTHING IS CHECKED BEFORE THE TERMINAL IS HANDED OVER, because nothing
+    can be said after the exec, and claude's own answer to most of these -- "No
+    conversation found with session ID" -- names none of the causes. Each
+    refusal says what was checked."""
+    conv = rec["conversation"]
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return NO_TTY
+    known = set(live or ())
+    if conv in known | live_conversations(_queue_snapshot()):
+        return OPEN_NOW
+    cfg = rec["config_dir"]
+    found, base = _locate(rec)
+    kept = chat_kept(rec)
+    if cfg and not os.path.isdir(cfg):
+        gone = (f"its account profile {_clean(_label_of(cfg))} no longer "
+                f"exists ({printable(cfg)})")
+        if kept:
+            # NOT MADE AGAIN FROM HERE. The kept link is the whole
+            # conversation, but the login went with the profile: a resume
+            # into a bare directory would start claude logged out, as an
+            # account that is not the one the chat ran as.
+            return (f"{gone} — the conversation is kept; recreate the profile "
+                    f"and log in to resume it as that account")
+        return (f"{gone}, and no copy of the conversation was kept in "
+                f"{printable(history_dir())}")
+    if not found and not kept:
+        where = " or ".join(printable(os.path.join(b, "projects"))
+                            for b in _search_bases(rec))
+        return (f"no {conv[:8]}….jsonl under {where}, and none kept in "
+                f"{printable(history_dir())}. Claude Code may have cleaned it "
+                f"up (cleanupPeriodDays), `claude purge` may have removed it, "
+                f"or the profile it lived in may have been deleted")
+    try:
+        W = _wrapper()
+        recorded = W.transcript_cwd(found or kept)
+    except Exception as exc:                          # noqa: BLE001
+        return (f"cannot load the wrapper from {printable(WRAP)}: "
+                f"{printable(str(exc))}")
+    # THE TRANSCRIPT'S OWN cwd FIRST. It is where claude was really running --
+    # under -w that is the worktree, not the directory the wrapper started in
+    # -- and it is the directory --resume looks the conversation up through.
+    cwd = next((c for c in (recorded, rec["cwd"])
+                if isinstance(c, str) and c.startswith("/")
+                and os.path.isdir(c)), "")
+    if not cwd:
+        return (f"its directory {printable(recorded or rec['cwd'] or '?')} no "
+                f"longer exists — claude finds the conversation through it; "
+                f"recreate it, or delete the record")
+    try:
+        # Through the policy AGAIN, not replayed as stored: a record is a file,
+        # and what reaches execve() is decided by the wrapper's rules of today.
+        # As ITEMS, so the permission mode is swapped a whole flag at a time.
+        items = [list(it) for it in
+                 W.resume_flag_items(list(rec["flags"] or []), cwd=cwd)]
+    except Exception as exc:                          # noqa: BLE001
+        return (f"cannot load the wrapper's resume rules from "
+                f"{printable(WRAP)}: {printable(str(exc))}")
+    if mode == "skip":
+        if any(it[0] == "--restricted" for it in items):
+            return ("it was started with --restricted, which refuses to skip "
+                    "permission prompts")
+        items = [it for it in items if _permission_mode_of(it) is None]
+        if not any(it[0] == "--dangerously-skip-permissions" for it in items):
+            items.append(["--dangerously-skip-permissions"])
+    elif mode == "ask":
+        items = [it for it in items
+                 if it[0] != "--dangerously-skip-permissions"
+                 and _permission_mode_of(it) != "bypassPermissions"]
+    flags = [w for it in items for w in it]
+
+    env = dict(os.environ)
+    if cfg is None:
+        # Not recorded: run it as the login it was found under.
+        cfg = "" if os.path.realpath(base or os.path.expanduser("~/.claude")) \
+            == os.path.realpath(os.path.expanduser("~/.claude")) else base
+    if cfg:
+        # VERBATIM. Claude hashes the exact string into its Keychain entry, so
+        # CLAUDE_CONFIG_DIR=~/.claude is a different login from no variable.
+        env["CLAUDE_CONFIG_DIR"] = cfg
+        label = _label_of(cfg)
+    else:
+        env.pop("CLAUDE_CONFIG_DIR", None)
+        label = "default"
+    env["CLAUDE_MATE_ACCOUNT"] = label
+
+    # A TRANSCRIPT SOMETHING IS STILL WRITING. "Open" is only what claude-mate
+    # can see: a wrapped terminal that knows its chat. claude run without the
+    # wrapper, the VS Code panel, a chat opened by -r <name> or by claude's
+    # own picker before its first turn -- none of them says which chat it
+    # has, and a second claude on it forks the transcript all the same. What
+    # every one of them does leave is a fresh write, so a chat written
+    # moments ago is a question for the person, never a silent go.
+    ago = _written_ago(found or kept)
+    if ago is not None and ago < RECENT_WRITE_S:
+        question = (f"its transcript was written {chat_age(ago)} ago and no "
+                    f"terminal claude-mate can see has it — one it cannot see "
+                    f"may (claude run without the wrapper, the VS Code panel, "
+                    f"or a session opened by -r or the picker that has not "
+                    f"run a turn yet); resuming it twice writes one "
+                    f"transcript from two places")
+        if ask is None:
+            return question
+        if not ask(question):
+            return ""
+    # AND OPEN IS LOOKED AT AGAIN, RIGHT BEFORE ANYTHING IS DONE. What was
+    # read before -- by the caller, before a chooser, before a question that
+    # waited on a person -- is as old as that wait, and a chat opened in
+    # another terminal meanwhile would get a second claude.
+    if conv in known | live_conversations(_queue_snapshot()):
+        return OPEN_NOW
+
+    if not found:
+        # BACK FROM THE KEPT LINK. Claude's copy is gone -- cleaned up after
+        # cleanupPeriodDays, purged, or deleted with its profile (made again
+        # since) -- and the one kept here is the conversation. Put it where
+        # --resume looks: the directory it was last seen in, else Claude's
+        # mangling of the cwd. A link costs no space; across volumes, a copy.
+        proj = rec["project"] or re.sub(r"[^a-zA-Z0-9]", "-", cwd)
+        dst = os.path.join(cfg or os.path.expanduser("~/.claude"),
+                           "projects", proj, conv + ".jsonl")
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            try:
+                os.link(kept, dst)
+            except FileExistsError:
+                pass                      # someone put it back meanwhile
+            except OSError:
+                shutil.copy2(kept, dst)
+        except OSError as exc:
+            return (f"could not put the kept transcript back at "
+                    f"{printable(dst)}: {exc.strerror or exc}")
+
+    if term is not None:
+        term.restore()
+    print(f"resuming: {_clean(rec['name']) or conv[:8]} in {printable(cwd)} "
+          f"as {_clean(label)}")
+    exec_new_session(flags + ["--resume", conv], cwd=cwd, env=env,
+                     verb="resuming")
+    return "the wrapper did not start"      # exec_new_session never returns
 
 
 def extra_new_args():
@@ -934,10 +1974,70 @@ def _rows(snap):
                  "argv": extra_new_args()})
     rows.append({"kind": "new", "label": "Start new session · skip permissions",
                  "argv": ["--dangerously-skip-permissions"] + extra_new_args()})
+    # ONE ROW, AND NOTHING READ TO DRAW IT. The chats themselves are listed one
+    # level down: on this screen they would push the rows below off an 80x24
+    # terminal, and move under a cursor that is only a position.
+    rows.append({"kind": "history",
+                 "label": "History · resume or delete a past chat"})
     rows.append({"kind": "device", "label": "Device · link status and pairing"})
     rows.append({"kind": "accounts", "label": "Accounts · switch or review"})
     rows.append({"kind": "quit", "label": "Quit"})
     return rows
+
+
+NOTE_ROWS = 3             # rows one line of the app's note may wrap to
+_SGR_LEAD = re.compile(r"(?:\x1b\[[0-9;]*m)+")
+_RESET = "\033[0m"
+
+
+def _fits(text, room):
+    """How many characters of `text` fit in `room` columns: colour codes
+    cost none, a wide character two."""
+    used, i = 0, 0
+    while i < len(text):
+        m = _ANSI.match(text, i)
+        if m:
+            i = m.end()
+            continue
+        w = _cells(text[i])
+        if used + w > room:
+            break
+        used += w
+        i += 1
+    return i
+
+
+def _wrap(text, room, most):
+    """`text` as at most `most` rows of at most `room` columns, broken at a
+    space in the second half of a row, else wherever the row is full (a long
+    path would otherwise strand the word before it on a row of its own); the
+    last row cut with '…' when it all does not fit."""
+    rows = []
+    while len(rows) < most - 1 and vis_width(text) > room:
+        n = _fits(text, room)
+        if text[n:n + 1] != " ":
+            sp = text.rfind(" ", 0, n)
+            n = sp if sp > n // 2 else max(n, 1)
+        rows.append(text[:n].rstrip(" "))
+        text = text[n:].lstrip(" ")
+    return rows + [clip(text, room)]
+
+
+def _note_rows(note, room, most=NOTE_ROWS):
+    """A note as screen rows of at most `room` columns: each of its lines
+    wrapped to at most `most` rows -- a note that brings its own line breaks
+    (start_daemon's, with the reason the daemon died) keeps every line of it.
+    A colour the note starts with starts every row, and every row ends in a
+    reset, so no colour runs on past its row."""
+    m = _SGR_LEAD.match(note)
+    lead = m.group() if m else ""
+    body = note[len(lead):]
+    if body.endswith(_RESET):
+        body = body[:-len(_RESET)]
+    rows = [r for line in body.split("\n") for r in _wrap(line, room, most)]
+    if not (lead or _ANSI.search(body)):
+        return rows
+    return [f"{lead}{r}{_RESET}" for r in rows]
 
 
 def _draw(term, snap, sel, rows, note, alive):
@@ -991,7 +2091,11 @@ def _draw(term, snap, sel, rows, note, alive):
             out.append(f" {here}  {body}")
     out.append("")
     if note:
-        out.append(f" {note}")
+        # FITTED LIKE EVERY OTHER LINE HERE. A note is whatever a level below
+        # or a refusal had to say -- a resume refused because its directory is
+        # gone runs to 175 columns -- and painted raw it wrapped, pushed the
+        # frame past the bottom and scrolled the header off the top.
+        out += [f" {r}" for r in _note_rows(note, cols - 2)]
         out.append("")
     if rows[sel]["kind"] == "session":
         out.append(f" {D}↑↓ move   ⏎ raise this session   a ack   f follow"
@@ -1051,6 +2155,9 @@ def cmd_app():
                     last_poll = 0.0
                 elif row["kind"] == "accounts":
                     note = menu_accounts(term)
+                    last_poll = 0.0
+                elif row["kind"] == "history":
+                    note = menu_history(term)
                     last_poll = 0.0
                 elif row["kind"] == "session":
                     talk(f"select|{row['s']['name']}")
@@ -1148,9 +2255,15 @@ def _delete_account(term, a):
     """
     name = show_name(a["name"])
     email = read_email(a["name"], a["dir"])
+    in_history = history_on_account(a["dir"])
+    # term=term: without it pick() opened a Term of its own, and restoring that
+    # one took the app's screen out of the alternate buffer while it ran on.
     ok = confirm(
         f"DELETE {name}?",
-        f"{printable(email) or '(not logged in)'} · {printable(a['dir'])} · there is no undo")
+        f"{printable(email) or '(not logged in)'} · {printable(a['dir'])} · there is no undo",
+        term=term,
+        note=(f"{D}{history_account_note(in_history)}{OFF}"
+              .replace(" — ", " —\n ") if in_history else None))
     if not ok:
         return None
     try:
@@ -1159,6 +2272,179 @@ def _delete_account(term, a):
         return f"{COLOUR['error']}could not delete: {e}{OFF}"
     talk("accounts-refresh")
     return f"{COLOUR['done']}deleted {name}{OFF}"
+
+
+def menu_history(term):
+    """The chats the daemon has kept, newest first. Returns a note, or None.
+
+    Read when it opens, and again each time you come back to the list -- never
+    while it is on the screen, and never from the top level, which draws one
+    row for all of it."""
+    while True:
+        recs = load_history()
+        if not recs:
+            return (f"{D}no chats kept yet. a chat is kept after its first "
+                    f"turn in a wrapped session.{OFF}")
+        live = live_conversations(_queue_snapshot())
+        now = time.time()
+        facts = [_chat_facts(r, live, now) for r in recs]
+        # Titles cut to half the width, so one long title cannot pad every row
+        # until the details are pushed off the edge.
+        room = max(20, (term.size()[0] - 1) // 2)
+        items = [_chat_item(r, f, room) for r, f in zip(recs, facts)]
+        items.append(Item("Clear all history", value=("clear", None),
+                          danger=True, gap=True,
+                          detail="forget every chat that is not open"))
+        items.append(Item("Back", value=("back", None), gap=True))
+        got = pick("HISTORY", items, term=term,
+                   hint="↑↓ move   ⏎ open   esc back",
+                   note=f"{D}{_history_footer(recs, facts, short=True)}{OFF}")
+        if got is None or got[0] == "back":
+            return None
+        if got[0] == "clear":
+            note = _clear_history(term, recs, facts, live)
+        else:
+            note = menu_one_chat(term, got[1], live)
+        if note:
+            return note
+
+
+def menu_one_chat(term, rec, live):
+    """What you can do with one kept chat. Returns a note, or None.
+
+    NO DIGITS HERE. A number would resume -- possibly skipping permissions --
+    or reach Delete in one keystroke, with nothing in between to undo it."""
+    conv = rec["conversation"]
+    f = _chat_facts(rec, live)
+    flag_items = _flag_items(rec["flags"], rec["cwd"] or None)
+    flags = [w for it in flag_items for w in it]
+    label = f["title"] or _clean(rec["name"]) or conv[:8]
+    items = []
+    if conv in live:
+        items.append(Item("Raise its terminal", value="raise",
+                          detail="it is open: bring that window forward"))
+    elif f["transcript"] or f["kept"]:
+        # THE PERMISSION MODE IS IN THE LABEL, NOT HIDDEN IN A DETAIL that the
+        # width cuts first -- the same rule as the two Start rows on the top
+        # level. A chat started skipping prompts says so before it does it.
+        if _skip_items(flag_items):
+            items.append(Item("Resume · skip permissions", value="as-started",
+                              detail="as it was started"))
+            items.append(Item("Resume · ask permissions", value="ask",
+                              detail="the same flags, prompts back on"))
+        else:
+            items.append(Item("Resume", value="as-started",
+                              detail=" ".join(flags) or "as it was started"))
+            if not any(it[0] == "--restricted" for it in flag_items):
+                items.append(Item("Resume · skip permissions", value="skip",
+                                  detail="--dangerously-skip-permissions"))
+    items.append(Item("Delete from history", value="rm", danger=True, gap=True,
+                      detail=_copies(f)))
+    items.append(Item("Back", value="back", gap=True))
+    where = [_clean(rec["account"]) or "-", conv[:8],
+             f"active {f['age']} ago" if f["age"] != "-" else "never active",
+             f["status"]]
+    if f["only"]:
+        where.append("kept only here")
+    elif not (f["transcript"] or f["kept"]):
+        where.append("no transcript left to resume")
+    got = pick(f"CHAT · {label}", items, term=term, digits=False,
+               note=f"{D}{printable(rec['cwd']) or '?'}\n "
+                    f"{' · '.join(where)}{OFF}")
+    if got is None or got == "back":
+        return None
+    if got == "raise":
+        return _raise_chat(rec)
+    if got == "rm":
+        if conv in live:
+            return (f"{COLOUR['error']}still open — it would come back on its "
+                    f"next turn; close it first{OFF}")
+        ok = confirm(f"DELETE {label}?", _copies(f), term=term,
+                     note=f"{D}{_clean(rec['name']) or '?'} · "
+                          f"{printable(rec['cwd']) or '?'} · {conv[:8]}{OFF}")
+        if not ok:
+            return None
+        _gone, errors = forget_chats([conv])
+        if errors:
+            return f"{COLOUR['error']}{printable('; '.join(errors))}{OFF}"
+        return f"{COLOUR['done']}forgot {label}{OFF}"
+
+    def ask(question):
+        # No first and no digits (confirm()); the question as the note, since
+        # the hint line is cut to the width and this one has to be read whole.
+        note = "\n ".join(_note_rows(f"{D}{question}{OFF}",
+                                     term.size()[0] - 2, most=6))
+        return confirm(f"RESUME {label}?", "resume it anyway?", term=term,
+                       note=note)
+
+    problem = resume_chat(rec, got, term=term, ask=ask)  # returns only to stop
+    if not problem:
+        return None                 # asked, and the answer was no
+    return f"{COLOUR['error']}{problem}{OFF}"
+
+
+def _raise_chat(rec):
+    """Bring an open chat's terminal forward: GO, on ITS row.
+
+    By the row's key, re-read now -- not by a queue index from when the menu
+    opened, which a session starting or ending since would have shifted onto
+    another row -- and GO only once the daemon says that row is selected.
+    Raising the wrong window is the one mistake select refuses to guess at.
+
+    AND ONLY A ROW STILL BEING HEARD FROM, the freshest. A terminal killed
+    outright keeps its row for minutes, and the chat resumed since, in the
+    same directory, has a second row under the same name -- which of the two
+    sorts first is a coin toss on their random keys. GO on the dead one
+    brought VS Code forward instead, acknowledged a row nobody was in, and
+    said it had raised the chat."""
+    snap = _queue_snapshot()
+    if snap is None:
+        return (f"{COLOUR['error']}no daemon to raise it with — it is open "
+                f"in a terminal, by that terminal's own record{OFF}")
+    queue = snap.get("queue")
+    rows = [s for s in (queue if isinstance(queue, list) else [])
+            if isinstance(s, dict) and str(s.get("conversation") or "").lower()
+            == rec["conversation"]]
+    heard = sorted((s for s in rows if _heard(s)), key=_quiet)
+    if rows and not heard:
+        return (f"{COLOUR['error']}its terminal has stopped reporting to the "
+                f"daemon (nothing for over {int(LIVE_REPORT_S)} s) — raising "
+                f"that row could bring the wrong window forward{OFF}")
+    entry = heard[0] if heard else None
+    key = str((entry or {}).get("key") or "")
+    if not key or any(c in key for c in "|\r\n"):
+        return (f"{COLOUR['error']}the daemon has no row for it yet — it is "
+                f"open, by its terminal's own record{OFF}")
+    reply = talk(f"select|{key}") or ""
+    if not reply.startswith("ok"):
+        return (f"{COLOUR['error']}could not select it: "
+                f"{printable(reply.strip() or 'no reply')}{OFF}")
+    talk("press|G")
+    return f"{D}raised {_clean(entry.get('name')) or printable(key)}{OFF}"
+
+
+def _clear_history(term, recs, facts, live):
+    """Forget every kept chat that is not open, behind one confirmation that
+    says how many go and how many of them exist nowhere else."""
+    go = [(r, f) for r, f in zip(recs, facts) if r["conversation"] not in live]
+    stay = len(recs) - len(go)
+    if not go:
+        return f"{D}nothing to clear: every chat in it is open{OFF}"
+    only = sum(1 for _r, f in go if f["only"])
+    question = (f"{_plural(len(go), 'chat')} go · {only} of them the only copy "
+                f"of the conversation — there is no undo" if only else
+                f"{_plural(len(go), 'chat')} go · none of them the only copy "
+                f"of a conversation")
+    ok = confirm("CLEAR ALL HISTORY?", question, term=term,
+                 note=(f"{D}{_plural(stay, 'open chat')} {_stays(stay)}{OFF}"
+                       if stay else None))
+    if not ok:
+        return None
+    gone, errors = forget_chats([r["conversation"] for r, _f in go])
+    if errors:
+        return (f"{COLOUR['error']}forgot {len(gone)}; "
+                f"{printable('; '.join(errors))}{OFF}")
+    return f"{COLOUR['done']}forgot {_plural(len(gone), 'chat')}{OFF}"
 
 
 def menu_device(term):
@@ -1239,6 +2525,8 @@ def main(argv):
         return cmd_select(rest[0])
     if cmd in ("accounts", "account"):
         return cmd_accounts(rest)
+    if cmd == "history":
+        return cmd_history(rest)
     if cmd == "link":
         return cmd_link(rest)
     if cmd == "trust":
