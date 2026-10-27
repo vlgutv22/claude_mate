@@ -24,7 +24,9 @@ echo 'alias claude="'"$PWD"'/bin/claude-mate-wrap"' >> ~/.zshrc && exec zsh
 **You do not need hardware.** `claude-mate` in a terminal is the same interface
 as the device — see [USING.md](USING.md), which is the manual for both.
 
-Undo it all with `./install/uninstall.sh`.
+Undo it all with `./install/uninstall.sh`. It leaves what is yours in place:
+the logs, and the shared token and the chat history under
+`~/.config/claude-mate/`.
 
 The rest of this page is the **manual** route, and the firmware. Read it if you
 are flashing a board, or if you want to know exactly what the installer touched.

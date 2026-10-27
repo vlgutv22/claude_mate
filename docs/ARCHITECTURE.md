@@ -119,6 +119,39 @@ read off the row Claude Code draws under the prompt box for each one. That
 field is what the workflow band is drawn from, so only a wrapped session has a
 band; the hook does not carry it. See [PROTOCOL.md §2](PROTOCOL.md#wf-field).
 
+**The chat history** comes in on that same line, as field 9: which Claude Code
+conversation the session is running, where, under which login, and with which
+launch flags a resume would replay. Unlike anything else on that line it ends
+up on disk, and the writing is kept off the socket thread entirely:
+
+```
+claude-mate-wrap   field 9 on every report, `end` included: directory, login,
+        |          flags -- and the conversation's id once it is sure of it
+        v
+socket thread      Registry.update (sticky, like the account), then -- last,
+        |          fenced -- history.note(): queue the event, wake the writer.
+        |          No file I/O on this thread, ever.
+        v
+history writer     its own thread; a burst gathered for 0.5 s, then per record:
+        |          created only by a turn, written whole (temp file, fsync,
+        |          rename, directory fsync), never one write per keepalive;
+        |          the record first, then the link to its transcript
+        v
+~/.config/claude-mate/history/<id>.json    the record           (0600, dir 0700)
+~/.config/claude-mate/history/<id>.jsonl   hard link to Claude Code's transcript
+        ^
+        |  read, resumed and deleted directly, daemon up or down; the socket
+        |  only for `queue` (which chats are open) and the app's Raise
+        |  (`select|<key>`, then `press|G`)
+claude-mate history  /  the app's History menu
+```
+
+The record outlives the session: `end` and the TTL prune take a session out of
+the queue, and leave its record where it is. Deleting one is the CLI's, in its
+own process, for the reason `accounts rm` is: nothing a hook can reach may
+delete anything. The record, its rules and the kept link are in
+[PROTOCOL.md §3](PROTOCOL.md#chat-history).
+
 ---
 
 ## Component diagram (ASCII)
@@ -289,7 +322,10 @@ described.
   sessions come and go (only the `pos/total` number changes).
 - **WYSIWYG:** GO/ACK act on exactly the session whose frame is on the glass —
   never a freshly recomputed most-urgent alert. So a press can only ever raise the
-  terminal whose name the user is actually looking at.
+  terminal whose name the user is actually looking at. With no device reachable
+  there is no glass: `refresh()` forgets the last frame, and a press from a
+  terminal acts on the selection instead of the last session a dropped device
+  showed.
 - The daemon sends an `F` line whenever the rendered bytes change: immediately
   on any state change or button, and ~1/s while a displayed time ticks.
   Identical frames are not re-sent (except on handshake, and while a workflow
@@ -401,8 +437,24 @@ GO (~0.5 s, `B|K`) acknowledges *without* any window op.
   and **auto-reconnects** if the device disappears and returns; it never crashes
   on a missing port.
 - Work is split across **threads with locks** (socket server, button reader,
-  serial maintainer, 1 Hz ticker) — no busy-wait spinning; focus runs on
-  serialized side threads so the button reader never blocks.
+  serial maintainer, 1 Hz ticker, history writer) — no busy-wait spinning;
+  focus runs on serialized side threads so the button reader never blocks.
+- **One bad socket line costs that line, never the socket thread.** Each line
+  is handled inside its own guard, and a fault is logged at most once a minute
+  with a count of the repeats. Before, anything but an `OSError` ended the
+  socket thread for good while the process lived on — and launchd restarts a
+  daemon that dies, not one that has stopped listening, so every report after
+  it went nowhere without a word.
+- **The history never costs a state report.** Field 9 is parsed by a function
+  that never raises and drops a bad key on its own; the history's work on a line
+  runs last, after the registry, the screen and the LED, inside its own guard;
+  and the socket thread only queues — the writer thread does every file
+  operation. A record that cannot be written costs that record, logged once a
+  minute for as long as it keeps failing. The directory is made again on the
+  next write if someone deletes it, the history is never read at startup (a
+  fault there would be a launchd restart every five seconds), and at shutdown
+  the writer is stopped last, after the socket thread is joined, so the final
+  `end`s are written.
 - The **hook always exits 0** and never blocks Claude; if the daemon/socket is
   down it silently no-ops with a short timeout.
 - The **Arduino** tolerates partial/garbled lines, caps its input buffer
@@ -461,6 +513,21 @@ These are deliberate, documented boundaries — not bugs:
   daemon falls back to **raising the VS Code window** for the workspace folder.
   Focus is therefore best-effort and may land you on the workspace rather than
   the precise chat in some cases.
+- **The chat history keeps only wrapped sessions, and only conversations it can
+  name.** Hook-only sessions are not recorded — hooks never send `end`, so a
+  hook row could never be closed. A session that has to find its conversation
+  for itself — a cold capability cache, `--fork-session`, and `-c`,
+  `-r <name>`, the picker or `--from-pr`, which carry on one already there —
+  looks after its own first turn, and gives up rather than guess when another
+  terminal in that directory started or carried on a chat meanwhile. The daemon
+  is the only writer and keeps only a turn it saw start, so a chat that ran
+  entirely while it was down is not kept. `/clear` or `/resume` inside a
+  running session switches Claude's conversation while the wrapper keeps
+  reporting the one it started with. A terminal reported by both the hook and
+  the wrapper is still two rows in the queue; nothing merges them. Kept
+  transcripts are hard links, so they cost no disk until Claude Code deletes
+  its own copy, and none can be made across volumes. Nothing reaches the
+  device: it shows the live queue, as before.
 - **No persistence on the device.** The Arduino holds no state; every reset
   relies on the `H` handshake and the daemon re-sending state. If the daemon is
   not running, the firmware shows the **LINK LOST** screen after ~30 s rather

@@ -8,7 +8,8 @@ There are three interfaces:
 
 1. **Serial protocol** — daemon ⇄ Arduino (USB CDC serial).
 2. **Socket message** — hook / PTY wrapper → daemon (Unix domain socket).
-3. **Session state model** — the triage queue the daemon keeps.
+3. **Session state model** — the triage queue the daemon keeps, and the
+   [chat history](#chat-history) it writes to disk.
 
 ---
 
@@ -96,6 +97,15 @@ collapses, resizes, or miniaturizes anything.
 **WYSIWYG:** GO/ACK act on **exactly the session whose frame is on the glass** —
 never a freshly recomputed most-urgent alert. So a press can only ever raise the
 terminal whose name the user is actually looking at.
+
+**No glass, the selection.** With no device reachable — a cable pulled, a
+battery device asleep — nothing is on the glass, and a press from a terminal
+(`claude-mate go`, the app) acts on the **selection**: the row `select`, `next`
+or `prev` last pointed at. GO, ACK, CONTINUE, NEW TERMINAL, a switch and
+FOLLOW's raise all go there; MIRROR, a view *of* the glass, opens nothing. It
+used to be the last session drawn on the device that had gone, so the app's
+*Raise its terminal* — which selects a chat's row by its key, is told `ok`, then
+presses GO — raised and acknowledged another terminal.
 
 **No auto-switch, ever:** the selection is **sticky** — the screen only
 changes subject when you navigate (PREV/NEXT), and a GO/ACK **stays on the tab
@@ -473,13 +483,13 @@ every replug.
 **Framing:** one **newline-terminated** line per message.
 
 ```
-<state>|<session_id>|<name>[|<ctrl_sock>|<model>|<effort>|<account>|<limit>|<wf>]
+<state>|<session_id>|<name>[|<ctrl_sock>|<model>|<effort>|<account>|<limit>|<wf>|<hist>]
 ```
 
 | Field        | Description |
 |--------------|-------------|
 | `state`      | One of: `working`, `waiting`, `done`, `error` (or `idle`/`end` from the PTY wrapper). |
-| `session_id` | The Claude Code session id. **MAY be empty** if not provided. |
+| `session_id` | The session's key. **The hook sends Claude Code's session id** — the conversation itself. **The PTY wrapper sends its own per-run id**, eight hex digits, new every time a wrapper starts (a launch, an account switch, a resume); the conversation it is running is field 9. **MAY be empty** if not provided. |
 | `name`       | Basename of `cwd`. The wrapper sanitises it like the meta fields — `\|` → `/`, CR/LF removed — because a `\|` in a directory name used to shift every field after it. |
 | `ctrl_sock`  | (PTY wrapper) per-session control socket GO's `focus` connects to. Empty for hooks. |
 | `model`      | (PTY wrapper) model in use, e.g. `Opus 4.8`. Empty until scraped / for hooks. |
@@ -487,19 +497,30 @@ every replug.
 | `account`    | (PTY wrapper) account/profile the session runs as, e.g. `work` or `default`. Empty for hooks. |
 | `limit`      | (PTY wrapper) remaining-limit chip for that account, e.g. `5h82%` (82% of the 5-hour window left) or `wk31%` (31% of the week left) — whichever window is more depleted. Refreshed every `CLAUDE_MATE_USAGE_POLL_S` (default 120 s) from Anthropic's OAuth usage endpoint; empty until the first successful poll / for hooks. |
 | `wf`         | (PTY wrapper) the session's **dynamic workflows**, read off Claude's footer: up to three records, or `-` for none. Empty = keep what the daemon has. See [Field 8](#wf-field) below. |
+| `hist`       | (PTY wrapper) **which Claude Code conversation** the session is running — in which directory, under which login, with which launch flags a resume replays — as one percent-encoded JSON object. Empty = unknown. What the [chat history](#chat-history) is built from. See [Field 9](#hist-field) below. |
 
 The hook path sends only the first three fields, and still does now that there
-is a workflow band — so a hook-only session never shows one. The PTY wrapper
-always sends all nine: the control socket, (once scraped) the model + effort,
-(once known) the account + remaining limit, and `wf`. All trailing fields are
-optional — the daemon defaults missing ones to empty, and an empty model,
-effort, account or limit means *unchanged*, never *cleared*. Fields after the
-ninth are ignored, so a later producer can append one without confusing this
-daemon.
+is a workflow band and a chat history — so a hook-only session never shows a
+band and is never kept. The PTY wrapper always sends all ten: the control
+socket, (once scraped) the model + effort, (once known) the account + remaining
+limit, `wf` and `hist`. All trailing fields are optional — the daemon defaults
+missing ones to empty, and an empty model, effort, account or limit means
+*unchanged*, never *cleared*. Fields after the tenth are ignored, so a later
+producer can append one without confusing this daemon — which is also why a
+daemon from before the history simply never sees `hist`: it stops at the
+ninth.
 
 The hook is **fire-and-forget**: it connects with a short timeout, writes one
 line, and exits **0** regardless of outcome. If the daemon/socket is down it
 **silently no-ops**. The hook must never block or fail a Claude turn.
+
+**One bad line costs one line.** The daemon handles every line inside a guard
+of its own: whatever a line raises is logged — `socket line failed (…)`, at
+most once a minute, each repeat with a count of what it skipped — and the next
+line is read. It used to be that anything but an `OSError` ended the socket
+thread for good while the process lived on, and launchd restarts a daemon that
+dies, not one that has stopped listening: every hook and wrapper report after
+it went nowhere, without a word.
 
 ### Field 8 — `wf`, the session's workflows {#wf-field}
 
@@ -601,30 +622,209 @@ as:
 working|3f9c1a2b|aladdin|/tmp/claude-mate-ctrl-3f9c1a2b.sock|Opus 5.5|xhigh|claudealaddin2|5h82%|R;0;5;;0;159;542800;;deployment-risk-sweep-3802
 ```
 
+(That line is from before field 9; a wrapper today sends the same with `|` and
+field 9 after it — below.)
+
+### Field 9 — `hist`, the conversation {#hist-field}
+
+The wrapper's own id (field 1) is new every time a wrapper starts, so it names
+a terminal's *run*, not the chat in it: a resumed chat, or one carried to
+another account, comes back under a new one. Field 9 names what those runs
+continue — Claude Code's **conversation id**, the one `claude --resume` takes —
+and everything a resume needs besides: where it ran, as whom, and how it was
+started.
+
+```
+hist := quote(json.dumps(obj, ensure_ascii=True, separators=(",", ":"), sort_keys=True), safe="")
+obj  := { "id": <uuid>, "cwd": <path>, "config": "" | <path>, "flags": [<flag>, ...] }
+```
+
+| Key | Description |
+|---|---|
+| `id` | Claude Code's conversation id, a lowercase UUID. Sent **only once the wrapper has seen this conversation's transcript exist** — a session that never ran a turn has nothing to resume — and never changed once sent (below). |
+| `cwd` | The wrapper's working directory, absolute. |
+| `config` | The login. `""` when `CLAUDE_CONFIG_DIR` is unset or empty — the default login, `~/.claude` and `~/.claude.json` — else the variable **exactly as set** when it is absolute, or its absolute form when it is not. Exactly, because Claude Code hashes the raw string into the name of its Keychain entry: `CLAUDE_CONFIG_DIR=~/.claude` is a different login from no variable at all, and a tidier spelling of the same directory is another one again. |
+| `flags` | The launch flags a resume replays, already through the wrapper's `resume_flags()` ([below](#resume-flags)). |
+
+A key that is **absent means unknown**, never *cleared*: the session keeps what
+it had. One JSON object rather than four fields means one encoding and one
+decoder, and later keys need no new field number. `ensure_ascii` carries a
+directory name that is not UTF-8 as `\udcXX` escapes, which decode back to the
+same bytes, and percent-encoding leaves no `|` or newline to split the line on.
+The wrapper never puts it through the sanitiser the other fields get, where
+`|` → `/` would change a path.
+
+**Every report carries it, `end` included** — the id can arrive first on the
+`end` line, when the transcript appeared after the last report. **Nothing goes
+out after `end`:** the wrapper's monitor thread could still be halfway through
+a report when `end` was sent, and that late line used to register the session
+all over again — a ghost row for ten minutes, and a chat that had just closed
+reading as open all that time. **At most 4096 bytes:** over that the field
+sends `flags` as `[]`, the one part that grows with what was typed — none, not
+*unknown*: a missing key would let a record keep an earlier session's flags, a
+bypass included — and still over, it goes out empty.
+
+**How the wrapper knows the id** depends on how claude was started:
+
+| Started as | The id |
+|---|---|
+| a new session with the capability cache warm — the wrapper mints the id and hands it over as `--session-id` — or one started with the user's own `--resume <uuid>` / `--session-id <uuid>` | in hand; sent once its transcript exists |
+| a new session with the cache cold — the first after every Claude Code update — or one started with `--fork-session` | the **one** UUID-named transcript in this directory's project directories that was not there at launch and records this directory. Two such, and it gives up for the session: which is whose would be a guess |
+| `-c` / `--continue`, a bare `--resume` (the picker), `-r <name>`, `--from-pr` — each without `--fork-session` | the **one** UUID-named transcript there that was there at launch, records this directory and has **grown** since. Not the newest one, which is what `--continue` was taken to pick: it skips `claude -p` and SDK runs, `/loop`, `--bg` and teammate transcripts, so the newest file can be one it never touches. Two grown — another terminal at work in this directory, or a file that does not say which directory it belongs to — and it gives up for the session |
+| a `--session-id` that is not a UUID | never — claude refuses one anyway |
+
+Once sent, the id is **locked** for the life of the wrapper. `/clear` or
+`/resume` typed inside the running TUI switches Claude's conversation, and the
+wrapper goes on reporting the one it started with. The two discovering rules
+wait for this session's **own first turn**, its first `working`: until it has
+run one, its transcript need not have appeared or grown at all, so the one new
+transcript there — or the one that has grown — is another terminal's. Looked
+at after the turn, another terminal at work in this directory makes two, and
+two is a give-up rather than a lock on the wrong id; none yet, and it goes on
+looking. The per-terminal context file (`$TMPDIR/claude-mate-ctx-<uid>/`)
+carries the same id as `conversation`, which is how `claude-mate history` tells
+an open chat from a closed one while the daemon is down — and the transcript
+the wrapper's own scan found, as `transcript` and `session_id`. That is no
+evidence to record a chat by, but it counts for liveness: a chat opened through
+the picker reads open once its terminal has found it, named or not, and a wrong
+guess there only ever refuses a resume.
+
+**What the daemon accepts.** `json.loads(unquote(hist))` must be an object, and
+each key is checked on its own — one that fails is dropped as if absent, so
+flags over their budget cost the flags and never the id beside them:
+
+- `id` — a UUID, in any case; kept lowercased.
+- `cwd` — starts with `/`, at most 4096 characters, no control character (below
+  0x20) and no DEL.
+- `config` — `""`, or a path by the same rule.
+- `flags` — a list of at most 64 strings, at most 4096 characters between them,
+  none holding a control character.
+
+A field over 64 KB is not parsed at all. And field 9 counts only from a **whole
+wrapper line**: one that ended with its newline — a sender that timed out stops
+at the socket buffer, 8 KB on macOS, and a path cut short still reads as a
+path, one directory up — and whose `ctrl_sock` is not empty. A line cut short
+still counts for its state; only its field 9 is ignored.
+
+#### Which flags a resume replays {#resume-flags}
+
+`resume_flags()` in `bin/claude-mate-wrap` is the **one** answer to *which of
+the flags a session was started with make a resumed one the same kind of
+session* — for the history, which starts a chat again days later from the
+flags its record kept. It is an **allowlist** taken from Claude Code 2.1.311's
+`--help`, and every flag that `--help` lists is in exactly one of its sets, the
+dropped ones included. `tools/test_account_switch.py` holds a copy of that
+option list and checks the sets against it — the copy, not the claude you have
+installed. After a Claude Code upgrade, paste the new `--help` into it: the
+test then fails until every new option has a class. Until someone does, a new
+option is dropped from every history resume, without a word.
+
+**The account switch keeps its own rule.** `claude-mate-switch` replays
+everything the session was started with except what names another
+conversation, then `--resume <id>`. That is right for a switch: it happens now,
+from this terminal's own argv, and stores nothing — so nothing a kept record
+has to leave out (inline JSON, a system prompt, whatever is past the budget
+below) goes missing on the way to another account. It replays a positional
+opening prompt and `-w` too, so a switch sends that prompt again and makes a
+new worktree: known, and a fix of its own.
+
+| | Flags |
+|---|---|
+| **kept** | `--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions`, `--verbose`, `--chrome`, `--no-chrome`, `--ide`, `--strict-mcp-config`, `--disable-slash-commands`, `--ax-screen-reader`, `--brief`, `--bare`, `--safe-mode`, `--restricted`, `--exclude-dynamic-system-prompt-sections` |
+| **kept, with its value** | `--model`, `--effort`, `--permission-mode`, `--fallback-model`, `--agent`, `--setting-sources`, `--autocompact`, `--plugin-dir`, `--plugin-url`, `--name` / `-n` |
+| **kept, with every value up to the next flag** | `--add-dir`, `--allowedTools` / `--allowed-tools`, `--disallowedTools` / `--disallowed-tools`, `--tools`, `--betas` |
+| **kept only as a file** | `--settings` and `--agents` (one value), `--mcp-config` (each value): only a value that names a file that exists, relative ones looked up in the session's directory — inline JSON is where tokens and API keys go, and a record keeps its flags until someone deletes it. `--mcp-config` goes when no value survives |
+| **dropped** | everything else, with its value: whatever names a conversation (`--resume`, `--continue`, `--session-id`, `--fork-session`, `--from-pr`, …); whatever starts something other than this terminal's session (`-p`, `--bg`, `--cloud`, `-w`, which makes a *new* worktree, …); `--system-prompt` and `--append-system-prompt`, because claude records the system prompt on the conversation's first request and sends that record on every resume; a positional prompt, which a resume would **send again**; and any flag `--help` does not list |
+
+A value is whatever claude's own parser takes as one. The word after a flag
+that requires a value goes with it even when it starts with `-`, so
+`--name --dangerously-skip-permissions` names a session and skips nothing — and
+replays as exactly that. **A short-option cluster** — one dash and two or more
+letters, `-cn`, `-nc` — is several flags to claude, and what the word after it
+is depends on its letters: `-cn x` continues a session named `x`, while
+`-nc --model opus` names one `c` and reads `--model` as a flag. So a cluster is
+never replayed: a plain word after it goes with it, and a flag-shaped one, `--`
+included, leaves no flags at all. A value over 256 characters, or holding a
+control character, goes, with its flag; once what is kept would pass 1024
+characters, only booleans and restrictions (below) are added, and nothing past
+64 words — what the daemon accepts, since it refuses the whole list otherwise.
+`--flag=value` stays one word, and `--` ends the flags: what follows it is a
+prompt.
+
+**Restrictions are kept, or nothing is.** `--dangerously-skip-permissions` is
+a boolean, always kept — so the flags that take something away are kept as
+surely: `--disallowedTools` / `--disallowed-tools`, `--tools`,
+`--permission-mode` and `--restricted` pass the 1024-character budget, the
+`--flag=value` spelling too. One that still cannot be kept — a value over 256
+characters or holding a control character, or past the 64-word cap — leaves
+**no flags at all**, the bypass with them: the safe way to be wrong.
+`--permission-mode bypassPermissions` takes nothing away, so losing it to the
+word cap is that safe way already, and costs only itself.
+
+**An agent defined inline goes the same way.** An interactive claude takes
+`--agents` only as inline JSON, which a record never keeps — so an `--agent`
+naming one of those agents would come back as claude's default one, its tools
+and prompt gone, and under `--dangerously-skip-permissions` with nothing asked:
+freer than the agent it ran as. A session that lost an inline `--agents` and
+picked an `--agent` keeps no flags at all. Inline `--agents` with no `--agent`
+costs only itself, and an `--agent` alone — its agent defined elsewhere — is
+kept.
+
+Whatever has to reason about a flag rather than replay it — the app labelling a
+resume by its permission mode, or swapping that mode — takes them as items,
+each flag with its values (`resume_flag_items()`): a word alone cannot say
+whether it is a flag or the value of the one before it.
+
+A session that has had a turn, with no workflow running, as it reaches the
+socket today:
+
+```
+working|3f9c1a2b|aladdin|/tmp/claude-mate-ctrl-3f9c1a2b.sock|Opus 5.5|xhigh|default|5h82%|-|%7B%22config%22%3A%22%22%2C%22cwd%22%3A%22%2FUsers%2Fyou%2Faladdin%22%2C%22flags%22%3A%5B%22--dangerously-skip-permissions%22%2C%22--model%22%2C%22opus%22%5D%2C%22id%22%3A%223f2a9c1e-5b7d-4c21-9a3e-1f0b2c3d4e5f%22%7D
+```
+
+Field 9 there, decoded:
+
+```
+{"config":"","cwd":"/Users/you/aladdin","flags":["--dangerously-skip-permissions","--model","opus"],"id":"3f2a9c1e-5b7d-4c21-9a3e-1f0b2c3d4e5f"}
+```
+
 ### The control socket (CLI → daemon) {#the-control-socket}
 
 The same socket carries **commands**, not just session updates, and this is the
-whole surface — six verbs. Anything unrecognised is parsed as a session update
+whole surface — seven verbs. Anything unrecognised is parsed as a session update
 above and dropped, so a typo is silent rather than an error.
 
 | Line | Reply | Meaning |
 |---|---|---|
-| `queue` | JSON | the whole queue, as the device shows it — each entry with its visible `workflows` ([§3](#per-session-workflows)). Also the only liveness check there is |
+| `queue` | JSON | the whole queue, as the device shows it — each entry with its visible `workflows` ([§3](#per-session-workflows)) and the `conversation` it is running (`""` until a wrapper has named one, and always for a hook session), and `seen`, the seconds since its last line — a wrapper reports at least every 20 s, so a row quiet for a minute is a terminal that died without an `end`. Also the only liveness check there is |
 | `accounts` | JSON | the saved logins and where they live |
 | `accounts-refresh` | `ok` | re-read the accounts directory (after something changed it) |
 | `press\|<code>` | `ok` | press a device button: `P N G K F M C T`, or `A<n>` to continue on saved account *n* |
-| `select\|<n\|name>` | `ok <name>` | point the selection at a row |
+| `select\|<key\|n\|name>` | `ok <name>` | point the selection at a row: a session's exact `key` from the queue JSON first, then an index, then a name (exact, unique prefix, unique substring — ambiguous is refused) |
+| `link\|<mode>` | `ok` | switch the **cabled** device's transport: `auto`, `cable`, `wifi`, `ble` or `p2p`. The daemon builds the console's `I\|` line itself — a narrow verb, not a relay, since the same console takes `T\|<token>` |
 | `pair` | `ok` | arm BLE enrolment for the next unprovisioned device |
 
 **The button codes are the device's own**, and deliberately so: `press|G` is
 handed to the same `ButtonReader` that handles `B|G` off the wire, so GO cannot
 mean one thing to the device and another to the terminal.
 
-There is **no** `status`, `ping` or `version` verb, and **no** delete. A hook in
-any of your shells can write to this socket; a hook firing a malformed line
-should not be able to remove a login, so `claude-mate accounts rm` does the
-deletion in its own process and only asks the daemon to re-read afterwards. The
-socket is mode 0600 — owner only.
+**`select` by key** is how a client that already knows which row it means says
+so — the app raising the terminal of a chat from its History. An index can
+shift between the client's read and this one, and a name is refused whenever two
+rows share it, which a terminal's hook row and wrapper row usually do. With no
+device linked, the `press|G` after it acts on that selection too — not on the
+last row a dropped device showed (§0, *No glass, the selection*).
+
+There is **no** `status`, `ping` or `version` verb, and **no** delete — not of a
+login, and not of a chat. A hook in any of your shells can write to this socket,
+and a hook firing a malformed line should not be able to remove either. So
+`claude-mate accounts rm` does the deletion in its own process and only asks the
+daemon to re-read afterwards, and `claude-mate history rm` / `history clear`
+delete the chat history's files in their own process. When a daemon answers,
+they ask it for `queue` and nothing else, to tell which chats are open — and a
+reply can only keep a chat from being deleted, never name one to delete, so no
+line on this socket can delete anything. The daemon writes the history and
+never deletes a chat from it. The socket is mode 0600 — owner only.
 
 Starting the daemon is not on here either, for the reason in
 [CLI.md](CLI.md#starting-and-stopping-the-daemon): it goes through launchd, or
@@ -674,14 +874,19 @@ daemon **never sends it**.
 
 > **No `SessionEnd` hook is installed.** The daemon's `idle` state is **not**
 > driven by any socket message — it is reached purely via the
-> done-until-acknowledged model and TTL pruning (see §3).
+> done-until-acknowledged model and TTL pruning (see §3). It is also why a
+> hook-only session is never kept in the [chat history](#chat-history): a
+> session that never says it closed would read as open for as long as its row
+> lived, and then as interrupted for good.
 
 ---
 
 ## 3. Session state model (kept by the daemon)
 
 The daemon keeps a dictionary of sessions, **keyed by `session_id`** (or by
-`name` when the id is empty).
+`name` when the id is empty) — Claude's id for a hook session, the wrapper's
+per-run id for a wrapped one. So a terminal that both the hook and the wrapper
+report is two rows, and nothing merges them.
 
 ### Per-session fields
 
@@ -690,7 +895,11 @@ The daemon keeps a dictionary of sessions, **keyed by `session_id`** (or by
 | `name`           | cwd basename. |
 | `state`          | Current state (see below). |
 | `sid`            | Session id (`session_id`). |
-| `cwd`            | Working directory, if known (used by the FOCUS fallback). |
+| `cwd`            | Working directory, if known: a wrapped session's from field 9 — NEW TERMINAL opens it, and the FOCUS fallback uses it. Empty for a hook session, which sends only the directory's name. |
+| `conversation`   | The Claude Code conversation a wrapped session is running (field 9's `id`), `""` until the wrapper names it. Sticky, like the account. |
+| `config_dir`     | The login it runs under (field 9's `config`): unknown, `""` for the default login, else the `CLAUDE_CONFIG_DIR` path. |
+| `flags`          | The launch flags a resume replays (field 9's `flags`). |
+| `turned`/`turn_ts` | Whether a turn has started in this session, and when the latest one did — set on a transition **into** `working`, never by a keepalive. What lets the history keep a conversation ([below](#chat-history)). |
 | `last_update_ts` | Timestamp of the last update for this session. |
 | `state_since`    | When the current state began — the displayed time is always *time in state* (for `working` that IS the live turn runtime; for an alert it is how long it has been waiting on the human). |
 | `model`/`effort` | Best-effort strings scraped by the PTY wrapper. |
@@ -744,6 +953,11 @@ re-entering the SAME alert class within 5 s of being acknowledged stays
 acknowledged (a bouncing detector cannot re-fire the LED the user just
 silenced).
 
+**An ended or pruned session leaves the queue, but its record stays.** `end`
+and the TTL prune are about what is live — the device and the queue. A
+conversation the [chat history](#chat-history) has kept outlives both, until
+someone deletes it.
+
 ### Selection rules
 
 * Tab order is **stable (alphabetical)** — tabs never change position as their
@@ -751,7 +965,8 @@ silenced).
 * The selection is **sticky**: the screen never changes subject on its own.
   Only when the selected session ends does it fall back to the first tab.
 * GO/ACK act on the session **currently shown** (WYSIWYG) and **stay** on it —
-  the device never auto-switches tabs.
+  the device never auto-switches tabs. With no device reachable nothing is
+  shown, and they act on the selection (§0).
 * PREV/NEXT wrap around the ends.
 * **FOLLOW** (double-click GO) makes PREV/NEXT also raise the selected terminal
   after the selection settles (~250 ms); double-click again to turn it off.
@@ -840,3 +1055,113 @@ records, each with `name`, `st` (the letter), `status` (the word: `running`,
 `paused`, `done`, `ended`), `done`, `total`, `failed`, `pct`, `secs` (the
 displayed clock in whole seconds, rounded down, or null), `tokens` and `note`.
 The record the device shows comes first, then the rest in on-screen order.
+
+### The chat history {#chat-history}
+
+The daemon keeps one record per Claude Code conversation that a **wrapped**
+session has run a turn in, until the user deletes it — through `end`, the TTL
+prune, a daemon restart or crash, and a reboot. It is built from field 9 and
+nothing else, so a hook-only session is never kept: hooks never send `end`, and
+a row that can never close would keep a closed chat looking open for minutes.
+
+```
+~/.config/claude-mate/history/    0700, made again on the next write if it is gone
+    <id>.json                     the record, 0600
+    <id>.jsonl                    a hard link to the conversation's transcript
+```
+
+**The record**, schema v1 (`json.dumps(indent=1, sort_keys=True,
+ensure_ascii=True)`; keys this version does not know are kept as they are):
+
+| Key | Holds |
+|---|---|
+| `v` | `1`. A record with a higher `v` was written by a newer daemon, and is left exactly as it is |
+| `conversation` | the id — also the file's name |
+| `name` | the directory's name |
+| `cwd` | the directory it ran in |
+| `config_dir` | the login: `null` unknown, `""` the default, else the `CLAUDE_CONFIG_DIR` path |
+| `account` | the account it ran as, as the wrapper labels it (`default`, `work`) |
+| `flags` | `null`, or the launch flags a resume replays |
+| `last_active` | when its latest turn started, in Unix seconds |
+| `ended` | `null`, or when its wrapper said it closed |
+| `project` | *(optional)* the directory under `<login>/projects/` its transcript was last found in |
+
+**Its status**, as `claude-mate history` reads it: `open` while a terminal has
+it — the daemon's queue says so, or a live wrapper's context file does;
+`closed` when `ended` is set — its wrapper said so, and an account switch
+reopens it on the next turn; `interrupted` otherwise — the daemon never heard it
+close (a crash, a killed wrapper, a machine that went down with it). A queue
+row counts only while its wrapper is still reporting, `seen` under a minute, so
+a wrapper killed without a word stops holding its chat open within a minute. A
+context file counts while its process is alive and it was refreshed in the last
+15 minutes, by the conversation it names and by the transcript its scan found
+([field 9](#hist-field)) — and only a file of yours, in a real directory of
+yours that no one else can write. Nothing in those files is signed: where the
+temp directory is a shared `/tmp`, another user who made that directory first
+could otherwise hold any chat open, refused by `rm`, `clear` and resume alike.
+
+**What may write what.** Per event, the writer goes by four rules:
+
+1. **A record is created only by a turn** — a session that has had a
+   transition into `working`. A session that never ran a turn has no
+   transcript and nothing to resume, and an `end` from a session this daemon
+   never saw (it restarted since) knows too little to start one.
+2. **After the user deletes a record,** only a turn begun after the deletion
+   brings it back — not the session that is still reporting, nor its `end`.
+   The deletion is dated by when the writer last saw the record on disk, not
+   by when it noticed it gone: `claude -c` names its chat only once its first
+   turn is under way, and dated by the noticing, that turn — begun after the
+   deletion — read as older, and the chat it picked up again was not kept.
+3. **Only a session that ran a turn may change a record's directory, login or
+   flags.** `claude --resume <id>` started in the wrong directory or under the
+   wrong login is refused by claude before it runs anything, and must not
+   repoint the record at where the chat could not be found. Its `end` may only
+   set `ended`.
+4. **A turn reopens a closed record:** `ended` goes back to `null`, and
+   `last_active` moves on.
+
+**The kept link.** On every write a turn causes, and at `end`, the writer looks
+for `<login>/projects/*/<id>.jsonl` — by listing, never by glob: a profile named
+`work [eu]` is a glob pattern that matches nothing — and, **once the record is
+written**, hard-links it beside the record. The same inode, so it costs no disk
+while Claude Code has its copy. The record goes first: a writer killed between
+the two, or a record that could not be written, leaves a record without its
+link, which the next write heals — never a link without a record, a transcript
+nothing lists or deletes. A record with nothing new is not written again, but
+its link still follows a transcript Claude has replaced with a new file.
+
+Once Claude's copy goes — `cleanupPeriodDays` (30 days by default),
+`claude purge`, a profile deleted with `claude-mate accounts rm` — the kept
+link *is* the conversation, and a resume puts it back where `--resume` looks.
+A deleted profile's directory it does not make again: the login went with it,
+and claude in a bare directory starts logged out, as an account that is not the
+one the chat ran as. So until the profile exists again — make it, and log in
+there — a resume refuses, and says the conversation is kept. When the
+transcript is not found, an existing kept link is left alone: that is the point
+of it.
+When no link can be made at all (the history on another volume from the
+transcripts), the daemon says so once and keeps the records anyway.
+
+**Deleting a record deletes the kept link**, and when that link is the only
+copy left, the conversation is gone with it — which is why every delete
+confirmation says whether it is. Deletion is the CLI's, in its own process
+([CLI.md](CLI.md#history)); nothing on the socket can ask for it.
+
+**How it is written.** On the socket thread a line only queues the event and
+wakes the writer: no file is touched there, ever. The writer, a thread of its
+own, gathers a burst for half a second, then writes each record whole or not at
+all — a temp file in the same directory, `fsync`, renamed over the record, and
+the directory `fsync`ed so the rename survives a power cut. Nothing new, no
+write: a keepalive is not a disk write. Each event is fenced on its own, and a
+record that cannot be written is logged at most once a minute for as long as it
+keeps failing. Temp files a killed writer left behind are swept on the first
+write of a process. One log line when a record is kept and one when it closes —
+`history: kept aladdin 3f2a9c1e`, `history: aladdin 3f2a9c1e closed` — never
+one per write.
+
+**Never at startup, never for the demo.** The daemon neither reads nor writes
+the history when it starts — a fault there would be a launchd restart every five
+seconds — and `--mock` keeps none: its sessions are fake, and the history is a
+promise about chats you had. At shutdown the writer stops last, after the socket
+thread is joined, so a chat whose `end` arrived just before reads `closed`, not
+`interrupted`.

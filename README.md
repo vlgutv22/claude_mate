@@ -147,6 +147,7 @@ claude-mate
 
   ▸  Start new session
      Start new session · skip permissions
+     History · resume or delete a past chat
      Device · link status and pairing
      Accounts · switch or review
      Quit
@@ -158,7 +159,9 @@ claude-mate
 Arrow keys move, Enter chooses, `q` quits. **Start new session** runs `claude`
 through the wrapper in this terminal, which is the part you would otherwise
 have typed — and going through the wrapper is what makes the new session show
-up on the device at all.
+up on the device at all. **History** is every chat you have closed — or lost to
+a crash or a reboot — kept until you delete it, ready to resume where and as it
+was.
 
 Piped, hooked, cron'd or tested, `claude-mate` is still the plain one-shot queue
 print it always was; the app appears only when both ends are a terminal.
@@ -183,6 +186,10 @@ variable: **[docs/CLI.md](docs/CLI.md)**.
 | `claude-mate select <n\|name>` | *(none)* | point at a row instead of stepping to it |
 | `claude-mate accounts` | — | the saved logins |
 | `claude-mate accounts rm <n\|name>` | — | delete one, after typing its name back |
+| `claude-mate history` | — | the chats it has kept, newest first |
+| `claude-mate history resume <n\|id>` | — | pick one up again, where and as it was |
+| `claude-mate history rm <n\|id>` | — | forget one, after typing its id back |
+| `claude-mate history clear` | — | forget every chat that is not open |
 | `claude-mate daemon` | — | start the daemon, or restart it, through launchd |
 | `claude-mate --version` | — | which build this is |
 
@@ -283,7 +290,9 @@ You can drive the daemon from **either or both** of these — mix freely:
 The wrapper is the more capable feed (true live state, plus terminal focus); the
 hooks are the zero-dependency feed. Use whichever fits each session. The
 workflow band needs the wrapper: a hook-only session shows none, and neither
-does a `.pkg` install on its own, which ships no wrapper.
+does a `.pkg` install on its own, which ships no wrapper. So does the chat
+history: only a wrapped session says which conversation it is running, and
+only a wrapped session says when it has closed.
 
 ---
 
@@ -377,6 +386,21 @@ does a `.pkg` install on its own, which ships no wrapper.
   auto-detects and auto-reconnects to the device, never crashes on a missing
   port; the hooks never block a turn; the wrapper falls back to running `claude`
   directly if anything is wrong.
+- **Chats kept until you delete them** — closing a terminal, a crash or a
+  reboot used to be the end of a chat as far as Claude Mate knew. Now the daemon
+  keeps a record of every conversation a wrapped session runs a turn in —
+  where it ran, under which login, with which launch flags — in
+  `~/.config/claude-mate/history`, with a **hard link to its transcript**
+  beside it: Claude Code's own cleanup (`cleanupPeriodDays`, 30 days by
+  default), `claude purge` or a deleted profile cannot take the conversation
+  away while the record is there, and while Claude still has its copy the link
+  costs no disk. `claude-mate history` lists them — `open`, `closed`, or
+  `interrupted` when the session never said it closed — `history resume` picks
+  one up again in its directory, as its account, with its flags, through the
+  wrapper, and `history rm` / `history clear` delete in the CLI's own process,
+  after you type the chat's id (or `clear`) back. In the app it is the
+  **History** row. Deleting a record deletes its kept link: when that is the
+  only copy, the conversation goes with it, and the confirmation says so.
 - **`--mock` demo mode** — run the whole display with fake sessions cycling
   through every state, no Claude and no hardware required.
 
@@ -444,8 +468,9 @@ does a `.pkg` install on its own, which ships no wrapper.
    │                 "<state>|<sid>|<name>\n"
    │
    └─ (b) PTY wrapper ─ bin/claude-mate-wrap  (alias claude=claude-mate-wrap)
-                     "<state>|<sid>|<name>|<ctrl_sock>|<model>|<effort>|<account>|<limit>|<wf>\n"
-                     + screen-scrapes the live TUI (wf = its dynamic workflows)
+                     "<state>|<sid>|<name>|<ctrl_sock>|<model>|<effort>|<account>|<limit>|<wf>|<hist>\n"
+                     + screen-scrapes the live TUI (wf = its dynamic workflows,
+                       hist = the conversation it runs, for the chat history)
                             │
                             ▼
               Unix domain socket  /tmp/claude-mate.sock
@@ -826,6 +851,9 @@ claude-mate new-terminal     # open a terminal in that session's directory
 claude-mate select api       # point at a row instead of stepping to it
 claude-mate accounts         # the saved logins
 claude-mate accounts rm old  # delete one, after typing its name back
+claude-mate history          # the chats it has kept, newest first
+claude-mate history resume 2 # pick one up again, where and as it was
+claude-mate history rm 8c41  # forget one, after typing its id back
 claude-mate daemon           # start it, or restart it
 ```
 
@@ -838,13 +866,15 @@ full reference for all four commands.
 **It presses the same buttons.** `claude-mate go` sends `press|G`, which the
 daemon hands to the *same* `ButtonReader` that handles `B|G` off the wire — so GO
 means one thing on this project (mirror closes first, a double press toggles
-FOLLOW, the raised window is the one whose name was on the glass) and there is no
-second implementation to drift. `claude-mate select` is the only thing the device
-has no equivalent for; it walks there with PREV/NEXT instead.
+FOLLOW, the raised window is the one whose name was on the glass — or, with no
+device linked, the one you selected) and there is no second implementation to
+drift. `claude-mate select` is the only thing the device has no equivalent for;
+it walks there with PREV/NEXT instead.
 
-**Deleting an account happens in the CLI's own process, never over the socket.**
-That socket is `chmod 0600` — the user's own, which is all a hook needs. Even
-so, a hook firing a malformed line should not be able to remove a login.
+**Deleting an account — or a kept chat — happens in the CLI's own process,
+never over the socket.** That socket is `chmod 0600` — the user's own, which is
+all a hook needs. Even so, a hook firing a malformed line should not be able to
+remove a login, or a conversation the history is keeping for you.
 
 **Device will not connect?** — press `d` at the account picker, or run
 `claude-mate-connect`. It reports every link — daemon, token, cable, BLE — and
@@ -1032,6 +1062,12 @@ does not blink off the device and come back with its minute started over when
 the dialog closes. The daemon turns it into the [workflow band](#features). The
 format is in [PROTOCOL.md](docs/PROTOCOL.md#wf-field).
 
+**Field 9 is not read off the screen.** It says which Claude Code conversation
+the session is running — learned once, from the transcripts, and never guessed —
+with the directory, the login and the flags a resume would replay. The chat
+history is kept from it; the format is in
+[PROTOCOL.md](docs/PROTOCOL.md#hist-field).
+
 ---
 
 ## How the status maps to your sessions
@@ -1176,6 +1212,46 @@ claude_mate/
   seeing that takes ten seconds of watching, or a minute on a run past an
   hour, whose clock moves once a minute (Claude has usually dropped that row,
   and the band with it, by then). A run that fails does the same.
+- **Only wrapped sessions are kept in History.** Hook-only sessions — the
+  VS Code panel, a bare `claude`, every `.pkg` install, which ships no wrapper —
+  are not recorded: hooks never send `end` (no `SessionEnd` hook is installed),
+  so a hook row can never be closed, and would keep a closed chat reading open
+  for minutes and then interrupted for good.
+- **History names a conversation only on evidence.** A session that has to find
+  its id rather than be handed it — the first one after a Claude Code update,
+  `--fork-session`, and `-c`, `-r <name>`, a bare `--resume` (the picker) or
+  `--from-pr`, which carry on a conversation already there — looks only after
+  its own first turn: for the one new transcript in its directory, or the one
+  already there that has grown. If another terminal in that directory started
+  or carried on a chat meanwhile, there are two, it cannot tell which is its
+  own, and the session is not kept rather than kept under the other one's id.
+  `/clear` or `/resume` typed inside a running session switches Claude's
+  conversation while the wrapper goes on reporting the one it started with.
+- **Only a turn the daemon saw is kept.** The daemon writes every record, and
+  only for a turn it saw start: a chat whose turns all ran while the daemon was
+  down — or while a daemon from before the history was still running — is not
+  in History.
+- **Open is only what claude-mate can see.** claude run without the wrapper, or
+  the VS Code panel, says nothing about which chat it has, and a second claude
+  on that chat forks its transcript all the same. So `history resume` asks
+  first whenever a chat's transcript was written in the last two minutes and no
+  terminal it can see has it — right after a clean close, too.
+- **A wrapper killed without a word reads `open` for up to a minute.** History
+  counts a queue row as open only while its wrapper is still reporting, and a
+  wrapper that could not send `end` (`kill -9`) has stopped: once it has missed
+  three keepalives its chat reads `interrupted` and can be resumed (with that
+  question, while its transcript is under two minutes old), though the device
+  lists the session until the TTL prune.
+- **Kept links hold disk space once Claude Code's copy is gone.** While Claude
+  Code has the transcript, the kept link is the same file and costs nothing.
+  Once Claude deletes its copy, the kept link is the only one, and its size is
+  what `claude-mate history` reports as *kept only here*. Nothing expires and
+  there is no off switch — the history keeps every chat until you delete it, and
+  `history clear` empties it. Deleting a record deletes its kept link — and
+  when that is the only copy, there is no undo. A hard link cannot cross
+  volumes either: with the history on a different volume from the transcripts,
+  records are kept but transcripts only by Claude Code (the daemon says so in
+  its log, once).
 - **FOCUS targets the wrapper's terminal first, then VS Code.** A wrapped session
   raises its own terminal window (matched by TTY) using the terminal app's own
   scripting — it selects the session's tab and brings that window to the front.

@@ -12,6 +12,380 @@ they are the project's history, not the current behavior (which the
 
 ## [Unreleased]
 
+### 2026-10-27 — Chats are kept until you delete them
+
+Asked for in one breath: *"adding to entire deamon a history log with ability
+to kill history as well now If I close chat its destroyed I want keep chats
+untill user delete it to preevent crashes and reload to preevent context
+loosing"*. Closing a terminal did destroy a chat, as far as anything here knew:
+the session left the queue, and which conversation it had been — in which
+directory, under which login, started how — went with it. A crash or a reboot
+did the same. Claude Code still had the transcript, for thirty days by default,
+but finding it again meant knowing its id, its directory and its login, and
+resuming it *as it was* meant remembering the flags it had been started with.
+
+- **The wrapper says which conversation it is running.** Field 9 of the socket
+  line is one percent-encoded JSON object: Claude Code's conversation id — the
+  one `claude --resume` takes — the directory, the login (`CLAUDE_CONFIG_DIR`
+  exactly as set, because Claude hashes the raw string into its Keychain entry
+  and `~/.claude` spelled out is a different login from none) and the launch
+  flags a resume would replay. The id goes out only once its transcript exists,
+  and is learned once and never changes: handed over as `--session-id`, or the
+  user's own `--resume <uuid>`; for a cold capability cache — the first session
+  after every Claude Code update — and `--fork-session`, the one new transcript
+  that records the session's directory; for `-c`, a bare `--resume` (claude's
+  own picker), `-r <name>` and `--from-pr`, the one transcript already there
+  that has grown. Both are looked for only after the session's own first turn,
+  and two of them is a give-up, not a guess. On every report, `end` included,
+  at most 4096 bytes (past it the flags go as none — never left out, which
+  would let a record keep an older session's bypass), and never after `end`:
+  the monitor thread could still be mid-report when `end` went out, and its
+  late line registered a ghost row for ten minutes. The per-terminal context file carries
+  the id too. An older daemon stops at field 8 and never sees it.
+- **The daemon keeps a record of every chat, and a link to its transcript.**
+  `~/.config/claude-mate/history/<id>.json`, written by a thread of its own and
+  never on the socket thread: a burst gathered for half a second, then each
+  record whole or not at all (temp file, fsync, rename, directory fsync), 0600
+  in a 0700 directory it makes again if you delete it. A chat's first turn in a
+  wrapped session creates its record, which survives close, prune, a daemon
+  restart or crash and a reboot, until you delete it. Beside it, `<id>.jsonl`
+  is a hard link to Claude Code's transcript, made once the record is written:
+  the same inode, so no extra disk while Claude has its copy — and the
+  conversation itself once Claude's cleanup (`cleanupPeriodDays`),
+  `claude purge` or a deleted profile has taken that copy. A clean exit marks a
+  record `closed`; one the daemon never heard close reads `interrupted`; one a
+  terminal has, `open`. A turn reopens a closed one. One log line per record
+  kept and per record closed, never per write; nothing read at startup; nothing
+  kept under `--mock`.
+- **`claude-mate history resume` picks a chat up where and as it was.** In the
+  directory its transcript records, under its login (`CLAUDE_CONFIG_DIR` set
+  verbatim, or unset for the default, whatever the shell exports), with its
+  flags put through the wrapper's policy again rather than replayed from the
+  file — and through the wrapper, so it is on the device like any other
+  session. When Claude's copy is gone, the kept link is put back where
+  `--resume` looks — once the profile is there again, if it was deleted: its
+  login went with it. `--skip-permissions` and `--ask-permissions` change the
+  permission mode and nothing else. Every refusal says what it checked: no
+  terminal on both ends, open in a terminal already, a profile or a directory
+  that no longer exists, no transcript anywhere — with where it looked, and the
+  likely causes as possibilities, not as fact. Whether it is open is looked at
+  again right before the exec; a transcript written in the last two minutes
+  that no terminal it can see has is a question, not a go; and `resume <n>` by
+  number says which chat that is now and waits for Enter. The app's new
+  **History** row, under the two Start rows, does the same with the arrow
+  keys: *Raise its terminal* for an open chat (`select|` now takes an exact
+  session key first, so it raises that row and no other), *Resume* with the
+  permission mode in the label, *Delete from history*.
+- **`history rm` and `history clear` delete — in the CLI's own process.**
+  Nothing on the socket can delete a chat, for the reason nothing there can
+  delete a login. `rm` takes an index or four or more characters of the id,
+  prints the record and wants its short id typed back; `clear` wants `clear`.
+  Both refuse an open chat, which would come back on its next turn, and both
+  say whether a kept link is the only copy: deleting a record deletes its link,
+  and when that is the last copy the conversation is gone with it.
+  `accounts rm`, at the prompt and in the app, now says how many kept chats ran
+  on the profile — their kept transcripts outlive it.
+- **Open means open, daemon or no daemon.** Liveness is the daemon's queue
+  *plus* every wrapper's per-terminal context file whose process is alive and
+  that was refreshed in the last 15 minutes — by the conversation it names and
+  by the transcript its scan found, and only a file of yours, in a directory
+  only you can write. With the queue alone, a daemon that was down or had just
+  restarted — wrappers re-register within a keepalive, 20 s — showed every open
+  chat as interrupted, and Resume would have started a second claude on one:
+  two processes appending to one transcript fork it, and whichever branch a
+  later resume follows, the other's turns are gone from the context. A queue
+  row counts only while its wrapper is still reporting (the queue's new
+  `seen`), so a terminal killed without a word stops holding its chat open
+  within a minute. `claude-mate history` says when the context files were all
+  it had.
+- **The flags a resume replays, decided once.** `resume_flags()` in the wrapper
+  is an allowlist from Claude Code 2.1.311's `--help`, with every flag the help
+  lists classified: the permission mode, model, effort, tool lists and
+  directories come back; `--settings`, `--agents` and `--mcp-config` only when
+  they name a file; nothing that names a conversation, no `-p`, no `-w`, which
+  would make a new worktree, no opening prompt, which a resume would send
+  again, no `--system-prompt` or `--append-system-prompt` (claude resends its
+  own record of the prompt on every resume), and no flag nobody has classified.
+  A value goes with its flag even when it starts with `-`, the way claude
+  parses it; one over 256 characters, or holding a control character, goes;
+  past 1024 characters only booleans and restrictions are added, and nothing
+  past 64 words. A short-option cluster such as `-cn`, which claude reads as
+  several flags, is never replayed. **Restrictions are kept, or nothing is:**
+  the deny list, `--tools`, `--permission-mode` and `--restricted` pass that
+  budget, and when one still cannot be kept, no flag is —
+  `--dangerously-skip-permissions` included — and the same goes for an
+  `--agent` whose inline `--agents` a record cannot keep. The account switch
+  keeps its own rule; see *Not in this change*.
+- **One bad line no longer silences the daemon.** Every socket line is handled
+  inside a guard of its own: a fault is logged — at most once a minute, with a
+  count of the repeats — and the next line is read. Before, anything but an
+  `OSError` ended the socket thread for good while the process lived on;
+  launchd restarts a daemon that dies, not one that has stopped listening, and
+  every hook and wrapper report after it went nowhere without a word. The
+  history's part of a line runs last, fenced again, after the registry, the
+  screen and the LED have had theirs.
+- **The chooser keeps its cursor on the screen.** A list longer than the
+  terminal is drawn as a window around the cursor, with a dim `↑ N more` /
+  `↓ N more`, and every line is cut to the width by the columns it takes. The
+  number keys choose only while every row is on the screen — never in a yes/no,
+  where `1` answered *Yes* to a destructive question without the cursor leaving
+  *No*, and never in a chat's own menu, where one keystroke would resume or
+  delete. A list that fits is drawn as it always was, the wrapper's account
+  picker among them. And deleting an account from the app no longer drops the
+  app out of its own screen: the confirmation opened a terminal of its own, and
+  restoring that left the alternate screen while the app ran on.
+- **NEW TERMINAL opens the session's directory.** It always meant to — the
+  daemon opens Terminal in the session's `cwd` — but no real session ever had
+  one: the socket carried no directory, so every press opened `~`. Field 9
+  brings a wrapped session's. A hook-only session still opens `~`.
+
+New tests: `tools/test_history.py` — the chat history against a temp `HOME`
+with no Claude: field 9 from the wrapper's own line through the daemon's
+parser, key by key; the socket thread outliving a history fault; `select|<key>`;
+the writer's rules for creating, closing, reopening, deleting and keeping a
+transcript; resume with the exec stubbed — where, as whom, with which flags,
+and what it refuses or asks first; Raise passing over a killed terminal's row;
+a real daemon fed by the wrapper's `send_daemon()`, killed with SIGKILL and
+started again; old line shapes and `--mock` keeping nothing; and the CLI
+listing and deleting with no daemon at all, liveness from the terminals'
+context files. `tools/test_wrapper.py` checks ten fields, and drives the real
+wrapper five times — a minted id and a discovered one, each reaching field 9
+without a state change, `end` last and carrying it; another terminal's new chat
+appearing before the first turn, which is never claimed; and `-c` twice,
+naming the chat it continued rather than the newer `claude -p` job beside it,
+and nothing at all when another chat there grew during the turn.
+`tools/test_workflow_rows.py` checks field 9's encoding, its budget and nothing
+after `end`; `tools/test_account_switch.py` the flag policy, held to a copy of
+the `--help` option list, the prompt and `-w` left behind, how `-c`, the
+picker, `-r <name>` and `--from-pr` learn their id, the switch keeping its own
+rule, and a sweep of short argvs, short-option clusters among them, that always
+resumes the right conversation with nothing the original did not have — and
+with every restriction it had, or no flag at all;
+`tools/test_workflow_daemon.py` the presses with no device linked, a deletion
+dated by when the record was last seen, and the record before its link;
+`tools/test_app.py` the History row, the chooser's window and digits and a key
+whose UTF-8 reads as a digit, the note under the menu wrapped to the width, a
+repaint that leaves nothing behind, and a History run in the real app at 80×24,
+its resume question included; `tools/test_cli.py` the history commands, and
+`history` in the manual. [`docs/PROTOCOL.md`](docs/PROTOCOL.md) has field 9,
+the flag policy and the record.
+
+Found by review before it shipped — the design went to an adversarial review
+before a line of it was written, and came back changed in these places:
+
+- **The socket thread had no guard.** The first design parsed field 9,
+  snapshotted the session and queued the event on the socket thread with
+  nothing around it — and anything but an `OSError` there already ended that
+  thread for good, with the process alive and launchd none the wiser. Every
+  line is fenced now, and the history's part runs last, fenced again, so it can
+  cost the history and never the report.
+- **Hook rows kept closed chats open.** In the documented install the hook and
+  the wrapper both report a wrapped terminal, as two rows, and hooks never send
+  `end`. With hook rows counted, a chat closed cleanly read `open` for two to
+  ten minutes — refusing resume and delete, offering to raise a terminal that
+  was gone — and `interrupted` for good after. Only wrapper lines feed the
+  history.
+- **Resume while the daemon was down.** Liveness came from the queue alone, so
+  with the daemon down or just restarted every open chat read `interrupted`,
+  and Resume would have started a second claude on it — forking the transcript,
+  which is the very context loss this was asked for to prevent. The context
+  files count now.
+- **Claude's 30-day cleanup is not "until user delete it".** The first design
+  kept a pointer to the transcript, so a record outlived its chat by however
+  long Claude Code's `cleanupPeriodDays` allowed — 30 days by default — or
+  until `claude purge` or a deleted profile. The hard link closes that.
+- **Inline flag values held secrets.** Replaying `--settings`, `--mcp-config` or
+  `--agents` meant keeping their inline JSON — tokens, API keys — in a file
+  that lasts until someone deletes it; and one long `--append-system-prompt`
+  pushed the list past the daemon's limit, which dropped every flag,
+  `--dangerously-skip-permissions` with them. Those three count only as files
+  now, the system-prompt flags are not replayed, and the budget drops one value
+  at a time.
+- **A delete by index could take another chat.** `rm <n>` with the name typed
+  back, as `accounts rm` does — but every chat in a project shares its name,
+  and the list's order shifts as chats run, so typing the name confirmed
+  whichever chat the index had come to point at. The short id is what you type
+  back now, so a shifted index can only end in `not deleted.`
+
+Smaller: a session that never ran a turn — `--resume <id>` from the wrong
+directory, which claude refuses — could repoint a record's directory, login and
+flags, so only a turn writes them; a line cut at the socket buffer could store
+a path one directory up, so field 9 counts only from a whole line; a fixed
+temp-file name could freeze a record for the life of the daemon after one
+failed write, logged five times and then never, so the names are random, a
+sweep clears what a killed writer left, and a stuck record is logged every
+minute; a list of recent chats on the app's top level pushed Device, Accounts
+and Quit off an 80×24 screen, so it is one row; and the first way of learning
+the id changed which transcript the account switch carries, which the switch's
+own tests caught — the switch's rule is untouched, and the id is learned
+beside it.
+
+Found by review of the built code, and fixed before it shipped:
+
+- **A flag's value was read as a flag.** The app labelled a resume, and swapped
+  its permission mode, a word at a time — so a session *named*
+  `--dangerously-skip-permissions` was offered as one that skipped permission
+  prompts, and *Resume · ask permissions* took that word out and left `--name`
+  to swallow the `--resume` after it: claude would have started a new session
+  with the conversation's id as its first prompt. The wrapper now hands out its
+  flags as items, each flag with its values (`resume_flag_items()`), and the
+  app works on those.
+- **Another terminal's new chat could be taken for this one's.** A session whose
+  id has to be discovered — the first after a Claude Code update, or
+  `--fork-session` — took the one new transcript recording its directory; if a
+  second terminal there started a conversation before this session's first
+  turn, that one was the only new file, and this session was recorded under its
+  id. It now looks only after its own first turn, when such a race leaves two
+  new files — and two is a give-up, not a guess.
+- **A killed terminal's chat read `open` for up to ten minutes.** A wrapper
+  killed without a word (`kill -9`) stays in the queue until the TTL prune, and
+  its row kept the chat `open` — resume refused it — all that time. The queue
+  now says how long since each row's last line (`seen`), and a row that has
+  missed three keepalives no longer makes a chat open: within a minute it reads
+  `interrupted`, and can be resumed.
+- **A flag list the daemon would refuse.** The daemon takes at most 64 flag
+  words with no control character in any, and refuses the WHOLE list
+  otherwise — permission flags included. The wrapper now keeps at most 64
+  words and drops a value holding a control character, with its flag.
+- **The account switch had taken the history's flag rule.** The first build
+  sent `claude-mate-switch` through `resume_flags()` too — and a rule made for
+  a record kept for days is wrong for a switch, which happens now and stores
+  nothing. A read-only agent defined with inline `--agents` came back as
+  claude's default one (`--agents` dropped, `--agent` kept); the system prompt,
+  Remote Control and inline settings and MCP servers were gone; and a long
+  `--add-dir` took the deny list after it along. The switch is back to its own
+  rule, exactly as it was before this change.
+- **`claude -c` could be filed under another chat.** It took the transcript
+  that was newest at launch, which is what `--continue` was taken to pick — but
+  claude skips `claude -p` and SDK runs, `/loop`, `--bg` and teammate
+  transcripts, so the newest file could be a job it never touched: recorded
+  under this terminal's directory and flags, while the chat it did carry on
+  went unrecorded. And a chat picked up through claude's own picker,
+  `-r <name>` or `--from-pr` was never named at all — open in a terminal, it
+  read closed, and History offered to resume it a second time. All of them now
+  take the one transcript that was already there and grew during the session's
+  own first turn, and two that grew is a give-up; and what a terminal's own
+  scan found counts as open, named or not.
+- **Open was only what claude-mate could see.** claude run without the
+  wrapper, the VS Code panel, a chat opened through the picker that has not run
+  a turn yet — none says which chat it has, and a second claude on one forks
+  its transcript all the same. What each does leave is a fresh write: a chat
+  whose transcript was written in the last two minutes, with no terminal
+  claude-mate can see holding it, is a question now — `yes` typed at a shell, a
+  yes/no that starts on *No* in the app. And whether it is open is read again
+  right before the exec: read once, before a chooser that waited on a person,
+  it let a chat opened elsewhere meanwhile get a second claude.
+- **Raise raised the wrong terminal once the device had gone.** A press acts on
+  the frame on the glass, and the daemon learned which frame that was only when
+  one reached a device — so with the cable pulled, or a battery device asleep,
+  it went on naming the last session drawn. *Raise its terminal* selected the
+  chat's row, was told `ok`, and its GO raised and acknowledged another
+  terminal; `claude-mate select` then `go`, and the app's session rows, did the
+  same from before this change. With no device linked a press acts on the
+  selection now, and `mirror` opens nothing.
+- **…or a dead terminal's row.** A terminal killed outright keeps its row for
+  minutes, and the same chat resumed since has a second one under the same
+  name. Raise took whichever sorted first, a coin toss on their random keys,
+  and GO on the dead one brought VS Code forward and said it had raised the
+  chat. Only a row still reporting counts now, the freshest first.
+- **A resume could come back freer than its chat.** The budget dropped flags in
+  order, and `--dangerously-skip-permissions`, a boolean, was always kept: past
+  1024 characters of `--add-dir`, the deny list or plan mode behind it went,
+  and the chat came back skipping every prompt with nothing denied. And an
+  agent defined with inline `--agents`, which a record never keeps, came back
+  as claude's default one through the `--agent` that was kept. Restrictions
+  pass the budget now, and one that still cannot be kept — or an `--agent`
+  whose definition went — leaves no flag at all.
+- **`-cn --dangerously-skip-permissions` came back as a bypass.** claude reads
+  `-cn` as `-c` then `-n`, and `-n` takes the next word whatever it looks like:
+  that session was *named* `--dangerously-skip-permissions`, and skipped
+  nothing. Read a word at a time, the name came back as the flag. A
+  short-option cluster is never replayed now, and a flag-shaped word after one
+  leaves no flags at all — whether claude read that word as a value or as a
+  flag depends on the cluster's letters.
+- **A chat kept from a deleted profile was promised a resume it could not
+  have.** The docs said a resume puts its kept link back. But `accounts rm`
+  takes the login with the profile, and resume refused on the missing
+  directory before it looked for the link, with a message that gave no way
+  forward. It still refuses — into a bare directory claude would start logged
+  out, as an account that is not the chat's — but says the conversation is
+  kept, and that making the profile again and logging in brings it back.
+- **`history resume <n>` resumed whatever was at `n` now.** The list reorders
+  as chats run: one new chat's first turn and `resume 1` was another chat in
+  the same project, under the same name, perhaps skipping permissions — and the
+  next prompt went into it. By number it now shows which chat that is and
+  waits for Enter; by id it goes straight on.
+- **Another user's files could hold a chat open.** The terminals' context files
+  are not signed, so they are only as true as their directory is private, and
+  where the temp directory is a shared `/tmp`, another local user who made it
+  first could plant files holding any chat open — refused by `rm`, `clear` and
+  resume. They count now only in a real directory of yours that no one else
+  can write, and only files you own.
+- **A deletion was dated by when the daemon noticed it.** A chat deleted from
+  History and picked up again with `claude -c` names itself only once its first
+  turn is under way, and the deletion, dated when the writer saw the record
+  gone, read as newer than that turn: the chat was kept only from its second.
+  It is dated by when the record was last seen now, so the first turn keeps it.
+- **A failed first write left a transcript nobody could see.** The writer
+  linked the transcript before it wrote the record, so a record whose first
+  write failed — or a daemon killed between the two — left an `<id>.jsonl` with
+  no `<id>.json` beside it: never listed, never deleted, holding its disk after
+  Claude dropped its own copy. The record goes down first now, and a record
+  without its link heals on the next write.
+- **The docs promised more than the code.** `claude-mate history` on a pipe
+  was said to cut nothing, and cut names past 24 columns and accounts past 16;
+  now it does not (a title still stops at 200 characters). History was said
+  never to ask the daemon anything; it asks for `queue`, to tell which chats
+  are open, and a reply can only keep a chat from being deleted. The flag test
+  was said to fail when Claude Code adds a flag; it checks a pasted copy of
+  `--help`, which someone has to refresh. The causes given for a chat missing
+  from History were too few. And the README's diagram still drew the wrapper's
+  line with nine fields, and PROTOCOL's field-9 example paired the account
+  `work` with the default login, which no wrapper sends.
+
+Smaller: a key whose UTF-8 bytes include `²`, `³` or `¹` — a Cyrillic `в`,
+`г` or `й`, an `ó`, `ò` or `ù`, a Greek `β`, `γ` or `ι` — crashed every
+chooser, the wrapper's account picker at session start among them, because
+`str.isdigit()` calls those bytes digits and `int()` does not; older than this
+change, but it rewrote that line, so only `0`–`9` are number keys now. A
+refusal under the app's menu wrapped over several rows and scrolled the header
+off, so the note is wrapped to the width, at most three rows a line. A chat's
+two-row note left the previous screen's text on its first row, so each row of
+a note is erased to its end. And a CLI whose own directory had been deleted
+under it refused every resume with `cannot load the wrapper … No such file or
+directory`, so the wrapper loads from `~`.
+
+Each code fix is a case in `tools/test_history.py`, `tools/test_wrapper.py`,
+`tools/test_account_switch.py`, `tools/test_workflow_daemon.py` or
+`tools/test_app.py`, and each failed against the code before it.
+
+**Not in this change**, deliberately, each with its reason:
+
+- **Hook-only sessions.** Hooks never send `end` — no `SessionEnd` hook is
+  installed — so a hook row can never be closed, and would keep a closed chat
+  looking open for minutes. `hooks/claude-status.sh` is unchanged, and a
+  `.pkg` install, which ships no wrapper, records nothing.
+- **The device.** No firmware change: it shows the live queue, as before.
+- **Merging a terminal's hook row and its wrapper row.** Both could now carry
+  the conversation a merge would key on, but that is a change of its own.
+- **A conversation switched inside a running session.** `/clear` or `/resume`
+  typed inside the TUI switches Claude's conversation while the wrapper keeps
+  reporting the one it started with: nothing says for certain which one it
+  moved to, and guessing would file one chat under another's id.
+- **The account switch's flags.** `claude-mate-switch` keeps its own rule: it
+  replays everything the session was started with that does not name another
+  conversation. That is right for a switch, which happens now and stores
+  nothing — so inline JSON, a system prompt and a long `--add-dir` all come
+  across. Its known faults, an opening prompt sent to claude again and `-w`
+  making a new worktree instead of going back to the conversation's own, are a
+  fix of their own.
+- **Bringing back an agent defined inline.** An interactive claude takes
+  `--agents` only as inline JSON, and a record keeps none — that is where
+  tokens go — so a chat that ran as one of those agents resumes with no flags
+  at all, rather than as claude's default agent with the bypass still on.
+- **An off switch for recording.** Nobody asked for one; `history clear` is the
+  kill.
+
 ### 2026-10-09 — The device shows a running workflow, not just WORK
 
 Asked for once the entries below had the wrapper reading a workflow's row, with

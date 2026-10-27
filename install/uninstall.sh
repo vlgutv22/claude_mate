@@ -84,3 +84,15 @@ done
 
 ok "Claude Mate uninstalled."
 info "Note: log files in ~/Library/Logs/claude-mate.*.log were left in place."
+
+# The chat history is left too, and said to be, like the logs -- but it is not
+# a log. Its records are the chats the user asked to keep until THEY delete
+# them, and a kept transcript beside a record may be the only copy left of a
+# conversation Claude Code has since cleaned up. An uninstaller that removed it
+# would be the one deletion nobody typed.
+HISTORY_DIR="${HOME}/.config/claude-mate/history"
+if [[ -d "${HISTORY_DIR}" ]]; then
+    info "Note: your chat history in ${HISTORY_DIR} was left in place."
+    info "      It may hold the only copy of a conversation. To delete it anyway:"
+    info "      rm -r \"${HISTORY_DIR}\""
+fi
